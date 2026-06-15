@@ -1,0 +1,40 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Java
+target/
+*.class
+
+# Node / React
+node_modules/
+dist/
+build/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local storage
+uploads/
+data/
+tmp/
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+
