@@ -1,4 +1,4 @@
-# Multimodal-RAG-Agent-Learning-Evidence-Platform-React-Java-Python
+# Multimodal-RAG-Agent-Learning-Evidence-Platform
 
 中文名：学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
 
