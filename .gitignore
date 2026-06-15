@@ -18,6 +18,7 @@ target/
 node_modules/
 dist/
 build/
+*.tsbuildinfo
 .env
 .env.*
 
@@ -37,4 +38,3 @@ tmp/
 *.mkv
 *.wav
 *.mp3
-

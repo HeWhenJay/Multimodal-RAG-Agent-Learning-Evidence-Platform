@@ -1,0 +1,30 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: learning-evidence-backend
+  datasource:
+    driver-class-name: org.h2.Driver
+    url: jdbc:h2:mem:evidence;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+  sql:
+    init:
+      mode: always
+
+mybatis:
+  mapper-locations: classpath*:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+
+evidence:
+  ai:
+    python-base-url: http://127.0.0.1:8090
+    query-timeout-seconds: 30
+    index-timeout-seconds: 60
+    overview-timeout-seconds: 5
+
