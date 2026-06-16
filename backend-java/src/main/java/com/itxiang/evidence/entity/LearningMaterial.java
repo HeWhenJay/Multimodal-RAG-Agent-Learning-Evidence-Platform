@@ -15,7 +15,8 @@ public class LearningMaterial {
     private String parser;
     private String documentSummary;
     private Integer chunkCount;
+    private String originalFilename;
+    private String originalFilePath;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }
-

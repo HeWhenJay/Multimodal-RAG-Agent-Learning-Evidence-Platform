@@ -702,6 +702,22 @@ button {
   font-weight: 700;
 }
 
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.toggle-row input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
 .compact-textarea {
   min-height: 110px;
   padding: 12px;

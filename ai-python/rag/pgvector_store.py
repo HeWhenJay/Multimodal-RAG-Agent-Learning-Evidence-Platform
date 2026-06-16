@@ -8,6 +8,7 @@ from typing import Any
 
 from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
+from rag.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.retrieval import (
     build_answer,
     embed_text,
@@ -17,10 +18,12 @@ from rag.retrieval import (
 )
 from rag.summary_index import SummaryIndex
 from schemas.rag import (
+    DocumentBlock,
     Evidence,
     IndexResponse,
     IndexTextRequest,
     OverviewResponse,
+    ParseQuality,
     QueryRequest,
     QueryResponse,
 )
@@ -50,19 +53,69 @@ class PgVectorRagStore:
             self.ensure_schema()
 
     def index_text(self, request: IndexTextRequest) -> IndexResponse:
-        document_id = request.documentId
+        block = DocumentBlock(
+            documentId=request.documentId,
+            blockId=f"{request.documentId}-manual-1",
+            fileType=request.documentType,
+            blockType="text",
+            sectionTitle="全文",
+            contentText=request.content,
+            parseEngine=request.parser,
+            confidence=1.0,
+            sourceTitle=request.title,
+            sourcePath=request.sourcePath,
+            metadata={"source": "manual-text"},
+        )
+        quality = evaluate_parse_quality(
+            QualitySignals(native_text_chars=len(request.content), paragraph_count=1),
+            high_precision=False,
+        )
+        return self.index_blocks(
+            document_id=request.documentId,
+            title=request.title,
+            document_type=request.documentType,
+            source=request.source,
+            user_id=request.userId,
+            visibility_scope=request.visibilityScope,
+            language=request.language,
+            parser=request.parser,
+            blocks=[block],
+            parse_quality=quality,
+            status="READY",
+            source_path=request.sourcePath,
+        )
+
+    def index_blocks(
+        self,
+        *,
+        document_id: str,
+        title: str,
+        document_type: str,
+        source: str,
+        user_id: str,
+        visibility_scope: str,
+        language: str,
+        parser: str,
+        blocks: list[DocumentBlock],
+        parse_quality: ParseQuality,
+        status: str,
+        source_path: str | None = None,
+    ) -> IndexResponse:
         metadata = {
             "documentId": document_id,
-            "title": request.title,
-            "documentType": request.documentType,
-            "source": request.source,
-            "userId": request.userId,
-            "visibilityScope": request.visibilityScope,
+            "title": title,
+            "documentType": document_type,
+            "source": source,
+            "sourcePath": source_path,
+            "userId": user_id,
+            "visibilityScope": visibility_scope,
             "uploadTime": utc_now_iso(),
-            "language": request.language,
-            "parser": request.parser,
+            "language": language,
+            "parser": parser,
+            "parseStatus": status,
+            "parseQuality": parse_quality.model_dump(),
         }
-        chunks = self.chunker.split(request.content, document_id=document_id, metadata=metadata)
+        chunks = self.chunker.split_blocks(blocks, document_id=document_id, metadata=metadata)
         summaries = self.summary_index.build(chunks)
 
         Json = self._json_adapter()
@@ -88,13 +141,13 @@ class PgVectorRagStore:
                     """,
                     (
                         document_id,
-                        request.title,
-                        request.documentType,
-                        request.source,
-                        request.userId,
-                        request.visibilityScope,
-                        request.language,
-                        request.parser,
+                        title,
+                        document_type,
+                        source,
+                        user_id,
+                        visibility_scope,
+                        language,
+                        parser,
                         summaries["documentSummary"],
                         Json(summaries["sectionSummaries"]),
                         len(chunks),
@@ -133,11 +186,12 @@ class PgVectorRagStore:
 
         return IndexResponse(
             documentId=document_id,
-            title=request.title,
-            status="INDEXED",
+            title=title,
+            status=status if chunks else "FAILED",
             chunkCount=len(chunks),
-            parser=request.parser,
+            parser=parser,
             documentSummary=summaries["documentSummary"],
+            parseQuality=parse_quality,
         )
 
     def query(self, request: QueryRequest) -> QueryResponse:
@@ -158,7 +212,10 @@ class PgVectorRagStore:
 
         fused = reciprocal_rank_fusion(ranked_lists)
         selected = [(chunk_id, score) for chunk_id, score in fused[: request.topK] if chunk_id in chunk_by_id]
-        evidences = [self._to_evidence(chunk_by_id[chunk_id], score) for chunk_id, score in selected]
+        evidences = [
+            self._to_evidence(chunk_by_id[chunk_id], score, retrieval_source="fusion")
+            for chunk_id, score in selected
+        ]
         answer = build_answer(request.question, evidences)
         return QueryResponse(
             answer=answer,
@@ -195,6 +252,34 @@ class PgVectorRagStore:
             evidenceCount=chunk_count,
             lastIndexedTitle=last.get("title") if last else None,
         )
+
+    def list_evidences(self, document_id: str, limit: int = 20) -> list[Evidence]:
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        c.chunk_id,
+                        c.document_id,
+                        c.chunk_position,
+                        c.section_name,
+                        c.text,
+                        c.metadata,
+                        c.term_counts,
+                        c.token_count,
+                        d.title,
+                        d.source,
+                        d.document_type
+                    FROM rag_chunk c
+                    JOIN rag_document d ON d.document_id = c.document_id
+                    WHERE c.document_id = %s
+                    ORDER BY c.chunk_position ASC
+                    LIMIT %s
+                    """,
+                    (document_id, limit),
+                )
+                rows = cursor.fetchall()
+        return [self._to_evidence(normalize_row(row), 1.0, retrieval_source="summary") for row in rows]
 
     def ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -362,19 +447,35 @@ class PgVectorRagStore:
                 rows = cursor.fetchall()
         return [(str(row["chunk_id"]), float(row["score"] or 0.0)) for row in rows]
 
-    def _to_evidence(self, row: dict[str, Any], score: float) -> Evidence:
+    def _to_evidence(self, row: dict[str, Any], score: float, retrieval_source: str) -> Evidence:
         snippet = " ".join(str(row["text"]).split())
         if len(snippet) > 220:
             snippet = snippet[:220].rstrip() + "..."
+        metadata = ensure_dict(row.get("metadata"))
+        title = str(row.get("title") or metadata.get("title") or "未命名资料")
+        section_title = str(metadata.get("sectionTitle") or row.get("section_name") or "全文")
         return Evidence(
             evidenceId=str(row["chunk_id"]),
             documentId=str(row["document_id"]),
-            title=str(row.get("title") or "未命名资料"),
+            documentTitle=title,
+            blockId=as_optional_str(metadata.get("blockId")),
+            blockType=as_optional_str(metadata.get("blockType")),
+            pageIndex=as_optional_int(metadata.get("pageIndex")),
+            slideIndex=as_optional_int(metadata.get("slideIndex")),
+            sheetName=as_optional_str(metadata.get("sheetName")),
+            cellRange=as_optional_str(metadata.get("cellRange")),
+            sectionTitle=section_title,
+            title=title,
             snippet=snippet,
             source=str(row.get("source") or "unknown"),
-            sectionName=str(row.get("section_name") or "全文"),
+            sourcePath=as_optional_str(metadata.get("sourcePath")),
+            assetPath=as_optional_str(metadata.get("assetPath")),
+            sectionName=section_title,
             documentType=str(row.get("document_type") or "document"),
             score=round(score, 6),
+            retrievalSource=retrieval_source,  # type: ignore[arg-type]
+            parseEngine=as_optional_str(metadata.get("parseEngine") or metadata.get("parser")),
+            metadata=metadata.get("blockMetadata") if isinstance(metadata.get("blockMetadata"), dict) else {},
         )
 
 
@@ -419,6 +520,21 @@ def ensure_dict(value: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def as_optional_str(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def as_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def vector_literal(vector: list[float]) -> str:

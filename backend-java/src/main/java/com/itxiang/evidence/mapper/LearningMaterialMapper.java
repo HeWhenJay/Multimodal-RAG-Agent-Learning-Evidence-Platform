@@ -19,10 +19,11 @@ public interface LearningMaterialMapper {
 
     void updateStatus(@Param("id") Long id, @Param("status") String status);
 
+    LearningMaterial findById(@Param("id") Long id);
+
     List<LearningMaterial> findRecent(@Param("limit") Integer limit);
 
     Long countAll();
 
     Integer sumChunkCount();
 }
-

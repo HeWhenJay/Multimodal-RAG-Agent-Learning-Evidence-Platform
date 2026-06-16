@@ -59,7 +59,11 @@ public class PythonRagClient {
         return readIndexResult(root);
     }
 
-    public IndexResult indexFile(Long materialId, String userId, LearningMaterial material, MultipartFile file) {
+    public IndexResult indexFile(Long materialId,
+                                 String userId,
+                                 LearningMaterial material,
+                                 MultipartFile file,
+                                 Boolean highPrecision) {
         try {
             MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
             body.add("document_id", "material-" + materialId);
@@ -68,6 +72,8 @@ public class PythonRagClient {
             body.add("source", material.getSource());
             body.add("user_id", userId);
             body.add("visibility_scope", "private");
+            body.add("source_path", material.getOriginalFilePath());
+            body.add("high_precision", Boolean.TRUE.equals(highPrecision));
             body.add("file", new NamedByteArrayResource(file.getBytes(), material.getTitle()));
 
             String response = restClient.post()
@@ -96,16 +102,7 @@ public class PythonRagClient {
         JsonNode evidenceNodes = root.get("evidences");
         if (evidenceNodes != null && evidenceNodes.isArray()) {
             for (JsonNode item : evidenceNodes) {
-                evidences.add(RagEvidenceVO.builder()
-                        .evidenceId(text(item, "evidenceId"))
-                        .documentId(text(item, "documentId"))
-                        .title(text(item, "title"))
-                        .snippet(text(item, "snippet"))
-                        .source(text(item, "source"))
-                        .sectionName(text(item, "sectionName"))
-                        .documentType(text(item, "documentType"))
-                        .score(item.path("score").asDouble())
-                        .build());
+                evidences.add(readEvidence(item));
             }
         }
         return RagQueryVO.builder()
@@ -113,6 +110,29 @@ public class PythonRagClient {
                 .expandedQueries(readTextArray(root.get("expandedQueries")))
                 .evidences(evidences)
                 .build();
+    }
+
+    public List<RagEvidenceVO> listDocumentEvidences(String documentId, Integer limit) {
+        try {
+            String response = restClient.get()
+                    .uri(resolve("/internal/rag/documents/" + documentId + "/evidences?limit=" + limit))
+                    .retrieve()
+                    .body(String.class);
+            JsonNode root = objectMapper.readTree(response);
+            List<RagEvidenceVO> evidences = new ArrayList<>();
+            JsonNode evidenceNodes = root.get("evidences");
+            if (evidenceNodes != null && evidenceNodes.isArray()) {
+                for (JsonNode item : evidenceNodes) {
+                    evidences.add(readEvidence(item));
+                }
+            }
+            return evidences;
+        } catch (RestClientResponseException e) {
+            throw new IllegalStateException("Python RAG evidence 查询失败: "
+                    + e.getStatusCode() + " " + e.getResponseBodyAsString(), e);
+        } catch (Exception e) {
+            throw new IllegalStateException("Python RAG evidence 查询失败: " + e.getMessage(), e);
+        }
     }
 
     public PythonOverview fetchOverviewSafely() {
@@ -167,9 +187,39 @@ public class PythonRagClient {
         );
     }
 
+    private RagEvidenceVO readEvidence(JsonNode item) {
+        return RagEvidenceVO.builder()
+                .evidenceId(text(item, "evidenceId"))
+                .documentId(text(item, "documentId"))
+                .documentTitle(text(item, "documentTitle"))
+                .blockId(text(item, "blockId"))
+                .blockType(text(item, "blockType"))
+                .pageIndex(nullableInt(item, "pageIndex"))
+                .slideIndex(nullableInt(item, "slideIndex"))
+                .sheetName(text(item, "sheetName"))
+                .cellRange(text(item, "cellRange"))
+                .sectionTitle(text(item, "sectionTitle"))
+                .title(text(item, "title"))
+                .snippet(text(item, "snippet"))
+                .source(text(item, "source"))
+                .sourcePath(text(item, "sourcePath"))
+                .assetPath(text(item, "assetPath"))
+                .sectionName(text(item, "sectionName"))
+                .documentType(text(item, "documentType"))
+                .score(item.path("score").asDouble())
+                .retrievalSource(text(item, "retrievalSource"))
+                .parseEngine(text(item, "parseEngine"))
+                .build();
+    }
+
     private String text(JsonNode node, String fieldName) {
         JsonNode value = node == null ? null : node.get(fieldName);
         return value == null || value.isNull() ? null : value.asText();
+    }
+
+    private Integer nullableInt(JsonNode node, String fieldName) {
+        JsonNode value = node == null ? null : node.get(fieldName);
+        return value == null || value.isNull() ? null : value.asInt();
     }
 
     private List<String> readTextArray(JsonNode node) {

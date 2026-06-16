@@ -13,6 +13,8 @@
         <result property="parser" column="parser"/>
         <result property="documentSummary" column="document_summary"/>
         <result property="chunkCount" column="chunk_count"/>
+        <result property="originalFilename" column="original_filename"/>
+        <result property="originalFilePath" column="original_file_path"/>
         <result property="createdAt" column="created_at"/>
         <result property="updatedAt" column="updated_at"/>
     </resultMap>
@@ -26,7 +28,9 @@
             status,
             parser,
             document_summary,
-            chunk_count
+            chunk_count,
+            original_filename,
+            original_file_path
         )
         VALUES (
             #{title},
@@ -35,7 +39,9 @@
             #{status},
             #{parser},
             #{documentSummary},
-            #{chunkCount}
+            #{chunkCount},
+            #{originalFilename},
+            #{originalFilePath}
         )
     </insert>
 
@@ -66,11 +72,31 @@
             parser,
             document_summary,
             chunk_count,
+            original_filename,
+            original_file_path,
             created_at,
             updated_at
         FROM learning_material
         ORDER BY updated_at DESC, id DESC
         LIMIT #{limit}
+    </select>
+
+    <select id="findById" resultMap="LearningMaterialResultMap">
+        SELECT
+            id,
+            title,
+            document_type,
+            source,
+            status,
+            parser,
+            document_summary,
+            chunk_count,
+            original_filename,
+            original_file_path,
+            created_at,
+            updated_at
+        FROM learning_material
+        WHERE id = #{id}
     </select>
 
     <select id="countAll" resultType="long">
@@ -81,4 +107,3 @@
         SELECT COALESCE(SUM(chunk_count), 0) FROM learning_material
     </select>
 </mapper>
-

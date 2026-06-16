@@ -13,6 +13,7 @@ export function LearningMaterials() {
   const [materials, setMaterials] = useState<LearningMaterial[]>([]);
   const [title, setTitle] = useState('RAG 检索优化笔记');
   const [content, setContent] = useState(sampleText);
+  const [highPrecision, setHighPrecision] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
 
@@ -30,7 +31,7 @@ export function LearningMaterials() {
     setMessage('');
     try {
       await indexText({ title, documentType: 'markdown', source: 'manual', content });
-      setMessage('已索引文本资料');
+      setMessage('文本资料已入库');
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '索引失败');
@@ -44,7 +45,7 @@ export function LearningMaterials() {
     setBusy(true);
     setMessage('');
     try {
-      await uploadMaterial(file);
+      await uploadMaterial(file, highPrecision);
       setMessage('已上传并索引文件');
       await refresh();
     } catch (error) {
@@ -85,13 +86,17 @@ export function LearningMaterials() {
 
         <article className="panel">
           <div className="panel-title">
-            <h3><FileUp size={20} />MinerU 文件识别</h3>
+            <h3><FileUp size={20} />多格式文件解析</h3>
           </div>
           <label className="file-drop">
             <FileUp size={30} />
-            <strong>PDF / DOCX / PPTX / MD</strong>
-            <span>优先使用 MinerU，未配置时本地降级解析</span>
+            <strong>PDF / DOC / DOCX / PPT / PPTX / MD / XLSX / TXT / 图片</strong>
+            <span>原生结构解析优先，复杂版式再补跑 PDF + MinerU / OCR</span>
             <input type="file" onChange={(event) => submitFile(event.target.files?.[0] || null)} />
+          </label>
+          <label className="toggle-row">
+            <input type="checkbox" checked={highPrecision} onChange={(event) => setHighPrecision(event.target.checked)} />
+            <span>高精度解析</span>
           </label>
         </article>
       </section>
@@ -108,9 +113,10 @@ export function LearningMaterials() {
                 <strong>{item.title}</strong>
                 <span>{formatDocumentType(item.documentType)} · {formatSource(item.source)} · {item.parser || '等待解析'}</span>
                 <p>{item.documentSummary || '等待索引摘要'}</p>
+                {(item.originalFilePath || item.originalFilename) && <p>{item.originalFilePath || item.originalFilename}</p>}
               </div>
               <div className="material-meta">
-                <span className={`status-pill ${item.status === 'INDEXED' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
+                <span className={`status-pill ${item.status === 'READY' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
                 <strong>{item.chunkCount} 个切块</strong>
               </div>
             </div>
@@ -135,8 +141,11 @@ function formatSource(source: string) {
 }
 
 function formatStatus(status: string) {
-  if (status === 'INDEXED') return '已索引';
-  if (status === 'INDEXING') return '索引中';
-  if (status === 'FAILED') return '索引失败';
+  if (status === 'READY') return '已入库';
+  if (status === 'PARTIAL') return '部分完成';
+  if (status === 'PENDING') return '等待解析';
+  if (status === 'PARSING') return '解析中';
+  if (status === 'REINDEXING') return '重建索引';
+  if (status === 'FAILED') return '解析失败';
   return status;
 }

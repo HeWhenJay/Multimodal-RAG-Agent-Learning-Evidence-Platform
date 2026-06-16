@@ -19,7 +19,7 @@ import { fetchOverview, queryRag } from '../api/rag';
 import type { RagEvidence, RagOverview } from '../api/types';
 
 const stats = [
-  { label: '已索引材料', value: '128', delta: '+12', note: '本周新增', icon: LibraryBig },
+  { label: '已入库材料', value: '128', delta: '+12', note: '本周新增', icon: LibraryBig },
   { label: '视频片段', value: '456', delta: '+45', note: '本周新增', icon: Video },
   { label: 'RAG 证据锚点', value: '1.2k', delta: '98%', note: '命中率', icon: Anchor },
   { label: '运行中 Agent', value: '0', delta: 'RAG', note: '第一阶段', icon: Bot }
@@ -109,7 +109,7 @@ export function Dashboard() {
                 evidences.slice(0, 3).map((item) => (
                   <span key={item.evidenceId}>
                     <FileText size={15} />
-                    [{item.title} / {item.sectionName}]
+                    [{item.title} / {item.sectionTitle || item.sectionName}]
                   </span>
                 ))
               )}
@@ -135,7 +135,7 @@ export function Dashboard() {
           <div className="task-row">
             <FileText size={20} />
             <span>系统设计笔记.pdf</span>
-            <strong>100% 已索引</strong>
+            <strong>100% 已入库</strong>
           </div>
           <div className="task-row">
             <Video size={20} />

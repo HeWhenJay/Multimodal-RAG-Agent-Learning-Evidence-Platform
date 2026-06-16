@@ -62,7 +62,9 @@ export function KnowledgeBase() {
                 <div className="evidence-card" key={item.evidenceId}>
                   <div>
                     <strong>{item.title}</strong>
-                    <span>{item.documentType} · {item.sectionName} · 分数 {item.score.toFixed(4)}</span>
+                    <span>
+                      {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || 'fusion'} · {item.parseEngine || 'parser'} · 分数 {item.score.toFixed(4)}
+                    </span>
                   </div>
                   <p>{item.snippet}</p>
                 </div>
@@ -73,4 +75,11 @@ export function KnowledgeBase() {
       )}
     </div>
   );
+}
+
+function formatEvidenceLocation(item: RagQueryResult['evidences'][number]) {
+  if (item.pageIndex) return `第 ${item.pageIndex} 页`;
+  if (item.slideIndex) return `第 ${item.slideIndex} 页幻灯片`;
+  if (item.sheetName) return `${item.sheetName}${item.cellRange ? ` ${item.cellRange}` : ''}`;
+  return item.sectionTitle || item.sectionName;
 }

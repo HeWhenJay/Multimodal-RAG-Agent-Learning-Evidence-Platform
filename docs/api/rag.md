@@ -4,7 +4,27 @@
 
 ## 变更摘要
 
-本项目第一阶段实现到 RAG 闭环，不实现 Agent 编排任务。前端只调用 Java Spring Boot，Java 负责业务状态、资料记录和权限边界，Python FastAPI 负责 MinerU 文档识别、递归切块、PostgreSQL/pgvector 索引、混合检索和证据引用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+
+边界约定：
+
+- React 只调用 Java Spring Boot。
+- Java 负责资料记录、文件上传、原始文件路径、解析状态、统一 `Result<T>` 响应和调用 Python。
+- Python FastAPI 负责多格式解析路由、MinerU/OCR 降级、`DocumentBlock` 统一模型、解析质量评分、递归切块、BM25、向量索引、RRF/RAG-Fusion 和 evidence 引用。
+- 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
+
+## 状态机
+
+| 状态 | 含义 | 前端展示建议 |
+| --- | --- | --- |
+| `PENDING` | Java 已创建资料记录，等待调用 Python 解析 | 等待解析 |
+| `PARSING` | Python 正在解析、切块和索引 | 解析中 |
+| `READY` | 解析和索引完成，可检索 | 已入库 |
+| `PARTIAL` | 主解析成功但存在补充解析失败、部分空内容或低置信块，仍可检索已入库证据 | 部分完成 |
+| `FAILED` | 无可用文本或索引失败 | 解析失败 |
+| `REINDEXING` | 资料重新解析/重新索引中 | 重建索引 |
+
+`PARTIAL` 不是接口失败。Java 应保存该状态并返回资料摘要、切块数和可检索 evidence；前端应提示“部分完成”，允许用户继续检索。
 
 ## Java 对外接口
 
@@ -17,22 +37,44 @@
 | 鉴权 | 第一阶段本地演示暂不强制，后续接登录态 |
 | 响应 | `Result<RagOverviewVO>` |
 
-成功示例：
+### 获取学习资料列表
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/rag/materials` |
+| 响应 | `Result<List<LearningMaterialVO>>` |
+
+`LearningMaterialVO`：
 
 ```json
 {
-  "code": 1,
-  "msg": null,
-  "data": {
-    "materialCount": 3,
-    "chunkCount": 24,
-    "evidenceCount": 24,
-    "lastIndexedTitle": "Java 并发编程笔记"
-  }
+  "id": 1,
+  "title": "系统设计笔记.pdf",
+  "documentType": "pdf",
+  "source": "upload",
+  "status": "READY",
+  "parser": "mineru",
+  "documentSummary": "系统设计笔记主要包含...",
+  "chunkCount": 18,
+  "originalFilename": "系统设计笔记.pdf",
+  "originalFilePath": "uploads/rag/20260616/1-系统设计笔记.pdf",
+  "createdAt": "2026-06-16T10:00:00",
+  "updatedAt": "2026-06-16T10:01:12"
 }
 ```
 
-### 上传并索引学习资料
+### 查询单个资料解析状态
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/rag/materials/{id}` |
+| 响应 | `Result<LearningMaterialVO>` |
+
+用途：前端轮询或刷新单个资料的解析状态、摘要、切块数和原始文件路径。
+
+### 上传并解析入库学习资料
 
 | 项目 | 内容 |
 | --- | --- |
@@ -40,20 +82,19 @@
 | 路径 | `/api/rag/materials/upload` |
 | 请求类型 | `multipart/form-data` |
 | 文件字段 | `file` |
-| 约束 | 支持 `md/txt/pdf/docx/pptx/html`，建议单文件不超过 20MB |
+| 可选字段 | `highPrecision`，布尔值，是否强制补跑高精度解析 |
+| 支持格式 | `pdf/doc/docx/ppt/pptx/md/txt/xls/xlsx/png/jpg/jpeg/webp` |
+| 建议大小 | 单文件不超过 20MB |
 | 响应 | `Result<LearningMaterialVO>` |
 
-Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/index-file`。Python 优先走 MinerU，未配置 MinerU 时使用本地解析降级。
+流程：
 
-失败示例：
-
-```json
-{
-  "code": 0,
-  "msg": "Python RAG 服务暂不可用，请稍后重试",
-  "data": null
-}
-```
+1. Java 保存原始文件到本地 `uploads/` 忽略目录。
+2. Java 创建 `learning_material` 记录，初始状态 `PENDING`。
+3. Java 调用 Python `/internal/rag/documents/index-file`，传入原始路径和高精度参数。
+4. Python 按格式选择原生解析器，必要时补跑 PDF + MinerU/OCR。
+5. Python 返回 `READY/PARTIAL/FAILED`、切块数、解析器和摘要。
+6. Java 回写资料状态并返回统一响应。
 
 ### 直接索引文本资料
 
@@ -71,9 +112,21 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
   "title": "Spring Boot 项目笔记",
   "documentType": "markdown",
   "source": "manual",
+  "visibilityScope": "private",
   "content": "## IOC\nSpring 容器负责对象创建与依赖注入..."
 }
 ```
+
+### 查询资料 evidence
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/rag/materials/{id}/evidences` |
+| Query | `limit`，默认 20，最大 100 |
+| 响应 | `Result<List<RagEvidenceVO>>` |
+
+用途：展示某个资料已入库的 evidence 元数据和片段。
 
 ### RAG 检索问答
 
@@ -88,39 +141,11 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 
 ```json
 {
-  "question": "如何解释 Spring Boot 自动配置？",
+  "question": "BM25 和向量检索如何融合？",
   "topK": 5,
   "metadataFilter": {
     "documentType": "markdown",
     "visibilityScope": "private"
-  }
-}
-```
-
-响应示例：
-
-```json
-{
-  "code": 1,
-  "msg": null,
-  "data": {
-    "answer": "根据已索引资料，Spring Boot 自动配置通过条件装配减少重复配置...",
-    "expandedQueries": [
-      "如何解释 Spring Boot 自动配置？",
-      "Spring Boot 自动配置 证据",
-      "Spring Boot 自动配置 学习资料"
-    ],
-    "evidences": [
-      {
-        "evidenceId": "doc-1-0",
-        "documentId": "doc-1",
-        "title": "Spring Boot 项目笔记",
-        "snippet": "Spring Boot 自动配置通过条件注解...",
-        "source": "manual",
-        "sectionName": "IOC",
-        "score": 0.0327
-      }
-    ]
   }
 }
 ```
@@ -133,29 +158,37 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 | --- | --- | --- |
 | `GET` | `/health` | FastAPI 服务健康检查 |
 
-### 索引文件
+### 解析并入库文件
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/internal/rag/documents/index-file` | 接收 Java 转发文件，使用 MinerU/降级解析后索引 |
+| `POST` | `/internal/rag/documents/index-file` | 接收 Java 转发文件，解析为 `DocumentBlock` 后切块、索引、存储 evidence |
 
-字段：
+`multipart/form-data` 字段：
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `file` | file | 原始文件 |
-| `document_id` | string | Java 侧资料 ID |
-| `title` | string | 资料标题 |
-| `document_type` | string | `markdown/pdf/docx/pptx/html/text/video` |
-| `source` | string | 来源 |
-| `user_id` | string | 用户 ID，第一阶段默认 `demo-user` |
-| `visibility_scope` | string | `private/public/team` |
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `file` | file | 是 | 原始文件 |
+| `document_id` | string | 是 | Java 资料 ID，形如 `material-1` |
+| `title` | string | 是 | 资料标题 |
+| `document_type` | string | 是 | 文件类型或业务类型 |
+| `source` | string | 是 | `upload/manual/import` 等 |
+| `user_id` | string | 是 | 第一阶段默认 `demo-user` |
+| `visibility_scope` | string | 是 | `private/public/team` |
+| `source_path` | string | 否 | Java 保存的原始文件路径 |
+| `high_precision` | bool | 否 | 强制补跑 PDF + MinerU/OCR |
 
 ### 索引文本
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/internal/rag/documents/index-text` | 接收已提取文本并建立索引 |
+| `POST` | `/internal/rag/documents/index-text` | 接收已提取文本，转换为 `DocumentBlock` 后建立索引 |
+
+### 查询文档 evidence
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/internal/rag/documents/{document_id}/evidences?limit=20` | 返回某个文档已入库 evidence |
 
 ### 检索问答
 
@@ -167,40 +200,39 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/internal/rag/overview` | 返回 PostgreSQL/pgvector RAG 仓库统计 |
-
-## PostgreSQL/pgvector 仓库
-
-正式运行使用 PostgreSQL/pgvector：
-
-```powershell
-conda env create -f ai-python/environment.yml
-conda activate learning-evidence-rag
-```
-
-```powershell
-$env:RAG_STORE_BACKEND='pgvector'
-$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
-$env:RAG_VECTOR_DIMENSIONS='128'
-```
-
-核心表：
-
-| 表名 | 用途 |
-| --- | --- |
-| `rag_document` | 保存资料标题、类型、来源、用户、可见范围、文档摘要和章节摘要 |
-| `rag_chunk` | 保存递归切块、元数据、BM25 词项统计、token 数量和 `VECTOR(128)` 向量 |
-
-真实建库和向量仓库创建语句见 `docs/database/postgresql-pgvector.md`；全量初始化脚本见 `infra/sql/init.sql`；增量迁移脚本见 `infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql`。
+| `GET` | `/internal/rag/overview` | 返回 RAG 仓库统计 |
 
 ## Java 调 Python 契约
 
 | Java 动作 | Python Endpoint | 超时 | 重试 | 幂等键 |
 | --- | --- | --- | --- | --- |
-| 文本索引 | `POST /internal/rag/documents/index-text` | 20s | 不自动重试 | `documentId` |
-| 文件索引 | `POST /internal/rag/documents/index-file` | 60s | 不自动重试 | `documentId` |
+| 文本索引 | `POST /internal/rag/documents/index-text` | 60s | 不自动重试 | `documentId` |
+| 文件解析入库 | `POST /internal/rag/documents/index-file` | 60s | 不自动重试 | `documentId` |
+| 资料 evidence | `GET /internal/rag/documents/{document_id}/evidences` | 30s | 不自动重试 | 无 |
 | 检索问答 | `POST /internal/rag/query` | 30s | 不自动重试 | 无 |
 | 概览同步 | `GET /internal/rag/overview` | 5s | 不自动重试 | 无 |
+
+Python `IndexResponse`：
+
+```json
+{
+  "documentId": "material-1",
+  "title": "系统设计笔记.pdf",
+  "status": "READY",
+  "chunkCount": 18,
+  "parser": "mineru",
+  "documentSummary": "系统设计笔记主要包含...",
+  "parseQuality": {
+    "score": 0.92,
+    "nativeTextChars": 8120,
+    "paragraphCount": 86,
+    "tableCount": 4,
+    "imageCount": 8,
+    "screenshotLike": false,
+    "needsSupplement": false
+  }
+}
+```
 
 错误映射：
 
@@ -211,18 +243,120 @@ $env:RAG_VECTOR_DIMENSIONS='128'
 | `5xx` | `Result.error("Python RAG 服务暂不可用，请稍后重试")` |
 | 超时 | `Result.error("Python RAG 服务响应超时")` |
 
+## DocumentBlock
+
+所有解析器最终输出统一 `DocumentBlock`：
+
+```json
+{
+  "documentId": "material-1",
+  "blockId": "material-1-docx-p12",
+  "fileType": "docx",
+  "blockType": "text",
+  "pageIndex": null,
+  "slideIndex": null,
+  "sheetName": null,
+  "cellRange": null,
+  "sectionTitle": "项目背景",
+  "contentText": "本项目围绕多模态学习证据库...",
+  "contentHtml": null,
+  "assetPath": null,
+  "bbox": null,
+  "parseEngine": "python-docx",
+  "confidence": 0.88,
+  "sourceTitle": "系统设计笔记.docx",
+  "sourcePath": "uploads/rag/20260616/1-系统设计笔记.docx",
+  "metadata": {
+    "paragraphIndex": 12,
+    "style": "Normal"
+  }
+}
+```
+
+`blockType` 取值：`heading/text/table/image/chart/formula/code/list`。
+
+## Evidence 结构
+
+检索和资料 evidence 查询统一返回：
+
+```json
+{
+  "evidenceId": "material-1-3",
+  "documentId": "material-1",
+  "documentTitle": "系统设计笔记.pdf",
+  "blockId": "material-1-p2-b4",
+  "blockType": "table",
+  "pageIndex": 2,
+  "slideIndex": null,
+  "sheetName": null,
+  "cellRange": null,
+  "sectionTitle": "RAG 入库流程",
+  "snippet": "原始文件 -> 解析路由 -> DocumentBlock -> 递归切块...",
+  "sourcePath": "uploads/rag/20260616/1-系统设计笔记.pdf",
+  "assetPath": null,
+  "score": 0.0327,
+  "retrievalSource": "fusion",
+  "parseEngine": "mineru"
+}
+```
+
+兼容字段：Java/前端仍可读取 `title`、`source`、`sectionName`、`documentType`，其值分别映射自 `documentTitle`、`sourcePath/source`、`sectionTitle` 和资料类型。
+
+## 多格式解析策略
+
+| 格式 | 原生优先策略 | 补充策略 |
+| --- | --- | --- |
+| `pdf` | MinerU；失败后 PyMuPDF/pdfplumber/pypdf 可用方案 | OCR 可用时补充图片型页面 |
+| `docx` | `python-docx` 提取标题、段落、表格、图片 | 低置信或高精度时 LibreOffice 转 PDF 后 MinerU/OCR |
+| `doc` | LibreOffice headless 转 `docx` 和 `pdf` | 分别走 DOCX 原生解析与 PDF/MinerU |
+| `pptx` | `python-pptx` 提取幻灯片标题、文本框、表格、图片、备注 | 低置信或高精度时渲染 PDF/图片后 MinerU/OCR |
+| `ppt` | LibreOffice headless 转 `pptx` 和 `pdf` | 分别走 PPTX 原生解析与 PDF/MinerU |
+| `md` | Markdown AST parser，保留标题、段落、列表、表格、代码块、图片链接 | AST 依赖不可用时退回结构化行解析 |
+| `xlsx/xls` | `openpyxl/pandas` 解析 sheet、区域、坐标、公式、合并单元格 | 无文本区域时返回低置信 `PARTIAL/FAILED` |
+| `png/jpg/jpeg/webp` | OCR | 预留图片摘要字段，不在 Java 中生成摘要 |
+| `txt` | 编码探测后直接文本解析 | 解码失败时返回 `FAILED` |
+
+## 解析质量判断
+
+Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
+
+- 原生解析文本字符数。
+- 段落数量。
+- 表格数量。
+- 图片数量。
+- shape/textbox/drawing 数量。
+- 嵌入对象数量。
+- 合并单元格数量。
+- 空单元格比例。
+- 是否疑似截图型文档。
+- 用户是否选择高精度解析。
+
+当质量低、疑似截图型或用户选择高精度解析时，Python 补跑 PDF + MinerU/OCR。补跑失败但原生块可用时返回 `PARTIAL`。
+
+## RAG 入库流程
+
+```text
+原始文件
+-> 解析路由
+-> DocumentBlock
+-> 内容清洗
+-> 递归切块
+-> 文档/章节/表格/图片摘要
+-> BM25 索引
+-> Embedding 向量索引
+-> Evidence 元数据存储
+```
+
+切块规则：
+
+- 文本块按标题、章节、页面、幻灯片、段落、句子递归切分。
+- 表格、图片、代码块、公式和图表默认作为原子块保存，避免随意切碎。
+- chunk metadata 保留 `blockId/blockType/pageIndex/slideIndex/sheetName/cellRange/sectionTitle/sourcePath/assetPath/parseEngine`。
+
 ## 前端影响
 
-前端新增：
+前端保持后台管理风格，只补充必要字段：
 
-- `frontend-react/src/api/rag.ts`
-- `frontend-react/src/pages/Dashboard.tsx`
-- `frontend-react/src/pages/KnowledgeBase.tsx`
-- `frontend-react/src/pages/LearningMaterials.tsx`
-
-用户态：
-
-- 索引中：上传或文本索引后显示 `INDEXING`。
-- 已完成：显示 `INDEXED`、chunk 数、更新时间。
-- 检索为空：提示先上传或粘贴资料。
-- Python 不可用：展示 Java 返回的错误，不直连 Python。
+- 上传支持格式文案扩展。
+- 资料列表显示 `PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING`。
+- evidence 卡片展示页码、幻灯片、sheet、cell range、解析器和检索来源。

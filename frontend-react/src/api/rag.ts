@@ -24,6 +24,14 @@ export function fetchMaterials(): Promise<LearningMaterial[]> {
   return request<LearningMaterial[]>('/api/rag/materials');
 }
 
+export function fetchMaterial(id: number): Promise<LearningMaterial> {
+  return request<LearningMaterial>(`/api/rag/materials/${id}`);
+}
+
+export function fetchMaterialEvidences(id: number, limit = 20): Promise<RagQueryResult['evidences']> {
+  return request<RagQueryResult['evidences']>(`/api/rag/materials/${id}/evidences?limit=${limit}`);
+}
+
 export function indexText(payload: {
   title: string;
   documentType: string;
@@ -49,12 +57,12 @@ export function queryRag(payload: {
   });
 }
 
-export function uploadMaterial(file: File): Promise<LearningMaterial> {
+export function uploadMaterial(file: File, highPrecision = false): Promise<LearningMaterial> {
   const form = new FormData();
   form.append('file', file);
+  form.append('highPrecision', String(highPrecision));
   return request<LearningMaterial>('/api/rag/materials/upload', {
     method: 'POST',
     body: form
   });
 }
-

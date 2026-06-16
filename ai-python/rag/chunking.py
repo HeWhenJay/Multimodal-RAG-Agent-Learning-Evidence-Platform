@@ -4,6 +4,10 @@ import re
 from dataclasses import replace
 
 from rag.models import Chunk
+from schemas.rag import DocumentBlock
+
+
+ATOMIC_BLOCK_TYPES = {"table", "image", "chart", "formula", "code"}
 
 
 class RecursiveChunker:
@@ -38,6 +42,67 @@ class RecursiveChunker:
                     metadata=chunk_metadata,
                 )
             )
+        return chunks
+
+    def split_blocks(
+        self,
+        blocks: list[DocumentBlock],
+        document_id: str,
+        metadata: dict | None = None,
+    ) -> list[Chunk]:
+        metadata = metadata or {}
+        chunks: list[Chunk] = []
+        current_section = metadata.get("sectionName") or "全文"
+        position = 0
+
+        for block in blocks:
+            block_text = self._normalize(block.contentText)
+            if not block_text:
+                continue
+
+            if block.sectionTitle:
+                current_section = block.sectionTitle
+            if block.blockType == "heading":
+                current_section = block_text.strip("# :：") or current_section
+
+            block_metadata = {
+                **metadata,
+                **document_block_metadata(block),
+                "sectionName": current_section,
+            }
+            if block.blockType in ATOMIC_BLOCK_TYPES:
+                chunks.append(
+                    Chunk(
+                        chunk_id=f"{document_id}-{position}",
+                        document_id=document_id,
+                        text=block_text,
+                        metadata={**block_metadata, "chunkPosition": position},
+                    )
+                )
+                position += 1
+                continue
+
+            raw_chunks = self._split_recursive(block_text, self.separators)
+            for raw in raw_chunks:
+                chunk_text = raw.strip()
+                if not chunk_text:
+                    continue
+                heading = self._detect_heading(chunk_text)
+                if heading:
+                    current_section = heading
+                chunks.append(
+                    Chunk(
+                        chunk_id=f"{document_id}-{position}",
+                        document_id=document_id,
+                        text=chunk_text,
+                        metadata={
+                            **block_metadata,
+                            "sectionName": current_section,
+                            "chunkPosition": position,
+                        },
+                    )
+                )
+                position += 1
         return chunks
 
     def _normalize(self, text: str) -> str:
@@ -106,3 +171,22 @@ class RecursiveChunker:
 def update_chunk_metadata(chunks: list[Chunk], metadata: dict) -> list[Chunk]:
     return [replace(chunk, metadata={**chunk.metadata, **metadata}) for chunk in chunks]
 
+
+def document_block_metadata(block: DocumentBlock) -> dict:
+    return {
+        "blockId": block.blockId,
+        "fileType": block.fileType,
+        "blockType": block.blockType,
+        "pageIndex": block.pageIndex,
+        "slideIndex": block.slideIndex,
+        "sheetName": block.sheetName,
+        "cellRange": block.cellRange,
+        "sectionTitle": block.sectionTitle,
+        "assetPath": block.assetPath,
+        "bbox": block.bbox,
+        "parseEngine": block.parseEngine,
+        "confidence": block.confidence,
+        "sourceTitle": block.sourceTitle,
+        "sourcePath": block.sourcePath,
+        "blockMetadata": block.metadata,
+    }

@@ -9,12 +9,13 @@ flowchart LR
     A["React 前端"] --> B["Java Spring Boot API"]
     B --> C["MyBatis Mapper / H2 或 PostgreSQL"]
     B --> D["Python FastAPI RAG 服务"]
-    D --> E["MinerU 文档识别适配器"]
-    D --> F["递归切块"]
-    D --> G["摘要索引"]
-    D --> H["BM25 + PostgreSQL/pgvector 检索"]
-    H --> I["RRF / RAG-Fusion"]
-    I --> J["证据引用回答"]
+    D --> E["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
+    E --> F["DocumentBlock 统一模型"]
+    F --> G["递归切块"]
+    G --> H["摘要索引"]
+    H --> I["BM25 + PostgreSQL/pgvector 检索"]
+    I --> J["RRF / RAG-Fusion"]
+    J --> K["证据引用回答"]
 ```
 
 ## Python RAG 流程
@@ -22,11 +23,12 @@ flowchart LR
 索引阶段：
 
 1. 接收 Java 传入的文件或文本。
-2. 文件优先使用 `MINERU_COMMAND` 指定的 MinerU 命令解析。
-3. 未配置 MinerU 或解析失败时，使用本地文本/PDF/DOCX 降级解析。
-4. 按标题、段落、句子和长度预算做递归切块。
-5. 为文档和章节建立摘要索引。
-6. 为 chunk 建 BM25 词项统计和确定性哈希向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`。
+2. Python 按文件类型选择解析器，DOCX/PPTX/XLSX/Markdown/TXT 优先走原生结构解析，PDF 优先 MinerU。
+3. 解析器统一输出 `DocumentBlock`，保留 block 类型、页码、幻灯片、sheet、cell range、来源路径和解析器置信度。
+4. 低置信、截图型或高精度模式时，Python 通过 LibreOffice 转 PDF 后补跑 MinerU/OCR；补跑失败但原生块可用时返回 `PARTIAL`。
+5. 按标题、章节、页面、幻灯片、段落、句子和长度预算做递归切块；表格、图片、代码块、公式和图表默认作为原子块。
+6. 为文档和章节建立摘要索引。
+7. 为 chunk 建 BM25 词项统计和确定性哈希向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`，evidence 元数据保存在 `rag_chunk.metadata`。
 
 查询阶段：
 

@@ -8,12 +8,15 @@ from collections import Counter, defaultdict
 
 from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
+from rag.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.summary_index import SummaryIndex
 from schemas.rag import (
+    DocumentBlock,
     Evidence,
     IndexResponse,
     IndexTextRequest,
     OverviewResponse,
+    ParseQuality,
     QueryRequest,
     QueryResponse,
 )
@@ -33,20 +36,70 @@ class InMemoryRagStore:
         self.embeddings: dict[str, list[float]] = {}
 
     def index_text(self, request: IndexTextRequest) -> IndexResponse:
-        document_id = request.documentId
+        block = DocumentBlock(
+            documentId=request.documentId,
+            blockId=f"{request.documentId}-manual-1",
+            fileType=request.documentType,
+            blockType="text",
+            sectionTitle="全文",
+            contentText=request.content,
+            parseEngine=request.parser,
+            confidence=1.0,
+            sourceTitle=request.title,
+            sourcePath=request.sourcePath,
+            metadata={"source": "manual-text"},
+        )
+        quality = evaluate_parse_quality(
+            QualitySignals(native_text_chars=len(request.content), paragraph_count=1),
+            high_precision=False,
+        )
+        return self.index_blocks(
+            document_id=request.documentId,
+            title=request.title,
+            document_type=request.documentType,
+            source=request.source,
+            user_id=request.userId,
+            visibility_scope=request.visibilityScope,
+            language=request.language,
+            parser=request.parser,
+            blocks=[block],
+            parse_quality=quality,
+            status="READY",
+            source_path=request.sourcePath,
+        )
+
+    def index_blocks(
+        self,
+        *,
+        document_id: str,
+        title: str,
+        document_type: str,
+        source: str,
+        user_id: str,
+        visibility_scope: str,
+        language: str,
+        parser: str,
+        blocks: list[DocumentBlock],
+        parse_quality: ParseQuality,
+        status: str,
+        source_path: str | None = None,
+    ) -> IndexResponse:
         metadata = {
             "documentId": document_id,
-            "title": request.title,
-            "documentType": request.documentType,
-            "source": request.source,
-            "userId": request.userId,
-            "visibilityScope": request.visibilityScope,
+            "title": title,
+            "documentType": document_type,
+            "source": source,
+            "sourcePath": source_path,
+            "userId": user_id,
+            "visibilityScope": visibility_scope,
             "uploadTime": utc_now_iso(),
-            "language": request.language,
-            "parser": request.parser,
+            "language": language,
+            "parser": parser,
+            "parseStatus": status,
+            "parseQuality": parse_quality.model_dump(),
         }
         self._remove_document(document_id)
-        chunks = self.chunker.split(request.content, document_id=document_id, metadata=metadata)
+        chunks = self.chunker.split_blocks(blocks, document_id=document_id, metadata=metadata)
         summaries = self.summary_index.build(chunks)
         for chunk in chunks:
             self.chunks[chunk.chunk_id] = chunk
@@ -63,11 +116,12 @@ class InMemoryRagStore:
         }
         return IndexResponse(
             documentId=document_id,
-            title=request.title,
-            status="INDEXED",
+            title=title,
+            status=status if chunks else "FAILED",
             chunkCount=len(chunks),
-            parser=request.parser,
+            parser=parser,
             documentSummary=summaries["documentSummary"],
+            parseQuality=parse_quality,
         )
 
     def query(self, request: QueryRequest) -> QueryResponse:
@@ -85,7 +139,7 @@ class InMemoryRagStore:
 
         fused = reciprocal_rank_fusion(ranked_lists)
         selected = fused[: request.topK]
-        evidences = [self._to_evidence(chunk_id, score) for chunk_id, score in selected]
+        evidences = [self._to_evidence(chunk_id, score, retrieval_source="fusion") for chunk_id, score in selected]
         answer = build_answer(request.question, evidences)
         return QueryResponse(
             answer=answer,
@@ -105,6 +159,17 @@ class InMemoryRagStore:
             evidenceCount=len(self.chunks),
             lastIndexedTitle=last_title,
         )
+
+    def list_evidences(self, document_id: str, limit: int = 20) -> list[Evidence]:
+        chunk_ids = [
+            chunk.chunk_id
+            for chunk in sorted(
+                self.chunks.values(),
+                key=lambda item: int(item.metadata.get("chunkPosition") or 0),
+            )
+            if chunk.document_id == document_id
+        ]
+        return [self._to_evidence(chunk_id, 1.0, retrieval_source="summary") for chunk_id in chunk_ids[:limit]]
 
     def _remove_document(self, document_id: str) -> None:
         old_chunk_ids = [chunk_id for chunk_id, chunk in self.chunks.items() if chunk.document_id == document_id]
@@ -173,22 +238,52 @@ class InMemoryRagStore:
                 scores.append((chunk.chunk_id, score))
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
-    def _to_evidence(self, chunk_id: str, score: float) -> Evidence:
+    def _to_evidence(self, chunk_id: str, score: float, retrieval_source: str) -> Evidence:
         chunk = self.chunks[chunk_id]
         metadata = chunk.metadata
         snippet = " ".join(chunk.text.split())
         if len(snippet) > 220:
             snippet = snippet[:220].rstrip() + "..."
+        title = str(metadata.get("title") or metadata.get("sourceTitle") or "未命名资料")
+        section_title = str(metadata.get("sectionTitle") or metadata.get("sectionName") or "全文")
         return Evidence(
             evidenceId=chunk.chunk_id,
             documentId=chunk.document_id,
-            title=str(metadata.get("title") or "未命名资料"),
+            documentTitle=title,
+            blockId=as_optional_str(metadata.get("blockId")),
+            blockType=as_optional_str(metadata.get("blockType")),
+            pageIndex=as_optional_int(metadata.get("pageIndex")),
+            slideIndex=as_optional_int(metadata.get("slideIndex")),
+            sheetName=as_optional_str(metadata.get("sheetName")),
+            cellRange=as_optional_str(metadata.get("cellRange")),
+            sectionTitle=section_title,
+            title=title,
             snippet=snippet,
             source=str(metadata.get("source") or "unknown"),
-            sectionName=str(metadata.get("sectionName") or "全文"),
+            sourcePath=as_optional_str(metadata.get("sourcePath")),
+            assetPath=as_optional_str(metadata.get("assetPath")),
+            sectionName=section_title,
             documentType=str(metadata.get("documentType") or "document"),
             score=round(score, 6),
+            retrievalSource=retrieval_source,  # type: ignore[arg-type]
+            parseEngine=as_optional_str(metadata.get("parseEngine") or metadata.get("parser")),
+            metadata=metadata.get("blockMetadata") if isinstance(metadata.get("blockMetadata"), dict) else {},
         )
+
+
+def as_optional_str(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def as_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def tokenize(text: str) -> list[str]:

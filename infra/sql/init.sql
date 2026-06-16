@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS learning_material (
     parser VARCHAR(80),
     document_summary TEXT,
     chunk_count INTEGER DEFAULT 0,
+    original_filename VARCHAR(255),
+    original_file_path VARCHAR(500),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

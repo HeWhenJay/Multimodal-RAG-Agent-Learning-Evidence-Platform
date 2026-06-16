@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from schemas.rag import DocumentBlock, ParseQuality
+
 
 @dataclass(frozen=True)
 class ParsedDocument:
@@ -18,6 +20,16 @@ class Chunk:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ParsedBlockDocument:
+    blocks: list[DocumentBlock]
+    parser: str
+    status: str
+    parse_quality: ParseQuality
+    document_summary: str = ""
+    section_summaries: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-

@@ -25,20 +25,21 @@ flowchart TD
 
     FE -->|"资料上传 / 文本索引"| JC["Java RAG 控制器"]
     JC --> JS["RAG 业务服务创建学习资料记录"]
-    JS --> DB["MyBatis 持久层写入资料表<br/>初始状态：索引中"]
+    JS --> DB["MyBatis 持久层写入资料表<br/>PENDING -> PARSING"]
     JS --> PC["Python 服务调用客户端<br/>转发到 FastAPI"]
 
-    PC --> PYI{"Python 索引入口"}
-    PYI -->|"文件"| MU["MinerU 文档识别<br/>失败则本地降级解析"]
-    PYI -->|"文本"| TXT["直接接收已提取文本"]
-    MU --> CH["递归切块<br/>标题 / 段落 / 句子 / 长度预算"]
+    PC --> PYI{"Python 解析入库入口"}
+    PYI -->|"文件"| ROUTE["多格式解析路由<br/>原生结构解析优先"]
+    PYI -->|"文本"| TXT["转换为 DocumentBlock"]
+    ROUTE --> BLOCK["统一 DocumentBlock<br/>页码/幻灯片/sheet/cell range"]
+    BLOCK --> CH["递归切块<br/>标题 / 章节 / 页面 / 段落 / 句子"]
     TXT --> CH
-    CH --> META["补充切块元数据<br/>资料ID、标题、类型、来源、用户、可见范围、章节"]
+    CH --> META["补充 evidence 元数据<br/>blockId、来源、解析器、置信度"]
     META --> SUM["摘要索引<br/>资料摘要 + 章节摘要"]
     SUM --> IDX["写入 PostgreSQL/pgvector<br/>BM25 词项统计 + 向量列"]
-    IDX --> IR["返回已索引状态、切块数、资料摘要"]
+    IDX --> IR["返回 READY / PARTIAL / FAILED<br/>切块数、解析器、摘要"]
     IR --> JU["Java 更新资料记录"]
-    JU --> FEI["前端展示已索引、切块数和摘要"]
+    JU --> FEI["前端展示解析状态、切块数和摘要"]
 
     FE -->|"RAG 提问"| JQ["Java 查询接口"]
     JQ --> PQ["Python 查询入口"]
@@ -62,26 +63,26 @@ flowchart TD
 flowchart TD
     A0["用户提交学习资料<br/>文件或文本"] --> A1["React 提交表单<br/>标题、类型、来源、可见范围"]
     A1 --> A2["Java RAG 控制器<br/>校验空内容、文件大小、资料类型"]
-    A2 --> A3["RAG 业务服务<br/>生成资料ID，状态写为索引中"]
+    A2 --> A3["RAG 业务服务<br/>生成资料ID，状态写为 PENDING"]
     A3 --> A4["MyBatis 持久层<br/>保存资料记录"]
     A3 --> A5["Python 服务调用客户端<br/>按接口契约转发资料"]
     A5 --> A6{"输入是文件还是文本"}
-    A6 -->|"文件"| A7["MinerU 文档识别<br/>解析版面、标题、段落、表格"]
-    A7 --> A8{"是否得到有效文本"}
-    A8 -->|"否"| A9["本地降级解析<br/>PDF / DOCX / UTF-8 文本"]
-    A8 -->|"是"| A10["文本规范化<br/>统一换行、空格、Markdown 结构"]
+    A6 -->|"文件"| A7["按格式选择解析器<br/>PDF / DOCX / PPTX / MD / XLSX / 图片 / TXT"]
+    A7 --> A8{"原生解析质量是否足够"}
+    A8 -->|"否或高精度"| A9["LibreOffice 转 PDF<br/>补跑 MinerU / OCR"]
+    A8 -->|"是"| A10["统一 DocumentBlock<br/>保留结构和来源定位"]
     A9 --> A10
     A6 -->|"文本"| A10
-    A10 --> A11["递归切块<br/>标题 -> 段落 -> 换行 -> 句子 -> 长度预算"]
-    A11 --> A12["重叠窗口保留上下文<br/>默认长度 700，重叠 90"]
-    A12 --> A13["补齐切块元数据<br/>资料ID、用户、来源、章节、位置、解析器"]
+    A10 --> A11["递归切块<br/>标题 -> 章节 -> 页面/幻灯片 -> 段落 -> 句子"]
+    A11 --> A12["表格、图片、代码块原子保存<br/>文本块使用重叠窗口"]
+    A12 --> A13["补齐 evidence 元数据<br/>资料ID、blockId、来源、解析器、位置"]
     A13 --> A14["摘要索引<br/>资料摘要 + 章节摘要"]
     A14 --> A15["关键词索引<br/>分词、词频、文档频率"]
     A14 --> A16["pgvector 向量索引<br/>真实 PostgreSQL 向量列"]
     A15 --> A17["PostgreSQL/pgvector 检索仓库<br/>资料、切块、词项统计、向量"]
     A16 --> A17
-    A17 --> A18["Python 返回索引结果<br/>已索引、切块数、解析器、摘要"]
-    A18 --> A19["Java 回写资料状态<br/>已索引或失败"]
+    A17 --> A18["Python 返回解析入库结果<br/>READY / PARTIAL / FAILED"]
+    A18 --> A19["Java 回写资料状态<br/>完成、部分完成或失败"]
     A19 --> A20["前端刷新资料列表<br/>展示状态、切块数、摘要或错误"]
 ```
 
@@ -138,13 +139,15 @@ flowchart TD
 
 1. 用户在前端上传文件，或在“学习资料”页面粘贴文本笔记。
 2. 前端只调用 Java API：文件走 `/api/rag/materials/upload`，文本走 `/api/rag/materials/text`。
-3. Java 在 `learning_material` 中先创建资料记录，状态设为 `INDEXING`，用于前端展示处理状态和最近资料列表。
+3. Java 在 `learning_material` 中先创建资料记录，状态从 `PENDING` 进入 `PARSING`，Python 返回后更新为 `READY`、`PARTIAL` 或 `FAILED`，用于前端展示处理状态和最近资料列表。
 4. Java 通过 `PythonRagClient` 调 Python 内部接口。文本会被包装为 `documentId/title/documentType/source/userId/visibilityScope/content`；文件会用 `multipart/form-data` 转发给 Python。
-5. Python 文件入口优先调用 `MINERU_COMMAND` 配置的 MinerU 命令。MinerU 未配置、执行失败或没有解析出文本时，使用本地降级解析：PDF 走 `pypdf`，DOCX 走 `python-docx`，其他文本按 UTF-8 解码。
-6. Python 使用递归切块器做切块，按 Markdown 标题、空行、换行、句号、分号、逗号和空格逐级拆分；默认切块长度为 700，重叠窗口为 90，尽量保留上下文。
-7. 每个切块都保留元数据：资料 ID、标题、类型、来源、用户、可见范围、解析器、上传时间、章节名和切块位置。
-8. 摘要索引组件生成文档级摘要和章节级摘要；同时把每个切块的 BM25 词项统计、元数据和向量写入 PostgreSQL/pgvector。
-9. Python 返回已索引状态、切块数量、解析器和摘要；Java 更新资料记录，前端就能看到“已索引”、切块数和摘要。
+5. Python 文件入口按格式选择解析器：PDF 优先 MinerU；DOCX/PPTX/XLSX/Markdown/TXT 优先原生结构解析；DOC/PPT 通过 LibreOffice 转换后解析；图片走 OCR。
+6. Python 将所有解析结果统一为 `DocumentBlock`，保留 block 类型、页码、幻灯片、sheet、cell range、来源路径、解析器和置信度。
+7. 对 DOCX/PPTX/XLSX 等结构化文件计算解析质量；低置信、截图型或高精度模式时，补跑 PDF + MinerU/OCR。
+8. Python 使用递归切块器做切块，优先保留标题、章节、页面、幻灯片、段落和句子结构；表格、图片、代码块、公式和图表默认作为原子块。
+9. 每个切块都保留 evidence 元数据：资料 ID、标题、类型、来源、用户、可见范围、blockId、blockType、位置、解析器、来源路径和置信度。
+10. 摘要索引组件生成文档级摘要和章节级摘要；同时把每个切块的 BM25 词项统计、元数据和向量写入 PostgreSQL/pgvector。
+11. Python 返回 `READY/PARTIAL/FAILED`、切块数量、解析器和摘要；Java 更新资料记录，前端展示解析状态、切块数和摘要。
 
 ### 查询阶段：把问题变成带证据引用的回答
 

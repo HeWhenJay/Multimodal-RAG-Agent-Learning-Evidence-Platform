@@ -1,7 +1,7 @@
 import { CheckCircle2, Clock, PlayCircle, Video } from 'lucide-react';
 
 const slices = [
-  { title: 'Java 并发编程核心原理解析', topic: 'JVM Memory Model', time: '01:23:10 - 01:25:42', status: 'ASR/OCR 已索引' },
+  { title: 'Java 并发编程核心原理解析', topic: 'JVM Memory Model', time: '01:23:10 - 01:25:42', status: 'ASR/OCR 已入库' },
   { title: '分布式系统架构设计 (B站录播)', topic: 'CAP 定理与实践', time: '00:45:22 - 00:48:15', status: '关键帧已就绪' },
   { title: '云原生架构实战', topic: 'Kubernetes 调度', time: '00:18:02 - 00:22:36', status: '已关联 RAG' }
 ];
