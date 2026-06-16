@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from rag.bailian_ocr import BailianOcrClient, OcrResult
 from rag.mineru_loader import MineruDocumentLoader
 from rag.models import ParsedBlockDocument
 from rag.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
@@ -37,8 +38,13 @@ ATOMIC_BLOCK_TYPES = {"table", "image", "chart", "formula", "code"}
 
 
 class DocumentParserRouter:
-    def __init__(self, mineru_loader: MineruDocumentLoader | None = None) -> None:
+    def __init__(
+        self,
+        mineru_loader: MineruDocumentLoader | None = None,
+        ocr_client: BailianOcrClient | None = None,
+    ) -> None:
         self.mineru_loader = mineru_loader or MineruDocumentLoader()
+        self.ocr_client = ocr_client or BailianOcrClient.from_env()
         self.summary_index = SummaryIndex()
 
     def parse_bytes(
@@ -205,12 +211,14 @@ class DocumentParserRouter:
                 return blocks, quality, "mineru", warnings
             warnings.append(f"MinerU did not return usable blocks: {parsed.parser}")
 
-        blocks = parse_pdf_native_blocks(
+        blocks, native_warnings = parse_pdf_native_blocks(
             content=content,
             document_id=document_id,
             source_title=source_title,
             source_path=source_path,
+            ocr_client=self.ocr_client,
         )
+        warnings.extend(native_warnings)
         quality = evaluate_parse_quality(
             QualitySignals(
                 native_text_chars=sum(len(block.contentText) for block in blocks),
@@ -426,18 +434,25 @@ class DocumentParserRouter:
         source_path: str | None,
         file_type: str,
     ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
-        text = ""
         warnings: list[str] = []
-        parser = "pytesseract"
-        try:
-            from PIL import Image
-            import pytesseract
+        ocr_result = self._ocr_image_bytes(content, filename=filename)
+        warnings.extend(ocr_result.warnings)
+        text = ocr_result.text
+        parser = ocr_result.parser if text else "ocr-unavailable"
+        confidence = ocr_result.confidence if text else 0.2
+        if not text:
+            try:
+                from PIL import Image
+                import pytesseract
 
-            image = Image.open(BytesIO(content))
-            text = pytesseract.image_to_string(image, lang=os.getenv("OCR_LANG", "chi_sim+eng")).strip()
-        except Exception as exc:
-            parser = "ocr-unavailable"
-            warnings.append(f"OCR unavailable: {exc}")
+                image = Image.open(BytesIO(content))
+                text = pytesseract.image_to_string(image, lang=os.getenv("OCR_LANG", "chi_sim+eng")).strip()
+                if text:
+                    parser = "pytesseract"
+                    confidence = 0.75
+            except Exception as exc:
+                parser = "ocr-unavailable"
+                warnings.append(f"OCR unavailable: {exc}")
 
         block = DocumentBlock(
             documentId=document_id,
@@ -447,16 +462,27 @@ class DocumentParserRouter:
             contentText=text or "[图片] OCR 未获得可索引文字",
             assetPath=source_path,
             parseEngine=parser,
-            confidence=0.75 if text else 0.2,
+            confidence=confidence,
             sourceTitle=source_title,
             sourcePath=source_path,
-            metadata={"filename": filename, "ocrTextChars": len(text)},
+            metadata={
+                "filename": filename,
+                "ocrTextChars": len(text),
+                **ocr_result.metadata,
+            },
         )
         quality = evaluate_parse_quality(
             QualitySignals(native_text_chars=len(text), image_count=1),
             high_precision=False,
         )
+        if text:
+            quality = quality.model_copy(update={"score": max(quality.score, confidence), "needsSupplement": False})
         return [block], quality, parser, warnings
+
+    def _ocr_image_bytes(self, content: bytes, *, filename: str) -> OcrResult:
+        if self.ocr_client.enabled:
+            return self.ocr_client.recognize_image_bytes(image_bytes=content, filename=filename)
+        return OcrResult(text="", parser="bailian-qwen-ocr-disabled")
 
     def _finalize(
         self,
@@ -894,21 +920,22 @@ def parse_pdf_native_blocks(
     document_id: str,
     source_title: str,
     source_path: str | None,
-) -> list[DocumentBlock]:
+    ocr_client: BailianOcrClient | None = None,
+) -> tuple[list[DocumentBlock], list[str]]:
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(content)
         tmp_path = Path(tmp.name)
     try:
         blocks = parse_pdf_with_pymupdf(tmp_path, document_id, source_title, source_path)
         if blocks:
-            return blocks
+            return blocks, []
         blocks = parse_pdf_with_pdfplumber(tmp_path, document_id, source_title, source_path)
         if blocks:
-            return blocks
+            return blocks, []
         blocks = parse_pdf_with_pypdf(tmp_path, document_id, source_title, source_path)
         if blocks:
-            return blocks
-        return parse_pdf_with_ocr(tmp_path, document_id, source_title, source_path)
+            return blocks, []
+        return parse_pdf_with_ocr(tmp_path, document_id, source_title, source_path, ocr_client=ocr_client)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -994,20 +1021,50 @@ def parse_pdf_with_pypdf(path: Path, document_id: str, source_title: str, source
     return blocks
 
 
-def parse_pdf_with_ocr(path: Path, document_id: str, source_title: str, source_path: str | None) -> list[DocumentBlock]:
+def parse_pdf_with_ocr(
+    path: Path,
+    document_id: str,
+    source_title: str,
+    source_path: str | None,
+    ocr_client: BailianOcrClient | None = None,
+) -> tuple[list[DocumentBlock], list[str]]:
     try:
         import fitz
-        from PIL import Image
-        import pytesseract
-    except Exception:
-        return []
+    except Exception as exc:
+        return [], [f"PDF OCR unavailable: {exc}"]
 
+    warnings: list[str] = []
     blocks: list[DocumentBlock] = []
     with fitz.open(str(path)) as doc:
         for page_number, page in enumerate(doc, start=1):
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-            text = normalize_text(pytesseract.image_to_string(image, lang=os.getenv("OCR_LANG", "chi_sim+eng")) or "")
+            png_bytes = pixmap.tobytes("png")
+            text = ""
+            parser = "pymupdf-ocr"
+            confidence = 0.2
+            metadata: dict[str, Any] = {"pageIndex": page_number}
+
+            if ocr_client is not None and ocr_client.enabled:
+                result = ocr_client.recognize_image_bytes(
+                    image_bytes=png_bytes,
+                    filename=f"{path.stem}-page-{page_number}.png",
+                    mime_type="image/png",
+                )
+                warnings.extend(result.warnings)
+                text = result.text
+                parser = result.parser if text else parser
+                confidence = result.confidence if text else confidence
+                metadata.update(result.metadata)
+
+            if not text:
+                local_text, local_warnings = _ocr_image_bytes_with_pytesseract(png_bytes, page_number=page_number)
+                warnings.extend(local_warnings)
+                if local_text.strip():
+                    text = local_text
+                    parser = "pymupdf-ocr"
+                    confidence = 0.78
+
+            text = normalize_text(text or "")
             if text:
                 blocks.append(
                     make_block(
@@ -1018,12 +1075,26 @@ def parse_pdf_with_ocr(path: Path, document_id: str, source_title: str, source_p
                         text,
                         source_title,
                         source_path,
-                        "pymupdf-ocr",
+                        parser,
                         None,
                         page_index=page_number,
-                    )
+                        metadata=metadata,
+                    ).model_copy(update={"confidence": confidence})
                 )
-    return blocks
+
+    return blocks, warnings
+
+
+def _ocr_image_bytes_with_pytesseract(image_bytes: bytes, *, page_number: int | None = None) -> tuple[str, list[str]]:
+    try:
+        from PIL import Image
+        import pytesseract
+
+        image = Image.open(BytesIO(image_bytes))
+        return normalize_text(pytesseract.image_to_string(image, lang=os.getenv("OCR_LANG", "chi_sim+eng")) or ""), []
+    except Exception as exc:
+        location = f" page {page_number}" if page_number is not None else ""
+        return "", [f"Local OCR unavailable{location}: {exc}"]
 
 
 def parse_docx_blocks(

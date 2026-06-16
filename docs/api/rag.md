@@ -360,3 +360,78 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 - 上传支持格式文案扩展。
 - 资料列表显示 `PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING`。
 - evidence 卡片展示页码、幻灯片、sheet、cell range、解析器和检索来源。
+
+## 百炼 OCR 接入
+
+更新日期：2026-06-16
+
+本阶段只把 OCR 模型作为 Python RAG 文档解析降级链路的一部分，不新增 Agent 编排、工具调用或长任务调度。Java 仍只上传文件、记录状态并调用 Python；百炼 OCR Key、模型选择、超时和失败降级全部位于 `ai-python/`。
+
+### 调用位置
+
+| 输入场景 | Python 行为 | 失败处理 |
+| --- | --- | --- |
+| `png/jpg/jpeg/webp` 图片文件 | 优先调用百炼 Qwen-OCR，输出 `DocumentBlock(blockType=image)` | 百炼未配置或调用失败时降级 `pytesseract`；仍失败则返回低置信图片块并进入 `PARTIAL/FAILED` 判定 |
+| PDF 本地文本提取为空 | 将页面渲染为图片后逐页调用百炼 Qwen-OCR | 单页失败则继续后续页面；百炼失败后再降级本地 `pytesseract` |
+| DOCX/PPTX 高精度或低质量补充 | LibreOffice 转 PDF 后复用 PDF 解析链路 | 转换或 OCR 失败但原生块可用时返回 `PARTIAL` |
+
+### 百炼请求配置
+
+使用阿里云百炼 / DashScope OpenAI 兼容接口。官方参考：
+
+- `https://help.aliyun.com/zh/model-studio/qwen-vl-ocr-api-reference`
+- `https://www.alibabacloud.com/help/en/model-studio/qwen-vl-ocr`
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `BAILIAN_OCR_ENABLED` | `auto` | `auto` 表示存在 Key 时启用；`true/1/yes` 强制启用；`false/0/no` 禁用 |
+| `BAILIAN_OCR_API_KEY` | 空 | 百炼 OCR 专用 Key，优先级高于 `DASHSCOPE_API_KEY` |
+| `DASHSCOPE_API_KEY` | 空 | 兼容课程和本地笔记中的百炼通用 Key |
+| `BAILIAN_OCR_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 API 根地址 |
+| `BAILIAN_OCR_MODEL` | `qwen3.5-ocr` | OCR 模型名 |
+| `BAILIAN_OCR_TIMEOUT_SECONDS` | `60` | 单次 HTTP 调用超时 |
+| `BAILIAN_OCR_MAX_IMAGE_BYTES` | `10485760` | 图片转 Base64 前的最大字节数 |
+
+请求 schema：
+
+```json
+{
+  "model": "qwen3.5-ocr",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,<base64>"
+          }
+        },
+        {
+          "type": "text",
+          "text": "请只返回图片中的 OCR 文本..."
+        }
+      ]
+    }
+  ],
+  "temperature": 0
+}
+```
+
+响应处理：
+
+- 读取 `choices[0].message.content` 作为 OCR 文本；如果内容为 OpenAI 多模态数组，则拼接其中的文本片段。
+- `parseEngine` 统一写入 `bailian-qwen-ocr`，`metadata.ocrModel` 写入具体模型名。
+- 不记录、不返回、不持久化 API Key。
+- HTTP 超时、401/403、5xx 或空响应都不会在 Java 中重试；Python 记录 warning 并按本地 OCR 降级。
+
+### 状态和错误映射
+
+| 情况 | Python 解析状态 | Java 行为 |
+| --- | --- | --- |
+| 百炼成功且获得文本 | `READY` 或由整体质量决定 | 保存 parser、摘要、chunk 数 |
+| 百炼失败但本地 OCR 或原生解析可用 | `PARTIAL` | 保留已入库 evidence，前端显示“部分完成” |
+| 百炼和本地 OCR 均无可索引文本 | `FAILED` | 返回资料记录，状态为解析失败 |
+| Key 未配置 | 不视为接口错误 | 自动跳过百炼并使用本地降级链路 |
