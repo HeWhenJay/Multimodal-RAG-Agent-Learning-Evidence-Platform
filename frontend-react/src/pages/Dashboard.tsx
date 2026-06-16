@@ -14,7 +14,7 @@ import {
   TriangleAlert,
   Video
 } from 'lucide-react';
-import { Fragment, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { fetchOverview, queryRag } from '../api/rag';
 import type { RagEvidence, RagOverview } from '../api/types';
 
@@ -23,6 +23,12 @@ const stats = [
   { label: '视频片段', value: '456', delta: '+45', note: '本周新增', icon: Video },
   { label: 'RAG 证据锚点', value: '1.2k', delta: '98%', note: '命中率', icon: Anchor },
   { label: '运行中 Agent', value: '0', delta: 'RAG', note: '第一阶段', icon: Bot }
+];
+
+const evidenceRows = [
+  { requirement: 'Kubernetes 实战经验', evidence: '主导 50+ 微服务的 k8s 迁移项目', status: 'supported' },
+  { requirement: '高并发调优经验', evidence: '参与性能压测与接口响应时间优化', status: 'weak' },
+  { requirement: 'React / 前端能力', evidence: '未找到相关简历记录', status: 'missing' }
 ];
 
 export function Dashboard() {
@@ -194,25 +200,23 @@ export function Dashboard() {
             </h3>
             <span className="status-pill">复核模式</span>
           </div>
-          <div className="evidence-table">
-            <div className="table-head">JD 要求</div>
-            <div className="table-head">简历证据</div>
-            <div className="table-head">状态</div>
-            {[
-              ['Kubernetes 实战经验', '主导 50+ 微服务的 k8s 迁移项目', 'supported'],
-              ['高并发调优经验', '参与性能压测与接口响应时间优化', 'weak'],
-              ['React / 前端能力', '未找到相关简历记录', 'missing']
-            ].map(([requirement, evidence, status]) => (
-              <Fragment key={requirement}>
-                <div>
-                  <strong>{requirement}</strong>
+          <div className="evidence-stack">
+            {evidenceRows.map((item) => (
+              <div className="evidence-item" key={item.requirement}>
+                <div className="evidence-field">
+                  <span className="evidence-field-label">JD 要求</span>
+                  <strong>{item.requirement}</strong>
                   <p>需要可验证的生产实践证据。</p>
                 </div>
-                <div>{evidence}</div>
-                <div>
-                  <StatusIcon status={status} />
+                <div className="evidence-field">
+                  <span className="evidence-field-label">简历证据</span>
+                  <p>{item.evidence}</p>
                 </div>
-              </Fragment>
+                <div className="evidence-field">
+                  <span className="evidence-field-label">状态</span>
+                  <StatusIcon status={item.status} />
+                </div>
+              </div>
             ))}
           </div>
         </article>
