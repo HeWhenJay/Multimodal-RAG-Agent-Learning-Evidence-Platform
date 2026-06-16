@@ -14,6 +14,7 @@ npm run dev
 
 ## 路由
 
+- `/login`：登录页
 - `/`：工作台
 - `/materials`：学习资料
 - `/knowledge`：个人知识库 RAG
@@ -22,4 +23,3 @@ npm run dev
 - `/resume`：简历适配
 - `/agent-tasks`：Agent 任务入口，当前不实现编排
 - `/settings`：系统设置
-

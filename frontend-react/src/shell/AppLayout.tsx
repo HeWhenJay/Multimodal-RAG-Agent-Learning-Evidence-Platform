@@ -6,6 +6,7 @@ import {
   FileSearch,
   LayoutDashboard,
   LifeBuoy,
+  LogOut,
   Menu,
   Search,
   Settings,
@@ -15,6 +16,7 @@ import {
   WandSparkles
 } from 'lucide-react';
 import { NavLink, Outlet } from 'react-router-dom';
+import { useAuth } from '../stores/auth';
 
 const navItems = [
   { to: '/', label: '工作台', icon: LayoutDashboard },
@@ -28,6 +30,11 @@ const navItems = [
 ];
 
 export function AppLayout() {
+  const { user, logout } = useAuth();
+  const displayName = user?.displayName || '管理员';
+  const accountLabel = user?.email || user?.account || 'admin@evidence.ai';
+  const avatarText = displayName.slice(0, 1).toUpperCase();
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -51,11 +58,14 @@ export function AppLayout() {
         </nav>
 
         <div className="user-strip">
-          <div className="avatar">U</div>
-          <div>
-            <strong>管理员</strong>
-            <span>admin@evidence.ai</span>
+          <div className="avatar">{avatarText}</div>
+          <div className="user-strip-copy">
+            <strong>{displayName}</strong>
+            <span>{accountLabel}</span>
           </div>
+          <button className="icon-button tiny" onClick={logout} aria-label="退出登录">
+            <LogOut size={16} />
+          </button>
         </div>
       </aside>
 
@@ -79,8 +89,12 @@ export function AppLayout() {
           <button className="icon-button" aria-label="通知">
             <Bell size={18} />
           </button>
-          <button className="icon-button" aria-label="账户">
+          <button className="icon-button" aria-label={`${displayName} 账户`}>
             <UserCircle size={20} />
+          </button>
+          <button className="ghost-action logout-action" onClick={logout}>
+            <LogOut size={17} />
+            <span>退出</span>
           </button>
         </header>
 
