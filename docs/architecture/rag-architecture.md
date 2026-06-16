@@ -12,7 +12,7 @@ flowchart LR
     D --> E["MinerU 文档识别适配器"]
     D --> F["递归切块"]
     D --> G["摘要索引"]
-    D --> H["BM25 + 哈希向量检索"]
+    D --> H["BM25 + PostgreSQL/pgvector 检索"]
     H --> I["RRF / RAG-Fusion"]
     I --> J["证据引用回答"]
 ```
@@ -26,13 +26,13 @@ flowchart LR
 3. 未配置 MinerU 或解析失败时，使用本地文本/PDF/DOCX 降级解析。
 4. 按标题、段落、句子和长度预算做递归切块。
 5. 为文档和章节建立摘要索引。
-6. 为 chunk 建 BM25 词项统计和确定性哈希向量。
+6. 为 chunk 建 BM25 词项统计和确定性哈希向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`。
 
 查询阶段：
 
 1. 基于原问题生成 Multi-Query 变体。
 2. 按 metadata 过滤用户、文档类型、来源和可见范围。
-3. 对每个 query 同时执行 BM25 和向量召回。
+3. 对每个 query 同时执行 BM25 和 pgvector 向量召回。
 4. 使用 Reciprocal Rank Fusion 合并多路排名。
 5. 返回可追溯 evidence，并生成确定性回答摘要。
 
@@ -58,4 +58,3 @@ Stitch 页面包含的核心模块：
 - 岗位适配分析入口。
 - 视频知识切片回顾。
 - 简历证据对齐。
-

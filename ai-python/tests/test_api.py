@@ -1,4 +1,8 @@
+import os
+
 from fastapi.testclient import TestClient
+
+os.environ["RAG_STORE_BACKEND"] = "memory"
 
 from app.main import app
 
@@ -28,4 +32,3 @@ def test_index_and_query_api():
     data = query_response.json()
     assert data["evidences"]
     assert "RAG 项目笔记" in data["evidences"][0]["title"]
-

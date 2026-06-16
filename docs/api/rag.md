@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-本项目第一阶段实现到 RAG 闭环，不实现 Agent 编排任务。前端只调用 Java Spring Boot，Java 负责业务状态、资料记录和权限边界，Python FastAPI 负责 MinerU 文档识别、递归切块、索引、混合检索和证据引用。
+本项目第一阶段实现到 RAG 闭环，不实现 Agent 编排任务。前端只调用 Java Spring Boot，Java 负责业务状态、资料记录和权限边界，Python FastAPI 负责 MinerU 文档识别、递归切块、PostgreSQL/pgvector 索引、混合检索和证据引用。
 
 ## Java 对外接口
 
@@ -167,7 +167,26 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/internal/rag/overview` | 返回 Python 内存索引统计 |
+| `GET` | `/internal/rag/overview` | 返回 PostgreSQL/pgvector RAG 仓库统计 |
+
+## PostgreSQL/pgvector 仓库
+
+正式运行使用 PostgreSQL/pgvector：
+
+```powershell
+$env:RAG_STORE_BACKEND='pgvector'
+$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
+$env:RAG_VECTOR_DIMENSIONS='128'
+```
+
+核心表：
+
+| 表名 | 用途 |
+| --- | --- |
+| `rag_document` | 保存资料标题、类型、来源、用户、可见范围、文档摘要和章节摘要 |
+| `rag_chunk` | 保存递归切块、元数据、BM25 词项统计、token 数量和 `VECTOR(128)` 向量 |
+
+真实建库和向量仓库创建语句见 `docs/database/postgresql-pgvector.md`；全量初始化脚本见 `infra/sql/init.sql`；增量迁移脚本见 `infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql`。
 
 ## Java 调 Python 契约
 
@@ -202,4 +221,3 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 - 已完成：显示 `INDEXED`、chunk 数、更新时间。
 - 检索为空：提示先上传或粘贴资料。
 - Python 不可用：展示 Java 返回的错误，不直连 Python。
-

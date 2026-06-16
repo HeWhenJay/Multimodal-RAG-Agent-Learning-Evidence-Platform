@@ -1,24 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE IF NOT EXISTS learning_material (
-    id BIGSERIAL PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    document_type VARCHAR(50) NOT NULL,
-    source VARCHAR(255),
-    status VARCHAR(30) NOT NULL,
-    parser VARCHAR(80),
-    document_summary TEXT,
-    chunk_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_learning_material_status
-    ON learning_material(status);
-
-CREATE INDEX IF NOT EXISTS idx_learning_material_document_type
-    ON learning_material(document_type);
-
 CREATE TABLE IF NOT EXISTS rag_document (
     document_id VARCHAR(120) PRIMARY KEY,
     title VARCHAR(255) NOT NULL,

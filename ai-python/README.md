@@ -5,8 +5,12 @@
 ```powershell
 python -m pip install -r ai-python/requirements.txt
 $env:PYTHONPATH='ai-python'
+$env:RAG_STORE_BACKEND='pgvector'
+$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
+
+未配置 `RAG_DATABASE_URL` 时会退回内存后端，主要用于本地单元测试。正式运行使用 PostgreSQL/pgvector，建库和建表语句见 `docs/database/postgresql-pgvector.md` 与 `infra/sql/init.sql`。
 
 ## 接口
 
@@ -21,6 +25,6 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 - MinerU 文档识别适配入口：`MINERU_COMMAND`
 - 递归切块：标题、段落、换行、句子、长度预算
 - 摘要索引：文档摘要与章节摘要
-- 混合检索：BM25 + deterministic hash embedding
+- 混合检索：BM25 + PostgreSQL/pgvector 向量召回
 - 融合重排：RRF / RAG-Fusion
-
+- 持久化：`rag_document` 保存资料摘要，`rag_chunk` 保存切块、元数据、词频统计和 `VECTOR(128)` 向量

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from collections import Counter, defaultdict
 
@@ -246,3 +247,20 @@ def build_answer(question: str, evidences: list[Evidence]) -> str:
         f"优先参考：{evidence_text}。建议基于这些资料整理回答，并在正式输出中保留证据引用。"
     )
 
+
+def create_rag_store():
+    database_url = os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL")
+    backend = os.getenv("RAG_STORE_BACKEND")
+    if backend is None:
+        backend = "pgvector" if database_url else "memory"
+
+    backend = backend.lower()
+    if backend == "memory":
+        return InMemoryRagStore()
+    if backend in {"pgvector", "postgres", "postgresql"}:
+        if not database_url:
+            raise RuntimeError("RAG_STORE_BACKEND=pgvector 时必须配置 RAG_DATABASE_URL 或 DATABASE_URL")
+        from rag.pgvector_store import PgVectorRagStore
+
+        return PgVectorRagStore(database_url=database_url)
+    raise RuntimeError(f"不支持的 RAG_STORE_BACKEND: {backend}")

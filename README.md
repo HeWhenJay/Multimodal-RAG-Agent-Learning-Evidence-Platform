@@ -10,7 +10,7 @@
 
 - 文档识别：优先使用 MinerU，通过 `MINERU_COMMAND` 接入；未配置时走本地解析降级。
 - 切块：使用递归切块，优先保留标题、段落、句子结构。
-- 检索：Multi-Query + BM25 + 哈希向量召回 + RRF/RAG-Fusion。
+- 检索：Multi-Query + BM25 + PostgreSQL/pgvector 向量召回 + RRF/RAG-Fusion。
 - 引用：回答返回证据片段、来源、章节和分数。
 
 ## RAG 业务流程
@@ -35,7 +35,7 @@ flowchart TD
     TXT --> CH
     CH --> META["补充切块元数据<br/>资料ID、标题、类型、来源、用户、可见范围、章节"]
     META --> SUM["摘要索引<br/>资料摘要 + 章节摘要"]
-    SUM --> IDX["建立检索索引<br/>BM25 词项统计 + 哈希向量"]
+    SUM --> IDX["写入 PostgreSQL/pgvector<br/>BM25 词项统计 + 向量列"]
     IDX --> IR["返回已索引状态、切块数、资料摘要"]
     IR --> JU["Java 更新资料记录"]
     JU --> FEI["前端展示已索引、切块数和摘要"]
@@ -44,7 +44,7 @@ flowchart TD
     JQ --> PQ["Python 查询入口"]
     PQ --> MQ["Multi-Query 扩展问题"]
     MQ --> FILTER["按元数据过滤条件筛选候选切块"]
-    FILTER --> RET["BM25 + 向量并行召回"]
+    FILTER --> RET["BM25 + pgvector 并行召回"]
     RET --> FUSE["RRF / RAG-Fusion 融合排序"]
     FUSE --> EV["选择优先证据<br/>片段、来源、章节、分数"]
     EV --> ANS["生成带引用意识的回答摘要"]
@@ -77,8 +77,8 @@ flowchart TD
     A12 --> A13["补齐切块元数据<br/>资料ID、用户、来源、章节、位置、解析器"]
     A13 --> A14["摘要索引<br/>资料摘要 + 章节摘要"]
     A14 --> A15["关键词索引<br/>分词、词频、文档频率"]
-    A14 --> A16["哈希向量索引<br/>本地确定性向量表示"]
-    A15 --> A17["内存检索存储<br/>资料、切块、词项统计、向量"]
+    A14 --> A16["pgvector 向量索引<br/>真实 PostgreSQL 向量列"]
+    A15 --> A17["PostgreSQL/pgvector 检索仓库<br/>资料、切块、词项统计、向量"]
     A16 --> A17
     A17 --> A18["Python 返回索引结果<br/>已索引、切块数、解析器、摘要"]
     A18 --> A19["Java 回写资料状态<br/>已索引或失败"]
@@ -114,14 +114,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    C0["检索任务输入<br/>扩展问题列表、过滤条件、返回数量"] --> C1["读取内存检索存储<br/>资料、切块、词频、文档频率、向量"]
+    C0["检索任务输入<br/>扩展问题列表、过滤条件、返回数量"] --> C1["读取 PostgreSQL/pgvector 仓库<br/>资料、切块、词频、文档频率、向量"]
     C1 --> C2["按元数据过滤候选切块<br/>用户、可见范围、资料类型、来源、章节"]
     C2 --> C3{"过滤后是否还有切块"}
     C3 -->|"否"| C4["返回空证据列表<br/>记录过滤后数量为 0"]
     C3 -->|"是"| C5["遍历每一个扩展问题"]
     C5 --> C6["分词处理<br/>中文单字 + 英文术语 + 数字符号"]
     C6 --> C7["BM25 关键词召回<br/>计算词频、逆文档频率、长度归一"]
-    C6 --> C8["哈希向量召回<br/>构造查询向量并计算余弦相似度"]
+    C6 --> C8["pgvector 向量召回<br/>按余弦距离排序"]
     C7 --> C9["关键词排名列表<br/>适合精确术语和岗位关键词"]
     C8 --> C10["语义排名列表<br/>适合同义表达和上下文近似"]
     C9 --> C11["汇总多路排名列表<br/>每个扩展问题保留候选结果"]
@@ -143,7 +143,7 @@ flowchart TD
 5. Python 文件入口优先调用 `MINERU_COMMAND` 配置的 MinerU 命令。MinerU 未配置、执行失败或没有解析出文本时，使用本地降级解析：PDF 走 `pypdf`，DOCX 走 `python-docx`，其他文本按 UTF-8 解码。
 6. Python 使用递归切块器做切块，按 Markdown 标题、空行、换行、句号、分号、逗号和空格逐级拆分；默认切块长度为 700，重叠窗口为 90，尽量保留上下文。
 7. 每个切块都保留元数据：资料 ID、标题、类型、来源、用户、可见范围、解析器、上传时间、章节名和切块位置。
-8. 摘要索引组件生成文档级摘要和章节级摘要；同时为每个切块建 BM25 词项统计和确定性哈希向量。
+8. 摘要索引组件生成文档级摘要和章节级摘要；同时把每个切块的 BM25 词项统计、元数据和向量写入 PostgreSQL/pgvector。
 9. Python 返回已索引状态、切块数量、解析器和摘要；Java 更新资料记录，前端就能看到“已索引”、切块数和摘要。
 
 ### 查询阶段：把问题变成带证据引用的回答
@@ -152,15 +152,15 @@ flowchart TD
 2. 前端调用 Java `/api/rag/query`，Java 不做检索逻辑，只做统一接口和错误边界，然后调用 Python `/internal/rag/query`。
 3. Python 先做 Multi-Query 扩展：保留原问题，再补充“关键证据”“学习资料/笔记”等查询变体；如果问题包含 JD、岗位、简历、项目等词，会补充更贴近岗位适配或简历证据的查询变体。
 4. Python 按元数据过滤条件过滤候选切块。当前第一阶段默认本地演示用户是 `demo-user`，后续可接真实登录态和资料权限。
-5. 每个查询变体同时走两路召回：BM25 负责关键词精确匹配，哈希向量负责语义近似匹配。
+5. 每个查询变体同时走两路召回：BM25 负责关键词精确匹配，pgvector 负责向量相似度召回。
 6. 多个查询变体、多个召回器的结果通过 RRF 做 RAG-Fusion 融合排序，避免单一路径漏召回。
 7. 系统按返回数量选择证据，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和融合分数。
 8. 当前阶段生成的是确定性回答摘要：说明检索到几条证据、优先参考哪些资料和章节，并提醒正式输出保留证据引用。后续可以把这一步替换为真实 LLM 生成，但证据结构不需要改。
 
 ### 当前实现边界
 
-- 当前 Python 检索索引是内存态，适合第一阶段端到端验证；服务重启后需要重新索引资料。后续可替换为 PostgreSQL + pgvector、Qdrant、Milvus 或 Elasticsearch。
-- 当前向量召回使用 deterministic hash embedding，保证本地无模型密钥也能运行；后续可以替换为真实 embedding 模型。
+- 当前 Python RAG 正式存储使用 PostgreSQL/pgvector，`rag_document` 保存资料摘要，`rag_chunk` 保存递归切块、元数据、BM25 词项统计和 `VECTOR(128)` 向量。
+- 当前向量生成仍使用 deterministic hash embedding，保证本地无模型密钥也能写入 pgvector；后续可以替换为真实 embedding 模型，表结构只需要同步调整向量维度。
 - 当前回答生成是规则化摘要，不调用大模型；后续接 LLM 时应继续保留 evidence 引用和检索诊断。
 - 当前 Agent 任务只保留页面入口，不实现自主规划、工具调用或长任务编排。
 
@@ -183,8 +183,12 @@ Python RAG 服务：
 cd ai-python
 python -m pip install -r requirements.txt
 $env:PYTHONPATH='.'
+$env:RAG_STORE_BACKEND='pgvector'
+$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
+
+PostgreSQL/pgvector 建库和向量仓库创建语句见 [docs/database/postgresql-pgvector.md](docs/database/postgresql-pgvector.md)。完整初始化 SQL 在 [infra/sql/init.sql](infra/sql/init.sql)，增量迁移 SQL 在 [infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql](infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql)。
 
 Java 后端：
 

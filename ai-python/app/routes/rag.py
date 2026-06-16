@@ -1,7 +1,7 @@
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from rag.mineru_loader import MineruDocumentLoader
-from rag.retrieval import InMemoryRagStore
+from rag.retrieval import create_rag_store
 from schemas.rag import (
     IndexResponse,
     IndexTextRequest,
@@ -13,7 +13,7 @@ from schemas.rag import (
 
 router = APIRouter(prefix="/internal/rag", tags=["RAG"])
 loader = MineruDocumentLoader()
-store = InMemoryRagStore()
+store = create_rag_store()
 
 
 @router.post("/documents/index-text", response_model=IndexResponse)
@@ -68,4 +68,3 @@ def query(request: QueryRequest) -> QueryResponse:
 @router.get("/overview", response_model=OverviewResponse)
 def overview() -> OverviewResponse:
     return store.overview()
-
