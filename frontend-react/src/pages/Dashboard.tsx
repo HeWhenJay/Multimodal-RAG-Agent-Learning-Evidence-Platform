@@ -50,7 +50,7 @@ export function Dashboard() {
         </div>
         <div className="status-pill indexed">
           <Database size={15} />
-          RAG Ready
+          RAG 已就绪
         </div>
       </section>
 
@@ -96,8 +96,8 @@ export function Dashboard() {
             <div className="citation-row">
               {evidences.length === 0 ? (
                 <>
-                  <span><FileText size={15} />[Doc A, p.24]</span>
-                  <span><PlayCircle size={15} />[Video B, 05:20]</span>
+                  <span><FileText size={15} />[文档 A, 第 24 页]</span>
+                  <span><PlayCircle size={15} />[视频 B, 05:20]</span>
                 </>
               ) : (
                 evidences.slice(0, 3).map((item) => (
@@ -128,12 +128,12 @@ export function Dashboard() {
           <h4>近期处理任务</h4>
           <div className="task-row">
             <FileText size={20} />
-            <span>System Design.pdf</span>
-            <strong>100% Indexed</strong>
+            <span>系统设计笔记.pdf</span>
+            <strong>100% 已索引</strong>
           </div>
           <div className="task-row">
             <Video size={20} />
-            <span>Java Concurrency.mp4</span>
+            <span>Java 并发课程.mp4</span>
             <strong className="processing">65% OCR/ASR</strong>
           </div>
         </article>
@@ -146,16 +146,16 @@ export function Dashboard() {
             </h3>
           </div>
           <label className="field-label">目标岗位描述 (JD) 输入</label>
-          <textarea className="compact-textarea" placeholder="Paste Job Description here..." />
+          <textarea className="compact-textarea" placeholder="在这里粘贴岗位描述..." />
           <button className="full-action">
             <BarChart3 size={17} />
             运行适配分析
           </button>
           <h4>能力雷达匹配度</h4>
           <div className="stacked-bar" aria-label="能力匹配度">
-            <span className="mastered" style={{ width: '60%' }}>Mastered</span>
-            <span className="partial" style={{ width: '25%' }}>Partial</span>
-            <span className="gaps" style={{ width: '15%' }}>Gaps</span>
+            <span className="mastered" style={{ width: '60%' }}>已掌握</span>
+            <span className="partial" style={{ width: '25%' }}>待强化</span>
+            <span className="gaps" style={{ width: '15%' }}>缺口</span>
           </div>
           <div className="plan-note">
             <Flag size={17} />
@@ -179,8 +179,8 @@ export function Dashboard() {
               <div>
                 <h4>{title}</h4>
                 <span>知识命中</span>
-                <p>Fragment: {fragment}</p>
-                <p>Timeline: {timeline}</p>
+                <p>知识片段：{fragment}</p>
+                <p>时间范围：{timeline}</p>
               </div>
             </div>
           ))}
@@ -190,23 +190,23 @@ export function Dashboard() {
           <div className="panel-title">
             <h3>
               <FileText size={20} />
-              简历证据对齐 (JD vs Resume)
+              简历证据对齐 (JD 与简历)
             </h3>
-            <span className="status-pill">Review Mode</span>
+            <span className="status-pill">复核模式</span>
           </div>
           <div className="evidence-table">
-            <div className="table-head">JD Requirement</div>
-            <div className="table-head">Resume Evidence</div>
-            <div className="table-head">Status</div>
+            <div className="table-head">JD 要求</div>
+            <div className="table-head">简历证据</div>
+            <div className="table-head">状态</div>
             {[
-              ['Kubernetes Experience', '"Lead k8s migration project for 50+ microservices..."', 'supported'],
-              ['High Concurrency Tuning', '"Participated in performance testing..."', 'weak'],
-              ['React / Frontend Skills', 'No relevant entries found.', 'missing']
+              ['Kubernetes 实战经验', '主导 50+ 微服务的 k8s 迁移项目', 'supported'],
+              ['高并发调优经验', '参与性能压测与接口响应时间优化', 'weak'],
+              ['React / 前端能力', '未找到相关简历记录', 'missing']
             ].map(([requirement, evidence, status]) => (
               <Fragment key={requirement}>
                 <div>
                   <strong>{requirement}</strong>
-                  <p>Require hands-on production evidence.</p>
+                  <p>需要可验证的生产实践证据。</p>
                 </div>
                 <div>{evidence}</div>
                 <div>
@@ -223,10 +223,10 @@ export function Dashboard() {
 
 function StatusIcon({ status }: { status: string }) {
   if (status === 'supported') {
-    return <span className="evidence-status supported"><CheckCircle2 size={16} />Evidence Supported</span>;
+    return <span className="evidence-status supported"><CheckCircle2 size={16} />证据充分</span>;
   }
   if (status === 'weak') {
-    return <span className="evidence-status weak"><TriangleAlert size={16} />Insufficient Evidence</span>;
+    return <span className="evidence-status weak"><TriangleAlert size={16} />证据不足</span>;
   }
-  return <span className="evidence-status missing">Not Recommended</span>;
+  return <span className="evidence-status missing">不建议写入</span>;
 }

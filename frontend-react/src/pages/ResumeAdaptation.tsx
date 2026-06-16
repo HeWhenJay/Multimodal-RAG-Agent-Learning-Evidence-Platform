@@ -19,14 +19,14 @@ export function ResumeAdaptation() {
       <section className="panel">
         <div className="panel-title">
           <h3><FileDiff size={20} />证据对齐矩阵</h3>
-          <span className="status-pill">Review Mode</span>
+          <span className="status-pill">复核模式</span>
         </div>
         <div className="resume-grid">
           {rows.map(([requirement, evidence, status]) => (
             <div className="resume-row" key={requirement}>
               <div>
                 <strong>{requirement}</strong>
-                <span>JD Requirement</span>
+                <span>JD 要求</span>
               </div>
               <p>{evidence}</p>
               <StatusBadge status={status} />
@@ -40,11 +40,10 @@ export function ResumeAdaptation() {
 
 function StatusBadge({ status }: { status: string }) {
   if (status === 'supported') {
-    return <span className="evidence-status supported"><CheckCircle2 size={16} />Evidence Supported</span>;
+    return <span className="evidence-status supported"><CheckCircle2 size={16} />证据充分</span>;
   }
   if (status === 'weak') {
-    return <span className="evidence-status weak"><TriangleAlert size={16} />Insufficient Evidence</span>;
+    return <span className="evidence-status weak"><TriangleAlert size={16} />证据不足</span>;
   }
-  return <span className="evidence-status missing"><XCircle size={16} />Not Recommended</span>;
+  return <span className="evidence-status missing"><XCircle size={16} />不建议写入</span>;
 }
-

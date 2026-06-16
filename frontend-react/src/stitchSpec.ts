@@ -9,13 +9,12 @@ export const stitchTokens = {
 };
 
 export const stitchNav = [
-  'Dashboard',
-  'Learning Materials',
-  'Knowledge Base',
-  'Video Review',
-  'JD Analysis',
-  'Resume Adaptation',
-  'Agent Tasks',
-  'System Settings'
+  '工作台',
+  '学习资料',
+  '知识库',
+  '视频复习',
+  'JD 分析',
+  '简历适配',
+  'Agent 任务',
+  '系统设置'
 ];
-

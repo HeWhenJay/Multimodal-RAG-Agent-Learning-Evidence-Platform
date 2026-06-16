@@ -24,7 +24,7 @@ export function KnowledgeBase() {
           <h2>个人知识库</h2>
           <p>RAG 检索、证据锚点与引用结果</p>
         </div>
-        <div className="status-pill indexed"><Database size={15} />Hybrid Search</div>
+        <div className="status-pill indexed"><Database size={15} />混合检索</div>
       </section>
 
       <section className="panel">
@@ -45,7 +45,7 @@ export function KnowledgeBase() {
           <article className="panel">
             <div className="panel-title">
               <h3>回答</h3>
-              <span className="status-pill">{result.evidences.length} evidences</span>
+              <span className="status-pill">{result.evidences.length} 条证据</span>
             </div>
             <p className="answer-copy">{result.answer}</p>
             <div className="query-tags">
@@ -62,7 +62,7 @@ export function KnowledgeBase() {
                 <div className="evidence-card" key={item.evidenceId}>
                   <div>
                     <strong>{item.title}</strong>
-                    <span>{item.documentType} · {item.sectionName} · score {item.score.toFixed(4)}</span>
+                    <span>{item.documentType} · {item.sectionName} · 分数 {item.score.toFixed(4)}</span>
                   </div>
                   <p>{item.snippet}</p>
                 </div>
@@ -74,4 +74,3 @@ export function KnowledgeBase() {
     </div>
   );
 }
-

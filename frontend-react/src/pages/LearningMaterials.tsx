@@ -7,7 +7,7 @@ const sampleText = `## RAG 检索优化
 BM25 适合关键词召回，向量检索适合语义召回。RAG-Fusion 使用 Multi-Query 和 RRF 将多路结果合并排序。
 
 ## 递归切块
-递归切块会优先保留标题、段落和句子结构，并通过 overlap 保留上下文。`;
+递归切块会优先保留标题、段落和句子结构，并通过重叠窗口保留上下文。`;
 
 export function LearningMaterials() {
   const [materials, setMaterials] = useState<LearningMaterial[]>([]);
@@ -99,19 +99,19 @@ export function LearningMaterials() {
       <section className="panel">
         <div className="panel-title">
           <h3>近期资料</h3>
-          <span className="status-pill">{materials.length} items</span>
+          <span className="status-pill">{materials.length} 条资料</span>
         </div>
         <div className="material-list">
           {materials.map((item) => (
             <div className="material-row" key={item.id}>
               <div>
                 <strong>{item.title}</strong>
-                <span>{item.documentType} · {item.source} · {item.parser || 'pending'}</span>
+                <span>{formatDocumentType(item.documentType)} · {formatSource(item.source)} · {item.parser || '等待解析'}</span>
                 <p>{item.documentSummary || '等待索引摘要'}</p>
               </div>
               <div className="material-meta">
-                <span className={`status-pill ${item.status === 'INDEXED' ? 'indexed' : ''}`}>{item.status}</span>
-                <strong>{item.chunkCount} chunks</strong>
+                <span className={`status-pill ${item.status === 'INDEXED' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
+                <strong>{item.chunkCount} 个切块</strong>
               </div>
             </div>
           ))}
@@ -122,3 +122,21 @@ export function LearningMaterials() {
   );
 }
 
+function formatDocumentType(type: string) {
+  const normalized = type.toLowerCase();
+  if (normalized === 'markdown') return 'Markdown';
+  if (normalized === 'text') return '文本';
+  return type.toUpperCase();
+}
+
+function formatSource(source: string) {
+  if (source === 'manual') return '手动录入';
+  return source;
+}
+
+function formatStatus(status: string) {
+  if (status === 'INDEXED') return '已索引';
+  if (status === 'INDEXING') return '索引中';
+  if (status === 'FAILED') return '索引失败';
+  return status;
+}

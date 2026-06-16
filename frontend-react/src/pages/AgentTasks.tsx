@@ -8,7 +8,7 @@ export function AgentTasks() {
           <h2>Agent 任务</h2>
           <p>当前阶段保留入口，正式编排不在本轮实现</p>
         </div>
-        <div className="status-pill"><LockKeyhole size={15} />Not Started</div>
+        <div className="status-pill"><LockKeyhole size={15} />未开始</div>
       </section>
 
       <section className="agent-placeholder">
@@ -33,4 +33,3 @@ export function AgentTasks() {
     </div>
   );
 }
-

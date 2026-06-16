@@ -11,7 +11,7 @@ export function JdAnalysis() {
           <h2>JD 分析</h2>
           <p>岗位要求解析、知识证据匹配与学习计划摘要</p>
         </div>
-        <div className="status-pill"><BrainCircuit size={15} />RAG First</div>
+        <div className="status-pill"><BrainCircuit size={15} />RAG 优先</div>
       </section>
 
       <section className="two-column">
@@ -68,4 +68,3 @@ export function JdAnalysis() {
     </div>
   );
 }
-
