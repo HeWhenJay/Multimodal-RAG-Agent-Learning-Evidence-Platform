@@ -6,6 +6,14 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Local AI assistant instructions
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+GEMINI.md
+.codex/
+.cursor/
+
 # Logs
 *.log
 logs/
