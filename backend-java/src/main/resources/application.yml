@@ -27,4 +27,10 @@ evidence:
     query-timeout-seconds: 30
     index-timeout-seconds: 60
     overview-timeout-seconds: 5
-
+  logs:
+    enabled: true
+    max-batch-size: 50
+    max-context-bytes: 20480
+    max-stack-trace-bytes: 20480
+    retention-days: 30
+    internal-token: ${EVIDENCE_INTERNAL_LOG_TOKEN:}

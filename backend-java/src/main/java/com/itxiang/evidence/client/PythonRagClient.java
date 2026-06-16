@@ -84,10 +84,9 @@ public class PythonRagClient {
                     .body(String.class);
             return readIndexResult(objectMapper.readTree(response));
         } catch (RestClientResponseException e) {
-            throw new IllegalStateException("Python RAG 服务暂不可用，请稍后重试: "
-                    + e.getStatusCode() + " " + e.getResponseBodyAsString(), e);
+            throw pythonException("index-file", "/internal/rag/documents/index-file", e);
         } catch (Exception e) {
-            throw new IllegalStateException("Python RAG 服务暂不可用，请稍后重试: " + e.getMessage(), e);
+            throw pythonException("index-file", "/internal/rag/documents/index-file", e);
         }
     }
 
@@ -128,10 +127,9 @@ public class PythonRagClient {
             }
             return evidences;
         } catch (RestClientResponseException e) {
-            throw new IllegalStateException("Python RAG evidence 查询失败: "
-                    + e.getStatusCode() + " " + e.getResponseBodyAsString(), e);
+            throw pythonException("list-evidences", "/internal/rag/documents/{document_id}/evidences", e);
         } catch (Exception e) {
-            throw new IllegalStateException("Python RAG evidence 查询失败: " + e.getMessage(), e);
+            throw pythonException("list-evidences", "/internal/rag/documents/{document_id}/evidences", e);
         }
     }
 
@@ -165,10 +163,9 @@ public class PythonRagClient {
                     .body(String.class);
             return objectMapper.readTree(response);
         } catch (RestClientResponseException e) {
-            throw new IllegalStateException("Python RAG 服务暂不可用，请稍后重试: "
-                    + e.getStatusCode() + " " + e.getResponseBodyAsString(), e);
+            throw pythonException("post-json", path, e);
         } catch (Exception e) {
-            throw new IllegalStateException("Python RAG 服务暂不可用，请稍后重试: " + e.getMessage(), e);
+            throw pythonException("post-json", path, e);
         }
     }
 
@@ -177,6 +174,16 @@ public class PythonRagClient {
     }
 
     private IndexResult readIndexResult(JsonNode root) {
+        if (root == null || !root.hasNonNull("documentId") || !root.hasNonNull("status")) {
+            throw new PythonRagClientException(
+                    "read-index-result",
+                    "python-response",
+                    null,
+                    null,
+                    "Python RAG response schema is invalid",
+                    null
+            );
+        }
         return new IndexResult(
                 text(root, "documentId"),
                 text(root, "title"),
@@ -233,6 +240,28 @@ public class PythonRagClient {
         return result;
     }
 
+    private PythonRagClientException pythonException(String operation, String endpoint, RestClientResponseException e) {
+        return new PythonRagClientException(
+                operation,
+                endpoint,
+                e.getStatusCode().value(),
+                e.getResponseBodyAsString(),
+                "Python RAG call failed: " + e.getStatusCode(),
+                e
+        );
+    }
+
+    private PythonRagClientException pythonException(String operation, String endpoint, Exception e) {
+        return new PythonRagClientException(
+                operation,
+                endpoint,
+                null,
+                null,
+                "Python RAG call failed: " + e.getMessage(),
+                e
+        );
+    }
+
     public record IndexResult(
             String documentId,
             String title,
@@ -249,6 +278,42 @@ public class PythonRagClient {
             Integer evidenceCount,
             String lastIndexedTitle
     ) {
+    }
+
+    public static class PythonRagClientException extends IllegalStateException {
+        private final String operation;
+        private final String endpoint;
+        private final Integer statusCode;
+        private final String responseBody;
+
+        public PythonRagClientException(String operation,
+                                        String endpoint,
+                                        Integer statusCode,
+                                        String responseBody,
+                                        String message,
+                                        Throwable cause) {
+            super(message, cause);
+            this.operation = operation;
+            this.endpoint = endpoint;
+            this.statusCode = statusCode;
+            this.responseBody = responseBody;
+        }
+
+        public String getOperation() {
+            return operation;
+        }
+
+        public String getEndpoint() {
+            return endpoint;
+        }
+
+        public Integer getStatusCode() {
+            return statusCode;
+        }
+
+        public String getResponseBody() {
+            return responseBody;
+        }
     }
 
     private static class NamedByteArrayResource extends ByteArrayResource {

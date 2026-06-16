@@ -17,6 +17,8 @@
 
 本项目的 RAG 不是前端直接调用 Python，也不是把 AI 逻辑写在 Java 里。业务边界是：React 只面向用户交互，Java Spring Boot 负责业务状态、资料记录、权限边界和统一 `Result<T>` 响应，Python FastAPI 负责文档识别、递归切块、索引、混合检索和证据引用。这样后续替换向量库、embedding 模型或增加重排序模型时，不需要破坏 Java 业务接口。
 
+日志记录是横切能力：Java 统一接收并写入 `log_event` / `log_error`，当前 RAG 使用 `domain=rag`，后续 Agent 编排、工具调用或长任务如果落地，可以复用同一套 `domain/module/stage/action/errorCode/contextJson` 结构。
+
 ### 整体业务流程图
 
 ```mermaid
@@ -27,8 +29,11 @@ flowchart TD
     JC --> JS["RAG 业务服务创建学习资料记录"]
     JS --> DB["MyBatis 持久层写入资料表<br/>PENDING -> PARSING"]
     JS --> PC["Python 服务调用客户端<br/>转发到 FastAPI"]
+    JS -->|"关键状态 / RAG 错误"| LOG["通用日志服务<br/>domain=rag，可复用到 Agent"]
+    PC -->|"Python 调用失败"| LOG
 
     PC --> PYI{"Python 解析入库入口"}
+    PYI -->|"解析 / OCR / 索引异常内部上报"| LOG
     PYI -->|"文件"| ROUTE["多格式解析路由<br/>原生结构解析优先"]
     PYI -->|"文本"| TXT["转换为 DocumentBlock"]
     ROUTE --> BLOCK["统一 DocumentBlock<br/>页码/幻灯片/sheet/cell range"]
@@ -42,6 +47,7 @@ flowchart TD
     JU --> FEI["前端展示解析状态、切块数和摘要"]
 
     FE -->|"RAG 提问"| JQ["Java 查询接口"]
+    JQ -->|"查询开始 / 失败 / 无证据"| LOG
     JQ --> PQ["Python 查询入口"]
     PQ --> MQ["Multi-Query 扩展问题"]
     MQ --> FILTER["按元数据过滤条件筛选候选切块"]
@@ -51,6 +57,7 @@ flowchart TD
     EV --> ANS["生成带引用意识的回答摘要"]
     ANS --> JR["Java 封装统一响应对象"]
     JR --> UI["前端展示回答、扩展问题和证据引用"]
+    LOG --> LDB["log_event / log_error<br/>traceId、stage、errorCode、contextJson"]
 ```
 
 ### 细分 RAG 流程图

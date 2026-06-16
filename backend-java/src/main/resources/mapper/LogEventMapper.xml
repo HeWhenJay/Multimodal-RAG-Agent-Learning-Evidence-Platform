@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.LogEventMapper">
+
+    <resultMap id="LogEventResultMap" type="com.itxiang.evidence.entity.LogEvent">
+        <id property="id" column="id"/>
+        <result property="traceId" column="trace_id"/>
+        <result property="sessionId" column="session_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="source" column="source"/>
+        <result property="domain" column="domain"/>
+        <result property="level" column="level"/>
+        <result property="module" column="module"/>
+        <result property="stage" column="stage"/>
+        <result property="eventType" column="event_type"/>
+        <result property="action" column="action"/>
+        <result property="message" column="message"/>
+        <result property="route" column="route"/>
+        <result property="httpMethod" column="http_method"/>
+        <result property="requestPath" column="request_path"/>
+        <result property="statusCode" column="status_code"/>
+        <result property="success" column="success"/>
+        <result property="durationMs" column="duration_ms"/>
+        <result property="materialId" column="material_id"/>
+        <result property="documentId" column="document_id"/>
+        <result property="parser" column="parser"/>
+        <result property="clientTime" column="client_time"/>
+        <result property="serverTime" column="server_time"/>
+        <result property="contextJson" column="context_json"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.LogEvent"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO log_event (
+            trace_id,
+            session_id,
+            user_id,
+            source,
+            domain,
+            level,
+            module,
+            stage,
+            event_type,
+            action,
+            message,
+            route,
+            http_method,
+            request_path,
+            status_code,
+            success,
+            duration_ms,
+            material_id,
+            document_id,
+            parser,
+            client_time,
+            server_time,
+            context_json
+        )
+        VALUES (
+            #{traceId},
+            #{sessionId},
+            #{userId},
+            #{source},
+            #{domain},
+            #{level},
+            #{module},
+            #{stage},
+            #{eventType},
+            #{action},
+            #{message},
+            #{route},
+            #{httpMethod},
+            #{requestPath},
+            #{statusCode},
+            #{success},
+            #{durationMs},
+            #{materialId},
+            #{documentId},
+            #{parser},
+            #{clientTime},
+            #{serverTime},
+            #{contextJson}
+        )
+    </insert>
+
+    <select id="findRecent" resultMap="LogEventResultMap">
+        SELECT
+            id,
+            trace_id,
+            session_id,
+            user_id,
+            source,
+            domain,
+            level,
+            module,
+            stage,
+            event_type,
+            action,
+            message,
+            route,
+            http_method,
+            request_path,
+            status_code,
+            success,
+            duration_ms,
+            material_id,
+            document_id,
+            parser,
+            client_time,
+            server_time,
+            context_json,
+            created_at
+        FROM log_event
+        ORDER BY created_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countSince" resultType="long">
+        SELECT COUNT(1)
+        FROM log_event
+        WHERE created_at &gt;= #{startTime}
+    </select>
+</mapper>
