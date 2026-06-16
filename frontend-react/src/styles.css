@@ -246,7 +246,7 @@ button {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -259,7 +259,7 @@ button {
 }
 
 .metric-card {
-  min-height: 112px;
+  min-height: 132px;
   padding: 18px;
   display: flex;
   align-items: center;
