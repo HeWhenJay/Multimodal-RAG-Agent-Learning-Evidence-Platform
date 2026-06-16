@@ -23,107 +23,115 @@
 flowchart TD
     U["用户：上传资料、粘贴笔记或输入问题"] --> FE["React 前端"]
 
-    FE -->|"资料上传 / 文本索引"| JC["Java RagController"]
-    JC --> JS["RagService 创建学习资料记录"]
-    JS --> DB["MyBatis Mapper 写入 learning_material<br/>初始状态：INDEXING"]
-    JS --> PC["PythonRagClient 调用 Python FastAPI"]
+    FE -->|"资料上传 / 文本索引"| JC["Java RAG 控制器"]
+    JC --> JS["RAG 业务服务创建学习资料记录"]
+    JS --> DB["MyBatis 持久层写入资料表<br/>初始状态：索引中"]
+    JS --> PC["Python 服务调用客户端<br/>转发到 FastAPI"]
 
     PC --> PYI{"Python 索引入口"}
     PYI -->|"文件"| MU["MinerU 文档识别<br/>失败则本地降级解析"]
     PYI -->|"文本"| TXT["直接接收已提取文本"]
     MU --> CH["递归切块<br/>标题 / 段落 / 句子 / 长度预算"]
     TXT --> CH
-    CH --> META["补充 chunk 元数据<br/>documentId、title、type、source、user、visibility、section"]
-    META --> SUM["摘要索引<br/>documentSummary + sectionSummaries"]
+    CH --> META["补充切块元数据<br/>资料ID、标题、类型、来源、用户、可见范围、章节"]
+    META --> SUM["摘要索引<br/>资料摘要 + 章节摘要"]
     SUM --> IDX["建立检索索引<br/>BM25 词项统计 + 哈希向量"]
-    IDX --> IR["返回 INDEXED、chunkCount、documentSummary"]
+    IDX --> IR["返回已索引状态、切块数、资料摘要"]
     IR --> JU["Java 更新资料记录"]
     JU --> FEI["前端展示已索引、切块数和摘要"]
 
-    FE -->|"RAG 提问"| JQ["Java /api/rag/query"]
-    JQ --> PQ["Python /internal/rag/query"]
+    FE -->|"RAG 提问"| JQ["Java 查询接口"]
+    JQ --> PQ["Python 查询入口"]
     PQ --> MQ["Multi-Query 扩展问题"]
-    MQ --> FILTER["按 metadataFilter 过滤候选 chunk"]
+    MQ --> FILTER["按元数据过滤条件筛选候选切块"]
     FILTER --> RET["BM25 + 向量并行召回"]
     RET --> FUSE["RRF / RAG-Fusion 融合排序"]
-    FUSE --> EV["选择 TopK 证据<br/>snippet、source、section、score"]
+    FUSE --> EV["选择优先证据<br/>片段、来源、章节、分数"]
     EV --> ANS["生成带引用意识的回答摘要"]
-    ANS --> JR["Java 封装 Result<RagQueryVO>"]
+    ANS --> JR["Java 封装统一响应对象"]
     JR --> UI["前端展示回答、扩展问题和证据引用"]
 ```
 
 ### 细分 RAG 流程图
 
-这张图把 RAG 拆成“索引链路”和“查询链路”两条主线：索引链路负责把资料变成可检索证据，查询链路负责把用户问题变成带引用的回答；Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
+这里把 RAG 拆成“索引流程”“查询流程”“检索流程”三张图。查询流程解决“用户问题如何进入 RAG 并形成响应”，检索流程解决“候选切块如何被召回、融合、排序并变成证据”。Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
+
+#### 索引流程图：资料到可检索证据
 
 ```mermaid
 flowchart TD
-    START["用户入口<br/>上传资料、粘贴文本、输入问题"]
+    A0["用户提交学习资料<br/>文件或文本"] --> A1["React 提交表单<br/>标题、类型、来源、可见范围"]
+    A1 --> A2["Java RAG 控制器<br/>校验空内容、文件大小、资料类型"]
+    A2 --> A3["RAG 业务服务<br/>生成资料ID，状态写为索引中"]
+    A3 --> A4["MyBatis 持久层<br/>保存资料记录"]
+    A3 --> A5["Python 服务调用客户端<br/>按接口契约转发资料"]
+    A5 --> A6{"输入是文件还是文本"}
+    A6 -->|"文件"| A7["MinerU 文档识别<br/>解析版面、标题、段落、表格"]
+    A7 --> A8{"是否得到有效文本"}
+    A8 -->|"否"| A9["本地降级解析<br/>PDF / DOCX / UTF-8 文本"]
+    A8 -->|"是"| A10["文本规范化<br/>统一换行、空格、Markdown 结构"]
+    A9 --> A10
+    A6 -->|"文本"| A10
+    A10 --> A11["递归切块<br/>标题 -> 段落 -> 换行 -> 句子 -> 长度预算"]
+    A11 --> A12["重叠窗口保留上下文<br/>默认长度 700，重叠 90"]
+    A12 --> A13["补齐切块元数据<br/>资料ID、用户、来源、章节、位置、解析器"]
+    A13 --> A14["摘要索引<br/>资料摘要 + 章节摘要"]
+    A14 --> A15["关键词索引<br/>分词、词频、文档频率"]
+    A14 --> A16["哈希向量索引<br/>本地确定性向量表示"]
+    A15 --> A17["内存检索存储<br/>资料、切块、词项统计、向量"]
+    A16 --> A17
+    A17 --> A18["Python 返回索引结果<br/>已索引、切块数、解析器、摘要"]
+    A18 --> A19["Java 回写资料状态<br/>已索引或失败"]
+    A19 --> A20["前端刷新资料列表<br/>展示状态、切块数、摘要或错误"]
+```
 
-    subgraph INDEX["索引链路：资料入库到可检索证据"]
-        direction TB
-        I1["React 表单提交<br/>文件 / 文本 / 元数据"] --> I2["Java RagController<br/>校验标题、类型、大小、空内容"]
-        I2 --> I3["RagService<br/>生成 documentId，写入 INDEXING"]
-        I3 --> I4["LearningMaterialMapper<br/>保存资料记录和处理状态"]
-        I3 --> I5["PythonRagClient<br/>按 Java-Python 契约转发"]
-        I5 --> I6{"Python 输入类型"}
-        I6 -->|"文件"| I7["MinerU 解析<br/>优先做版面、标题、段落、表格识别"]
-        I7 --> I8{"解析成功且文本非空"}
-        I8 -->|"否"| I9["本地降级解析<br/>pypdf / python-docx / UTF-8 文本"]
-        I8 -->|"是"| I10["文本规范化<br/>统一换行、空格、Markdown 结构"]
-        I9 --> I10
-        I6 -->|"文本"| I10
-        I10 --> I11["RecursiveChunker 递归切块<br/>标题 -> 段落 -> 换行 -> 句子 -> 长度预算"]
-        I11 --> I12["Overlap 上下文保留<br/>默认 chunkSize=700，overlap=90"]
-        I12 --> I13["Chunk 元数据补齐<br/>userId、documentId、type、source、visibility、section、position、parser"]
-        I13 --> I14["SummaryIndex<br/>文档摘要 + 章节摘要"]
-        I14 --> I15["BM25 倒排统计<br/>tokenize + term frequency + document frequency"]
-        I14 --> I16["向量索引<br/>deterministic hash embedding"]
-        I15 --> I17["InMemoryRagStore<br/>documents、chunks、termFreqs、docFreq、embeddings"]
-        I16 --> I17
-        I17 --> I18["IndexResponse<br/>INDEXED、chunkCount、parser、documentSummary"]
-        I18 --> I19["Java 回写资料状态<br/>INDEXED 或 FAILED"]
-        I19 --> I20["React 刷新页面<br/>材料列表、chunk 数、摘要、错误提示"]
-    end
+#### 查询流程图：用户问题到响应封装
 
-    subgraph QUERY["查询链路：问题到带引用回答"]
-        direction TB
-        Q1["React RAG 提问<br/>question、topK、metadataFilter"] --> Q2["Java /api/rag/query<br/>校验问题和检索参数"]
-        Q2 --> Q3["Python /internal/rag/query<br/>进入检索问答服务"]
-        Q3 --> Q4["查询规范化<br/>去空、保留原问题、限制 topK"]
-        Q4 --> Q5["Multi-Query 扩展<br/>原问题 + 关键证据 + 学习资料/笔记 + JD/简历变体"]
-        Q5 --> Q6["metadataFilter 过滤<br/>用户、可见范围、资料类型、来源、标签"]
-        Q6 --> Q7{"过滤后是否存在 chunk"}
-        Q7 -->|"否"| Q8["空检索回答<br/>提示先上传资料或放宽过滤条件"]
-        Q7 -->|"是"| Q9["多路并行召回"]
-        Q9 --> Q10["BM25 召回<br/>适合术语、代码名、岗位要求、关键词"]
-        Q9 --> Q11["向量召回<br/>适合语义近似、同义表达、上下文匹配"]
-        Q10 --> Q12["候选集合<br/>每个 query 取 max(topK*3, 10)"]
-        Q11 --> Q12
-        Q12 --> Q13["RRF / RAG-Fusion<br/>按 1/(k+rank) 融合多查询、多召回器排名"]
-        Q13 --> Q14["TopK Evidence<br/>evidenceId、documentId、title、snippet、source、section、score"]
-        Q14 --> Q15{"回答生成策略"}
-        Q15 -->|"当前阶段"| Q16["确定性回答摘要<br/>说明命中证据和推荐引用"]
-        Q15 -->|"后续扩展"| Q17["LLM Prompt Assembly<br/>问题 + evidence + 引用约束"]
-        Q17 --> Q18["带引用答案<br/>只基于证据回答，保留出处"]
-        Q16 --> Q19["QueryResponse<br/>answer、expandedQueries、evidences、diagnostics"]
-        Q18 --> Q19
-        Q8 --> Q19
-        Q19 --> Q20["Java Result<RagQueryVO><br/>统一错误映射和响应格式"]
-        Q20 --> Q21["React 展示<br/>回答、扩展问题、证据卡片、来源章节"]
-    end
+```mermaid
+flowchart TD
+    B0["用户在工作台或知识库提问"] --> B1["React 发送 RAG 请求<br/>问题、返回数量、元数据过滤条件"]
+    B1 --> B2["Java 查询接口<br/>校验问题、数量和过滤条件"]
+    B2 --> B3["Java 统一业务边界<br/>不直接执行智能检索逻辑"]
+    B3 --> B4["Python 查询入口<br/>接收问题和过滤条件"]
+    B4 --> B5["查询规范化<br/>去除空白、保留原问题、限制返回数量"]
+    B5 --> B6["Multi-Query 扩展<br/>原问题、关键证据、学习资料、JD 或简历变体"]
+    B6 --> B7["生成检索任务<br/>扩展问题列表 + 元数据过滤条件 + 返回数量"]
+    B7 --> B8["进入检索流程<br/>执行召回、融合、排序"]
+    B8 --> B9{"是否命中证据"}
+    B9 -->|"否"| B10["空结果响应<br/>提示先上传资料或放宽过滤条件"]
+    B9 -->|"是"| B11["回答生成策略选择"]
+    B11 -->|"当前阶段"| B12["确定性回答摘要<br/>说明命中证据和推荐引用"]
+    B11 -->|"后续扩展"| B13["LLM 提示词组装<br/>问题 + 证据 + 引用约束"]
+    B13 --> B14["带引用答案<br/>只基于证据回答并保留出处"]
+    B12 --> B15["Python 组装查询响应<br/>回答、扩展问题、证据、诊断信息"]
+    B14 --> B15
+    B10 --> B15
+    B15 --> B16["Java 统一响应封装<br/>成功结果或错误映射"]
+    B16 --> B17["React 展示结果<br/>回答、扩展问题、证据卡片、来源章节"]
+```
 
-    subgraph GUARD["失败处理与诊断闭环"]
-        direction TB
-        G1["输入失败<br/>空内容、类型不支持、文件过大"] --> G2["Java Result.error<br/>前端展示可理解错误"]
-        G3["Python 超时或 5xx"] --> G2
-        G4["MinerU 失败"] --> I9
-        G5["无召回结果"] --> Q8
-        G6["检索诊断<br/>expandedQueries、filteredChunkCount"] --> G7["开发日志<br/>不记录敏感简历原文"]
-    end
+#### 检索流程图：召回、融合、排序到证据
 
-    START --> I1
-    START --> Q1
+```mermaid
+flowchart TD
+    C0["检索任务输入<br/>扩展问题列表、过滤条件、返回数量"] --> C1["读取内存检索存储<br/>资料、切块、词频、文档频率、向量"]
+    C1 --> C2["按元数据过滤候选切块<br/>用户、可见范围、资料类型、来源、章节"]
+    C2 --> C3{"过滤后是否还有切块"}
+    C3 -->|"否"| C4["返回空证据列表<br/>记录过滤后数量为 0"]
+    C3 -->|"是"| C5["遍历每一个扩展问题"]
+    C5 --> C6["分词处理<br/>中文单字 + 英文术语 + 数字符号"]
+    C6 --> C7["BM25 关键词召回<br/>计算词频、逆文档频率、长度归一"]
+    C6 --> C8["哈希向量召回<br/>构造查询向量并计算余弦相似度"]
+    C7 --> C9["关键词排名列表<br/>适合精确术语和岗位关键词"]
+    C8 --> C10["语义排名列表<br/>适合同义表达和上下文近似"]
+    C9 --> C11["汇总多路排名列表<br/>每个扩展问题保留候选结果"]
+    C10 --> C11
+    C11 --> C12["RRF / RAG-Fusion 融合<br/>按 1/(60 + 排名) 累加得分"]
+    C12 --> C13["去重并重新排序<br/>同一切块只保留一个融合分数"]
+    C13 --> C14["按返回数量截取切块<br/>形成最终证据候选"]
+    C14 --> C15["证据字段构造<br/>证据ID、资料ID、标题、片段、来源、章节、类型、分数"]
+    C15 --> C16["片段压缩<br/>清理空白，超过 220 字符则截断"]
+    C16 --> C17["返回证据列表和诊断信息<br/>扩展问题、过滤后切块数量"]
 ```
 
 ### 索引阶段：把学习资料变成可检索证据
@@ -133,20 +141,20 @@ flowchart TD
 3. Java 在 `learning_material` 中先创建资料记录，状态设为 `INDEXING`，用于前端展示处理状态和最近资料列表。
 4. Java 通过 `PythonRagClient` 调 Python 内部接口。文本会被包装为 `documentId/title/documentType/source/userId/visibilityScope/content`；文件会用 `multipart/form-data` 转发给 Python。
 5. Python 文件入口优先调用 `MINERU_COMMAND` 配置的 MinerU 命令。MinerU 未配置、执行失败或没有解析出文本时，使用本地降级解析：PDF 走 `pypdf`，DOCX 走 `python-docx`，其他文本按 UTF-8 解码。
-6. Python 使用 `RecursiveChunker` 做递归切块，按 Markdown 标题、空行、换行、句号、分号、逗号和空格逐级拆分；默认 `chunk_size=700`，`overlap=90`，尽量保留上下文。
-7. 每个 chunk 都保留元数据：资料 ID、标题、类型、来源、用户、可见范围、解析器、上传时间、章节名和切块位置。
-8. `SummaryIndex` 生成文档级摘要和章节级摘要；同时为每个 chunk 建 BM25 词项统计和确定性哈希向量。
-9. Python 返回 `INDEXED`、切块数量、解析器和摘要；Java 更新资料记录，前端就能看到“已索引”、chunk 数和摘要。
+6. Python 使用递归切块器做切块，按 Markdown 标题、空行、换行、句号、分号、逗号和空格逐级拆分；默认切块长度为 700，重叠窗口为 90，尽量保留上下文。
+7. 每个切块都保留元数据：资料 ID、标题、类型、来源、用户、可见范围、解析器、上传时间、章节名和切块位置。
+8. 摘要索引组件生成文档级摘要和章节级摘要；同时为每个切块建 BM25 词项统计和确定性哈希向量。
+9. Python 返回已索引状态、切块数量、解析器和摘要；Java 更新资料记录，前端就能看到“已索引”、切块数和摘要。
 
 ### 查询阶段：把问题变成带证据引用的回答
 
 1. 用户在工作台或知识库页面输入问题。
 2. 前端调用 Java `/api/rag/query`，Java 不做检索逻辑，只做统一接口和错误边界，然后调用 Python `/internal/rag/query`。
 3. Python 先做 Multi-Query 扩展：保留原问题，再补充“关键证据”“学习资料/笔记”等查询变体；如果问题包含 JD、岗位、简历、项目等词，会补充更贴近岗位适配或简历证据的查询变体。
-4. Python 按 `metadataFilter` 过滤候选 chunk。当前第一阶段默认本地演示用户是 `demo-user`，后续可接真实登录态和资料权限。
-5. 每个 query 同时走两路召回：BM25 负责关键词精确匹配，哈希向量负责语义近似匹配。
-6. 多个 query、多个召回器的结果通过 RRF 做 RAG-Fusion 融合排序，避免单一路径漏召回。
-7. 系统选择 TopK evidence，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和融合分数。
+4. Python 按元数据过滤条件过滤候选切块。当前第一阶段默认本地演示用户是 `demo-user`，后续可接真实登录态和资料权限。
+5. 每个查询变体同时走两路召回：BM25 负责关键词精确匹配，哈希向量负责语义近似匹配。
+6. 多个查询变体、多个召回器的结果通过 RRF 做 RAG-Fusion 融合排序，避免单一路径漏召回。
+7. 系统按返回数量选择证据，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和融合分数。
 8. 当前阶段生成的是确定性回答摘要：说明检索到几条证据、优先参考哪些资料和章节，并提醒正式输出保留证据引用。后续可以把这一步替换为真实 LLM 生成，但证据结构不需要改。
 
 ### 当前实现边界
