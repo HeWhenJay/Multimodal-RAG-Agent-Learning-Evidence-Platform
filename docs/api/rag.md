@@ -174,6 +174,11 @@ Java 保存资料记录后，将文件转发到 Python `/internal/rag/documents/
 正式运行使用 PostgreSQL/pgvector：
 
 ```powershell
+conda env create -f ai-python/environment.yml
+conda activate learning-evidence-rag
+```
+
+```powershell
 $env:RAG_STORE_BACKEND='pgvector'
 $env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
 $env:RAG_VECTOR_DIMENSIONS='128'

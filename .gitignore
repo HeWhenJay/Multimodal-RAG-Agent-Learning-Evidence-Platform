@@ -36,6 +36,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.conda/
+conda-meta/
 
 # Local storage
 uploads/

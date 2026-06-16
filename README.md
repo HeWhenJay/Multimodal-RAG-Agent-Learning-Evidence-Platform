@@ -181,12 +181,15 @@ Python RAG 服务：
 
 ```powershell
 cd ai-python
-python -m pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate learning-evidence-rag
 $env:PYTHONPATH='.'
 $env:RAG_STORE_BACKEND='pgvector'
 $env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
+
+已创建过环境时，使用 `conda env update -f environment.yml --prune` 同步依赖即可。`ai-python/requirements.txt` 保留为 pip 兼容依赖清单，正式本地开发以 Conda 环境为准。
 
 PostgreSQL/pgvector 建库和向量仓库创建语句见 [docs/database/postgresql-pgvector.md](docs/database/postgresql-pgvector.md)。完整初始化 SQL 在 [infra/sql/init.sql](infra/sql/init.sql)，增量迁移 SQL 在 [infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql](infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql)。
 
@@ -220,6 +223,7 @@ $env:MINERU_COMMAND='mineru -p {input} -o {output}'
 ## 验证命令
 
 ```powershell
+conda activate learning-evidence-rag
 $env:PYTHONPATH='ai-python'
 python -B -m pytest ai-python/tests -q
 
