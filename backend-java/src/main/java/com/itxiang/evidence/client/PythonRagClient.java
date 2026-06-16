@@ -1,13 +1,13 @@
-package com.itsheng.evidence.client;
+package com.itxiang.evidence.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.itsheng.evidence.config.PythonRagProperties;
-import com.itsheng.evidence.dto.RagIndexTextDTO;
-import com.itsheng.evidence.dto.RagQueryDTO;
-import com.itsheng.evidence.entity.LearningMaterial;
-import com.itsheng.evidence.vo.RagEvidenceVO;
-import com.itsheng.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.config.PythonRagProperties;
+import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.vo.RagEvidenceVO;
+import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.MediaType;

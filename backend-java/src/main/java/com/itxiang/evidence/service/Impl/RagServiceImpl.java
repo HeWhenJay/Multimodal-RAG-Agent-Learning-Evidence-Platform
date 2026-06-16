@@ -1,14 +1,14 @@
-package com.itsheng.evidence.service.Impl;
+package com.itxiang.evidence.service.Impl;
 
-import com.itsheng.evidence.client.PythonRagClient;
-import com.itsheng.evidence.dto.RagIndexTextDTO;
-import com.itsheng.evidence.dto.RagQueryDTO;
-import com.itsheng.evidence.entity.LearningMaterial;
-import com.itsheng.evidence.mapper.LearningMaterialMapper;
-import com.itsheng.evidence.service.RagService;
-import com.itsheng.evidence.vo.LearningMaterialVO;
-import com.itsheng.evidence.vo.RagOverviewVO;
-import com.itsheng.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.client.PythonRagClient;
+import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.mapper.LearningMaterialMapper;
+import com.itxiang.evidence.service.RagService;
+import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;

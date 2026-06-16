@@ -1,4 +1,4 @@
-package com.itsheng.evidence.dto;
+package com.itxiang.evidence.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import lombok.Data;

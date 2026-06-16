@@ -1,4 +1,4 @@
-package com.itsheng.evidence.vo;
+package com.itxiang.evidence.vo;
 
 import lombok.Builder;
 import lombok.Data;

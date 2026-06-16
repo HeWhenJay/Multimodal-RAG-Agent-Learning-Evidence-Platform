@@ -1,4 +1,4 @@
-package com.itsheng.evidence.config;
+package com.itxiang.evidence.config;
 
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;

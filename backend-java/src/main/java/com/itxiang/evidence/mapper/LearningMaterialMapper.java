@@ -1,6 +1,6 @@
-package com.itsheng.evidence.mapper;
+package com.itxiang.evidence.mapper;
 
-import com.itsheng.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.entity.LearningMaterial;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 

@@ -11,7 +11,7 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.itsheng</groupId>
+    <groupId>com.itxiang</groupId>
     <artifactId>learning-evidence-backend</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <name>learning-evidence-backend</name>

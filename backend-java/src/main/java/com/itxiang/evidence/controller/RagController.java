@@ -1,12 +1,12 @@
-package com.itsheng.evidence.controller;
+package com.itxiang.evidence.controller;
 
-import com.itsheng.evidence.common.Result;
-import com.itsheng.evidence.dto.RagIndexTextDTO;
-import com.itsheng.evidence.dto.RagQueryDTO;
-import com.itsheng.evidence.service.RagService;
-import com.itsheng.evidence.vo.LearningMaterialVO;
-import com.itsheng.evidence.vo.RagOverviewVO;
-import com.itsheng.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.common.Result;
+import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.service.RagService;
+import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;

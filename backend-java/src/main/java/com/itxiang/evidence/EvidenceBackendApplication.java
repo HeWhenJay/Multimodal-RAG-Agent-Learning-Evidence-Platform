@@ -1,4 +1,4 @@
-package com.itsheng.evidence;
+package com.itxiang.evidence;
 
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
@@ -7,7 +7,7 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 
 @SpringBootApplication
 @ConfigurationPropertiesScan
-@MapperScan("com.itsheng.evidence.mapper")
+@MapperScan("com.itxiang.evidence.mapper")
 public class EvidenceBackendApplication {
 
     public static void main(String[] args) {

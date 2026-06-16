@@ -1,13 +1,11 @@
-package com.itsheng.evidence.vo;
+package com.itxiang.evidence.entity;
 
-import lombok.Builder;
 import lombok.Data;
 
 import java.time.LocalDateTime;
 
 @Data
-@Builder
-public class LearningMaterialVO {
+public class LearningMaterial {
 
     private Long id;
     private String title;

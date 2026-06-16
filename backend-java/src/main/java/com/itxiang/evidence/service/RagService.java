@@ -1,10 +1,10 @@
-package com.itsheng.evidence.service;
+package com.itxiang.evidence.service;
 
-import com.itsheng.evidence.dto.RagIndexTextDTO;
-import com.itsheng.evidence.dto.RagQueryDTO;
-import com.itsheng.evidence.vo.LearningMaterialVO;
-import com.itsheng.evidence.vo.RagOverviewVO;
-import com.itsheng.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryVO;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
