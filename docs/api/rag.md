@@ -365,7 +365,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 
 更新日期：2026-06-16
 
-本阶段只把 OCR 模型作为 Python RAG 文档解析降级链路的一部分，不新增 Agent 编排、工具调用或长任务调度。Java 仍只上传文件、记录状态并调用 Python；百炼 OCR Key、模型选择、超时和失败降级全部位于 `ai-python/`。
+本阶段只把 OCR 模型作为 Python RAG 文档解析降级链路的一部分，不新增 Agent 编排、工具调用或长任务调度。Java 仍只上传文件、记录状态并调用 Python；百炼 OCR 调用统一使用 `DASHSCOPE_API_KEY`，模型选择、超时和失败降级全部位于 `ai-python/`。
 
 ### 调用位置
 
@@ -387,8 +387,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `BAILIAN_OCR_ENABLED` | `auto` | `auto` 表示存在 Key 时启用；`true/1/yes` 强制启用；`false/0/no` 禁用 |
-| `BAILIAN_OCR_API_KEY` | 空 | 百炼 OCR 专用 Key，优先级高于 `DASHSCOPE_API_KEY` |
-| `DASHSCOPE_API_KEY` | 空 | 兼容课程和本地笔记中的百炼通用 Key |
+| `DASHSCOPE_API_KEY` | 空 | 百炼平台统一 API Key |
 | `BAILIAN_OCR_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 API 根地址 |
 | `BAILIAN_OCR_MODEL` | `qwen3.5-ocr` | OCR 模型名 |
 | `BAILIAN_OCR_TIMEOUT_SECONDS` | `60` | 单次 HTTP 调用超时 |

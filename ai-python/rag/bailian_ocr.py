@@ -39,7 +39,7 @@ class BailianOcrClient:
         max_image_bytes: int | None = None,
         http_client: Any | None = None,
     ) -> None:
-        self.api_key = api_key or os.getenv("BAILIAN_OCR_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+        self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = (base_url or os.getenv("BAILIAN_OCR_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or os.getenv("BAILIAN_OCR_MODEL") or DEFAULT_MODEL
         self.timeout_seconds = timeout_seconds or float(os.getenv("BAILIAN_OCR_TIMEOUT_SECONDS", "60"))
@@ -68,7 +68,7 @@ class BailianOcrClient:
         if not self.enabled:
             return OcrResult(text="", parser="bailian-qwen-ocr-disabled")
         if not self.api_key:
-            return OcrResult(text="", parser="bailian-qwen-ocr", warnings=["Bailian OCR enabled but API key is missing"])
+            return OcrResult(text="", parser="bailian-qwen-ocr", warnings=["DASHSCOPE_API_KEY is missing"])
         if len(image_bytes) > self.max_image_bytes:
             return OcrResult(
                 text="",

@@ -48,6 +48,14 @@ def test_bailian_ocr_client_builds_openai_compatible_request():
     assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_bailian_ocr_client_uses_dashscope_api_key(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test-key")
+    client = BailianOcrClient.from_env()
+
+    assert client.api_key == "dashscope-test-key"
+    assert client.enabled is True
+
+
 class FakeOcrClient:
     enabled = True
 

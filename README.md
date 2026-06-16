@@ -228,12 +228,12 @@ $env:MINERU_COMMAND='mineru -p {input} -o {output}'
 图片资料和 PDF 扫描页的 OCR 优先在 Python RAG 服务中调用阿里云百炼 Qwen-OCR。Java 不持有 Key，也不实现 OCR 逻辑；未配置或调用失败时自动降级为本地 `pytesseract`。
 
 ```powershell
-$env:BAILIAN_OCR_API_KEY='<your-bailian-api-key>'
+$env:DASHSCOPE_API_KEY='<your-dashscope-api-key>'
 $env:BAILIAN_OCR_MODEL='qwen3.5-ocr'
 $env:BAILIAN_OCR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 ```
 
-也可复用 `DASHSCOPE_API_KEY`。`BAILIAN_OCR_ENABLED=false` 可强制关闭远程 OCR。
+`BAILIAN_OCR_ENABLED=false` 可强制关闭远程 OCR。
 
 ## 验证命令
 
