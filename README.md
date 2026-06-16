@@ -52,6 +52,80 @@ flowchart TD
     JR --> UI["前端展示回答、扩展问题和证据引用"]
 ```
 
+### 细分 RAG 流程图
+
+这张图把 RAG 拆成“索引链路”和“查询链路”两条主线：索引链路负责把资料变成可检索证据，查询链路负责把用户问题变成带引用的回答；Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
+
+```mermaid
+flowchart TD
+    START["用户入口<br/>上传资料、粘贴文本、输入问题"]
+
+    subgraph INDEX["索引链路：资料入库到可检索证据"]
+        direction TB
+        I1["React 表单提交<br/>文件 / 文本 / 元数据"] --> I2["Java RagController<br/>校验标题、类型、大小、空内容"]
+        I2 --> I3["RagService<br/>生成 documentId，写入 INDEXING"]
+        I3 --> I4["LearningMaterialMapper<br/>保存资料记录和处理状态"]
+        I3 --> I5["PythonRagClient<br/>按 Java-Python 契约转发"]
+        I5 --> I6{"Python 输入类型"}
+        I6 -->|"文件"| I7["MinerU 解析<br/>优先做版面、标题、段落、表格识别"]
+        I7 --> I8{"解析成功且文本非空"}
+        I8 -->|"否"| I9["本地降级解析<br/>pypdf / python-docx / UTF-8 文本"]
+        I8 -->|"是"| I10["文本规范化<br/>统一换行、空格、Markdown 结构"]
+        I9 --> I10
+        I6 -->|"文本"| I10
+        I10 --> I11["RecursiveChunker 递归切块<br/>标题 -> 段落 -> 换行 -> 句子 -> 长度预算"]
+        I11 --> I12["Overlap 上下文保留<br/>默认 chunkSize=700，overlap=90"]
+        I12 --> I13["Chunk 元数据补齐<br/>userId、documentId、type、source、visibility、section、position、parser"]
+        I13 --> I14["SummaryIndex<br/>文档摘要 + 章节摘要"]
+        I14 --> I15["BM25 倒排统计<br/>tokenize + term frequency + document frequency"]
+        I14 --> I16["向量索引<br/>deterministic hash embedding"]
+        I15 --> I17["InMemoryRagStore<br/>documents、chunks、termFreqs、docFreq、embeddings"]
+        I16 --> I17
+        I17 --> I18["IndexResponse<br/>INDEXED、chunkCount、parser、documentSummary"]
+        I18 --> I19["Java 回写资料状态<br/>INDEXED 或 FAILED"]
+        I19 --> I20["React 刷新页面<br/>材料列表、chunk 数、摘要、错误提示"]
+    end
+
+    subgraph QUERY["查询链路：问题到带引用回答"]
+        direction TB
+        Q1["React RAG 提问<br/>question、topK、metadataFilter"] --> Q2["Java /api/rag/query<br/>校验问题和检索参数"]
+        Q2 --> Q3["Python /internal/rag/query<br/>进入检索问答服务"]
+        Q3 --> Q4["查询规范化<br/>去空、保留原问题、限制 topK"]
+        Q4 --> Q5["Multi-Query 扩展<br/>原问题 + 关键证据 + 学习资料/笔记 + JD/简历变体"]
+        Q5 --> Q6["metadataFilter 过滤<br/>用户、可见范围、资料类型、来源、标签"]
+        Q6 --> Q7{"过滤后是否存在 chunk"}
+        Q7 -->|"否"| Q8["空检索回答<br/>提示先上传资料或放宽过滤条件"]
+        Q7 -->|"是"| Q9["多路并行召回"]
+        Q9 --> Q10["BM25 召回<br/>适合术语、代码名、岗位要求、关键词"]
+        Q9 --> Q11["向量召回<br/>适合语义近似、同义表达、上下文匹配"]
+        Q10 --> Q12["候选集合<br/>每个 query 取 max(topK*3, 10)"]
+        Q11 --> Q12
+        Q12 --> Q13["RRF / RAG-Fusion<br/>按 1/(k+rank) 融合多查询、多召回器排名"]
+        Q13 --> Q14["TopK Evidence<br/>evidenceId、documentId、title、snippet、source、section、score"]
+        Q14 --> Q15{"回答生成策略"}
+        Q15 -->|"当前阶段"| Q16["确定性回答摘要<br/>说明命中证据和推荐引用"]
+        Q15 -->|"后续扩展"| Q17["LLM Prompt Assembly<br/>问题 + evidence + 引用约束"]
+        Q17 --> Q18["带引用答案<br/>只基于证据回答，保留出处"]
+        Q16 --> Q19["QueryResponse<br/>answer、expandedQueries、evidences、diagnostics"]
+        Q18 --> Q19
+        Q8 --> Q19
+        Q19 --> Q20["Java Result<RagQueryVO><br/>统一错误映射和响应格式"]
+        Q20 --> Q21["React 展示<br/>回答、扩展问题、证据卡片、来源章节"]
+    end
+
+    subgraph GUARD["失败处理与诊断闭环"]
+        direction TB
+        G1["输入失败<br/>空内容、类型不支持、文件过大"] --> G2["Java Result.error<br/>前端展示可理解错误"]
+        G3["Python 超时或 5xx"] --> G2
+        G4["MinerU 失败"] --> I9
+        G5["无召回结果"] --> Q8
+        G6["检索诊断<br/>expandedQueries、filteredChunkCount"] --> G7["开发日志<br/>不记录敏感简历原文"]
+    end
+
+    START --> I1
+    START --> Q1
+```
+
 ### 索引阶段：把学习资料变成可检索证据
 
 1. 用户在前端上传文件，或在“学习资料”页面粘贴文本笔记。
