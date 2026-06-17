@@ -4,6 +4,13 @@ SET search_path TO learning_evidence, public;
 ALTER TABLE jd_analysis_report
     ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
 
+UPDATE jd_analysis_report
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE jd_analysis_report
+    ALTER COLUMN user_id SET NOT NULL;
+
 ALTER TABLE jd_analysis_report
     ALTER COLUMN user_id DROP DEFAULT;
 
@@ -12,6 +19,13 @@ CREATE INDEX IF NOT EXISTS idx_jd_analysis_report_user_updated
 
 ALTER TABLE resume_evidence_alignment
     ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
+
+UPDATE resume_evidence_alignment
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE resume_evidence_alignment
+    ALTER COLUMN user_id SET NOT NULL;
 
 ALTER TABLE resume_evidence_alignment
     ALTER COLUMN user_id DROP DEFAULT;

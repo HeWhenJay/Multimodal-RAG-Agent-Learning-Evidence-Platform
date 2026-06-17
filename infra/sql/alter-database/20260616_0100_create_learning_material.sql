@@ -15,6 +15,20 @@ CREATE TABLE IF NOT EXISTS learning_material (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 兼容已存在但未包含 user_id 的旧表，避免后续索引创建失败。
+ALTER TABLE learning_material
+    ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
+
+UPDATE learning_material
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE learning_material
+    ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE learning_material
+    ALTER COLUMN user_id DROP DEFAULT;
+
 CREATE INDEX IF NOT EXISTS idx_learning_material_status
     ON learning_material(status);
 

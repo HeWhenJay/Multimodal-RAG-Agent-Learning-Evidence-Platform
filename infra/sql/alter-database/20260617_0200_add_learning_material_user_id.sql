@@ -4,6 +4,13 @@ SET search_path TO learning_evidence, public;
 ALTER TABLE learning_material
     ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
 
+UPDATE learning_material
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE learning_material
+    ALTER COLUMN user_id SET NOT NULL;
+
 ALTER TABLE learning_material
     ALTER COLUMN user_id DROP DEFAULT;
 

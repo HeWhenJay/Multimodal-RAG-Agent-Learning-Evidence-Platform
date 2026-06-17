@@ -28,6 +28,36 @@ CREATE TABLE IF NOT EXISTS resume_evidence_alignment (
     CONSTRAINT uk_resume_evidence_user_requirement UNIQUE (user_id, requirement)
 );
 
+-- 兼容已存在但未包含 user_id 的旧表，避免后续索引和唯一约束创建失败。
+ALTER TABLE resume_evidence_alignment
+    ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
+
+UPDATE resume_evidence_alignment
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE resume_evidence_alignment
+    ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE resume_evidence_alignment
+    ALTER COLUMN user_id DROP DEFAULT;
+
+ALTER TABLE resume_evidence_alignment
+    DROP CONSTRAINT IF EXISTS uk_resume_evidence_requirement;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uk_resume_evidence_user_requirement'
+          AND conrelid = 'resume_evidence_alignment'::regclass
+    ) THEN
+        ALTER TABLE resume_evidence_alignment
+            ADD CONSTRAINT uk_resume_evidence_user_requirement UNIQUE (user_id, requirement);
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_resume_evidence_status
     ON resume_evidence_alignment(status);
 
@@ -47,6 +77,20 @@ CREATE TABLE IF NOT EXISTS jd_analysis_report (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uk_jd_analysis_report_key UNIQUE (report_key)
 );
+
+-- 兼容已存在但未包含 user_id 的旧表，避免后续索引创建失败。
+ALTER TABLE jd_analysis_report
+    ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
+
+UPDATE jd_analysis_report
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE jd_analysis_report
+    ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE jd_analysis_report
+    ALTER COLUMN user_id DROP DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_jd_analysis_report_user_updated
     ON jd_analysis_report(user_id, updated_at DESC);

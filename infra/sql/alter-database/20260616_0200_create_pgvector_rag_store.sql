@@ -18,6 +18,20 @@ CREATE TABLE IF NOT EXISTS rag_document (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 兼容已存在但未包含 user_id 的旧表，避免后续索引创建失败。
+ALTER TABLE rag_document
+    ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) NOT NULL DEFAULT 'legacy-user';
+
+UPDATE rag_document
+SET user_id = 'legacy-user'
+WHERE user_id IS NULL;
+
+ALTER TABLE rag_document
+    ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE rag_document
+    ALTER COLUMN user_id DROP DEFAULT;
+
 CREATE TABLE IF NOT EXISTS rag_chunk (
     chunk_id VARCHAR(180) PRIMARY KEY,
     document_id VARCHAR(120) NOT NULL REFERENCES rag_document(document_id) ON DELETE CASCADE,
