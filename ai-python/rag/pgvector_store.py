@@ -10,7 +10,9 @@ from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.retrieval import (
+    DEFAULT_EMBEDDING_DIMENSIONS,
     build_answer,
+    build_playback_url,
     embed_text,
     expand_queries,
     reciprocal_rank_fusion,
@@ -46,7 +48,8 @@ class PgVectorRagStore:
 
     def __init__(self, database_url: str, dimensions: int | None = None, ensure_schema: bool = True) -> None:
         self.database_url = database_url
-        self.dimensions = dimensions or int(os.getenv("RAG_VECTOR_DIMENSIONS", "128"))
+        self.schema = os.getenv("RAG_DATABASE_SCHEMA", "learning_evidence")
+        self.dimensions = dimensions or int(os.getenv("RAG_VECTOR_DIMENSIONS", str(DEFAULT_EMBEDDING_DIMENSIONS)))
         self.chunker = RecursiveChunker()
         self.summary_index = SummaryIndex()
         if ensure_schema:
@@ -284,7 +287,7 @@ class PgVectorRagStore:
     def ensure_schema(self) -> None:
         with self._connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS rag_document (
@@ -292,7 +295,7 @@ class PgVectorRagStore:
                         title VARCHAR(255) NOT NULL,
                         document_type VARCHAR(50) NOT NULL,
                         source VARCHAR(255),
-                        user_id VARCHAR(120) NOT NULL DEFAULT 'demo-user',
+                        user_id VARCHAR(120) NOT NULL,
                         visibility_scope VARCHAR(30) NOT NULL DEFAULT 'private',
                         language VARCHAR(30) NOT NULL DEFAULT 'zh-CN',
                         parser VARCHAR(80),
@@ -320,6 +323,28 @@ class PgVectorRagStore:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    SELECT format_type(attribute.atttypid, attribute.atttypmod) AS column_type
+                    FROM pg_attribute attribute
+                    JOIN pg_class klass ON klass.oid = attribute.attrelid
+                    JOIN pg_namespace namespace ON namespace.oid = klass.relnamespace
+                    WHERE namespace.nspname = %s
+                      AND klass.relname = 'rag_chunk'
+                      AND attribute.attname = 'embedding'
+                      AND NOT attribute.attisdropped
+                    """,
+                    (self.schema,),
+                )
+                embedding_column = cursor.fetchone()
+                expected_column_type = f"vector({self.dimensions})"
+                actual_column_type = embedding_column.get("column_type") if embedding_column else None
+                if actual_column_type != expected_column_type:
+                    raise RuntimeError(
+                        "rag_chunk.embedding 维度与当前配置不一致："
+                        f"数据库={actual_column_type}，配置={expected_column_type}。"
+                        "请先执行 infra/sql/alter-database/20260617_0100_migrate_embedding_1024.sql 后重建资料索引。"
+                    )
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_rag_document_type
@@ -354,10 +379,15 @@ class PgVectorRagStore:
     def _connect(self):
         try:
             import psycopg
+            from psycopg import sql
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("使用 PostgreSQL/pgvector 需要安装 psycopg[binary] 依赖") from exc
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+        conn = psycopg.connect(self.database_url, row_factory=dict_row)
+        with conn.cursor() as cursor:
+            cursor.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
+            cursor.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.schema)))
+        return conn
 
     def _json_adapter(self):
         try:
@@ -462,6 +492,8 @@ class PgVectorRagStore:
             blockType=as_optional_str(metadata.get("blockType")),
             pageIndex=as_optional_int(metadata.get("pageIndex")),
             slideIndex=as_optional_int(metadata.get("slideIndex")),
+            startTime=as_optional_str(metadata.get("startTime")),
+            endTime=as_optional_str(metadata.get("endTime")),
             sheetName=as_optional_str(metadata.get("sheetName")),
             cellRange=as_optional_str(metadata.get("cellRange")),
             sectionTitle=section_title,
@@ -470,6 +502,11 @@ class PgVectorRagStore:
             source=str(row.get("source") or "unknown"),
             sourcePath=as_optional_str(metadata.get("sourcePath")),
             assetPath=as_optional_str(metadata.get("assetPath")),
+            playbackUrl=build_playback_url(
+                document_id=str(row["document_id"]),
+                title=title,
+                metadata=metadata,
+            ),
             sectionName=section_title,
             documentType=str(row.get("document_type") or "document"),
             score=round(score, 6),

@@ -19,7 +19,7 @@ from rag.summary_index import SummaryIndex
 from schemas.rag import DocumentBlock, ParseQuality
 
 
-TEXT_FILE_TYPES = {"txt", "text"}
+TEXT_FILE_TYPES = {"txt", "text", "srt", "vtt"}
 IMAGE_FILE_TYPES = {"png", "jpg", "jpeg", "webp"}
 SUPPORTED_FILE_TYPES = {
     "pdf",
@@ -84,6 +84,23 @@ class DocumentParserRouter:
                 blocks, quality, parser, warnings = self._parse_legacy_office(
                     content, filename, document_id, source_title, source_path, "pptx", high_precision
                 )
+            elif file_type in {"srt", "vtt"}:
+                text = decode_text(content)
+                blocks = parse_transcript_blocks(
+                    text=text,
+                    document_id=document_id,
+                    file_type=file_type,
+                    source_title=source_title,
+                    source_path=source_path,
+                    parse_engine=f"{file_type}-subtitle-parser",
+                )
+                quality = evaluate_parse_quality(
+                    QualitySignals(native_text_chars=len(text), paragraph_count=len(blocks)),
+                    high_precision=False,
+                )
+                quality = mark_text_native_quality(quality)
+                parser = f"{file_type}-subtitle-parser"
+                warnings = []
             elif file_type in {"md", "markdown"}:
                 text = decode_text(content)
                 blocks = parse_markdown_blocks(
@@ -116,20 +133,31 @@ class DocumentParserRouter:
                 )
             else:
                 text = decode_text(content)
-                blocks = parse_plain_text_blocks(
-                    text=text,
-                    document_id=document_id,
-                    file_type=file_type,
-                    source_title=source_title,
-                    source_path=source_path,
-                    parse_engine="text-encoding-detector",
-                )
+                if looks_like_transcript(text):
+                    blocks = parse_transcript_blocks(
+                        text=text,
+                        document_id=document_id,
+                        file_type=file_type,
+                        source_title=source_title,
+                        source_path=source_path,
+                        parse_engine="timestamp-transcript-parser",
+                    )
+                    parser = "timestamp-transcript-parser"
+                else:
+                    blocks = parse_plain_text_blocks(
+                        text=text,
+                        document_id=document_id,
+                        file_type=file_type,
+                        source_title=source_title,
+                        source_path=source_path,
+                        parse_engine="text-encoding-detector",
+                    )
+                    parser = "text-encoding-detector"
                 quality = evaluate_parse_quality(
                     QualitySignals(native_text_chars=len(text), paragraph_count=len(blocks)),
                     high_precision=False,
                 )
                 quality = mark_text_native_quality(quality)
-                parser = "text-encoding-detector"
                 warnings = []
         except Exception as exc:
             fallback_text = decode_text(content)
@@ -158,7 +186,16 @@ class DocumentParserRouter:
         parser: str,
     ) -> ParsedBlockDocument:
         file_type = normalize_file_type(document_type)
-        if file_type in {"md", "markdown"}:
+        if file_type in {"srt", "vtt"} or looks_like_transcript(content):
+            blocks = parse_transcript_blocks(
+                text=content,
+                document_id=document_id,
+                file_type=file_type,
+                source_title=title,
+                source_path=source_path,
+                parse_engine=parser or "manual-transcript",
+            )
+        elif file_type in {"md", "markdown"}:
             blocks = parse_markdown_blocks(
                 text=content,
                 document_id=document_id,
@@ -543,6 +580,10 @@ def normalize_file_type(document_type: str | None) -> str:
         return "md"
     if normalized == "text":
         return "txt"
+    if normalized in {"subtitle", "subtitles", "caption", "captions"}:
+        return "srt"
+    if normalized in {"transcript", "asr", "video-transcript", "video_transcript"}:
+        return "txt"
     return normalized
 
 
@@ -570,6 +611,125 @@ def decode_text(content: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return content.decode("utf-8", errors="ignore")
+
+
+TIMESTAMP_RANGE_PATTERN = re.compile(
+    r"(?P<start>(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,.]\d{1,3})?)\s*-->\s*"
+    r"(?P<end>(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,.]\d{1,3})?)"
+)
+TIMESTAMP_PREFIX_PATTERN = re.compile(
+    r"^\s*\[?(?P<start>(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[,.]\d{1,3})?)\]?\s+(?P<text>.+)$"
+)
+
+
+def looks_like_transcript(text: str) -> bool:
+    return bool(TIMESTAMP_RANGE_PATTERN.search(text) or any(TIMESTAMP_PREFIX_PATTERN.match(line) for line in text.splitlines()))
+
+
+def parse_transcript_blocks(
+    *,
+    text: str,
+    document_id: str,
+    file_type: str,
+    source_title: str,
+    source_path: str | None,
+    parse_engine: str,
+) -> list[DocumentBlock]:
+    blocks: list[DocumentBlock] = []
+    normalized = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    media_metadata = extract_transcript_media_metadata(normalized)
+    cue_groups = [group.strip() for group in re.split(r"\n\s*\n", normalized) if group.strip()]
+    for cue_index, group in enumerate(cue_groups, start=1):
+        lines = [line.strip() for line in group.splitlines() if line.strip()]
+        lines = [line for line in lines if line.upper() != "WEBVTT" and not line.isdigit()]
+        if not lines:
+            continue
+        timestamp_index = next((index for index, line in enumerate(lines) if TIMESTAMP_RANGE_PATTERN.search(line)), -1)
+        if timestamp_index >= 0:
+            match = TIMESTAMP_RANGE_PATTERN.search(lines[timestamp_index])
+            if not match:
+                continue
+            start_time = normalize_timestamp(match.group("start"))
+            end_time = normalize_timestamp(match.group("end"))
+            content = normalize_text("\n".join(lines[timestamp_index + 1 :]))
+        else:
+            prefix_match = TIMESTAMP_PREFIX_PATTERN.match(lines[0])
+            if not prefix_match:
+                continue
+            start_time = normalize_timestamp(prefix_match.group("start"))
+            end_time = None
+            content = normalize_text(prefix_match.group("text") + "\n" + "\n".join(lines[1:]))
+        if not content:
+            continue
+        section_title = f"{start_time} - {end_time}" if end_time else start_time
+        blocks.append(
+            DocumentBlock(
+                documentId=document_id,
+                blockId=f"{document_id}-subtitle-{cue_index}",
+                fileType=file_type,
+                blockType="text",
+                startTime=start_time,
+                endTime=end_time,
+                sectionTitle=section_title,
+                contentText=content,
+                parseEngine=parse_engine,
+                confidence=0.95,
+                sourceTitle=source_title,
+                sourcePath=source_path,
+                metadata={
+                    "cueIndex": cue_index,
+                    "startTime": start_time,
+                    "endTime": end_time,
+                    "mediaType": "video",
+                    "evidenceChannel": "subtitle",
+                    **media_metadata,
+                },
+            )
+        )
+    if blocks:
+        return blocks
+    return parse_plain_text_blocks(
+        text=text,
+        document_id=document_id,
+        file_type=file_type,
+        source_title=source_title,
+        source_path=source_path,
+        parse_engine=parse_engine,
+    )
+
+
+def extract_transcript_media_metadata(text: str) -> dict[str, str]:
+    """读取字幕或转写文本开头的可选视频播放地址。"""
+    result: dict[str, str] = {}
+    key_mapping = {
+        "videourl": "videoUrl",
+        "video_url": "videoUrl",
+        "mediaurl": "mediaUrl",
+        "media_url": "mediaUrl",
+        "playbackurl": "playbackUrl",
+        "playback_url": "playbackUrl",
+    }
+    for line in text.splitlines()[:12]:
+        if ":" not in line:
+            continue
+        raw_key, raw_value = line.split(":", 1)
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+        target_key = key_mapping.get(key)
+        if target_key and value:
+            result[target_key] = value
+    return result
+
+
+def normalize_timestamp(value: str) -> str:
+    cleaned = value.replace(",", ".").split(".", 1)[0]
+    parts = [int(part) for part in cleaned.split(":")]
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    else:
+        hours, minutes, seconds = parts[-3:]
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def parse_plain_text_blocks(

@@ -1,12 +1,19 @@
 import { CheckCircle2, FileDiff, TriangleAlert, XCircle } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { fetchResumeAlignments } from '../api/pageData';
+import type { ResumeEvidenceAlignment } from '../api/types';
 
-const rows = [
-  ['RAG 项目经验', '实现 FastAPI RAG 服务、递归切块、BM25 + 向量混合检索', 'supported'],
-  ['文档解析经验', '接入 MinerU 适配入口，当前本地降级解析可运行', 'weak'],
-  ['Agent 编排能力', '第一阶段未实现 Agent 任务', 'missing']
-];
-
+// 简历适配页展示 JD 要求与简历证据的对齐情况。
 export function ResumeAdaptation() {
+  const [rows, setRows] = useState<ResumeEvidenceAlignment[]>([]);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetchResumeAlignments()
+      .then(setRows)
+      .catch((loadError) => setError(loadError instanceof Error ? loadError.message : '简历证据数据加载失败'));
+  }, []);
+
   return (
     <div className="page-stack">
       <section className="page-heading">
@@ -22,22 +29,25 @@ export function ResumeAdaptation() {
           <span className="status-pill">复核模式</span>
         </div>
         <div className="resume-grid">
-          {rows.map(([requirement, evidence, status]) => (
-            <div className="resume-row" key={requirement}>
+          {rows.map((item) => (
+            <div className="resume-row" key={item.id}>
               <div>
-                <strong>{requirement}</strong>
+                <strong>{item.requirement}</strong>
                 <span>JD 要求</span>
               </div>
-              <p>{evidence}</p>
-              <StatusBadge status={status} />
+              <p>{item.evidence}</p>
+              <StatusBadge status={item.status} />
             </div>
           ))}
+          {rows.length === 0 ? <div className="empty-state">暂无简历证据对齐记录</div> : null}
         </div>
+        {error ? <p className="form-message danger">{error}</p> : null}
       </section>
     </div>
   );
 }
 
+// 根据证据状态展示中文徽标。
 function StatusBadge({ status }: { status: string }) {
   if (status === 'supported') {
     return <span className="evidence-status supported"><CheckCircle2 size={16} />证据充分</span>;

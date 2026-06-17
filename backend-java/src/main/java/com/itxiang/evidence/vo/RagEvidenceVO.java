@@ -14,6 +14,8 @@ public class RagEvidenceVO {
     private String blockType;
     private Integer pageIndex;
     private Integer slideIndex;
+    private String startTime;
+    private String endTime;
     private String sheetName;
     private String cellRange;
     private String sectionTitle;
@@ -22,6 +24,7 @@ public class RagEvidenceVO {
     private String source;
     private String sourcePath;
     private String assetPath;
+    private String playbackUrl;
     private String sectionName;
     private String documentType;
     private Double score;

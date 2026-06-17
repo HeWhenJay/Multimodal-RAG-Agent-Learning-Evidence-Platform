@@ -1,20 +1,20 @@
 server:
-  port: 8080
+  port: 7080
 
 spring:
   application:
     name: learning-evidence-backend
   datasource:
-    driver-class-name: org.h2.Driver
-    url: jdbc:h2:mem:evidence;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
-    username: sa
-    password:
+    driver-class-name: org.postgresql.Driver
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://127.0.0.1:5433/postgres?currentSchema=learning_evidence,public}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:123456}
   h2:
     console:
-      enabled: true
+      enabled: false
   sql:
     init:
-      mode: always
+      mode: never
 
 mybatis:
   mapper-locations: classpath*:mapper/*.xml

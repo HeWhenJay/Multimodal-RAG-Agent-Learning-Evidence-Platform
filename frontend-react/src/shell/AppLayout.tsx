@@ -29,10 +29,11 @@ const navItems = [
   { to: '/settings', label: '系统设置', icon: Settings }
 ];
 
+// 应用主布局负责导航、顶部栏和登录用户入口。
 export function AppLayout() {
   const { user, logout } = useAuth();
   const displayName = user?.displayName || '管理员';
-  const accountLabel = user?.email || user?.account || 'admin@evidence.ai';
+  const accountLabel = user?.email || user?.account || '未登录';
   const avatarText = displayName.slice(0, 1).toUpperCase();
 
   return (
@@ -63,7 +64,7 @@ export function AppLayout() {
             <strong>{displayName}</strong>
             <span>{accountLabel}</span>
           </div>
-          <button className="icon-button tiny" onClick={logout} aria-label="退出登录">
+          <button className="icon-button tiny" onClick={() => void logout()} aria-label="退出登录">
             <LogOut size={16} />
           </button>
         </div>
@@ -92,7 +93,7 @@ export function AppLayout() {
           <button className="icon-button" aria-label={`${displayName} 账户`}>
             <UserCircle size={20} />
           </button>
-          <button className="ghost-action logout-action" onClick={logout}>
+          <button className="ghost-action logout-action" onClick={() => void logout()}>
             <LogOut size={17} />
             <span>退出</span>
           </button>

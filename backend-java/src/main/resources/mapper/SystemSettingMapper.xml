@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.SystemSettingMapper">
+
+    <resultMap id="SystemSettingResultMap" type="com.itxiang.evidence.entity.SystemSetting">
+        <id property="settingKey" column="setting_key"/>
+        <result property="settingGroup" column="setting_group"/>
+        <result property="label" column="label"/>
+        <result property="settingValue" column="setting_value"/>
+        <result property="sortOrder" column="sort_order"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <select id="findAll" resultMap="SystemSettingResultMap">
+        SELECT
+            setting_key,
+            setting_group,
+            label,
+            setting_value,
+            sort_order,
+            updated_at
+        FROM system_setting
+        ORDER BY setting_group ASC, sort_order ASC, setting_key ASC
+    </select>
+</mapper>

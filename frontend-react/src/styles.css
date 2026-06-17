@@ -937,6 +937,18 @@ button {
   border-top: 1px solid var(--line);
 }
 
+.evidence-card-actions {
+  display: flex;
+  margin-top: 10px;
+}
+
+.evidence-play-link {
+  width: fit-content;
+  height: 34px;
+  padding: 0 12px;
+  text-decoration: none;
+}
+
 .evidence-card span,
 .video-meta span,
 .skill-list span {
@@ -950,6 +962,26 @@ button {
 .video-card {
   padding: 0;
   overflow: hidden;
+}
+
+.video-jump-panel {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  background: #f8fafc;
+}
+
+.video-jump-panel h3 {
+  margin: 0 0 6px;
+}
+
+.video-jump-panel p,
+.video-jump-panel span {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .video-thumb {
@@ -1079,8 +1111,10 @@ button {
   }
 
   .page-heading,
-  .material-row {
+  .material-row,
+  .video-jump-panel {
     flex-direction: column;
+    align-items: flex-start;
   }
 
   .side-nav,

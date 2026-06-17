@@ -3,6 +3,7 @@ package com.itxiang.evidence.client;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.config.PythonRagProperties;
+import com.itxiang.evidence.dto.JdAnalysisRequestDTO;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
@@ -33,6 +34,9 @@ public class PythonRagClient {
     private final ObjectMapper objectMapper;
     private final RestClient restClient;
 
+    /**
+     * 初始化 Python RAG HTTP 客户端并设置索引超时。
+     */
     public PythonRagClient(PythonRagProperties properties, ObjectMapper objectMapper) {
         this.properties = properties;
         this.objectMapper = objectMapper;
@@ -44,6 +48,9 @@ public class PythonRagClient {
                 .build();
     }
 
+    /**
+     * 调用 Python 文本索引接口。
+     */
     public IndexResult indexText(Long materialId, String userId, RagIndexTextDTO dto) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("documentId", "material-" + materialId);
@@ -59,6 +66,9 @@ public class PythonRagClient {
         return readIndexResult(root);
     }
 
+    /**
+     * 调用 Python 文件索引接口。
+     */
     public IndexResult indexFile(Long materialId,
                                  String userId,
                                  LearningMaterial material,
@@ -90,6 +100,9 @@ public class PythonRagClient {
         }
     }
 
+    /**
+     * 调用 Python RAG 查询接口。
+     */
     public RagQueryVO query(RagQueryDTO dto) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("question", dto.getQuestion());
@@ -111,6 +124,32 @@ public class PythonRagClient {
                 .build();
     }
 
+    /**
+     * 调用 Python JD 分析接口，基于当前用户知识库生成岗位匹配结果。
+     */
+    public JdAnalysisResult analyzeJd(String userId, JdAnalysisRequestDTO dto) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("userId", userId);
+        payload.put("jobDescription", dto.getJobDescription());
+        payload.put("resumeText", dto.getResumeText());
+        payload.put("topK", 3);
+
+        JsonNode root = postJson("/internal/rag/jd-analysis", payload);
+        return new JdAnalysisResult(
+                text(root, "jobDescription"),
+                root.path("matchScore").asInt(0),
+                root.path("masteredPercent").asInt(0),
+                root.path("partialPercent").asInt(0),
+                root.path("gapPercent").asInt(0),
+                readSkillResults(root.get("skills")),
+                readPlanResults(root.get("learningPlan")),
+                readAlignmentResults(root.get("resumeAlignments"))
+        );
+    }
+
+    /**
+     * 查询指定文档的 evidence 列表。
+     */
     public List<RagEvidenceVO> listDocumentEvidences(String documentId, Integer limit) {
         try {
             String response = restClient.get()
@@ -133,6 +172,9 @@ public class PythonRagClient {
         }
     }
 
+    /**
+     * 安全获取 Python RAG 概览；失败时返回空概览。
+     */
     public PythonOverview fetchOverviewSafely() {
         try {
             String response = restClient.get()
@@ -152,6 +194,9 @@ public class PythonRagClient {
         }
     }
 
+    /**
+     * 发送 JSON POST 请求并解析响应。
+     */
     private JsonNode postJson(String path, Map<String, Object> payload) {
         try {
             String requestBody = objectMapper.writeValueAsString(payload);
@@ -169,10 +214,16 @@ public class PythonRagClient {
         }
     }
 
+    /**
+     * 拼接 Python 服务完整接口地址。
+     */
     private URI resolve(String path) {
         return URI.create(properties.getPythonBaseUrl().replaceAll("/$", "") + path);
     }
 
+    /**
+     * 读取并校验 Python 索引响应结构。
+     */
     private IndexResult readIndexResult(JsonNode root) {
         if (root == null || !root.hasNonNull("documentId") || !root.hasNonNull("status")) {
             throw new PythonRagClientException(
@@ -180,7 +231,7 @@ public class PythonRagClient {
                     "python-response",
                     null,
                     null,
-                    "Python RAG response schema is invalid",
+                    "Python RAG 响应结构不符合预期",
                     null
             );
         }
@@ -194,6 +245,9 @@ public class PythonRagClient {
         );
     }
 
+    /**
+     * 将 Python evidence JSON 转换为前端展示对象。
+     */
     private RagEvidenceVO readEvidence(JsonNode item) {
         return RagEvidenceVO.builder()
                 .evidenceId(text(item, "evidenceId"))
@@ -203,6 +257,8 @@ public class PythonRagClient {
                 .blockType(text(item, "blockType"))
                 .pageIndex(nullableInt(item, "pageIndex"))
                 .slideIndex(nullableInt(item, "slideIndex"))
+                .startTime(text(item, "startTime"))
+                .endTime(text(item, "endTime"))
                 .sheetName(text(item, "sheetName"))
                 .cellRange(text(item, "cellRange"))
                 .sectionTitle(text(item, "sectionTitle"))
@@ -211,6 +267,7 @@ public class PythonRagClient {
                 .source(text(item, "source"))
                 .sourcePath(text(item, "sourcePath"))
                 .assetPath(text(item, "assetPath"))
+                .playbackUrl(text(item, "playbackUrl"))
                 .sectionName(text(item, "sectionName"))
                 .documentType(text(item, "documentType"))
                 .score(item.path("score").asDouble())
@@ -219,16 +276,25 @@ public class PythonRagClient {
                 .build();
     }
 
+    /**
+     * 读取 JSON 文本字段，空值返回 null。
+     */
     private String text(JsonNode node, String fieldName) {
         JsonNode value = node == null ? null : node.get(fieldName);
         return value == null || value.isNull() ? null : value.asText();
     }
 
+    /**
+     * 读取 JSON 整数字段，空值返回 null。
+     */
     private Integer nullableInt(JsonNode node, String fieldName) {
         JsonNode value = node == null ? null : node.get(fieldName);
         return value == null || value.isNull() ? null : value.asInt();
     }
 
+    /**
+     * 读取 JSON 字符串数组。
+     */
     private List<String> readTextArray(JsonNode node) {
         List<String> result = new ArrayList<>();
         if (node == null || !node.isArray()) {
@@ -240,28 +306,87 @@ public class PythonRagClient {
         return result;
     }
 
+    /**
+     * 读取 Python JD 技能分析数组。
+     */
+    private List<JdSkillResult> readSkillResults(JsonNode node) {
+        List<JdSkillResult> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            result.add(new JdSkillResult(text(item, "skillName"), text(item, "status")));
+        }
+        return result;
+    }
+
+    /**
+     * 读取 Python JD 学习计划数组。
+     */
+    private List<JdPlanResult> readPlanResults(JsonNode node) {
+        List<JdPlanResult> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            result.add(new JdPlanResult(
+                    item.path("stepNo").asInt(result.size() + 1),
+                    text(item, "title"),
+                    text(item, "description")
+            ));
+        }
+        return result;
+    }
+
+    /**
+     * 读取 Python 简历证据对齐数组。
+     */
+    private List<ResumeAlignmentResult> readAlignmentResults(JsonNode node) {
+        List<ResumeAlignmentResult> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            result.add(new ResumeAlignmentResult(
+                    text(item, "requirement"),
+                    text(item, "evidence"),
+                    text(item, "status")
+            ));
+        }
+        return result;
+    }
+
+    /**
+     * 将 Python HTTP 错误转换为统一客户端异常。
+     */
     private PythonRagClientException pythonException(String operation, String endpoint, RestClientResponseException e) {
         return new PythonRagClientException(
                 operation,
                 endpoint,
                 e.getStatusCode().value(),
                 e.getResponseBodyAsString(),
-                "Python RAG call failed: " + e.getStatusCode(),
+                "Python RAG 调用失败: " + e.getStatusCode(),
                 e
         );
     }
 
+    /**
+     * 将 Python 调用过程中的非 HTTP 异常转换为统一客户端异常。
+     */
     private PythonRagClientException pythonException(String operation, String endpoint, Exception e) {
         return new PythonRagClientException(
                 operation,
                 endpoint,
                 null,
                 null,
-                "Python RAG call failed: " + e.getMessage(),
+                "Python RAG 调用失败: " + e.getMessage(),
                 e
         );
     }
 
+    /**
+     * Python 索引响应摘要。
+     */
     public record IndexResult(
             String documentId,
             String title,
@@ -272,6 +397,9 @@ public class PythonRagClient {
     ) {
     }
 
+    /**
+     * Python 概览响应摘要。
+     */
     public record PythonOverview(
             Integer documentCount,
             Integer chunkCount,
@@ -280,6 +408,42 @@ public class PythonRagClient {
     ) {
     }
 
+    /**
+     * Python JD 分析响应。
+     */
+    public record JdAnalysisResult(
+            String jobDescription,
+            Integer matchScore,
+            Integer masteredPercent,
+            Integer partialPercent,
+            Integer gapPercent,
+            List<JdSkillResult> skills,
+            List<JdPlanResult> learningPlan,
+            List<ResumeAlignmentResult> resumeAlignments
+    ) {
+    }
+
+    /**
+     * Python JD 技能匹配结果。
+     */
+    public record JdSkillResult(String skillName, String status) {
+    }
+
+    /**
+     * Python JD 学习计划结果。
+     */
+    public record JdPlanResult(Integer stepNo, String title, String description) {
+    }
+
+    /**
+     * Python 简历证据对齐结果。
+     */
+    public record ResumeAlignmentResult(String requirement, String evidence, String status) {
+    }
+
+    /**
+     * 携带 Python 接口上下文的客户端异常。
+     */
     public static class PythonRagClientException extends IllegalStateException {
         private final String operation;
         private final String endpoint;
@@ -299,31 +463,52 @@ public class PythonRagClient {
             this.responseBody = responseBody;
         }
 
+        /**
+         * 获取调用操作名。
+         */
         public String getOperation() {
             return operation;
         }
 
+        /**
+         * 获取 Python 接口路径。
+         */
         public String getEndpoint() {
             return endpoint;
         }
 
+        /**
+         * 获取 HTTP 状态码。
+         */
         public Integer getStatusCode() {
             return statusCode;
         }
 
+        /**
+         * 获取 Python 响应体摘要。
+         */
         public String getResponseBody() {
             return responseBody;
         }
     }
 
+    /**
+     * 为 multipart 文件上传补充原始文件名。
+     */
     private static class NamedByteArrayResource extends ByteArrayResource {
         private final String filename;
 
+        /**
+         * 保存文件字节和文件名。
+         */
         NamedByteArrayResource(byte[] byteArray, String filename) {
             super(byteArray);
             this.filename = filename;
         }
 
+        /**
+         * 返回 multipart 中使用的文件名。
+         */
         @Override
         public String getFilename() {
             return filename;

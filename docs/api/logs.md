@@ -50,7 +50,7 @@
   "stage": "index",
   "eventType": "business_state",
   "action": "material_index_file_result",
-  "message": "File material index finished",
+  "message": "文件资料索引完成",
   "materialId": 12,
   "documentId": "material-12",
   "parser": "mineru",
@@ -88,7 +88,7 @@
   "action": "rag_query_failed",
   "errorType": "PythonRagClientException",
   "errorCode": "RAG_PYTHON_TIMEOUT",
-  "message": "RAG query failed",
+  "message": "RAG 查询失败",
   "materialId": null,
   "documentId": null,
   "context": {

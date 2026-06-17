@@ -9,6 +9,7 @@ public class LearningMaterial {
 
     private Long id;
     private String title;
+    private String userId;
     private String documentType;
     private String source;
     private String status;

@@ -20,14 +20,16 @@ const LoginRagScene = lazy(() =>
   import('../components/LoginRagScene').then((module) => ({ default: module.LoginRagScene }))
 );
 
+// 登录页负责账号密码提交和登录后跳转。
 export function Login() {
   const navigate = useNavigate();
   const location = useLocation();
   const { isAuthenticated, login } = useAuth();
-  const [account, setAccount] = useState('admin@evidence.ai');
+  const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
   const [remember, setRemember] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
   if (isAuthenticated) {
@@ -39,15 +41,19 @@ export function Login() {
     ? `${state.from.pathname}${state.from.search}${state.from.hash}`
     : '/';
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  // 提交账号密码并在成功后回到原目标页面。
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError('');
+    setSubmitting(true);
 
     try {
-      login({ account, password, remember });
+      await login({ account, password, remember });
       navigate(destination, { replace: true });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : '登录失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -79,7 +85,7 @@ export function Login() {
               value={account}
               onChange={(event) => setAccount(event.target.value)}
               autoComplete="username"
-              placeholder="admin@evidence.ai"
+              placeholder="请输入账号"
             />
           </div>
 
@@ -92,7 +98,7 @@ export function Login() {
               onChange={(event) => setPassword(event.target.value)}
               autoComplete="current-password"
               type={showPassword ? 'text' : 'password'}
-              placeholder="输入本地登录密码"
+              placeholder="输入登录密码"
             />
             <button
               type="button"
@@ -118,9 +124,9 @@ export function Login() {
 
           {error ? <p className="form-message danger">{error}</p> : null}
 
-          <button className="full-action login-submit" type="submit">
+          <button className="full-action login-submit" type="submit" disabled={submitting}>
             <Sparkles size={17} />
-            登录系统
+            {submitting ? '登录中...' : '登录系统'}
           </button>
         </form>
       </section>

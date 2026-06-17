@@ -4,6 +4,21 @@ export interface Result<T> {
   data: T;
 }
 
+export interface AuthUser {
+  id: number;
+  account: string;
+  displayName: string;
+  email: string | null;
+  role: string;
+  loginAt?: string | null;
+}
+
+export interface AuthLoginResult {
+  token: string;
+  expiresAt: string;
+  user: AuthUser;
+}
+
 export interface RagOverview {
   materialCount: number;
   chunkCount: number;
@@ -14,6 +29,7 @@ export interface RagOverview {
 export interface LearningMaterial {
   id: number;
   title: string;
+  userId?: string | null;
   documentType: string;
   source: string;
   status: string;
@@ -34,6 +50,8 @@ export interface RagEvidence {
   blockType?: string | null;
   pageIndex?: number | null;
   slideIndex?: number | null;
+  startTime?: string | null;
+  endTime?: string | null;
   sheetName?: string | null;
   cellRange?: string | null;
   sectionTitle?: string | null;
@@ -42,6 +60,7 @@ export interface RagEvidence {
   source: string;
   sourcePath?: string | null;
   assetPath?: string | null;
+  playbackUrl?: string | null;
   sectionName: string;
   documentType: string;
   score: number;
@@ -53,4 +72,78 @@ export interface RagQueryResult {
   answer: string;
   expandedQueries: string[];
   evidences: RagEvidence[];
+}
+
+export interface VideoSlice {
+  id: number;
+  title: string;
+  topic: string;
+  startTime: string;
+  endTime: string;
+  status: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ResumeEvidenceAlignment {
+  id: number;
+  userId?: string | null;
+  requirement: string;
+  evidence: string;
+  status: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface JdAnalysisSkill {
+  id: number;
+  skillName: string;
+  status: string;
+}
+
+export interface JdLearningPlanItem {
+  id: number;
+  stepNo: number;
+  title: string;
+  description: string;
+}
+
+export interface JdAnalysis {
+  id: number;
+  userId?: string | null;
+  jobDescription: string;
+  matchScore: number;
+  masteredPercent: number;
+  partialPercent: number;
+  gapPercent: number;
+  skills: JdAnalysisSkill[];
+  learningPlan: JdLearningPlanItem[];
+  updatedAt?: string;
+}
+
+export interface JdAnalysisRequest {
+  jobDescription: string;
+  resumeText?: string;
+}
+
+export interface SystemSetting {
+  key: string;
+  group: string;
+  label: string;
+  value: string;
+  sortOrder: number;
+}
+
+export interface DashboardData {
+  materialCount: number;
+  materialDelta7Days: number;
+  videoSliceCount: number;
+  videoSliceDelta7Days: number;
+  evidenceCount: number;
+  openErrorCount: number;
+  errorCount30Days: number;
+  recentMaterials: LearningMaterial[];
+  recentVideoSlices: VideoSlice[];
+  latestJdAnalysis: JdAnalysis | null;
+  resumeAlignments: ResumeEvidenceAlignment[];
 }

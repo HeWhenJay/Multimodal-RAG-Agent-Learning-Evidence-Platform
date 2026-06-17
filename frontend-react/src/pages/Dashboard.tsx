@@ -15,37 +15,42 @@ import {
   Video
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { fetchOverview, queryRag } from '../api/rag';
-import type { RagEvidence, RagOverview } from '../api/types';
+import { fetchDashboardData } from '../api/pageData';
+import { queryRag } from '../api/rag';
+import type { DashboardData, RagEvidence } from '../api/types';
 
-const stats = [
-  { label: '已入库材料', value: '128', delta: '+12', note: '本周新增', icon: LibraryBig },
-  { label: '视频片段', value: '456', delta: '+45', note: '本周新增', icon: Video },
-  { label: 'RAG 证据锚点', value: '1.2k', delta: '98%', note: '命中率', icon: Anchor },
-  { label: '运行中 Agent', value: '0', delta: 'RAG', note: '第一阶段', icon: Bot }
-];
-
-const evidenceRows = [
-  { requirement: 'Kubernetes 实战经验', evidence: '主导 50+ 微服务的 k8s 迁移项目', status: 'supported' },
-  { requirement: '高并发调优经验', evidence: '参与性能压测与接口响应时间优化', status: 'weak' },
-  { requirement: 'React / 前端能力', evidence: '未找到相关简历记录', status: 'missing' }
-];
-
+// 工作台首页展示 RAG 概览、检索入口和证据对齐摘要。
 export function Dashboard() {
-  const [overview, setOverview] = useState<RagOverview | null>(null);
-  const [question, setQuestion] = useState('如何处理微服务架构中的分布式事务？');
-  const [answer, setAnswer] = useState('在微服务架构中处理分布式事务通常有几种模式：两阶段提交、TCC、以及基于消息的最终一致性。当前第一阶段回答会优先展示 RAG 证据。');
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    fetchOverview().then(setOverview).catch(() => undefined);
+    fetchDashboardData().then(setDashboard).catch((loadError) => {
+      setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
+    });
   }, []);
 
+  // 执行一次 RAG 检索并刷新回答与证据列表。
   async function runQuery() {
+    if (!question.trim()) {
+      setError('请输入检索问题');
+      return;
+    }
+    setError('');
     const result = await queryRag({ question, topK: 3 });
     setAnswer(result.answer);
     setEvidences(result.evidences);
   }
+
+  const stats = [
+    { label: '已入库材料', value: dashboard?.materialCount ?? 0, delta: dashboard?.materialDelta7Days ?? 0, note: '本周新增', icon: LibraryBig },
+    { label: '视频片段', value: dashboard?.videoSliceCount ?? 0, delta: dashboard?.videoSliceDelta7Days ?? 0, note: '本周新增', icon: Video },
+    { label: 'RAG 证据锚点', value: dashboard?.evidenceCount ?? 0, delta: dashboard?.evidenceCount ?? 0, note: '当前切块', icon: Anchor },
+    { label: '待处理错误', value: dashboard?.openErrorCount ?? 0, delta: dashboard?.errorCount30Days ?? 0, note: '近 30 天错误', icon: Bot }
+  ];
 
   return (
     <div className="page-stack">
@@ -65,9 +70,9 @@ export function Dashboard() {
           <article className="metric-card" key={stat.label}>
             <div>
               <p>{stat.label}</p>
-              <h3>{index === 0 && overview ? overview.materialCount : index === 2 && overview ? overview.evidenceCount : stat.value}</h3>
+              <h3>{formatNumber(stat.value)}</h3>
               <span>
-                <strong>{index === 1 && overview ? overview.chunkCount : stat.delta}</strong>
+                <strong>{index < 2 ? `+${stat.delta}` : formatNumber(stat.delta)}</strong>
                 {stat.note}
               </span>
             </div>
@@ -98,23 +103,19 @@ export function Dashboard() {
               <Bot size={17} />
               RAG 回复
             </div>
-            <p>{answer}</p>
+            <p>{answer || '提交问题后展示基于数据库证据检索生成的回答。'}</p>
             <div className="citation-row">
-              {evidences.length === 0 ? (
-                <>
-                  <span><FileText size={15} />[文档 A, 第 24 页]</span>
-                  <span><PlayCircle size={15} />[视频 B, 05:20]</span>
-                </>
-              ) : (
+              {evidences.length > 0 ? (
                 evidences.slice(0, 3).map((item) => (
                   <span key={item.evidenceId}>
                     <FileText size={15} />
                     [{item.title} / {item.sectionTitle || item.sectionName}]
                   </span>
                 ))
-              )}
+              ) : <span><FileText size={15} />暂无证据引用</span>}
             </div>
           </div>
+          {error ? <p className="form-message danger">{error}</p> : null}
         </article>
 
         <article className="panel">
@@ -132,16 +133,14 @@ export function Dashboard() {
             </div>
           </div>
           <h4>近期处理任务</h4>
-          <div className="task-row">
-            <FileText size={20} />
-            <span>系统设计笔记.pdf</span>
-            <strong>100% 已入库</strong>
-          </div>
-          <div className="task-row">
-            <Video size={20} />
-            <span>Java 并发课程.mp4</span>
-            <strong className="processing">65% OCR/ASR</strong>
-          </div>
+          {(dashboard?.recentMaterials || []).map((item) => (
+            <div className="task-row" key={item.id}>
+              <FileText size={20} />
+              <span>{item.title}</span>
+              <strong className={item.status === 'READY' ? '' : 'processing'}>{formatMaterialStatus(item.status)}</strong>
+            </div>
+          ))}
+          {(dashboard?.recentMaterials || []).length === 0 ? <div className="empty-state">暂无资料处理任务</div> : null}
         </article>
 
         <article className="panel">
@@ -152,20 +151,20 @@ export function Dashboard() {
             </h3>
           </div>
           <label className="field-label">目标岗位描述 (JD) 输入</label>
-          <textarea className="compact-textarea" placeholder="在这里粘贴岗位描述..." />
+          <textarea className="compact-textarea" value={dashboard?.latestJdAnalysis?.jobDescription || ''} readOnly placeholder="暂无 JD 分析记录" />
           <button className="full-action">
             <BarChart3 size={17} />
-            运行适配分析
+            查看适配分析
           </button>
           <h4>能力雷达匹配度</h4>
           <div className="stacked-bar" aria-label="能力匹配度">
-            <span className="mastered" style={{ width: '60%' }}>已掌握</span>
-            <span className="partial" style={{ width: '25%' }}>待强化</span>
-            <span className="gaps" style={{ width: '15%' }}>缺口</span>
+            <span className="mastered" style={{ width: `${dashboard?.latestJdAnalysis?.masteredPercent || 0}%` }}>已掌握</span>
+            <span className="partial" style={{ width: `${dashboard?.latestJdAnalysis?.partialPercent || 0}%` }}>待强化</span>
+            <span className="gaps" style={{ width: `${dashboard?.latestJdAnalysis?.gapPercent || 0}%` }}>缺口</span>
           </div>
           <div className="plan-note">
             <Flag size={17} />
-            <span>下一步学习计划：补充 Kubernetes 集群调度理论，优先复习云原生架构资料。</span>
+            <span>下一步学习计划：{dashboard?.latestJdAnalysis?.learningPlan?.[0]?.title || '暂无学习计划'}</span>
           </div>
         </article>
 
@@ -176,20 +175,18 @@ export function Dashboard() {
               视频知识切片回顾
             </h3>
           </div>
-          {[
-            ['Java 并发编程核心原理解析', 'JVM Memory Model', '01:23:10 - 01:25:42'],
-            ['分布式系统架构设计 (B站录播)', 'CAP 定理与实践', '00:45:22 - 00:48:15']
-          ].map(([title, fragment, timeline]) => (
-            <div className="video-slice" key={title}>
+          {(dashboard?.recentVideoSlices || []).map((item) => (
+            <div className="video-slice" key={item.id}>
               <div className="play-badge"><PlayCircle size={18} /></div>
               <div>
-                <h4>{title}</h4>
+                <h4>{item.title}</h4>
                 <span>知识命中</span>
-                <p>知识片段：{fragment}</p>
-                <p>时间范围：{timeline}</p>
+                <p>知识片段：{item.topic}</p>
+                <p>时间范围：{item.startTime} - {item.endTime}</p>
               </div>
             </div>
           ))}
+          {(dashboard?.recentVideoSlices || []).length === 0 ? <div className="empty-state">暂无视频切片</div> : null}
         </article>
 
         <article className="panel wide">
@@ -201,12 +198,11 @@ export function Dashboard() {
             <span className="status-pill">复核模式</span>
           </div>
           <div className="evidence-stack">
-            {evidenceRows.map((item) => (
-              <div className="evidence-item" key={item.requirement}>
+            {(dashboard?.resumeAlignments || []).map((item) => (
+              <div className="evidence-item" key={item.id}>
                 <div className="evidence-field">
                   <span className="evidence-field-label">JD 要求</span>
                   <strong>{item.requirement}</strong>
-                  <p>需要可验证的生产实践证据。</p>
                 </div>
                 <div className="evidence-field">
                   <span className="evidence-field-label">简历证据</span>
@@ -218,6 +214,7 @@ export function Dashboard() {
                 </div>
               </div>
             ))}
+            {(dashboard?.resumeAlignments || []).length === 0 ? <div className="empty-state">暂无简历证据对齐记录</div> : null}
           </div>
         </article>
       </section>
@@ -225,6 +222,25 @@ export function Dashboard() {
   );
 }
 
+// 格式化统计数字展示。
+function formatNumber(value: number) {
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  return String(value);
+}
+
+// 将资料状态转换为中文展示。
+function formatMaterialStatus(status: string) {
+  if (status === 'READY') return '已入库';
+  if (status === 'PARTIAL') return '部分完成';
+  if (status === 'PARSING') return '解析中';
+  if (status === 'PENDING') return '等待解析';
+  if (status === 'FAILED') return '解析失败';
+  return status;
+}
+
+// 根据适配状态展示对应的中文状态标记。
 function StatusIcon({ status }: { status: string }) {
   if (status === 'supported') {
     return <span className="evidence-status supported"><CheckCircle2 size={16} />证据充分</span>;

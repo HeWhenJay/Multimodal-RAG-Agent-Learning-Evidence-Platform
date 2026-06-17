@@ -14,6 +14,8 @@ class DocumentBlock(BaseModel):
     blockType: BlockType = Field(validation_alias=AliasChoices("blockType", "block_type"))
     pageIndex: int | None = Field(default=None, validation_alias=AliasChoices("pageIndex", "page_index"))
     slideIndex: int | None = Field(default=None, validation_alias=AliasChoices("slideIndex", "slide_index"))
+    startTime: str | None = Field(default=None, validation_alias=AliasChoices("startTime", "start_time"))
+    endTime: str | None = Field(default=None, validation_alias=AliasChoices("endTime", "end_time"))
     sheetName: str | None = Field(default=None, validation_alias=AliasChoices("sheetName", "sheet_name"))
     cellRange: str | None = Field(default=None, validation_alias=AliasChoices("cellRange", "cell_range"))
     sectionTitle: str | None = Field(default=None, validation_alias=AliasChoices("sectionTitle", "section_title"))
@@ -51,7 +53,7 @@ class IndexTextRequest(BaseModel):
     title: str = Field(..., min_length=1)
     documentType: str = "text"
     source: str = "manual"
-    userId: str = "demo-user"
+    userId: str = Field(..., min_length=1)
     visibilityScope: str = "private"
     language: str = "zh-CN"
     parser: str = "manual-text"
@@ -83,6 +85,8 @@ class Evidence(BaseModel):
     blockType: str | None = Field(default=None, validation_alias=AliasChoices("blockType", "block_type"))
     pageIndex: int | None = Field(default=None, validation_alias=AliasChoices("pageIndex", "page_index"))
     slideIndex: int | None = Field(default=None, validation_alias=AliasChoices("slideIndex", "slide_index"))
+    startTime: str | None = Field(default=None, validation_alias=AliasChoices("startTime", "start_time"))
+    endTime: str | None = Field(default=None, validation_alias=AliasChoices("endTime", "end_time"))
     sheetName: str | None = Field(default=None, validation_alias=AliasChoices("sheetName", "sheet_name"))
     cellRange: str | None = Field(default=None, validation_alias=AliasChoices("cellRange", "cell_range"))
     sectionTitle: str | None = Field(default=None, validation_alias=AliasChoices("sectionTitle", "section_title"))
@@ -91,6 +95,7 @@ class Evidence(BaseModel):
     source: str
     sourcePath: str | None = Field(default=None, validation_alias=AliasChoices("sourcePath", "source_path"))
     assetPath: str | None = Field(default=None, validation_alias=AliasChoices("assetPath", "asset_path"))
+    playbackUrl: str | None = Field(default=None, validation_alias=AliasChoices("playbackUrl", "playback_url"))
     sectionName: str
     documentType: str
     score: float
@@ -119,3 +124,39 @@ class OverviewResponse(BaseModel):
     chunkCount: int
     evidenceCount: int
     lastIndexedTitle: str | None = None
+
+
+class JdAnalyzeRequest(BaseModel):
+    userId: str = Field(..., min_length=1)
+    jobDescription: str = Field(..., min_length=1)
+    resumeText: str | None = None
+    topK: int = Field(default=3, ge=1, le=10)
+
+
+class JdSkillResult(BaseModel):
+    skillName: str
+    status: Literal["supported", "weak", "missing"]
+    evidences: list[Evidence] = Field(default_factory=list)
+
+
+class JdLearningPlanResult(BaseModel):
+    stepNo: int
+    title: str
+    description: str
+
+
+class ResumeAlignmentResult(BaseModel):
+    requirement: str
+    evidence: str
+    status: Literal["supported", "weak", "missing"]
+
+
+class JdAnalyzeResponse(BaseModel):
+    jobDescription: str
+    matchScore: int
+    masteredPercent: int
+    partialPercent: int
+    gapPercent: int
+    skills: list[JdSkillResult]
+    learningPlan: list[JdLearningPlanResult]
+    resumeAlignments: list[ResumeAlignmentResult]

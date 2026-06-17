@@ -179,6 +179,8 @@ def document_block_metadata(block: DocumentBlock) -> dict:
         "blockType": block.blockType,
         "pageIndex": block.pageIndex,
         "slideIndex": block.slideIndex,
+        "startTime": block.startTime,
+        "endTime": block.endTime,
         "sheetName": block.sheetName,
         "cellRange": block.cellRange,
         "sectionTitle": block.sectionTitle,

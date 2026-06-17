@@ -4,24 +4,23 @@
 
 Chrome 中已打开的 Stitch 项目页标题为 `Stitch - Projects`，项目名为 `学迹智配管理后台`。Stitch 导出面板中 `.zip` 和复制代码入口在当前控制环境下未成功落盘，因此本地实现采用已读取的 Stitch DOM、设计说明和 design token 复刻。
 
-## 已读取的 Design Token
+## 已读取的设计令牌
 
-- Primary：`#4F46E5`
-- Secondary：`#0EA5E9`
-- Tertiary：`#A54100`
-- Neutral：`#F9FAFB`
-- Headline/Body：`Inter`
-- Label：`JetBrains Mono`
+- 主色：`#4F46E5`
+- 辅色：`#0EA5E9`
+- 第三级强调色：`#A54100`
+- 中性色：`#F9FAFB`
+- 标题和正文：`Inter`
+- 标签字体：`JetBrains Mono`
 
 ## 已读取的页面结构
 
-- 左侧导航：Dashboard、Learning Materials、Knowledge Base、Video Review、JD Analysis、Resume Adaptation、Agent Tasks、System Settings。
-- 顶部栏：全局搜索、Upload、Help、notifications、account。
+- 左侧导航：工作台、学习资料、知识库、视频复习、JD 分析、简历适配、Agent 任务、系统设置。
+- 顶部栏：全局搜索、上传、帮助、通知、账户。
 - 工作台标题：`Agent 工作台`，副标题：`系统全局监控与多模态证据处理中心`。
 - 统计卡片：已索引材料、视频片段、RAG 证据锚点、运行中 Agent。
 - RAG 卡片：问题输入、发送按钮、回答预览、文档页码/视频时间戳引用。
 - 多模态导入：PDF、DOCX、PPTX、MP4、MD 标签和近期处理任务。
 - JD 分析：JD 输入、运行适配分析、能力匹配度、下一步学习计划。
 - 视频复习：视频标题、知识命中、时间戳片段。
-- 简历适配：JD Requirement、Resume Evidence、Evidence Supported/Insufficient Evidence/Not Recommended。
-
+- 简历适配：JD 要求、简历证据、证据充分/证据不足/不建议写入。

@@ -27,36 +27,48 @@ import java.util.List;
 @RestController
 @RequiredArgsConstructor
 @RequestMapping("/api/logs")
-@Tag(name = "Logs", description = "System observation log APIs")
+@Tag(name = "系统日志", description = "系统观测日志接口")
 public class LogController {
 
     private final LogService logService;
     private final LogProperties logProperties;
 
+    /**
+     * 接收单条业务事件日志。
+     */
     @PostMapping("/events")
-    @Operation(summary = "Record a business event log")
+    @Operation(summary = "记录业务事件日志")
     public Result<Long> recordEvent(@Valid @RequestBody LogEventCreateDTO dto) {
         return Result.success(logService.recordEvent(dto));
     }
 
+    /**
+     * 批量接收业务事件日志。
+     */
     @PostMapping("/events/batch")
-    @Operation(summary = "Record business event logs in batch")
+    @Operation(summary = "批量记录业务事件日志")
     public Result<Integer> recordEvents(@Valid @RequestBody List<LogEventCreateDTO> dtoList) {
         return Result.success(logService.recordEvents(dtoList));
     }
 
+    /**
+     * 接收单条错误日志。
+     */
     @PostMapping("/errors")
-    @Operation(summary = "Record an error log")
+    @Operation(summary = "记录错误日志")
     public Result<Long> recordError(@Valid @RequestBody LogErrorCreateDTO dto) {
         return Result.success(logService.recordError(dto));
     }
 
+    /**
+     * 接收 Python 等内部服务上报的错误日志。
+     */
     @PostMapping("/internal/errors")
-    @Operation(summary = "Record an internal service error log")
+    @Operation(summary = "记录内部服务错误日志")
     public Result<Long> recordInternalError(@RequestHeader(value = "X-Internal-Log-Token", required = false) String token,
                                             @Valid @RequestBody LogErrorCreateDTO dto) {
         if (!internalTokenValid(token)) {
-            return Result.error("invalid internal log token");
+            return Result.error("内部日志令牌无效");
         }
         if (dto.getSource() == null || dto.getSource().isBlank() || "java".equals(dto.getSource())) {
             dto.setSource("python");
@@ -64,24 +76,36 @@ public class LogController {
         return Result.success(logService.recordError(dto));
     }
 
+    /**
+     * 查询最近业务事件日志。
+     */
     @GetMapping("/events/recent")
-    @Operation(summary = "List recent business event logs")
+    @Operation(summary = "查询最近业务事件日志")
     public Result<List<LogEventVO>> recentEvents(@RequestParam(defaultValue = "50") Integer limit) {
         return Result.success(logService.listRecentEvents(limit));
     }
 
+    /**
+     * 查询最近错误日志。
+     */
     @GetMapping("/errors/recent")
-    @Operation(summary = "List recent error logs")
+    @Operation(summary = "查询最近错误日志")
     public Result<List<LogErrorVO>> recentErrors(@RequestParam(defaultValue = "50") Integer limit) {
         return Result.success(logService.listRecentErrors(limit));
     }
 
+    /**
+     * 查询日志概览统计。
+     */
     @GetMapping("/overview")
-    @Operation(summary = "Get log overview")
+    @Operation(summary = "查询日志概览")
     public Result<LogOverviewVO> overview(@RequestParam(defaultValue = "7") Integer days) {
         return Result.success(logService.overview(days));
     }
 
+    /**
+     * 校验内部日志上报令牌；本地未配置令牌时默认放行。
+     */
     private boolean internalTokenValid(String token) {
         String configured = logProperties.getInternalToken();
         return configured == null || configured.isBlank() || configured.equals(token);

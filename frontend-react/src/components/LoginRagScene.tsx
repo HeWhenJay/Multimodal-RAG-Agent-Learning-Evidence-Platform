@@ -18,6 +18,7 @@ const evidenceNodes: EvidenceNode[] = [
   { label: 'CITE', color: '#0ea5e9', position: [-1.55, -1.1, -0.42] }
 ];
 
+// 登录页右侧的 RAG 证据网络三维场景。
 export function LoginRagScene() {
   const reducedMotion = useMemo(
     () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
@@ -47,6 +48,7 @@ export function LoginRagScene() {
   );
 }
 
+// 渲染中心节点、轨道和证据节点之间的连线。
 function RagConstellation({ reducedMotion }: { reducedMotion: boolean }) {
   const groupRef = useRef<Group>(null);
   const coreRef = useRef<Mesh>(null);
@@ -111,6 +113,7 @@ function RagConstellation({ reducedMotion }: { reducedMotion: boolean }) {
   );
 }
 
+// 渲染单个证据节点的浮动动效。
 function EvidenceNode({ node }: { node: EvidenceNode }) {
   const meshRef = useRef<Mesh>(null);
   const phase = node.position[0] + node.position[1];

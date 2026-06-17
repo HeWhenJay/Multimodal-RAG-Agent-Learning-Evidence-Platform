@@ -1,11 +1,13 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+CREATE SCHEMA IF NOT EXISTS learning_evidence AUTHORIZATION postgres;
+SET search_path TO learning_evidence, public;
 
 CREATE TABLE IF NOT EXISTS rag_document (
     document_id VARCHAR(120) PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     document_type VARCHAR(50) NOT NULL,
     source VARCHAR(255),
-    user_id VARCHAR(120) NOT NULL DEFAULT 'demo-user',
+    user_id VARCHAR(120) NOT NULL,
     visibility_scope VARCHAR(30) NOT NULL DEFAULT 'private',
     language VARCHAR(30) NOT NULL DEFAULT 'zh-CN',
     parser VARCHAR(80),
@@ -25,7 +27,7 @@ CREATE TABLE IF NOT EXISTS rag_chunk (
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     term_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
     token_count INTEGER NOT NULL DEFAULT 0,
-    embedding VECTOR(128) NOT NULL,
+    embedding VECTOR(1024) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

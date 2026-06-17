@@ -3,20 +3,16 @@ import { useEffect, useState } from 'react';
 import { fetchMaterials, indexText, uploadMaterial } from '../api/rag';
 import type { LearningMaterial } from '../api/types';
 
-const sampleText = `## RAG 检索优化
-BM25 适合关键词召回，向量检索适合语义召回。RAG-Fusion 使用 Multi-Query 和 RRF 将多路结果合并排序。
-
-## 递归切块
-递归切块会优先保留标题、段落和句子结构，并通过重叠窗口保留上下文。`;
-
+// 学习资料页负责文本索引、文件上传和资料状态展示。
 export function LearningMaterials() {
   const [materials, setMaterials] = useState<LearningMaterial[]>([]);
-  const [title, setTitle] = useState('RAG 检索优化笔记');
-  const [content, setContent] = useState(sampleText);
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
   const [highPrecision, setHighPrecision] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
 
+  // 刷新最近学习资料列表。
   async function refresh() {
     const data = await fetchMaterials();
     setMaterials(data);
@@ -26,7 +22,12 @@ export function LearningMaterials() {
     refresh().catch(() => undefined);
   }, []);
 
+  // 提交文本资料并等待索引结果。
   async function submitText() {
+    if (!title.trim() || !content.trim()) {
+      setMessage('请输入标题和内容');
+      return;
+    }
     setBusy(true);
     setMessage('');
     try {
@@ -40,6 +41,7 @@ export function LearningMaterials() {
     }
   }
 
+  // 提交文件资料并按当前解析精度选项入库。
   async function submitFile(file: File | null) {
     if (!file) return;
     setBusy(true);
@@ -60,7 +62,7 @@ export function LearningMaterials() {
       <section className="page-heading">
         <div>
           <h2>学习资料</h2>
-          <p>Markdown、PDF、Word、PPT 与视频资料入口</p>
+          <p>Markdown、PDF、Word、PPT、字幕与转写文本入口</p>
         </div>
         <button className="ghost-action" onClick={refresh}>
           <RefreshCw size={17} />
@@ -90,9 +92,9 @@ export function LearningMaterials() {
           </div>
           <label className="file-drop">
             <FileUp size={30} />
-            <strong>PDF / DOC / DOCX / PPT / PPTX / MD / XLSX / TXT / 图片</strong>
+            <strong>PDF / DOC / DOCX / PPT / PPTX / MD / XLSX / TXT / SRT / VTT / 图片</strong>
             <span>原生结构解析优先，复杂版式再补跑 PDF + MinerU / OCR</span>
-            <input type="file" onChange={(event) => submitFile(event.target.files?.[0] || null)} />
+            <input type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp" onChange={(event) => submitFile(event.target.files?.[0] || null)} />
           </label>
           <label className="toggle-row">
             <input type="checkbox" checked={highPrecision} onChange={(event) => setHighPrecision(event.target.checked)} />
@@ -128,6 +130,7 @@ export function LearningMaterials() {
   );
 }
 
+// 将资料类型转换为中文展示文本。
 function formatDocumentType(type: string) {
   const normalized = type.toLowerCase();
   if (normalized === 'markdown') return 'Markdown';
@@ -135,11 +138,13 @@ function formatDocumentType(type: string) {
   return type.toUpperCase();
 }
 
+// 将资料来源转换为中文展示文本。
 function formatSource(source: string) {
   if (source === 'manual') return '手动录入';
   return source;
 }
 
+// 将资料解析状态转换为中文展示文本。
 function formatStatus(status: string) {
   if (status === 'READY') return '已入库';
   if (status === 'PARTIAL') return '部分完成';

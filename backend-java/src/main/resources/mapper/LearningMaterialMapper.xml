@@ -7,6 +7,7 @@
     <resultMap id="LearningMaterialResultMap" type="com.itxiang.evidence.entity.LearningMaterial">
         <id property="id" column="id"/>
         <result property="title" column="title"/>
+        <result property="userId" column="user_id"/>
         <result property="documentType" column="document_type"/>
         <result property="source" column="source"/>
         <result property="status" column="status"/>
@@ -23,6 +24,7 @@
             useGeneratedKeys="true" keyProperty="id">
         INSERT INTO learning_material (
             title,
+            user_id,
             document_type,
             source,
             status,
@@ -34,6 +36,7 @@
         )
         VALUES (
             #{title},
+            #{userId},
             #{documentType},
             #{source},
             #{status},
@@ -62,10 +65,11 @@
         WHERE id = #{id}
     </update>
 
-    <select id="findRecent" resultMap="LearningMaterialResultMap">
+    <select id="findRecentByUserId" resultMap="LearningMaterialResultMap">
         SELECT
             id,
             title,
+            user_id,
             document_type,
             source,
             status,
@@ -77,14 +81,16 @@
             created_at,
             updated_at
         FROM learning_material
+        WHERE user_id = #{userId}
         ORDER BY updated_at DESC, id DESC
         LIMIT #{limit}
     </select>
 
-    <select id="findById" resultMap="LearningMaterialResultMap">
+    <select id="findByIdAndUserId" resultMap="LearningMaterialResultMap">
         SELECT
             id,
             title,
+            user_id,
             document_type,
             source,
             status,
@@ -97,13 +103,25 @@
             updated_at
         FROM learning_material
         WHERE id = #{id}
+          AND user_id = #{userId}
     </select>
 
-    <select id="countAll" resultType="long">
-        SELECT COUNT(1) FROM learning_material
+    <select id="countAllByUserId" resultType="long">
+        SELECT COUNT(1)
+        FROM learning_material
+        WHERE user_id = #{userId}
     </select>
 
-    <select id="sumChunkCount" resultType="int">
-        SELECT COALESCE(SUM(chunk_count), 0) FROM learning_material
+    <select id="countSinceByUserId" resultType="long">
+        SELECT COUNT(1)
+        FROM learning_material
+        WHERE user_id = #{userId}
+          AND created_at >= #{startTime}
+    </select>
+
+    <select id="sumChunkCountByUserId" resultType="int">
+        SELECT COALESCE(SUM(chunk_count), 0)
+        FROM learning_material
+        WHERE user_id = #{userId}
     </select>
 </mapper>

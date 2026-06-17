@@ -16,6 +16,7 @@ import './styles.css';
 
 const Login = lazy(() => import('./pages/Login').then((module) => ({ default: module.Login })));
 
+// 路由懒加载时展示统一加载态。
 function RouteFallback() {
   return <div className="route-loading">正在加载...</div>;
 }

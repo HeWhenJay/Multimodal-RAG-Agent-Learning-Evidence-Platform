@@ -33,7 +33,6 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class RagServiceImpl implements RagService {
 
-    private static final String DEMO_USER_ID = "demo-user";
     private static final Path UPLOAD_ROOT = Path.of("uploads", "rag");
     private static final DateTimeFormatter DATE_PATH_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
@@ -41,39 +40,52 @@ public class RagServiceImpl implements RagService {
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
 
+    /**
+     * 汇总 Java 资料记录和 Python 向量仓库概览。
+     */
     @Override
-    public RagOverviewVO overview() {
-        Long materialCount = learningMaterialMapper.countAll();
-        Integer chunkCount = learningMaterialMapper.sumChunkCount();
-        List<LearningMaterial> recent = learningMaterialMapper.findRecent(1);
-        PythonRagClient.PythonOverview pythonOverview = pythonRagClient.fetchOverviewSafely();
+    public RagOverviewVO overview(String userId) {
+        String scopedUserId = requireUserId(userId);
+        Long materialCount = learningMaterialMapper.countAllByUserId(scopedUserId);
+        Integer chunkCount = learningMaterialMapper.sumChunkCountByUserId(scopedUserId);
+        List<LearningMaterial> recent = learningMaterialMapper.findRecentByUserId(scopedUserId, 1);
+        int safeChunkCount = chunkCount == null ? 0 : chunkCount;
         return RagOverviewVO.builder()
                 .materialCount(materialCount == null ? 0 : materialCount)
-                .chunkCount(chunkCount == null ? pythonOverview.chunkCount() : chunkCount)
-                .evidenceCount(pythonOverview.evidenceCount())
-                .lastIndexedTitle(recent.isEmpty() ? pythonOverview.lastIndexedTitle() : recent.get(0).getTitle())
+                .chunkCount(safeChunkCount)
+                .evidenceCount(safeChunkCount)
+                .lastIndexedTitle(recent.isEmpty() ? null : recent.get(0).getTitle())
                 .build();
     }
 
+    /**
+     * 查询最近学习资料，用于前端资料列表。
+     */
     @Override
-    public List<LearningMaterialVO> listRecentMaterials() {
-        return learningMaterialMapper.findRecent(20).stream()
+    public List<LearningMaterialVO> listRecentMaterials(String userId) {
+        return learningMaterialMapper.findRecentByUserId(requireUserId(userId), 20).stream()
                 .map(this::convertToVO)
                 .toList();
     }
 
+    /**
+     * 查询单个学习资料记录。
+     */
     @Override
-    public LearningMaterialVO getMaterial(Long id) {
-        LearningMaterial material = learningMaterialMapper.findById(id);
+    public LearningMaterialVO getMaterial(Long id, String userId) {
+        LearningMaterial material = learningMaterialMapper.findByIdAndUserId(id, requireUserId(userId));
         if (material == null) {
             throw new IllegalArgumentException("资料不存在");
         }
         return convertToVO(material);
     }
 
+    /**
+     * 查询单个资料已入库的 evidence 片段。
+     */
     @Override
-    public List<RagEvidenceVO> listMaterialEvidences(Long id, Integer limit) {
-        LearningMaterial material = learningMaterialMapper.findById(id);
+    public List<RagEvidenceVO> listMaterialEvidences(Long id, String userId, Integer limit) {
+        LearningMaterial material = learningMaterialMapper.findByIdAndUserId(id, requireUserId(userId));
         if (material == null) {
             throw new IllegalArgumentException("资料不存在");
         }
@@ -89,7 +101,7 @@ public class RagServiceImpl implements RagService {
                     "evidence",
                     "material_evidence_query_failed",
                     resolveRagErrorCode(e),
-                    "Material evidence query failed",
+                    "查询学习资料证据失败",
                     e,
                     context
             );
@@ -97,11 +109,16 @@ public class RagServiceImpl implements RagService {
         }
     }
 
+    /**
+     * 创建文本资料记录并调用 Python RAG 索引。
+     */
     @Override
     @Transactional
-    public LearningMaterialVO indexText(RagIndexTextDTO dto) {
+    public LearningMaterialVO indexText(RagIndexTextDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
         LearningMaterial material = new LearningMaterial();
         material.setTitle(dto.getTitle());
+        material.setUserId(scopedUserId);
         material.setDocumentType(blankToDefault(dto.getDocumentType(), "markdown"));
         material.setSource(blankToDefault(dto.getSource(), "manual"));
         material.setStatus("PENDING");
@@ -111,21 +128,21 @@ public class RagServiceImpl implements RagService {
                 "material",
                 "index",
                 "material_index_text_start",
-                "Start indexing text material",
+                "开始索引文本学习资料",
                 materialContext(material)
         );
 
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
         try {
-            PythonRagClient.IndexResult result = pythonRagClient.indexText(material.getId(), DEMO_USER_ID, dto);
+            PythonRagClient.IndexResult result = pythonRagClient.indexText(material.getId(), scopedUserId, dto);
             recordIndexResultAnomalies(material, result);
             applyIndexResult(material, result);
             logService.recordRagEvent(
                     "material",
                     "index",
                     "material_index_text_result",
-                    "Text material index finished",
+                    "文本学习资料索引完成",
                     indexResultContext(material, result)
             );
         } catch (Exception e) {
@@ -135,7 +152,7 @@ public class RagServiceImpl implements RagService {
                     "index",
                     "material_index_text_failed",
                     resolveRagErrorCode(e),
-                    "Text material index failed",
+                    "文本学习资料索引失败",
                     e,
                     errorContext(material, e)
             );
@@ -144,9 +161,13 @@ public class RagServiceImpl implements RagService {
         return convertToVO(material);
     }
 
+    /**
+     * 保存上传文件、创建资料记录并调用 Python RAG 索引。
+     */
     @Override
     @Transactional
-    public LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision) {
+    public LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision, String userId) {
+        String scopedUserId = requireUserId(userId);
         String filename = file.getOriginalFilename() == null ? "未命名资料" : file.getOriginalFilename();
         Path savedPath;
         try {
@@ -157,7 +178,7 @@ public class RagServiceImpl implements RagService {
                     "upload",
                     "material_file_save_failed",
                     file.isEmpty() ? "RAG_FILE_EMPTY" : "RAG_FILE_SAVE_FAILED",
-                    "Material file save failed",
+                    "学习资料文件保存失败",
                     e,
                     uploadContext(file, filename, highPrecision)
             );
@@ -165,6 +186,7 @@ public class RagServiceImpl implements RagService {
         }
         LearningMaterial material = new LearningMaterial();
         material.setTitle(filename);
+        material.setUserId(scopedUserId);
         material.setDocumentType(detectDocumentType(filename));
         material.setSource("upload");
         material.setStatus("PENDING");
@@ -178,7 +200,7 @@ public class RagServiceImpl implements RagService {
                 "material",
                 "upload",
                 "material_upload_saved",
-                "Material file saved and record created",
+                "学习资料文件已保存并创建记录",
                 startContext
         );
 
@@ -187,7 +209,7 @@ public class RagServiceImpl implements RagService {
         try {
             PythonRagClient.IndexResult result = pythonRagClient.indexFile(
                     material.getId(),
-                    DEMO_USER_ID,
+                    scopedUserId,
                     material,
                     file,
                     Boolean.TRUE.equals(highPrecision)
@@ -198,7 +220,7 @@ public class RagServiceImpl implements RagService {
                     "material",
                     "index",
                     "material_index_file_result",
-                    "File material index finished",
+                    "文件学习资料索引完成",
                     indexResultContext(material, result)
             );
         } catch (Exception e) {
@@ -208,7 +230,7 @@ public class RagServiceImpl implements RagService {
                     "index",
                     "material_index_file_failed",
                     resolveRagErrorCode(e),
-                    "File material index failed",
+                    "文件学习资料索引失败",
                     e,
                     errorContext(material, e)
             );
@@ -217,19 +239,24 @@ public class RagServiceImpl implements RagService {
         return convertToVO(material);
     }
 
+    /**
+     * 调用 Python RAG 执行检索问答，并记录查询耗时和结果状态。
+     */
     @Override
-    public RagQueryVO query(RagQueryDTO dto) {
+    public RagQueryVO query(RagQueryDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        RagQueryDTO scopedDto = scopedQuery(dto, scopedUserId);
         long start = System.currentTimeMillis();
         logService.recordRagEvent(
                 "rag_query",
                 "retrieve",
                 "rag_query_start",
-                "Start RAG query",
-                queryContext(dto, null, null)
+                "开始 RAG 查询",
+                queryContext(scopedDto, null, null)
         );
         try {
-            RagQueryVO result = pythonRagClient.query(dto);
-            Map<String, Object> context = queryContext(dto, result, System.currentTimeMillis() - start);
+            RagQueryVO result = pythonRagClient.query(scopedDto);
+            Map<String, Object> context = queryContext(scopedDto, result, System.currentTimeMillis() - start);
             String action = result.getEvidences() == null || result.getEvidences().isEmpty()
                     ? "rag_query_no_evidence"
                     : "rag_query_success";
@@ -237,19 +264,19 @@ public class RagServiceImpl implements RagService {
                     "rag_query",
                     "retrieve",
                     action,
-                    "RAG query finished",
+                    "RAG 查询完成",
                     context
             );
             return result;
         } catch (Exception e) {
-            Map<String, Object> context = queryContext(dto, null, System.currentTimeMillis() - start);
+            Map<String, Object> context = queryContext(scopedDto, null, System.currentTimeMillis() - start);
             context.putAll(pythonExceptionContext(e));
             logService.recordRagError(
                     "rag_query",
                     "retrieve",
                     "rag_query_failed",
                     resolveRagErrorCode(e),
-                    "RAG query failed",
+                    "RAG 查询失败",
                     e,
                     context
             );
@@ -257,10 +284,14 @@ public class RagServiceImpl implements RagService {
         }
     }
 
+    /**
+     * 将资料实体转换为前端展示对象。
+     */
     private LearningMaterialVO convertToVO(LearningMaterial material) {
         return LearningMaterialVO.builder()
                 .id(material.getId())
                 .title(material.getTitle())
+                .userId(material.getUserId())
                 .documentType(material.getDocumentType())
                 .source(material.getSource())
                 .status(material.getStatus())
@@ -274,6 +305,9 @@ public class RagServiceImpl implements RagService {
                 .build();
     }
 
+    /**
+     * 根据文件名推断资料类型。
+     */
     private String detectDocumentType(String filename) {
         String lower = filename.toLowerCase();
         if (lower.endsWith(".md")) {
@@ -303,6 +337,12 @@ public class RagServiceImpl implements RagService {
         if (lower.endsWith(".txt")) {
             return "txt";
         }
+        if (lower.endsWith(".srt")) {
+            return "srt";
+        }
+        if (lower.endsWith(".vtt")) {
+            return "vtt";
+        }
         if (lower.endsWith(".png")) {
             return "png";
         }
@@ -315,10 +355,43 @@ public class RagServiceImpl implements RagService {
         return "text";
     }
 
+    /**
+     * 为空文本提供默认值。
+     */
     private String blankToDefault(String value, String defaultValue) {
         return value == null || value.isBlank() ? defaultValue : value;
     }
 
+    /**
+     * 校验并标准化当前登录用户 ID。
+     */
+    private String requireUserId(String userId) {
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("登录状态已失效");
+        }
+        return userId.trim();
+    }
+
+    /**
+     * 将查询强制限定在当前登录用户资料范围内。
+     */
+    private RagQueryDTO scopedQuery(RagQueryDTO dto, String userId) {
+        RagQueryDTO scoped = new RagQueryDTO();
+        scoped.setQuestion(dto.getQuestion());
+        scoped.setTopK(dto.getTopK());
+        Map<String, Object> metadataFilter = new LinkedHashMap<>();
+        if (dto.getMetadataFilter() != null) {
+            metadataFilter.putAll(dto.getMetadataFilter());
+        }
+        metadataFilter.put("userId", userId);
+        metadataFilter.putIfAbsent("visibilityScope", "private");
+        scoped.setMetadataFilter(metadataFilter);
+        return scoped;
+    }
+
+    /**
+     * 将 Python 索引结果回写到 Java 资料记录。
+     */
     private void applyIndexResult(LearningMaterial material, PythonRagClient.IndexResult result) {
         learningMaterialMapper.updateIndexResult(
                 material.getId(),
@@ -333,6 +406,9 @@ public class RagServiceImpl implements RagService {
         material.setChunkCount(result.chunkCount());
     }
 
+    /**
+     * 校验 Python 索引结果中可能影响状态一致性的异常情况。
+     */
     private void recordIndexResultAnomalies(LearningMaterial material, PythonRagClient.IndexResult result) {
         if (result == null) {
             logService.recordRagError(
@@ -340,7 +416,7 @@ public class RagServiceImpl implements RagService {
                     "sync",
                     "material_index_response_invalid",
                     "RAG_RESPONSE_SCHEMA_INVALID",
-                    "Python index response is empty",
+                    "Python 索引响应为空",
                     null,
                     materialContext(material)
             );
@@ -356,7 +432,7 @@ public class RagServiceImpl implements RagService {
                     "sync",
                     "material_document_id_mismatch",
                     "RAG_DOCUMENT_ID_MISMATCH",
-                    "Python document id does not match Java material id",
+                    "Python 文档 ID 与 Java 资料 ID 不一致",
                     null,
                     context
             );
@@ -367,7 +443,7 @@ public class RagServiceImpl implements RagService {
                     "index",
                     "material_index_failed_status",
                     "RAG_INDEX_FAILED",
-                    "Python returned FAILED index status",
+                    "Python 返回索引失败状态",
                     null,
                     indexResultContext(material, result)
             );
@@ -378,13 +454,16 @@ public class RagServiceImpl implements RagService {
                     "sync",
                     "material_ready_with_zero_chunk",
                     "RAG_READY_WITH_ZERO_CHUNK",
-                    "Python returned READY with zero chunks",
+                    "Python 返回 READY 但切块数为 0",
                     null,
                     indexResultContext(material, result)
             );
         }
     }
 
+    /**
+     * 将资料状态标记为索引失败并保留失败原因摘要。
+     */
     private void markFailed(LearningMaterial material, String reason) {
         String message = reason == null ? "Python RAG 解析失败" : reason;
         learningMaterialMapper.updateIndexResult(
@@ -400,6 +479,9 @@ public class RagServiceImpl implements RagService {
         material.setChunkCount(0);
     }
 
+    /**
+     * 按日期目录保存上传文件。
+     */
     private Path saveUploadFile(MultipartFile file, String filename) {
         if (file.isEmpty()) {
             throw new IllegalArgumentException("上传文件不能为空");
@@ -419,6 +501,9 @@ public class RagServiceImpl implements RagService {
         }
     }
 
+    /**
+     * 清理文件名中的路径分隔符和空白字符。
+     */
     private String sanitizeFilename(String filename) {
         String fallback = filename == null || filename.isBlank() ? "material" : filename;
         return fallback
@@ -427,6 +512,9 @@ public class RagServiceImpl implements RagService {
                 .toLowerCase(Locale.ROOT);
     }
 
+    /**
+     * 截断过长文本。
+     */
     private String truncate(String value, int maxLength) {
         if (value == null || value.length() <= maxLength) {
             return value;
@@ -434,10 +522,14 @@ public class RagServiceImpl implements RagService {
         return value.substring(0, maxLength);
     }
 
+    /**
+     * 构造资料相关日志上下文。
+     */
     private Map<String, Object> materialContext(LearningMaterial material) {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("materialId", material.getId());
         context.put("documentId", material.getId() == null ? null : "material-" + material.getId());
+        context.put("userId", material.getUserId());
         context.put("title", material.getTitle());
         context.put("documentType", material.getDocumentType());
         context.put("source", material.getSource());
@@ -448,6 +540,9 @@ public class RagServiceImpl implements RagService {
         return context;
     }
 
+    /**
+     * 构造 Python 索引结果日志上下文。
+     */
     private Map<String, Object> indexResultContext(LearningMaterial material, PythonRagClient.IndexResult result) {
         Map<String, Object> context = materialContext(material);
         context.put("documentId", result.documentId());
@@ -458,12 +553,18 @@ public class RagServiceImpl implements RagService {
         return context;
     }
 
+    /**
+     * 构造资料索引异常日志上下文。
+     */
     private Map<String, Object> errorContext(LearningMaterial material, Exception e) {
         Map<String, Object> context = materialContext(material);
         context.putAll(pythonExceptionContext(e));
         return context;
     }
 
+    /**
+     * 构造文件上传异常日志上下文。
+     */
     private Map<String, Object> uploadContext(MultipartFile file, String filename, Boolean highPrecision) {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("filename", filename);
@@ -473,6 +574,9 @@ public class RagServiceImpl implements RagService {
         return context;
     }
 
+    /**
+     * 构造 RAG 查询日志上下文，避免记录问题全文。
+     */
     private Map<String, Object> queryContext(RagQueryDTO dto, RagQueryVO result, Long elapsedMs) {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("questionLength", dto.getQuestion() == null ? 0 : dto.getQuestion().length());
@@ -491,6 +595,9 @@ public class RagServiceImpl implements RagService {
         return context;
     }
 
+    /**
+     * 提取 Python 调用异常中的接口、状态码和响应摘要。
+     */
     private Map<String, Object> pythonExceptionContext(Throwable e) {
         Map<String, Object> context = new LinkedHashMap<>();
         if (e instanceof PythonRagClient.PythonRagClientException pythonException) {
@@ -502,6 +609,9 @@ public class RagServiceImpl implements RagService {
         return context;
     }
 
+    /**
+     * 将 Python 调用异常映射为 RAG 错误码。
+     */
     private String resolveRagErrorCode(Throwable e) {
         if (e instanceof PythonRagClient.PythonRagClientException pythonException) {
             if ("read-index-result".equals(pythonException.getOperation())) {

@@ -7,7 +7,6 @@ import com.itxiang.evidence.vo.LogErrorVO;
 import com.itxiang.evidence.vo.LogEventVO;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -15,7 +14,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@SpringBootTest
+@EvidenceSpringBootTest
 class LogServiceTests {
 
     @Autowired

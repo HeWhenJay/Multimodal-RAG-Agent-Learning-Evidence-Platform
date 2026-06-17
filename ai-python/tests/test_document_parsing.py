@@ -43,7 +43,7 @@ def test_index_blocks_preserves_evidence_metadata():
         title="证据结构",
         document_type="markdown",
         source="unit-test",
-        user_id="demo-user",
+        user_id="unit-user",
         visibility_scope="private",
         language="zh-CN",
         parser=parsed.parser,
@@ -59,3 +59,43 @@ def test_index_blocks_preserves_evidence_metadata():
     assert evidences[0].blockId
     assert evidences[0].sectionTitle
     assert evidences[0].sourcePath == "uploads/rag/evidence.md"
+
+
+def test_subtitle_file_preserves_video_timestamp_metadata():
+    parser = DocumentParserRouter()
+    parsed = parser.parse_bytes(
+        content=(
+            "1\n"
+            "01:23:10,000 --> 01:25:42,000\n"
+            "这里讲到了 RAG-Fusion、Multi-Query 和 RRF 融合排序。\n"
+        ).encode("utf-8"),
+        filename="course-rag.srt",
+        document_id="doc-video",
+        source_title="某课程视频",
+        document_type="srt",
+        source_path="uploads/rag/course-rag.srt",
+    )
+
+    assert parsed.status == "READY"
+    assert parsed.blocks[0].startTime == "01:23:10"
+    assert parsed.blocks[0].endTime == "01:25:42"
+    assert parsed.blocks[0].metadata["evidenceChannel"] == "subtitle"
+
+
+def test_subtitle_file_preserves_video_url_header():
+    parser = DocumentParserRouter()
+    parsed = parser.parse_bytes(
+        content=(
+            "videoUrl: https://example.com/course.mp4\n\n"
+            "1\n"
+            "01:23:10,000 --> 01:25:42,000\n"
+            "这里讲到了 RAG-Fusion。\n"
+        ).encode("utf-8"),
+        filename="course-rag.srt",
+        document_id="doc-video-url",
+        source_title="某课程视频",
+        document_type="srt",
+        source_path="uploads/rag/course-rag.srt",
+    )
+
+    assert parsed.blocks[0].metadata["videoUrl"] == "https://example.com/course.mp4"

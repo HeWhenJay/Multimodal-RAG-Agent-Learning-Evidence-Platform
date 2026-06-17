@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AppUserMapper">
+
+    <resultMap id="AppUserResultMap" type="com.itxiang.evidence.entity.AppUser">
+        <id property="id" column="id"/>
+        <result property="account" column="account"/>
+        <result property="email" column="email"/>
+        <result property="displayName" column="display_name"/>
+        <result property="role" column="role"/>
+        <result property="passwordHash" column="password_hash"/>
+        <result property="passwordSalt" column="password_salt"/>
+        <result property="passwordAlgorithm" column="password_algorithm"/>
+        <result property="passwordIterations" column="password_iterations"/>
+        <result property="status" column="status"/>
+        <result property="lastLoginAt" column="last_login_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <select id="findByAccount" resultMap="AppUserResultMap">
+        SELECT
+            id,
+            account,
+            email,
+            display_name,
+            role,
+            password_hash,
+            password_salt,
+            password_algorithm,
+            password_iterations,
+            status,
+            last_login_at,
+            created_at,
+            updated_at
+        FROM app_user
+        WHERE account = #{account}
+    </select>
+
+    <select id="findById" resultMap="AppUserResultMap">
+        SELECT
+            id,
+            account,
+            email,
+            display_name,
+            role,
+            password_hash,
+            password_salt,
+            password_algorithm,
+            password_iterations,
+            status,
+            last_login_at,
+            created_at,
+            updated_at
+        FROM app_user
+        WHERE id = #{id}
+    </select>
+
+    <update id="updateLastLoginAt">
+        UPDATE app_user
+        SET last_login_at = #{loginAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+</mapper>

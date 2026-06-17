@@ -7,7 +7,10 @@ conda env create -f ai-python/environment.yml
 conda activate learning-evidence-rag
 $env:PYTHONPATH='ai-python'
 $env:RAG_STORE_BACKEND='pgvector'
-$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
+$env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic'
+$env:RAG_DATABASE_SCHEMA='learning_evidence'
+$env:RAG_VECTOR_DIMENSIONS='1024'
+$env:RAG_EMBEDDING_MODEL='text-embedding-v4'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
 
@@ -22,11 +25,12 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 - `POST /internal/rag/documents/index-file`
 - `GET /internal/rag/documents/{document_id}/evidences`
 - `POST /internal/rag/query`
+- `POST /internal/rag/jd-analysis`
 - `GET /internal/rag/overview`
 
 ## RAG 策略
 
-- 多格式解析路由：`pdf/doc/docx/ppt/pptx/md/txt/xls/xlsx/png/jpg/jpeg/webp`
+- 多格式解析路由：`pdf/doc/docx/ppt/pptx/md/txt/srt/vtt/xls/xlsx/png/jpg/jpeg/webp`
 - MinerU 文档识别适配入口：`MINERU_COMMAND`
 - 百炼 OCR 适配入口：`DASHSCOPE_API_KEY`
 - 原生结构解析优先：DOCX/PPTX/XLSX/Markdown/TXT 优先保留标题、段落、表格、图片、sheet 和 cell range
@@ -35,7 +39,9 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 - 摘要索引：文档摘要与章节摘要
 - 混合检索：BM25 + PostgreSQL/pgvector 向量召回
 - 融合重排：RRF / RAG-Fusion
-- 持久化：`rag_document` 保存资料摘要，`rag_chunk` 保存切块、DocumentBlock/evidence 元数据、词频统计和 `VECTOR(128)` 向量
+- 持久化：`rag_document` 保存资料摘要，`rag_chunk` 保存切块、DocumentBlock/evidence 元数据、词频统计和 `VECTOR(1024)` 向量
+- Embedding：默认使用百炼 `text-embedding-v4` 生成 1024 维向量，API Key 读取 `DASHSCOPE_API_KEY`
+- 视频证据：第一阶段解析 `.srt/.vtt` 和带时间戳的 `.txt` 转写文本，保留 `startTime/endTime/playbackUrl` 作为证据定位
 
 ## 百炼 OCR 接入
 

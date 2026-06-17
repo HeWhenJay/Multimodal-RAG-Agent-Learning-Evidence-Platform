@@ -4,7 +4,10 @@ import hashlib
 import math
 import os
 import re
+from urllib.parse import quote, urlencode
 from collections import Counter, defaultdict
+from functools import lru_cache
+from typing import Any
 
 from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
@@ -23,6 +26,9 @@ from schemas.rag import (
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
+DEFAULT_EMBEDDING_DIMENSIONS = 1024
+DEFAULT_DASHSCOPE_EMBEDDING_MODEL = "text-embedding-v4"
+DEFAULT_DASHSCOPE_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 class InMemoryRagStore:
@@ -254,6 +260,8 @@ class InMemoryRagStore:
             blockType=as_optional_str(metadata.get("blockType")),
             pageIndex=as_optional_int(metadata.get("pageIndex")),
             slideIndex=as_optional_int(metadata.get("slideIndex")),
+            startTime=as_optional_str(metadata.get("startTime")),
+            endTime=as_optional_str(metadata.get("endTime")),
             sheetName=as_optional_str(metadata.get("sheetName")),
             cellRange=as_optional_str(metadata.get("cellRange")),
             sectionTitle=section_title,
@@ -262,6 +270,11 @@ class InMemoryRagStore:
             source=str(metadata.get("source") or "unknown"),
             sourcePath=as_optional_str(metadata.get("sourcePath")),
             assetPath=as_optional_str(metadata.get("assetPath")),
+            playbackUrl=build_playback_url(
+                document_id=chunk.document_id,
+                title=title,
+                metadata=metadata,
+            ),
             sectionName=section_title,
             documentType=str(metadata.get("documentType") or "document"),
             score=round(score, 6),
@@ -286,11 +299,131 @@ def as_optional_int(value: object) -> int | None:
         return None
 
 
+def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]) -> str | None:
+    """根据视频 evidence 元数据生成播放定位链接。"""
+    start_time = as_optional_str(metadata.get("startTime"))
+    if not start_time:
+        return None
+    start_seconds = timestamp_to_seconds(start_time)
+    media_url = first_present(metadata, "playbackUrl", "videoUrl", "mediaUrl", "sourceVideoUrl")
+    if media_url:
+        base_url = media_url.split("#", 1)[0]
+        return f"{base_url}#t={start_seconds}"
+    params = {
+        "documentId": document_id,
+        "title": title,
+        "startTime": start_time,
+    }
+    end_time = as_optional_str(metadata.get("endTime"))
+    source_path = as_optional_str(metadata.get("sourcePath"))
+    if end_time:
+        params["endTime"] = end_time
+    if source_path:
+        params["sourcePath"] = source_path
+    return f"/videos?{urlencode(params, quote_via=quote)}"
+
+
+def first_present(metadata: dict[str, Any], *keys: str) -> str | None:
+    """从元数据中读取第一个非空字符串。"""
+    for key in keys:
+        value = as_optional_str(metadata.get(key))
+        if value:
+            return value
+    return None
+
+
+def timestamp_to_seconds(value: str) -> int:
+    """将 HH:MM:SS 或 MM:SS 时间戳转为秒数。"""
+    parts = [int(part) for part in value.replace(",", ".").split(".", 1)[0].split(":")]
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return minutes * 60 + seconds
+    if len(parts) >= 3:
+        hours, minutes, seconds = parts[-3:]
+        return hours * 3600 + minutes * 60 + seconds
+    return 0
+
+
 def tokenize(text: str) -> list[str]:
     return [token.lower() for token in TOKEN_PATTERN.findall(text)]
 
 
-def embed_text(text: str, dimensions: int = 128) -> list[float]:
+def embed_text(text: str, dimensions: int | None = None) -> list[float]:
+    """生成文本向量，生产环境优先使用百炼 embedding，离线测试可显式使用 hash。"""
+    target_dimensions = dimensions or embedding_dimensions()
+    provider = embedding_provider_name()
+    cache_key = (provider, embedding_model_name(), target_dimensions, text)
+    return list(cached_embedding(cache_key))
+
+
+@lru_cache(maxsize=4096)
+def cached_embedding(cache_key: tuple[str, str, int, str]) -> tuple[float, ...]:
+    provider, model, dimensions, text = cache_key
+    if provider == "hash":
+        return tuple(hash_embed_text(text, dimensions))
+    if provider != "dashscope":
+        raise RuntimeError(f"不支持的 RAG_EMBEDDING_PROVIDER: {provider}")
+    return tuple(dashscope_embed_text(text, model=model, dimensions=dimensions))
+
+
+def embedding_dimensions() -> int:
+    """读取当前 RAG 向量维度，默认与 text-embedding-v4 对齐为 1024。"""
+    return int(os.getenv("RAG_VECTOR_DIMENSIONS", str(DEFAULT_EMBEDDING_DIMENSIONS)))
+
+
+def embedding_model_name() -> str:
+    """读取百炼 embedding 模型名。"""
+    return os.getenv("RAG_EMBEDDING_MODEL") or os.getenv("DASHSCOPE_EMBEDDING_MODEL") or DEFAULT_DASHSCOPE_EMBEDDING_MODEL
+
+
+def embedding_provider_name() -> str:
+    """选择 embedding 提供方；生产默认走百炼，离线测试需显式设置 hash。"""
+    configured = os.getenv("RAG_EMBEDDING_PROVIDER")
+    if configured:
+        return configured.strip().lower()
+    return "dashscope"
+
+
+def dashscope_embed_text(text: str, *, model: str, dimensions: int) -> list[float]:
+    """通过百炼 OpenAI 兼容接口生成真实 embedding。"""
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("使用百炼 embedding 需要配置 DASHSCOPE_API_KEY")
+    base_url = (
+        os.getenv("RAG_EMBEDDING_BASE_URL")
+        or os.getenv("DASHSCOPE_EMBEDDING_BASE_URL")
+        or DEFAULT_DASHSCOPE_EMBEDDING_BASE_URL
+    ).rstrip("/")
+    timeout = float(os.getenv("RAG_EMBEDDING_TIMEOUT_SECONDS", "30"))
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError("使用百炼 embedding 需要安装 httpx 依赖") from exc
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": text,
+        "dimensions": dimensions,
+        "encoding_format": "float",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(f"{base_url}/embeddings", headers=headers, json=payload)
+    if response.status_code >= 400:
+        raise RuntimeError(f"百炼 embedding 调用失败: HTTP {response.status_code} {response.text[:500]}")
+    data = response.json()
+    try:
+        embedding = data["data"][0]["embedding"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("百炼 embedding 响应结构不符合预期") from exc
+    if not isinstance(embedding, list) or len(embedding) != dimensions:
+        actual = len(embedding) if isinstance(embedding, list) else "非数组"
+        raise RuntimeError(f"百炼 embedding 维度不符合预期: expected={dimensions}, actual={actual}")
+    return [float(value) for value in embedding]
+
+
+def hash_embed_text(text: str, dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS) -> list[float]:
+    """离线测试使用的确定性 hash embedding，不作为生产默认模型。"""
     vector = [0.0] * dimensions
     tokens = tokenize(text)
     for token in tokens:
@@ -307,7 +440,11 @@ def embed_text(text: str, dimensions: int = 128) -> list[float]:
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or not right or len(left) != len(right):
         return 0.0
-    return sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
 
 
 def expand_queries(question: str) -> list[str]:
@@ -337,8 +474,21 @@ def build_answer(question: str, evidences: list[Evidence]) -> str:
         return "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
     top = evidences[:3]
     evidence_text = "；".join(f"{item.title} / {item.sectionName}" for item in top)
+    video_evidences = [
+        item
+        for item in top
+        if item.startTime
+    ]
+    video_text = ""
+    if video_evidences:
+        locations = "；".join(
+            f"{item.title} {item.startTime}-{item.endTime}" if item.endTime else f"{item.title} {item.startTime}"
+            for item in video_evidences
+        )
+        video_text = f"视频证据：{locations}，可在证据卡片点击“从这里播放”定位。"
     return (
         f"针对“{question}”，已从个人学习证据库检索到 {len(evidences)} 条相关证据。"
+        f"{video_text}"
         f"优先参考：{evidence_text}。建议基于这些资料整理回答，并在正式输出中保留证据引用。"
     )
 

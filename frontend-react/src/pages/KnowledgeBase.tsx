@@ -1,15 +1,21 @@
-import { Database, FileText, Search, Send } from 'lucide-react';
+import { Database, FileText, PlayCircle, Search, Send } from 'lucide-react';
 import { useState } from 'react';
 import { queryRag } from '../api/rag';
 import type { RagQueryResult } from '../api/types';
 
+// 知识库页负责提交 RAG 问题并展示回答和证据。
 export function KnowledgeBase() {
-  const [question, setQuestion] = useState('BM25 和向量检索如何融合？');
+  const [question, setQuestion] = useState('');
   const [result, setResult] = useState<RagQueryResult | null>(null);
   const [error, setError] = useState('');
 
+  // 提交问题并刷新 RAG 检索结果。
   async function submit() {
     setError('');
+    if (!question.trim()) {
+      setError('请输入检索问题');
+      return;
+    }
     try {
       setResult(await queryRag({ question, topK: 6 }));
     } catch (err) {
@@ -63,10 +69,18 @@ export function KnowledgeBase() {
                   <div>
                     <strong>{item.title}</strong>
                     <span>
-                      {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || 'fusion'} · {item.parseEngine || 'parser'} · 分数 {item.score.toFixed(4)}
+                      {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || '融合检索'} · {item.parseEngine || '解析器未知'} · 分数 {item.score.toFixed(4)}
                     </span>
                   </div>
                   <p>{item.snippet}</p>
+                  {item.playbackUrl && (
+                    <div className="evidence-card-actions">
+                      <a className="ghost-action evidence-play-link" href={item.playbackUrl}>
+                        <PlayCircle size={16} />
+                        从这里播放
+                      </a>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -77,7 +91,9 @@ export function KnowledgeBase() {
   );
 }
 
+// 根据页码、幻灯片、表格区域或章节名生成证据位置。
 function formatEvidenceLocation(item: RagQueryResult['evidences'][number]) {
+  if (item.startTime) return item.endTime ? `${item.startTime} - ${item.endTime}` : item.startTime;
   if (item.pageIndex) return `第 ${item.pageIndex} 页`;
   if (item.slideIndex) return `第 ${item.slideIndex} 页幻灯片`;
   if (item.sheetName) return `${item.sheetName}${item.cellRange ? ` ${item.cellRange}` : ''}`;

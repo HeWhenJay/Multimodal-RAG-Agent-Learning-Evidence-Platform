@@ -2,6 +2,7 @@ package com.itxiang.evidence.service.Impl;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.itxiang.evidence.common.RagOperationContext;
 import com.itxiang.evidence.config.LogProperties;
 import com.itxiang.evidence.dto.LogErrorCreateDTO;
 import com.itxiang.evidence.dto.LogEventCreateDTO;
@@ -38,7 +39,7 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class LogServiceImpl implements LogService {
 
-    private static final String DEFAULT_USER_ID = "demo-user";
+    private static final String DEFAULT_USER_ID = "anonymous";
     private static final Pattern UUID_PATTERN = Pattern.compile(
             "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     );
@@ -49,6 +50,9 @@ public class LogServiceImpl implements LogService {
     private final ObjectMapper objectMapper;
     private final LogProperties logProperties;
 
+    /**
+     * 写入单条业务事件日志，并补齐默认追踪信息。
+     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Long recordEvent(LogEventCreateDTO dto) {
@@ -83,6 +87,9 @@ public class LogServiceImpl implements LogService {
         return event.getId();
     }
 
+    /**
+     * 按配置上限批量写入业务事件日志。
+     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Integer recordEvents(List<LogEventCreateDTO> dtoList) {
@@ -98,6 +105,9 @@ public class LogServiceImpl implements LogService {
         return count;
     }
 
+    /**
+     * 写入错误日志；同类指纹已存在时只累加出现次数。
+     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Long recordError(LogErrorCreateDTO dto) {
@@ -143,6 +153,9 @@ public class LogServiceImpl implements LogService {
         return error.getId();
     }
 
+    /**
+     * 记录 RAG 业务状态事件，失败时不影响主业务流程。
+     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordRagEvent(String module, String stage, String action, String message, Map<String, Object> context) {
@@ -158,10 +171,13 @@ public class LogServiceImpl implements LogService {
             enrichRagIds(dto, dto.getContext());
             recordEvent(dto);
         } catch (Exception e) {
-            log.warn("record rag event failed: {}", e.getMessage());
+            log.warn("记录 RAG 事件失败: {}", e.getMessage());
         }
     }
 
+    /**
+     * 记录 RAG 错误日志并标记异常，避免全局异常处理重复写入。
+     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordRagError(String module,
@@ -186,16 +202,20 @@ public class LogServiceImpl implements LogService {
             dto.setAction(action);
             dto.setErrorType(throwable == null ? "RagBusinessError" : throwable.getClass().getSimpleName());
             dto.setErrorCode(errorCode);
-            dto.setMessage(defaultText(message, throwable == null ? "RAG business error" : throwable.getMessage()));
+            dto.setMessage(defaultText(message, throwable == null ? "RAG 业务错误" : throwable.getMessage()));
             dto.setStackTrace(throwable == null ? null : stackTrace(throwable));
             dto.setContext(safeContext);
             enrichRagIds(dto, safeContext);
             recordError(dto);
+            RagOperationContext.markErrorLogged(throwable);
         } catch (Exception e) {
-            log.warn("record rag error failed: {}", e.getMessage());
+            log.warn("记录 RAG 错误失败: {}", e.getMessage());
         }
     }
 
+    /**
+     * 查询最近业务事件日志。
+     */
     @Override
     public List<LogEventVO> listRecentEvents(Integer limit) {
         int safeLimit = safeLimit(limit);
@@ -204,6 +224,9 @@ public class LogServiceImpl implements LogService {
                 .toList();
     }
 
+    /**
+     * 查询最近错误日志。
+     */
     @Override
     public List<LogErrorVO> listRecentErrors(Integer limit) {
         int safeLimit = safeLimit(limit);
@@ -212,6 +235,9 @@ public class LogServiceImpl implements LogService {
                 .toList();
     }
 
+    /**
+     * 统计日志概览并按来源拆分错误数量。
+     */
     @Override
     public LogOverviewVO overview(Integer days) {
         int safeDays = days == null ? 7 : Math.max(1, Math.min(days, 90));
@@ -226,6 +252,9 @@ public class LogServiceImpl implements LogService {
                 .build();
     }
 
+    /**
+     * 从 RAG 上下文中提取资料 ID、文档 ID 和解析器信息。
+     */
     private void enrichRagIds(LogEventCreateDTO dto, Map<String, Object> context) {
         Object materialId = context.get("materialId");
         if (materialId instanceof Number number) {
@@ -241,6 +270,9 @@ public class LogServiceImpl implements LogService {
         }
     }
 
+    /**
+     * 从 RAG 错误上下文中提取资料 ID、文档 ID 和解析器信息。
+     */
     private void enrichRagIds(LogErrorCreateDTO dto, Map<String, Object> context) {
         Object materialId = context.get("materialId");
         if (materialId instanceof Number number) {
@@ -256,6 +288,9 @@ public class LogServiceImpl implements LogService {
         }
     }
 
+    /**
+     * 序列化上下文前执行脱敏和长度截断。
+     */
     private String toContextJson(Map<String, Object> context, Integer maxBytes) {
         try {
             Map<String, Object> safe = sanitizeMap(context == null ? new LinkedHashMap<>() : context, 0);
@@ -265,6 +300,9 @@ public class LogServiceImpl implements LogService {
         }
     }
 
+    /**
+     * 递归清理 Map，限制嵌套深度。
+     */
     private Map<String, Object> sanitizeMap(Map<?, ?> source, int depth) {
         Map<String, Object> result = new LinkedHashMap<>();
         if (depth > 4) {
@@ -278,6 +316,9 @@ public class LogServiceImpl implements LogService {
         return result;
     }
 
+    /**
+     * 根据字段名脱敏敏感值，并限制列表和文本长度。
+     */
     private Object sanitizeValue(String key, Object value, int depth) {
         if (value == null) {
             return null;
@@ -301,6 +342,9 @@ public class LogServiceImpl implements LogService {
         return value;
     }
 
+    /**
+     * 判断上下文字段是否包含敏感信息。
+     */
     private boolean isSensitiveKey(String key) {
         String lower = key.toLowerCase(Locale.ROOT);
         return lower.contains("password")
@@ -318,6 +362,9 @@ public class LogServiceImpl implements LogService {
                 || lower.equals("jd");
     }
 
+    /**
+     * 根据错误来源、模块、类型、消息和堆栈生成聚合指纹。
+     */
     private String fingerprint(LogErrorCreateDTO dto, String stackTrace) {
         String raw = String.join("|",
                 defaultText(dto.getSource(), "java"),
@@ -331,6 +378,9 @@ public class LogServiceImpl implements LogService {
         return sha256(raw);
     }
 
+    /**
+     * 提取第一条业务相关堆栈用于错误聚合。
+     */
     private String topStackFrame(String stackTrace) {
         if (stackTrace == null || stackTrace.isBlank()) {
             return "";
@@ -351,11 +401,17 @@ public class LogServiceImpl implements LogService {
         return lines[0].trim();
     }
 
+    /**
+     * 归一化易变的 UUID 和数字，避免同类错误被拆散。
+     */
     private String normalize(String value) {
         String noUuid = UUID_PATTERN.matcher(value).replaceAll("{uuid}");
         return LARGE_NUMBER_PATTERN.matcher(noUuid).replaceAll("{num}");
     }
 
+    /**
+     * 计算 SHA-256 十六进制摘要。
+     */
     private String sha256(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -366,16 +422,22 @@ public class LogServiceImpl implements LogService {
             }
             return builder.toString();
         } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is unavailable", e);
+            throw new IllegalStateException("SHA-256 不可用", e);
         }
     }
 
+    /**
+     * 将异常堆栈转换为字符串。
+     */
     private String stackTrace(Throwable throwable) {
         StringWriter writer = new StringWriter();
         throwable.printStackTrace(new PrintWriter(writer));
         return writer.toString();
     }
 
+    /**
+     * 将事件实体转换为前端展示对象。
+     */
     private LogEventVO toEventVO(LogEvent event) {
         return LogEventVO.builder()
                 .id(event.getId())
@@ -398,6 +460,9 @@ public class LogServiceImpl implements LogService {
                 .build();
     }
 
+    /**
+     * 将错误实体转换为前端展示对象。
+     */
     private LogErrorVO toErrorVO(LogError error) {
         return LogErrorVO.builder()
                 .id(error.getId())
@@ -426,26 +491,44 @@ public class LogServiceImpl implements LogService {
                 .build();
     }
 
+    /**
+     * 生成本地追踪 ID。
+     */
     private String newTraceId() {
         return "tr_" + UUID.randomUUID().toString().replace("-", "");
     }
 
+    /**
+     * 为空文本提供默认值。
+     */
     private String defaultText(String value, String defaultValue) {
         return value == null || value.isBlank() ? defaultValue : value;
     }
 
+    /**
+     * 读取正整数配置，非法时回退默认值。
+     */
     private int safePositive(Integer value, int defaultValue) {
         return value == null || value <= 0 ? defaultValue : value;
     }
 
+    /**
+     * 限制查询日志条数范围。
+     */
     private int safeLimit(Integer limit) {
         return limit == null ? 50 : Math.max(1, Math.min(limit, 200));
     }
 
+    /**
+     * 为统计空值提供 0 默认值。
+     */
     private Long defaultLong(Long value) {
         return value == null ? 0L : value;
     }
 
+    /**
+     * 截断过长文本。
+     */
     private String truncate(String value, int maxLength) {
         if (value == null || value.length() <= maxLength) {
             return value;

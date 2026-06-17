@@ -12,17 +12,38 @@ import java.util.List;
 
 public interface RagService {
 
-    RagOverviewVO overview();
+    /**
+     * 获取 RAG 资料、切块和证据概览。
+     */
+    RagOverviewVO overview(String userId);
 
-    List<LearningMaterialVO> listRecentMaterials();
+    /**
+     * 查询最近学习资料。
+     */
+    List<LearningMaterialVO> listRecentMaterials(String userId);
 
-    LearningMaterialVO getMaterial(Long id);
+    /**
+     * 查询单个学习资料解析状态。
+     */
+    LearningMaterialVO getMaterial(Long id, String userId);
 
-    List<RagEvidenceVO> listMaterialEvidences(Long id, Integer limit);
+    /**
+     * 查询单个学习资料的证据片段。
+     */
+    List<RagEvidenceVO> listMaterialEvidences(Long id, String userId, Integer limit);
 
-    LearningMaterialVO indexText(RagIndexTextDTO dto);
+    /**
+     * 索引文本学习资料。
+     */
+    LearningMaterialVO indexText(RagIndexTextDTO dto, String userId);
 
-    LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision);
+    /**
+     * 上传并索引文件学习资料。
+     */
+    LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision, String userId);
 
-    RagQueryVO query(RagQueryDTO dto);
+    /**
+     * 执行 RAG 检索问答。
+     */
+    RagQueryVO query(RagQueryDTO dto, String userId);
 }

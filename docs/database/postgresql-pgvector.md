@@ -1,113 +1,60 @@
-# PostgreSQL/pgvector 知识仓库创建语句
+# PostgreSQL/pgvector 数据库初始化
 
-以下 SQL 面向真实 PostgreSQL + pgvector 环境。`learning_evidence` 是项目数据库，`rag_document` 保存资料级索引，`rag_chunk` 保存递归切块、元数据、词频统计和 pgvector 向量。
+本项目本地 Docker PostgreSQL/pgvector 连接约定：
 
-## 1. 创建数据库和账号
+- 容器名：`pgvector-postgres`
+- 数据库：`postgres`
+- Schema：`learning_evidence`
+- 用户名：`postgres`
+- 密码：`123456`
+- 宿主机端口：`5433`
+- Java JDBC：`jdbc:postgresql://127.0.0.1:5433/postgres?currentSchema=learning_evidence,public`
+- Python URL：`postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic`
 
-使用 PostgreSQL 超级用户执行：
+完整建表语句在 `infra/sql/init.sql`，包含：
 
-```sql
-CREATE DATABASE learning_evidence
-    WITH
-    ENCODING = 'UTF8'
-    TEMPLATE = template0;
+- `CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public`
+- `CREATE SCHEMA IF NOT EXISTS learning_evidence AUTHORIZATION postgres`
+- `app_user`
+- `auth_session`
+- `auth_login_record`
+- `learning_material`
+- `log_event`
+- `log_error`
+- `rag_document`
+- `rag_chunk`
+- RAG 元数据 GIN 索引
+- pgvector HNSW 余弦索引
 
-CREATE USER learning_evidence_app WITH PASSWORD 'learning_evidence_app';
+默认管理员账号：`admin@evidence.ai / 123456`。密码以 PBKDF2 哈希种子写入，不保存明文。
 
-GRANT ALL PRIVILEGES ON DATABASE learning_evidence TO learning_evidence_app;
-```
-
-进入项目数据库后执行：
-
-```sql
-\connect learning_evidence
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-GRANT USAGE, CREATE ON SCHEMA public TO learning_evidence_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO learning_evidence_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT USAGE, SELECT ON SEQUENCES TO learning_evidence_app;
-```
-
-## 2. 创建业务资料表
-
-```sql
-CREATE TABLE IF NOT EXISTS learning_material (
-    id BIGSERIAL PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    document_type VARCHAR(50) NOT NULL,
-    source VARCHAR(255),
-    status VARCHAR(30) NOT NULL,
-    parser VARCHAR(80),
-    document_summary TEXT,
-    chunk_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_learning_material_status
-    ON learning_material(status);
-
-CREATE INDEX IF NOT EXISTS idx_learning_material_document_type
-    ON learning_material(document_type);
-```
-
-## 3. 创建 RAG 向量仓库表
-
-```sql
-CREATE TABLE IF NOT EXISTS rag_document (
-    document_id VARCHAR(120) PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    document_type VARCHAR(50) NOT NULL,
-    source VARCHAR(255),
-    user_id VARCHAR(120) NOT NULL DEFAULT 'demo-user',
-    visibility_scope VARCHAR(30) NOT NULL DEFAULT 'private',
-    language VARCHAR(30) NOT NULL DEFAULT 'zh-CN',
-    parser VARCHAR(80),
-    document_summary TEXT,
-    section_summaries JSONB NOT NULL DEFAULT '{}'::jsonb,
-    chunk_count INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS rag_chunk (
-    chunk_id VARCHAR(180) PRIMARY KEY,
-    document_id VARCHAR(120) NOT NULL REFERENCES rag_document(document_id) ON DELETE CASCADE,
-    chunk_position INTEGER NOT NULL,
-    section_name VARCHAR(255) NOT NULL DEFAULT '全文',
-    text TEXT NOT NULL,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    term_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
-    token_count INTEGER NOT NULL DEFAULT 0,
-    embedding VECTOR(128) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_rag_document_type
-    ON rag_document(document_type);
-
-CREATE INDEX IF NOT EXISTS idx_rag_document_user_visibility
-    ON rag_document(user_id, visibility_scope);
-
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_document_position
-    ON rag_chunk(document_id, chunk_position);
-
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_metadata_gin
-    ON rag_chunk USING GIN (metadata);
-
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_embedding_hnsw
-    ON rag_chunk USING hnsw (embedding vector_cosine_ops);
-```
-
-## 4. Python RAG 连接配置
+在 PowerShell 中执行初始化：
 
 ```powershell
-$env:RAG_STORE_BACKEND='pgvector'
-$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
-$env:RAG_VECTOR_DIMENSIONS='128'
+Get-Content infra\sql\init.sql |
+  docker exec -i -e PGPASSWORD=123456 pgvector-postgres `
+  psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 ```
 
-未配置 `RAG_DATABASE_URL` 时，Python 服务会使用内存后端，方便无数据库环境下跑单元测试；正式运行必须使用以上 pgvector 配置。
+Python RAG 启动环境变量：
+
+```powershell
+$env:PYTHONPATH='ai-python'
+$env:RAG_STORE_BACKEND='pgvector'
+$env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic'
+$env:RAG_DATABASE_SCHEMA='learning_evidence'
+$env:RAG_VECTOR_DIMENSIONS='1024'
+$env:RAG_EMBEDDING_MODEL='text-embedding-v4'
+```
+
+## 128 维到 1024 维迁移
+
+旧版本 `rag_chunk.embedding` 使用 `VECTOR(128)` 存储确定性 hash 向量。迁移到百炼 `text-embedding-v4` 后，向量列统一为 `VECTOR(1024)`。
+
+已有 128 维向量不能无损转换为 1024 维真实 embedding。执行迁移脚本会清空旧 RAG 切块和向量仓库，并将已有学习资料状态标记为 `REINDEXING`，之后需要重新上传或重新索引资料。
+
+```powershell
+Get-Content infra\sql\alter-database\20260617_0100_migrate_embedding_1024.sql -Encoding UTF8 |
+  docker exec -i -e PGPASSWORD=123456 pgvector-postgres `
+  psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
+```

@@ -10,8 +10,10 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 @MapperScan("com.itxiang.evidence.mapper")
 public class EvidenceBackendApplication {
 
+    /**
+     * 启动学迹智配 Java 后端服务。
+     */
     public static void main(String[] args) {
         SpringApplication.run(EvidenceBackendApplication.class, args);
     }
 }
-

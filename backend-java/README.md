@@ -9,7 +9,7 @@ cd backend-java
 mvn spring-boot:run
 ```
 
-默认端口：`8080`
+默认端口：`7080`
 
 ## 分层
 
@@ -20,6 +20,9 @@ mvn spring-boot:run
 
 ## 主要接口
 
+- `POST /api/auth/login`
+- `GET /api/auth/me`
+- `POST /api/auth/logout`
 - `GET /api/rag/overview`
 - `GET /api/rag/materials`
 - `GET /api/rag/materials/{id}`
@@ -27,5 +30,10 @@ mvn spring-boot:run
 - `POST /api/rag/materials/text`
 - `POST /api/rag/materials/upload`
 - `POST /api/rag/query`
+- `POST /api/page-data/jd-analysis/analyze`
+
+默认初始化管理员：`admin@evidence.ai / 123456`。密码以 PBKDF2 哈希存储在 `app_user` 表中，登录 session 写入 `auth_session`，登录记录写入 `auth_login_record`。
+
+RAG 和页面数据接口需要携带 `Authorization: Bearer <token>`。Java 会把当前登录用户 ID 写入 `learning_material.user_id`，并传递给 Python RAG 的 `userId` 和查询 `metadataFilter.userId`，确保资料列表、索引和检索只作用于当前用户的个人知识库。
 
 资料状态：`PENDING`、`PARSING`、`READY`、`PARTIAL`、`FAILED`、`REINDEXING`。Java 只保存业务状态、原始文件路径和调用 Python 的结果，不实现 MinerU、OCR、Embedding 或 RAG 检索逻辑。

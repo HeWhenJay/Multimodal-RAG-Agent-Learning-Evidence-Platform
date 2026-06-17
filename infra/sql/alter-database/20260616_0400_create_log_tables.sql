@@ -1,8 +1,11 @@
+CREATE SCHEMA IF NOT EXISTS learning_evidence AUTHORIZATION postgres;
+SET search_path TO learning_evidence, public;
+
 CREATE TABLE IF NOT EXISTS log_event (
     id BIGSERIAL PRIMARY KEY,
     trace_id VARCHAR(80) NOT NULL,
     session_id VARCHAR(120),
-    user_id VARCHAR(120) NOT NULL DEFAULT 'demo-user',
+    user_id VARCHAR(120) NOT NULL DEFAULT 'anonymous',
     source VARCHAR(30) NOT NULL,
     domain VARCHAR(50) NOT NULL DEFAULT 'system',
     level VARCHAR(20) NOT NULL DEFAULT 'INFO',
@@ -42,7 +45,7 @@ CREATE TABLE IF NOT EXISTS log_error (
     id BIGSERIAL PRIMARY KEY,
     trace_id VARCHAR(80) NOT NULL,
     session_id VARCHAR(120),
-    user_id VARCHAR(120) NOT NULL DEFAULT 'demo-user',
+    user_id VARCHAR(120) NOT NULL DEFAULT 'anonymous',
     source VARCHAR(30) NOT NULL,
     domain VARCHAR(50) NOT NULL DEFAULT 'system',
     severity VARCHAR(20) NOT NULL DEFAULT 'ERROR',

@@ -1,6 +1,6 @@
-# Multimodal RAG Agent Learning Evidence Platform
+# 学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
 
-中文名：学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
+英文标识：Multimodal RAG Agent Learning Evidence Platform
 
 技术栈：React + Java Spring Boot + Python FastAPI + RAG。当前阶段完成到 RAG，暂不实现 Agent 任务编排。
 
@@ -18,6 +18,51 @@
 本项目的 RAG 不是前端直接调用 Python，也不是把 AI 逻辑写在 Java 里。业务边界是：React 只面向用户交互，Java Spring Boot 负责业务状态、资料记录、权限边界和统一 `Result<T>` 响应，Python FastAPI 负责文档识别、递归切块、索引、混合检索和证据引用。这样后续替换向量库、embedding 模型或增加重排序模型时，不需要破坏 Java 业务接口。
 
 日志记录是横切能力：Java 统一接收并写入 `log_event` / `log_error`，当前 RAG 使用 `domain=rag`，后续 Agent 编排、工具调用或长任务如果落地，可以复用同一套 `domain/module/stage/action/errorCode/contextJson` 结构。
+
+### RAG 闭环与视频证据流程图
+
+```mermaid
+flowchart LR
+    A["资料上传<br/>文档、图片、字幕、转写文本"] --> B["文档 / 字幕 / 转写文本解析<br/>MinerU、OCR、结构化解析"]
+    B --> C["结构化切块<br/>标题、章节、页面、字幕时间段"]
+    C --> D["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RAG-Fusion"]
+    D --> E["JD 分析<br/>按当前用户知识库检索岗位技能证据"]
+    E --> F["输出结果<br/>已掌握 / 半掌握 / 缺口 / 学习计划 / 证据引用"]
+```
+
+### 视频 RAG 第一阶段
+
+当前视频 RAG 不直接处理原始视频流，而是把视频对应的字幕或 ASR 转写文本作为学习证据入库。支持 `.srt`、`.vtt` 和带时间戳的 `.txt`，Python 会解析字幕时间段并写入 evidence 的 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
+
+典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 当前已完成字幕/转写文本时间戳证据、播放定位链接和文档/PPT OCR 证据闭环；原始视频自动 ASR、帧抽取、关键帧识别和内嵌播放器播放真实视频文件属于后续阶段。
+
+### 完整视频 RAG 技术路线
+
+下面是后续接入原始视频后的完整业务流程。当前代码只实现了其中“字幕 / ASR 转写文本解析 -> 时间戳 evidence -> RAG 检索 -> 播放定位”的第一阶段，不在本阶段启动长任务编排或 Agent 自主处理。
+
+```mermaid
+flowchart TD
+    V0["上传视频或课程资料包"] --> V1["保存视频文件和元数据<br/>课程名、来源、用户、可见范围"]
+    V1 --> V2["音频轨提取"]
+    V2 --> V3["百炼语音识别 ASR<br/>输出带时间戳转写文本"]
+    V1 --> V4["关键帧抽取<br/>按时间窗口或场景变化采样"]
+    V4 --> V5["百炼 Qwen-OCR / 多模态 OCR<br/>识别板书、PPT、代码和图表文字"]
+    V3 --> V6["字幕 / 转写文本解析<br/>生成 startTime、endTime"]
+    V5 --> V7["画面文字块<br/>绑定 frameTime 和 sourcePath"]
+    V6 --> V8["结构化切块<br/>保留时间戳、章节、来源"]
+    V7 --> V8
+    V8 --> V9["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RRF"]
+    V9 --> V10["回答与证据引用<br/>视频时间段、字幕片段、画面 OCR、相关 PPT/PDF"]
+    V10 --> V11["播放定位<br/>videoUrl#t=秒 或视频复习页定位"]
+```
+
+技术选型：
+
+- ASR：后续通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型，模型名保持配置化，输出优先转换为 `.srt/.vtt` 或带时间戳的 `.txt`。
+- 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。
+- Embedding：统一使用百炼 `text-embedding-v4` 1024 维向量，pgvector 使用 HNSW + cosine。
+- 检索：字幕、转写文本、PPT/PDF OCR 和文档切块进入同一 RAG 仓库，查询时通过 Multi-Query、BM25、向量召回和 RRF/RAG-Fusion 融合排序。
+- 播放定位：evidence 保留 `startTime/endTime/playbackUrl`；有真实视频地址时使用 `videoUrl#t=秒`，无真实视频地址时跳到视频复习页展示定位信息。
 
 ### 整体业务流程图
 
@@ -161,7 +206,7 @@ flowchart TD
 1. 用户在工作台或知识库页面输入问题。
 2. 前端调用 Java `/api/rag/query`，Java 不做检索逻辑，只做统一接口和错误边界，然后调用 Python `/internal/rag/query`。
 3. Python 先做 Multi-Query 扩展：保留原问题，再补充“关键证据”“学习资料/笔记”等查询变体；如果问题包含 JD、岗位、简历、项目等词，会补充更贴近岗位适配或简历证据的查询变体。
-4. Python 按元数据过滤条件过滤候选切块。当前第一阶段默认本地演示用户是 `demo-user`，后续可接真实登录态和资料权限。
+4. Python 按元数据过滤条件过滤候选切块。当前登录态由 Java `/api/auth/login` 处理，前端请求自动携带 Bearer Token；Java 将当前用户 ID 写入资料记录、Python 索引 metadata 和查询 `metadataFilter.userId`，默认管理员账号为 `admin@evidence.ai / 123456`。
 5. 每个查询变体同时走两路召回：BM25 负责关键词精确匹配，pgvector 负责向量相似度召回。
 6. 多个查询变体、多个召回器的结果通过 RRF 做 RAG-Fusion 融合排序，避免单一路径漏召回。
 7. 系统按返回数量选择证据，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和融合分数。
@@ -169,8 +214,10 @@ flowchart TD
 
 ### 当前实现边界
 
-- 当前 Python RAG 正式存储使用 PostgreSQL/pgvector，`rag_document` 保存资料摘要，`rag_chunk` 保存递归切块、元数据、BM25 词项统计和 `VECTOR(128)` 向量。
-- 当前向量生成仍使用 deterministic hash embedding，保证本地无模型密钥也能写入 pgvector；后续可以替换为真实 embedding 模型，表结构只需要同步调整向量维度。
+- 当前 Python RAG 正式存储使用 PostgreSQL/pgvector，`rag_document` 保存资料摘要，`rag_chunk` 保存递归切块、元数据、BM25 词项统计和 `VECTOR(1024)` 向量，HNSW 索引使用 cosine 距离。
+- 当前向量生成使用阿里云百炼 / DashScope `text-embedding-v4`，默认 1024 维，统一通过 `DASHSCOPE_API_KEY` 调用；单元测试可通过 `RAG_EMBEDDING_PROVIDER=hash` 使用离线确定性向量，生产环境不建议使用 hash provider。
+- 当前 OCR 优先使用百炼 Qwen-OCR，未配置或失败时降级 `pytesseract`；Embedding 与 OCR 都收敛在 Python RAG 服务内，Java 不持有模型 Key。
+- 当前视频 RAG 第一阶段采用字幕 / ASR 转写文本入库，而不是直接解析原始视频；时间戳证据通过 `startTime/endTime/playbackUrl` 返回。
 - 当前回答生成是规则化摘要，不调用大模型；后续接 LLM 时应继续保留 evidence 引用和检索诊断。
 - 当前 Agent 任务只保留页面入口，不实现自主规划、工具调用或长任务编排。
 
@@ -195,7 +242,10 @@ conda env create -f environment.yml
 conda activate learning-evidence-rag
 $env:PYTHONPATH='.'
 $env:RAG_STORE_BACKEND='pgvector'
-$env:RAG_DATABASE_URL='postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence'
+$env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic'
+$env:RAG_DATABASE_SCHEMA='learning_evidence'
+$env:RAG_VECTOR_DIMENSIONS='1024'
+$env:RAG_EMBEDDING_MODEL='text-embedding-v4'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
 
@@ -226,14 +276,19 @@ npm run dev
 
 | 变量 | 是否必填 | 用途 | 示例或默认值 |
 | --- | --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 使用百炼模型时必填 | 阿里云百炼 / DashScope 统一 API Key，当前用于百炼 Qwen-OCR，后续百炼模型调用也统一使用它 | `<your-dashscope-api-key>` |
+| `DASHSCOPE_API_KEY` | 使用百炼模型时必填 | 阿里云百炼 / DashScope 统一 API Key，当前用于百炼 Qwen-OCR 和 `text-embedding-v4` embedding | `<your-dashscope-api-key>` |
 | `MINERU_TOKEN` | 使用 MinerU 云端能力时必填 | MinerU / OpenXLab API Token，供 MinerU 命令或第三方封装读取 | `<your-mineru-token>` |
 | `MINERU_API_TOKEN` | 推荐同 `MINERU_TOKEN` | 兼容部分 MinerU 工具或 MCP 封装 | 与 `MINERU_TOKEN` 相同 |
 | `MINERU_API_KEY` | 推荐同 `MINERU_TOKEN` | 兼容部分 MinerU 工具或 MCP 封装 | 与 `MINERU_TOKEN` 相同 |
 | `MINERU_COMMAND` | 使用 MinerU 解析 PDF 时必填 | Python 通过该命令模板调用 MinerU，必须支持 `{input}` 和 `{output}` 占位 | `mineru -p {input} -o {output}` |
 | `RAG_STORE_BACKEND` | 生产/联调推荐 | RAG 存储后端；未配置时 Python 单测和本地演示回退内存存储 | `pgvector` |
-| `RAG_DATABASE_URL` | 使用 pgvector 时必填 | PostgreSQL/pgvector 连接串 | `postgresql://learning_evidence_app:learning_evidence_app@127.0.0.1:5432/learning_evidence` |
-| `RAG_VECTOR_DIMENSIONS` | 可选 | pgvector 向量维度，需与数据库列一致 | `128` |
+| `RAG_DATABASE_URL` | 使用 pgvector 时必填 | PostgreSQL/pgvector 连接串 | `postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic` |
+| `RAG_DATABASE_SCHEMA` | 可选 | PostgreSQL schema 名，Python 启动时会确保该 schema 存在并设置 search_path | `learning_evidence` |
+| `RAG_VECTOR_DIMENSIONS` | 可选 | pgvector 向量维度，需与数据库列一致 | `1024` |
+| `RAG_EMBEDDING_MODEL` | 可选 | 百炼 embedding 模型名 | `text-embedding-v4` |
+| `RAG_EMBEDDING_PROVIDER` | 可选 | embedding 提供方；生产默认 `dashscope`，单测或离线演示才显式设置 `hash` | `dashscope` |
+| `RAG_EMBEDDING_BASE_URL` | 可选 | 百炼 OpenAI 兼容 embedding 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `RAG_EMBEDDING_TIMEOUT_SECONDS` | 可选 | 单次 embedding 请求超时 | `30` |
 | `BAILIAN_OCR_MODEL` | 可选 | 百炼 OCR 模型名 | `qwen3.5-ocr` |
 | `BAILIAN_OCR_BASE_URL` | 可选 | 百炼 OpenAI 兼容接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `BAILIAN_OCR_ENABLED` | 可选 | 是否启用百炼 OCR；`auto` 表示存在 `DASHSCOPE_API_KEY` 时启用 | `auto` |
@@ -241,7 +296,7 @@ npm run dev
 | `BAILIAN_OCR_MAX_IMAGE_BYTES` | 可选 | 送入百炼 OCR 前允许的最大图片字节数 | `10485760` |
 | `LIBREOFFICE_COMMAND` / `SOFFICE_COMMAND` | 可选 | DOC/PPT 转 PDF 或结构化格式时指定 LibreOffice 命令 | `soffice` |
 | `OCR_LANG` | 可选 | 本地 `pytesseract` OCR 语言 | `chi_sim+eng` |
-| `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:8080` |
+| `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:7080` |
 
 ## MinerU 接入
 
