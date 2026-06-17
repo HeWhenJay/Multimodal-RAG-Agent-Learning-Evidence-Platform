@@ -43,6 +43,11 @@ public interface RagService {
     LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision, String userId);
 
     /**
+     * 重新读取原始文件并重建资料索引。
+     */
+    LearningMaterialVO reindexMaterial(Long id, Boolean highPrecision, String userId);
+
+    /**
      * 执行 RAG 检索问答。
      */
     RagQueryVO query(RagQueryDTO dto, String userId);

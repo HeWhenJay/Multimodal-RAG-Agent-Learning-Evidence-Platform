@@ -10,6 +10,11 @@ public interface ObjectStorageService {
     StoredObject store(MultipartFile file, String filename, String userId, String documentType);
 
     /**
+     * 读取已保存的原始文件，用于重新解析和补跑索引。
+     */
+    LoadedObject load(String storageType, String sourcePath, String objectKey, String filename);
+
+    /**
      * 上传后的对象信息。
      */
     record StoredObject(
@@ -17,6 +22,16 @@ public interface ObjectStorageService {
             String sourcePath,
             String objectKey,
             String publicUrl
+    ) {
+    }
+
+    /**
+     * 从本地或 OSS 读取出的原始文件内容。
+     */
+    record LoadedObject(
+            byte[] content,
+            String filename,
+            String contentType
     ) {
     }
 }

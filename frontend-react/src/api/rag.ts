@@ -80,3 +80,10 @@ export function uploadMaterial(file: File, highPrecision = false): Promise<Learn
     body: form
   });
 }
+
+// 重新读取原始文件并触发索引重建，高精度模式用于低质量资料补跑。
+export function reindexMaterial(id: number, highPrecision = false): Promise<LearningMaterial> {
+  return request<LearningMaterial>(`/api/rag/materials/${id}/reindex?highPrecision=${highPrecision}`, {
+    method: 'POST'
+  });
+}

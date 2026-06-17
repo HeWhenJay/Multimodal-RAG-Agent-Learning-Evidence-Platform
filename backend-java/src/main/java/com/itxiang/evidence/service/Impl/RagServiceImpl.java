@@ -240,6 +240,75 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 重新读取原始文件并调用 Python RAG 重建索引，可用于低质量资料高精度补跑。
+     */
+    @Override
+    @Transactional
+    public LearningMaterialVO reindexMaterial(Long id, Boolean highPrecision, String userId) {
+        String scopedUserId = requireUserId(userId);
+        LearningMaterial material = learningMaterialMapper.findByIdAndUserId(id, scopedUserId);
+        if (material == null) {
+            throw new IllegalArgumentException("资料不存在");
+        }
+        if ("manual".equals(material.getStorageType())) {
+            throw new IllegalArgumentException("手动文本资料没有原始上传文件，请重新提交文本内容");
+        }
+        learningMaterialMapper.updateStatus(material.getId(), "REINDEXING");
+        material.setStatus("REINDEXING");
+        Map<String, Object> startContext = materialContext(material);
+        startContext.put("highPrecision", Boolean.TRUE.equals(highPrecision));
+        startContext.put("storageType", material.getStorageType());
+        startContext.put("objectKey", material.getObjectKey());
+        logService.recordRagEvent(
+                "material",
+                "reindex",
+                "material_reindex_start",
+                "开始重建学习资料索引",
+                startContext
+        );
+
+        try {
+            ObjectStorageService.LoadedObject loadedObject = objectStorageService.load(
+                    material.getStorageType(),
+                    material.getOriginalFilePath(),
+                    material.getObjectKey(),
+                    material.getOriginalFilename()
+            );
+            PythonRagClient.IndexResult result = pythonRagClient.indexFileBytes(
+                    material.getId(),
+                    scopedUserId,
+                    material,
+                    loadedObject.content(),
+                    loadedObject.filename(),
+                    loadedObject.contentType(),
+                    Boolean.TRUE.equals(highPrecision)
+            );
+            recordIndexResultAnomalies(material, result);
+            applyIndexResult(material, result);
+            logService.recordRagEvent(
+                    "material",
+                    "reindex",
+                    "material_reindex_result",
+                    "学习资料索引重建完成",
+                    indexResultContext(material, result)
+            );
+        } catch (Exception e) {
+            log.warn("资料重建索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
+            logService.recordRagError(
+                    "material",
+                    "reindex",
+                    "material_reindex_failed",
+                    resolveRagErrorCode(e),
+                    "学习资料重建索引失败",
+                    e,
+                    errorContext(material, e)
+            );
+            markFailed(material, e.getMessage());
+        }
+        return convertToVO(material);
+    }
+
+    /**
      * 调用 Python RAG 执行检索问答，并记录查询耗时和结果状态。
      */
     @Override

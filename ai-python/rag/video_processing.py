@@ -51,7 +51,7 @@ def process_video_bytes(
         warnings.extend(audio_warnings)
         transcript_text = ""
         if audio_path:
-            transcript_text, asr_warnings = BailianAsrClient().transcribe_audio_file(audio_path)
+            transcript_text, asr_warnings = BailianAsrClient().transcribe_audio_file(audio_path, source_url=source_path)
             warnings.extend(asr_warnings)
 
         frames, frame_warnings = extract_keyframes(video_path, tmp_dir)

@@ -4,6 +4,7 @@ import com.aliyun.oss.ClientException;
 import com.aliyun.oss.OSS;
 import com.aliyun.oss.OSSClientBuilder;
 import com.aliyun.oss.OSSException;
+import com.aliyun.oss.model.OSSObject;
 import com.aliyun.oss.model.ObjectMetadata;
 import com.itxiang.evidence.config.ObjectStorageProperties;
 import com.itxiang.evidence.service.ObjectStorageService;
@@ -46,6 +47,21 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
             throw new IllegalArgumentException("不支持的文件存储模式: " + properties.getProvider());
         }
         return storeToLocal(file, filename);
+    }
+
+    /**
+     * 读取已保存原始文件，供资料重建索引或高精度补跑使用。
+     */
+    @Override
+    public LoadedObject load(String storageType, String sourcePath, String objectKey, String filename) {
+        String provider = storageType == null ? "local" : storageType.trim().toLowerCase(Locale.ROOT);
+        if ("oss".equals(provider)) {
+            return loadFromOss(sourcePath, objectKey, filename);
+        }
+        if ("local".equals(provider)) {
+            return loadFromLocal(sourcePath, filename);
+        }
+        throw new IllegalArgumentException("当前资料没有可读取的原始上传文件，无法重建索引");
     }
 
     /**
@@ -99,6 +115,55 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
+     * 从本地上传目录读取原始文件。
+     */
+    private LoadedObject loadFromLocal(String sourcePath, String filename) {
+        if (isBlank(sourcePath)) {
+            throw new IllegalArgumentException("本地资料缺少原始文件路径，无法重建索引");
+        }
+        Path target = resolveLocalPath(sourcePath);
+        if (!Files.exists(target) || !Files.isRegularFile(target)) {
+            throw new IllegalStateException("本地原始文件不存在，无法重建索引: " + sourcePath);
+        }
+        try {
+            String contentType = Files.probeContentType(target);
+            return new LoadedObject(Files.readAllBytes(target), blankToDefault(filename, target.getFileName().toString()), contentType);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取本地原始文件失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 从阿里 OSS 读取原始文件。
+     */
+    private LoadedObject loadFromOss(String sourcePath, String objectKey, String filename) {
+        ObjectStorageProperties.Oss ossProperties = properties.getOss();
+        validateOssProperties(ossProperties);
+        String key = blankToDefault(objectKey, parseObjectKeyFromOssUri(sourcePath, ossProperties.getBucket()));
+        if (isBlank(key)) {
+            throw new IllegalArgumentException("OSS 资料缺少 objectKey，无法重建索引");
+        }
+        OSS ossClient = new OSSClientBuilder().build(
+                ossProperties.getEndpoint(),
+                ossProperties.getAccessKeyId(),
+                ossProperties.getAccessKeySecret()
+        );
+        try {
+            OSSObject ossObject = ossClient.getObject(ossProperties.getBucket(), key);
+            String contentType = ossObject.getObjectMetadata() == null ? null : ossObject.getObjectMetadata().getContentType();
+            try (InputStream inputStream = ossObject.getObjectContent()) {
+                return new LoadedObject(inputStream.readAllBytes(), blankToDefault(filename, Path.of(key).getFileName().toString()), contentType);
+            }
+        } catch (OSSException | ClientException e) {
+            throw new IllegalStateException("从阿里 OSS 读取原始文件失败: " + e.getMessage(), e);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取 OSS 文件流失败: " + e.getMessage(), e);
+        } finally {
+            ossClient.shutdown();
+        }
+    }
+
+    /**
      * 校验 OSS 必填配置，避免运行时上传到未知位置。
      */
     private void validateOssProperties(ObjectStorageProperties.Oss ossProperties) {
@@ -123,19 +188,42 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
-     * 优先使用公开域名，否则按标准 bucket endpoint 生成 URL。
+     * 仅在配置公开域名时返回可播放 URL，私有桶默认只保留 oss:// 来源地址。
      */
     private String buildPublicUrl(ObjectStorageProperties.Oss ossProperties, String objectKey) {
         if (!isBlank(ossProperties.getPublicBaseUrl())) {
             return trimRightSlash(ossProperties.getPublicBaseUrl()) + "/" + objectKey;
         }
-        String endpoint = trimRightSlash(ossProperties.getEndpoint());
-        String normalizedEndpoint = endpoint
-                .replaceFirst("^https?://", "");
-        if (normalizedEndpoint.isBlank()) {
+        return null;
+    }
+
+    /**
+     * 解析并校验本地上传文件路径，避免读取上传目录之外的文件。
+     */
+    private Path resolveLocalPath(String sourcePath) {
+        Path root = Path.of(properties.getLocalRoot()).toAbsolutePath().normalize();
+        Path rawPath = Path.of(sourcePath);
+        Path target = rawPath.isAbsolute()
+                ? rawPath.normalize()
+                : Path.of("").toAbsolutePath().resolve(rawPath).normalize();
+        if (!target.startsWith(root)) {
+            throw new IllegalArgumentException("本地原始文件路径不在上传目录内，拒绝重建索引");
+        }
+        return target;
+    }
+
+    /**
+     * 从 oss://bucket/key 形式的来源地址中提取 objectKey。
+     */
+    private String parseObjectKeyFromOssUri(String sourcePath, String bucket) {
+        if (isBlank(sourcePath) || !sourcePath.startsWith("oss://")) {
             return null;
         }
-        return "https://" + ossProperties.getBucket() + "." + normalizedEndpoint + "/" + objectKey;
+        String prefix = "oss://" + bucket + "/";
+        if (!sourcePath.startsWith(prefix)) {
+            return null;
+        }
+        return sourcePath.substring(prefix.length());
     }
 
     /**

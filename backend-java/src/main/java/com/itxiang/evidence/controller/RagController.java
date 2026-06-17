@@ -136,6 +136,25 @@ public class RagController {
     }
 
     /**
+     * 重新读取原始文件并重建学习资料索引。
+     */
+    @PostMapping("/materials/{id}/reindex")
+    @Operation(summary = "重建学习资料索引")
+    public Result<LearningMaterialVO> reindexMaterial(@PathVariable Long id,
+                                                      @RequestHeader(value = "Authorization", required = false) String authorization,
+                                                      @RequestParam(value = "highPrecision", defaultValue = "false") Boolean highPrecision) {
+        log.info("重建学习资料索引: id={}, highPrecision={}", id, highPrecision);
+        return execute(
+                RagOperationContext.operation("material", "reindex", "material_reindex_request", "重建学习资料索引"),
+                context(
+                        "materialId", id,
+                        "highPrecision", Boolean.TRUE.equals(highPrecision)
+                ),
+                () -> ragService.reindexMaterial(id, highPrecision, currentUserId(authorization))
+        );
+    }
+
+    /**
      * 执行 RAG 检索问答。
      */
     @PostMapping("/query")

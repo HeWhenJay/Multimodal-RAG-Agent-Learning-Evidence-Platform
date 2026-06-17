@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_ASR_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_ASR_TASK_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_ASR_MODEL = "qwen3-asr-flash"
+DEFAULT_ASR_FILETRANS_MODEL = "qwen3-asr-flash-filetrans"
 DEFAULT_ASR_PROMPT = (
     "请将音频转写为 SRT 字幕格式，只输出字幕内容。"
     "每段必须包含序号、HH:MM:SS,mmm --> HH:MM:SS,mmm 时间范围和中文转写文本。"
@@ -22,39 +25,125 @@ class BailianAsrClient:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
+        task_base_url: str | None = None,
         model: str | None = None,
+        filetrans_model: str | None = None,
         provider: str | None = None,
         timeout_seconds: float | None = None,
         max_audio_bytes: int | None = None,
+        max_polls: int | None = None,
+        poll_interval_seconds: float | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = (base_url or os.getenv("RAG_ASR_BASE_URL") or DEFAULT_ASR_BASE_URL).rstrip("/")
+        self.task_base_url = (task_base_url or os.getenv("RAG_ASR_TASK_BASE_URL") or DEFAULT_ASR_TASK_BASE_URL).rstrip("/")
         self.model = model or os.getenv("RAG_ASR_MODEL") or DEFAULT_ASR_MODEL
+        self.filetrans_model = (
+            filetrans_model
+            or os.getenv("RAG_ASR_FILETRANS_MODEL")
+            or DEFAULT_ASR_FILETRANS_MODEL
+        )
         self.provider = (provider or os.getenv("RAG_ASR_PROVIDER") or "auto").strip().lower()
         self.timeout_seconds = timeout_seconds or float(os.getenv("RAG_ASR_TIMEOUT_SECONDS", "120"))
         self.max_audio_bytes = max_audio_bytes or int(os.getenv("RAG_ASR_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
+        self.max_polls = max_polls or int(os.getenv("RAG_ASR_FILETRANS_MAX_POLLS", "30"))
+        self.poll_interval_seconds = poll_interval_seconds if poll_interval_seconds is not None else float(
+            os.getenv("RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS", "2")
+        )
 
     @property
     def should_call_dashscope(self) -> bool:
         if self.provider == "local":
             return False
-        if self.provider == "dashscope":
+        if self.provider in {"dashscope", "filetrans", "dashscope_filetrans"}:
             return True
         return bool(self.api_key)
 
-    def transcribe_audio_file(self, audio_path: Path) -> tuple[str, list[str]]:
+    def transcribe_audio_file(self, audio_path: Path, source_url: str | None = None) -> tuple[str, list[str]]:
         if not self.should_call_dashscope:
             return "", ["百炼 ASR 未启用，跳过音频转写"]
         if not self.api_key:
             return "", ["DASHSCOPE_API_KEY 未配置，无法调用百炼 ASR"]
         if not audio_path.exists() or audio_path.stat().st_size == 0:
             return "", ["抽取的音频文件为空，无法调用百炼 ASR"]
+
+        warnings: list[str] = []
+        if self.should_call_filetrans(source_url):
+            try:
+                return self._call_filetrans(str(source_url)), []
+            except Exception as exc:
+                warnings.append(f"百炼 ASR 异步时间戳转写失败，降级同步识别: {exc}")
+
         if audio_path.stat().st_size > self.max_audio_bytes:
-            return "", [f"抽取的音频超过 {self.max_audio_bytes} 字节，当前同步 ASR 已跳过"]
+            warnings.append(f"抽取的音频超过 {self.max_audio_bytes} 字节，当前同步 ASR 已跳过")
+            return "", warnings
         try:
-            return self._call_chat_audio(audio_path), []
+            transcript = self._call_chat_audio(audio_path)
+            return transcript, warnings
         except Exception as exc:
-            return "", [f"百炼 ASR 调用失败: {exc}"]
+            warnings.append(f"百炼 ASR 调用失败: {exc}")
+            return "", warnings
+
+    def should_call_filetrans(self, source_url: str | None) -> bool:
+        """公开视频 URL 可用时优先使用带时间戳的异步转写模型。"""
+        enabled = (os.getenv("RAG_ASR_FILETRANS_ENABLED") or "auto").strip().lower()
+        if self.provider in {"filetrans", "dashscope_filetrans"}:
+            return bool(source_url and source_url.startswith(("http://", "https://")))
+        if enabled in {"false", "0", "no", "off"}:
+            return False
+        if enabled in {"true", "1", "yes", "on"}:
+            return bool(source_url and source_url.startswith(("http://", "https://")))
+        return bool(source_url and source_url.startswith(("http://", "https://")))
+
+    def _call_filetrans(self, file_url: str) -> str:
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("使用百炼 ASR 异步转写需要安装 httpx 依赖") from exc
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable",
+        }
+        payload = {
+            "model": self.filetrans_model,
+            "input": {"file_url": file_url},
+            "parameters": {
+                "channel_id": [0],
+                "enable_itn": False,
+                "enable_words": os.getenv("RAG_ASR_ENABLE_WORDS", "false").lower() in {"true", "1", "yes", "on"},
+            },
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
+            task_id = ((response.json().get("output") or {}).get("task_id"))
+            if not task_id:
+                raise RuntimeError("百炼 ASR 异步任务未返回 task_id")
+            transcription_url = self._wait_filetrans_result(client, task_id, headers)
+            result_response = client.get(transcription_url)
+            if result_response.status_code >= 400:
+                raise RuntimeError(f"下载 ASR 转写结果失败: HTTP {result_response.status_code}")
+            return transcription_json_to_srt(result_response.json())
+
+    def _wait_filetrans_result(self, client: Any, task_id: str, headers: dict[str, str]) -> str:
+        for _ in range(max(1, self.max_polls)):
+            response = client.get(f"{self.task_base_url}/tasks/{task_id}", headers=headers)
+            if response.status_code >= 400:
+                raise RuntimeError(f"查询 ASR 任务失败: HTTP {response.status_code} {response.text[:500]}")
+            output = response.json().get("output") or {}
+            status = output.get("task_status")
+            if status == "SUCCEEDED":
+                transcription_url = extract_transcription_url(output)
+                if not transcription_url:
+                    raise RuntimeError("百炼 ASR 任务成功但未返回 transcription_url")
+                return transcription_url
+            if status == "FAILED":
+                raise RuntimeError(output.get("message") or output.get("code") or "百炼 ASR 任务失败")
+            time.sleep(max(0.0, self.poll_interval_seconds))
+        raise RuntimeError("等待百炼 ASR 异步任务超时")
 
     def _call_chat_audio(self, audio_path: Path) -> str:
         try:
@@ -115,3 +204,52 @@ def extract_message_content(data: dict[str, Any]) -> str:
                     parts.append(item["content"])
         return "\n".join(parts)
     return str(content)
+
+
+def extract_transcription_url(output: dict[str, Any]) -> str | None:
+    result = output.get("result")
+    if isinstance(result, dict) and isinstance(result.get("transcription_url"), str):
+        return result["transcription_url"]
+    results = output.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and isinstance(item.get("transcription_url"), str):
+                return item["transcription_url"]
+    return None
+
+
+def transcription_json_to_srt(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    cue_index = 1
+    for transcript in data.get("transcripts") or []:
+        if not isinstance(transcript, dict):
+            continue
+        for sentence in transcript.get("sentences") or []:
+            if not isinstance(sentence, dict):
+                continue
+            text = str(sentence.get("text") or "").strip()
+            if not text:
+                continue
+            begin_time = int(sentence.get("begin_time") or 0)
+            end_time = int(sentence.get("end_time") or begin_time)
+            lines.extend(
+                [
+                    str(cue_index),
+                    f"{milliseconds_to_srt_timestamp(begin_time)} --> {milliseconds_to_srt_timestamp(end_time)}",
+                    text,
+                    "",
+                ]
+            )
+            cue_index += 1
+    if not lines:
+        raise RuntimeError("百炼 ASR 转写结果中没有可用句级时间戳")
+    return "\n".join(lines).strip()
+
+
+def milliseconds_to_srt_timestamp(value: int) -> str:
+    safe_value = max(0, value)
+    hours = safe_value // 3_600_000
+    minutes = (safe_value % 3_600_000) // 60_000
+    seconds = (safe_value % 60_000) // 1000
+    milliseconds = safe_value % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"

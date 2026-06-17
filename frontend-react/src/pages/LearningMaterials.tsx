@@ -1,6 +1,6 @@
-import { FileUp, Loader2, Plus, RefreshCw } from 'lucide-react';
+import { FileUp, Loader2, Plus, RefreshCw, RotateCcw, Wrench } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { fetchMaterials, indexText, uploadMaterial } from '../api/rag';
+import { fetchMaterials, indexText, reindexMaterial, uploadMaterial } from '../api/rag';
 import type { LearningMaterial } from '../api/types';
 
 // 学习资料页负责文本索引、文件上传和资料状态展示。
@@ -52,6 +52,21 @@ export function LearningMaterials() {
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '上传失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 重新读取原始文件，支持普通重建和高精度补跑。
+  async function submitReindex(item: LearningMaterial, highPrecisionRepair: boolean) {
+    setBusy(true);
+    setMessage('');
+    try {
+      await reindexMaterial(item.id, highPrecisionRepair);
+      setMessage(highPrecisionRepair ? '已触发高精度补跑' : '已触发索引重建');
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '重建索引失败');
     } finally {
       setBusy(false);
     }
@@ -120,6 +135,16 @@ export function LearningMaterials() {
               <div className="material-meta">
                 <span className={`status-pill ${item.status === 'READY' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
                 <strong>{item.chunkCount} 个切块</strong>
+                {item.storageType !== 'manual' && (
+                  <div className="material-actions">
+                    <button className="icon-button tiny" onClick={() => submitReindex(item, false)} disabled={busy} aria-label="重建索引" title="重建索引">
+                      <RotateCcw size={15} />
+                    </button>
+                    <button className="icon-button tiny" onClick={() => submitReindex(item, true)} disabled={busy} aria-label="高精度补跑" title="高精度补跑">
+                      <Wrench size={15} />
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           ))}

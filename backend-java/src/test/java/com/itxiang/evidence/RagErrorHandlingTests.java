@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.RagService;
+import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.LogErrorVO;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,6 +19,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -60,6 +62,29 @@ class RagErrorHandlingTests {
             assertThat(error.getErrorCode()).isEqualTo("RAG_UNEXPECTED_ERROR");
             assertThat(error.getContextJson()).contains("failureStageLabel");
         });
+    }
+
+    @Test
+    void reindexMaterialEndpointReturnsUpdatedMaterial() throws Exception {
+        when(ragService.reindexMaterial(eq(7L), eq(true), anyString())).thenReturn(
+                LearningMaterialVO.builder()
+                        .id(7L)
+                        .title("低质量课程视频.mp4")
+                        .documentType("mp4")
+                        .source("upload")
+                        .status("PARTIAL")
+                        .storageType("oss")
+                        .chunkCount(3)
+                        .build()
+        );
+
+        mockMvc.perform(post("/api/rag/materials/7/reindex?highPrecision=true")
+                        .header("Authorization", "Bearer " + loginToken()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(1))
+                .andExpect(jsonPath("$.data.id").value(7))
+                .andExpect(jsonPath("$.data.status").value("PARTIAL"))
+                .andExpect(jsonPath("$.data.storageType").value("oss"));
     }
 
     /**

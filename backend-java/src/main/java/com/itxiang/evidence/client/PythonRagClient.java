@@ -75,6 +75,33 @@ public class PythonRagClient {
                                  MultipartFile file,
                                  Boolean highPrecision) {
         try {
+            return indexFileBytes(
+                    materialId,
+                    userId,
+                    material,
+                    file.getBytes(),
+                    material.getTitle(),
+                    file.getContentType(),
+                    highPrecision
+            );
+        } catch (PythonRagClientException e) {
+            throw e;
+        } catch (Exception e) {
+            throw pythonException("index-file", "/internal/rag/documents/index-file", e);
+        }
+    }
+
+    /**
+     * 调用 Python 文件索引接口，使用已保存的原始文件字节重建索引。
+     */
+    public IndexResult indexFileBytes(Long materialId,
+                                      String userId,
+                                      LearningMaterial material,
+                                      byte[] content,
+                                      String filename,
+                                      String contentType,
+                                      Boolean highPrecision) {
+        try {
             MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
             body.add("document_id", "material-" + materialId);
             body.add("title", material.getTitle());
@@ -84,7 +111,7 @@ public class PythonRagClient {
             body.add("visibility_scope", "private");
             body.add("source_path", material.getOriginalFilePath());
             body.add("high_precision", Boolean.TRUE.equals(highPrecision));
-            body.add("file", new NamedByteArrayResource(file.getBytes(), material.getTitle()));
+            body.add("file", new NamedByteArrayResource(content, filename == null ? material.getTitle() : filename));
 
             String response = restClient.post()
                     .uri(resolve("/internal/rag/documents/index-file"))

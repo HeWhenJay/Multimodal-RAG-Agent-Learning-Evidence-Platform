@@ -34,7 +34,7 @@ flowchart LR
 
 当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储，Python 再基于本次上传文件字节执行 FFmpeg 抽音频、百炼 ASR 生成字幕、关键帧抽取和 OCR，最终把字幕 evidence 与画面 OCR evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
 
-典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR 或 OCR 未配置，视频会进入 `PARTIAL`，并保留可追踪的视频元数据 evidence，方便后续补配环境后重建索引。
+典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR 或 OCR 未配置，视频会进入 `PARTIAL`，并保留可追踪的视频元数据 evidence；补配环境后可在资料列表触发“重建索引”或“高精度补跑”，重新生成字幕和画面 OCR evidence。
 
 ### 完整视频 RAG 技术路线
 
@@ -58,11 +58,12 @@ flowchart TD
 
 技术选型：
 
-- ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型，模型名保持配置化，输出优先转换为 `.srt/.vtt` 或带时间戳的 `.txt`。
+- ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型；有公开视频 URL 时优先使用 `qwen3-asr-flash-filetrans` 异步文件转写获取句级时间戳，失败后降级 `qwen3-asr-flash` 同步转写。
 - 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。
 - Embedding：统一使用百炼 `text-embedding-v4` 1024 维向量，pgvector 使用 HNSW + cosine。
 - 检索：字幕、转写文本、PPT/PDF OCR 和文档切块进入同一 RAG 仓库，查询时通过 Multi-Query、BM25、向量召回和 RRF/RAG-Fusion 融合排序。
 - 播放定位：evidence 保留 `startTime/endTime/playbackUrl`；有真实视频地址时使用 `videoUrl#t=秒`，无真实视频地址时跳到视频复习页展示定位信息。
+- 补跑修复：资料列表提供重建索引和高精度补跑入口，Java 会从本地上传目录或阿里 OSS 重新读取原始文件，再调用 Python 重建同一 `documentId` 的 RAG 索引。
 
 ### 整体业务流程图
 

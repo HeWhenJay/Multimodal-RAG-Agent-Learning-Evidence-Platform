@@ -938,6 +938,11 @@ button {
   gap: 8px;
 }
 
+.material-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
 .empty-state {
   padding: 28px;
   text-align: center;
