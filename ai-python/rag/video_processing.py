@@ -53,6 +53,9 @@ def process_video_bytes(
         if audio_path:
             transcript_text, asr_warnings = BailianAsrClient().transcribe_audio_file(audio_path, source_url=source_path)
             warnings.extend(asr_warnings)
+            if transcript_text and not transcript_has_timestamps(transcript_text):
+                transcript_text = estimate_srt_from_transcript(transcript_text, probe_media_duration(video_path))
+                warnings.append("百炼同步 ASR 未返回时间戳，已按视频时长生成估算字幕时间段")
 
         frames, frame_warnings = extract_keyframes(video_path, tmp_dir)
         warnings.extend(frame_warnings)
@@ -141,6 +144,54 @@ def extract_keyframes(video_path: Path, tmp_dir: Path) -> tuple[list[FrameImage]
     if not frames:
         return [], ["FFmpeg 未生成关键帧图片"]
     return frames, []
+
+
+def probe_media_duration(video_path: Path) -> float:
+    """读取视频时长，供同步 ASR 纯文本降级为估算时间戳字幕。"""
+    ffprobe = os.getenv("FFPROBE_COMMAND") or shutil.which("ffprobe")
+    if not ffprobe:
+        return 60.0
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+        return max(1.0, float(result.stdout.strip()))
+    except Exception:
+        return 60.0
+
+
+def transcript_has_timestamps(text: str) -> bool:
+    return "-->" in text or bool(re.search(r"\d{1,2}:\d{2}(?::\d{2})?", text))
+
+
+def estimate_srt_from_transcript(text: str, duration_seconds: float) -> str:
+    """把纯文本转写切成估算 SRT，作为 filetrans 不可用时的时间轴保底。"""
+    cleaned = normalize_text(text)
+    sentences = [item.strip() for item in re.split(r"(?<=[。！？!?\.])\s*", cleaned) if item.strip()]
+    if not sentences:
+        sentences = [cleaned] if cleaned else ["视频转写文本为空"]
+    segment_seconds = max(1.0, duration_seconds / max(len(sentences), 1))
+    lines: list[str] = []
+    for index, sentence in enumerate(sentences, start=1):
+        start = (index - 1) * segment_seconds
+        end = duration_seconds if index == len(sentences) else min(duration_seconds, index * segment_seconds)
+        lines.extend(
+            [
+                str(index),
+                f"{seconds_to_srt_timestamp(start)} --> {seconds_to_srt_timestamp(end)}",
+                sentence,
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 def ocr_video_frames(
@@ -260,6 +311,15 @@ def seconds_to_timestamp(seconds: int) -> str:
     minutes = (safe_seconds % 3600) // 60
     second = safe_seconds % 60
     return f"{hours:02d}:{minutes:02d}:{second:02d}"
+
+
+def seconds_to_srt_timestamp(seconds: float) -> str:
+    milliseconds_total = max(0, round(seconds * 1000))
+    hours = milliseconds_total // 3_600_000
+    minutes = (milliseconds_total % 3_600_000) // 60_000
+    second = (milliseconds_total % 60_000) // 1000
+    milliseconds = milliseconds_total % 1000
+    return f"{hours:02d}:{minutes:02d}:{second:02d},{milliseconds:03d}"
 
 
 def is_public_url(value: str | None) -> bool:

@@ -424,7 +424,7 @@ mp4/mov/webm/mkv/avi
 | `RAG_VIDEO_FRAME_INTERVAL_SECONDS` | `30` | 关键帧抽取间隔 |
 | `RAG_VIDEO_MAX_FRAMES` | `20` | 单个视频最多 OCR 的关键帧数 |
 
-如果 FFmpeg、ASR 或 OCR 不可用，Python 会返回 `PARTIAL`，并至少保留视频元数据 evidence，方便前端展示失败原因和后续重建索引。同步 ASR 降级路径不保证模型一定返回真实时间戳，因此生产视频资料建议配置公开 OSS/CDN URL，让 filetrans 返回可验证的句级时间戳。
+如果 FFmpeg、ASR 或 OCR 不可用，Python 会返回 `PARTIAL`，并至少保留视频元数据 evidence，方便前端展示失败原因和后续重建索引。同步 ASR 降级路径不保证模型一定返回真实时间戳；若只得到纯文本，Python 会按视频时长生成估算 SRT 时间段作为播放定位保底。生产视频资料仍建议配置公开 OSS/CDN URL，让 filetrans 返回可验证的句级时间戳。
 
 ## 百炼 LLM 回答与 rerank
 

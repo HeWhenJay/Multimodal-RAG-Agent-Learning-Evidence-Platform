@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from rag.bailian_asr import BailianAsrClient, milliseconds_to_srt_timestamp, transcription_json_to_srt
+from rag.video_processing import estimate_srt_from_transcript, transcript_has_timestamps
 
 
 def test_filetrans_result_converts_to_srt(monkeypatch, tmp_path: Path):
@@ -95,3 +96,11 @@ def test_transcription_json_to_srt_requires_timestamped_sentences():
 
 def test_milliseconds_to_srt_timestamp_formats_hours():
     assert milliseconds_to_srt_timestamp(3_661_042) == "01:01:01,042"
+
+
+def test_estimate_srt_from_plain_transcript_creates_timestamp_ranges():
+    srt = estimate_srt_from_transcript("第一段讲 RAG。第二段讲 OCR。", 20)
+
+    assert transcript_has_timestamps(srt)
+    assert "00:00:00,000 --> 00:00:10,000" in srt
+    assert "00:00:10,000 --> 00:00:20,000" in srt
