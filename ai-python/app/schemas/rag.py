@@ -48,6 +48,22 @@ class ParseQuality(BaseModel):
     messages: list[str] = Field(default_factory=list)
 
 
+class ProgressEvent(BaseModel):
+    stageCode: str
+    stageLabel: str
+    message: str
+    status: Literal["RUNNING", "COMPLETED", "FAILED"] = "RUNNING"
+    currentStep: int | None = None
+    totalSteps: int | None = None
+    currentChunk: int | None = None
+    totalChunks: int | None = None
+    chunkId: str | None = None
+    blockId: str | None = None
+    percent: int | None = Field(default=None, ge=0, le=100)
+    detail: str | None = None
+    createdAt: str | None = None
+
+
 class IndexTextRequest(BaseModel):
     documentId: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
@@ -83,6 +99,7 @@ class IndexResponse(BaseModel):
     parser: str
     documentSummary: str
     parseQuality: ParseQuality = Field(default_factory=ParseQuality)
+    progressEvents: list[ProgressEvent] = Field(default_factory=list)
 
 
 class QueryRequest(BaseModel):
@@ -131,6 +148,7 @@ class QueryResponse(BaseModel):
     expandedQueries: list[str]
     evidences: list[Evidence]
     diagnostics: dict[str, Any] = Field(default_factory=dict)
+    progressEvents: list[ProgressEvent] = Field(default_factory=list)
 
 
 class OverviewResponse(BaseModel):

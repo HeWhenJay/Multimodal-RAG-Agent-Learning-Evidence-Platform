@@ -16,6 +16,8 @@ from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.models import ParsedBlockDocument
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
 from rag.indexes.summary_index import SummaryIndex
+from rag.progress import RagProgressReporter
+from rag.text_sanitizer import clean_postgres_text
 from video.chunking.video_processing import (
     VIDEO_FILE_TYPES,
     build_video_segment_summary_blocks,
@@ -65,10 +67,12 @@ class DocumentParserRouter:
         content_type: str | None = None,
         source_path: str | None = None,
         high_precision: bool = False,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> ParsedBlockDocument:
         file_type = detect_file_type(filename, document_type, content_type)
         if file_type not in SUPPORTED_FILE_TYPES:
             file_type = "txt"
+        emit_parse_stage(progress_reporter, file_type)
 
         try:
             if file_type == "pdf":
@@ -184,7 +188,9 @@ class DocumentParserRouter:
             parser = "fallback-text"
             warnings = [f"native parser failed: {exc}"]
 
-        return self._finalize(document_id, blocks, parser, quality, warnings)
+        result = self._finalize(document_id, blocks, parser, quality, warnings)
+        emit_parse_completed(progress_reporter, result)
+        return result
 
     def parse_text(
         self,
@@ -195,8 +201,10 @@ class DocumentParserRouter:
         source_path: str | None,
         content: str,
         parser: str,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> ParsedBlockDocument:
         file_type = normalize_file_type(document_type)
+        emit_parse_stage(progress_reporter, file_type)
         if file_type in {"srt", "vtt"} or looks_like_transcript(content):
             blocks = parse_transcript_blocks(
                 text=content,
@@ -229,7 +237,9 @@ class DocumentParserRouter:
             high_precision=False,
         )
         quality = mark_text_native_quality(quality)
-        return self._finalize(document_id, blocks, parser or "manual-text", quality, [])
+        result = self._finalize(document_id, blocks, parser or "manual-text", quality, [])
+        emit_parse_completed(progress_reporter, result)
+        return result
 
     def parse_video_source(
         self,
@@ -244,12 +254,14 @@ class DocumentParserRouter:
         filename: str | None = None,
         content_type: str | None = None,
         high_precision: bool = False,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> ParsedBlockDocument:
         """按已保存的视频来源路径解析长视频，避免 Java 再次转发完整文件。"""
         source_filename = filename or title
         file_type = detect_file_type(source_filename, document_type, content_type)
         if file_type not in VIDEO_FILE_TYPES:
             file_type = normalize_file_type(document_type)
+        emit_parse_stage(progress_reporter, "video")
         try:
             blocks, quality, parser, warnings = self._parse_video_source(
                 source_path=source_path,
@@ -263,7 +275,9 @@ class DocumentParserRouter:
             quality = evaluate_parse_quality(QualitySignals(), high_precision)
             parser = "video-source-unavailable"
             warnings = [f"video.source: 视频来源解析失败: {exc}"]
-        return self._finalize(document_id, blocks, parser, quality, warnings)
+        result = self._finalize(document_id, blocks, parser, quality, warnings)
+        emit_parse_completed(progress_reporter, result)
+        return result
 
     def _parse_pdf(
         self,
@@ -728,6 +742,72 @@ def detect_file_type(filename: str, document_type: str | None, content_type: str
     if content_type == "application/pdf":
         return "pdf"
     return "txt"
+
+
+def emit_parse_stage(progress_reporter: RagProgressReporter | None, file_type: str) -> None:
+    if progress_reporter is None:
+        return
+    stage_code = parse_stage_code(file_type)
+    progress_reporter.emit(
+        "parse.route",
+        f"已识别资料类型为 {file_type}，准备进入解析路线",
+        current_step=2,
+        total_steps=8,
+        percent=10,
+        detail=f"解析阶段将使用 {stage_code}",
+    )
+    progress_reporter.emit(
+        stage_code,
+        parse_stage_message(stage_code),
+        current_step=3,
+        total_steps=8,
+        percent=15,
+    )
+
+
+def emit_parse_completed(progress_reporter: RagProgressReporter | None, result: ParsedBlockDocument) -> None:
+    if progress_reporter is None:
+        return
+    progress_reporter.emit(
+        "parse.completed",
+        f"解析完成，得到 {len(result.blocks)} 个 DocumentBlock，解析器：{result.parser}",
+        status="COMPLETED",
+        current_step=3,
+        total_steps=8,
+        percent=25,
+        detail=f"解析状态：{result.status}",
+        parser=result.parser,
+    )
+
+
+def parse_stage_code(file_type: str) -> str:
+    normalized = normalize_file_type(file_type)
+    if normalized == "pdf":
+        return "parse.pdf"
+    if normalized in {"doc", "docx"}:
+        return "parse.docx"
+    if normalized in {"ppt", "pptx"}:
+        return "parse.pptx"
+    if normalized in {"xls", "xlsx"}:
+        return "parse.spreadsheet"
+    if normalized in IMAGE_FILE_TYPES:
+        return "parse.image.ocr"
+    if normalized in VIDEO_FILE_TYPES or normalized == "video":
+        return "parse.video"
+    return "parse.text"
+
+
+def parse_stage_message(stage_code: str) -> str:
+    messages = {
+        "parse.pdf": "正在解析 PDF：优先 MinerU，失败后使用 native/OCR 降级",
+        "parse.docx": "正在解析 Word：提取标题、段落、表格和图片线索",
+        "parse.pptx": "正在解析 PPT：提取幻灯片标题、文本框、表格、图片和备注",
+        "parse.spreadsheet": "正在解析表格：提取 sheet、单元格区域和公式线索",
+        "parse.image.ocr": "正在解析图片：执行 OCR 并生成图片 evidence",
+        "parse.video": "正在处理视频：执行 ASR、关键帧抽取、OCR 和片段摘要",
+        "parse.text": "正在解析文本：识别 Markdown、字幕或普通文本结构",
+    }
+    return messages.get(stage_code, "正在解析资料内容")
 
 
 def normalize_file_type(document_type: str | None) -> str:
@@ -1915,6 +1995,7 @@ def make_block(
 
 
 def normalize_text(text: str) -> str:
+    text = clean_postgres_text(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)

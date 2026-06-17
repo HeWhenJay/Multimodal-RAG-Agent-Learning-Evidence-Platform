@@ -13,8 +13,16 @@ from rag.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.progress import RagProgressReporter
 from rag.rerankers.reranking import rerank_evidences
 from rag.indexes.summary_index import SummaryIndex
+from rag.text_sanitizer import (
+    clean_postgres_text,
+    sanitize_chunks,
+    sanitize_document_blocks,
+    sanitize_for_postgres,
+    sanitize_parse_quality,
+)
 from app.schemas.rag import (
     DocumentBlock,
     Evidence,
@@ -91,8 +99,23 @@ class InMemoryRagStore:
         parse_quality: ParseQuality,
         status: str,
         source_path: str | None = None,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> IndexResponse:
-        metadata = {
+        document_id = clean_postgres_text(document_id)
+        title = clean_postgres_text(title)
+        document_type = clean_postgres_text(document_type)
+        source = clean_postgres_text(source)
+        user_id = clean_postgres_text(user_id)
+        visibility_scope = clean_postgres_text(visibility_scope)
+        language = clean_postgres_text(language)
+        parser = clean_postgres_text(parser)
+        status = clean_postgres_text(status)
+        source_path = clean_postgres_text(source_path) if source_path else source_path
+        if progress_reporter:
+            progress_reporter.emit("sanitize.blocks", "正在清洗解析块正文和元数据", current_step=4, total_steps=8, percent=28)
+        parse_quality = sanitize_parse_quality(parse_quality)
+        blocks = sanitize_document_blocks(blocks)
+        metadata = sanitize_for_postgres({
             "documentId": document_id,
             "title": title,
             "documentType": document_type,
@@ -105,35 +128,89 @@ class InMemoryRagStore:
             "parser": parser,
             "parseStatus": status,
             "parseQuality": parse_quality.model_dump(),
-        }
+        })
         self._remove_document(document_id)
-        chunks = self.chunker.split_blocks(blocks, document_id=document_id, metadata=metadata)
-        summaries = self.summary_index.build(chunks)
-        for chunk in chunks:
+        if progress_reporter:
+            progress_reporter.emit("chunk.recursive", "正在按标题、段落、句子和长度预算执行递归切块", current_step=5, total_steps=8, percent=32)
+        chunks = sanitize_chunks(self.chunker.split_blocks(blocks, document_id=document_id, metadata=metadata))
+        if progress_reporter:
+            progress_reporter.emit(
+                "chunk.recursive",
+                f"当前文件被切分为 {len(chunks)} 块",
+                status="COMPLETED",
+                current_step=5,
+                total_steps=8,
+                current_chunk=0,
+                total_chunks=len(chunks),
+                percent=38,
+            )
+            progress_reporter.emit("summary.index", "正在生成文档摘要和章节摘要索引", current_step=6, total_steps=8, percent=42)
+        summaries = sanitize_for_postgres(self.summary_index.build(chunks))
+        total_chunks = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            if progress_reporter:
+                progress_reporter.emit(
+                    "embedding.chunk",
+                    f"第 {index}/{total_chunks} 块：生成 embedding",
+                    current_step=7,
+                    total_steps=8,
+                    current_chunk=index,
+                    total_chunks=total_chunks,
+                    chunk_id=chunk.chunk_id,
+                    percent=chunk_percent(index, total_chunks, 45, 86),
+                )
             self.chunks[chunk.chunk_id] = chunk
             tokens = tokenize(chunk.text)
             token_counts = Counter(tokens)
             self.term_freqs[chunk.chunk_id] = token_counts
             self.doc_freq.update(set(token_counts))
             self.embeddings[chunk.chunk_id] = embed_text(chunk.text)
+            if progress_reporter:
+                progress_reporter.emit(
+                    "memory.upsert.chunk",
+                    f"第 {index}/{total_chunks} 块：写入内存检索索引",
+                    current_step=8,
+                    total_steps=8,
+                    current_chunk=index,
+                    total_chunks=total_chunks,
+                    chunk_id=chunk.chunk_id,
+                    percent=chunk_percent(index, total_chunks, 48, 92),
+                )
 
         self.documents[document_id] = {
             **metadata,
             "chunkCount": len(chunks),
             "summaries": summaries,
         }
+        final_status = status if chunks else "FAILED"
+        if progress_reporter:
+            progress_reporter.emit(
+                "index.completed" if chunks else "index.failed",
+                f"索引完成：状态 {final_status}，共 {len(chunks)} 个切块",
+                status="COMPLETED" if chunks else "FAILED",
+                current_step=8,
+                total_steps=8,
+                current_chunk=len(chunks),
+                total_chunks=len(chunks),
+                percent=100 if chunks else 0,
+                parser=parser,
+            )
         return IndexResponse(
             documentId=document_id,
             title=title,
-            status=status if chunks else "FAILED",
+            status=final_status,
             chunkCount=len(chunks),
             parser=parser,
             documentSummary=summaries["documentSummary"],
             parseQuality=parse_quality,
+            progressEvents=progress_reporter.events if progress_reporter else [],
         )
 
     def query(self, request: QueryRequest) -> QueryResponse:
+        progress_reporter = RagProgressReporter(document_id="query", persist=False)
+        progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
         expanded_queries = expand_queries(request.question)
+        progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
         filtered_chunks = self._filter_chunks(request.metadataFilter or {})
         ranked_lists: list[list[tuple[str, float]]] = []
         diagnostics: dict[str, int | list[str]] = {
@@ -142,24 +219,31 @@ class InMemoryRagStore:
         }
 
         for query_text in expanded_queries:
+            progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
             ranked_lists.append(self._bm25_search(query_text, filtered_chunks, limit=max(request.topK * 3, 10)))
+            progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=7, percent=45)
             ranked_lists.append(self._vector_search(query_text, filtered_chunks, limit=max(request.topK * 3, 10)))
 
+        progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=7, percent=62)
         fused = reciprocal_rank_fusion(ranked_lists)
         candidates = fused[: max(request.topK * 3, request.topK)]
         candidate_evidences = [
             self._to_evidence(chunk_id, score, retrieval_source="fusion")
             for chunk_id, score in candidates
         ]
+        progress_reporter.emit("query.rerank", "正在对融合候选 evidence 重排", current_step=6, total_steps=7, percent=78)
         reranked = rerank_evidences(request.question, candidate_evidences, request.topK)
         diagnostics.update(reranked.diagnostics())
+        progress_reporter.emit("query.answer", "正在基于 evidence 生成带引用回答", current_step=7, total_steps=7, percent=90)
         generated = generate_grounded_answer(request.question, reranked.evidences)
         diagnostics.update(generated.diagnostics())
+        progress_reporter.emit("query.answer", "RAG 检索问答完成", status="COMPLETED", current_step=7, total_steps=7, percent=100)
         return QueryResponse(
             answer=generated.answer,
             expandedQueries=expanded_queries,
             evidences=reranked.evidences,
             diagnostics=diagnostics,
+            progressEvents=progress_reporter.events,
         )
 
     def overview(self) -> OverviewResponse:
@@ -483,6 +567,12 @@ def reciprocal_rank_fusion(ranked_lists: list[list[tuple[str, float]]], k: int =
         for rank, (chunk_id, _score) in enumerate(ranked, start=1):
             scores[chunk_id] += 1.0 / (k + rank)
     return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def chunk_percent(index: int, total: int, start: int, end: int) -> int:
+    if total <= 0:
+        return start
+    return min(end, start + round(index * (end - start) / total))
 
 
 def build_answer(question: str, evidences: list[Evidence]) -> str:

@@ -1,10 +1,14 @@
 package com.itxiang.evidence.service.Impl;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.entity.LogEvent;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
+import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.RagService;
@@ -12,11 +16,14 @@ import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagProgressVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -39,9 +46,12 @@ import java.util.stream.Stream;
 public class RagServiceImpl implements RagService {
 
     private final LearningMaterialMapper learningMaterialMapper;
+    private final LogEventMapper logEventMapper;
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
     private final ObjectStorageService objectStorageService;
+    private final RagIndexWorker ragIndexWorker;
+    private final ObjectMapper objectMapper;
 
     /**
      * 汇总 Java 资料记录和 Python 向量仓库概览。
@@ -216,36 +226,11 @@ public class RagServiceImpl implements RagService {
 
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
-        try {
-            PythonRagClient.IndexResult result = indexStoredUpload(
-                    material.getId(),
-                    scopedUserId,
-                    material,
-                    file,
-                    Boolean.TRUE.equals(highPrecision)
-            );
-            recordIndexResultAnomalies(material, result);
-            applyIndexResult(material, result);
-            logService.recordRagEvent(
-                    "material",
-                    "index",
-                    "material_index_file_result",
-                    "文件学习资料索引完成",
-                    indexResultContext(material, result)
-            );
-        } catch (Exception e) {
-            log.warn("文件资料解析入库失败: materialId={}, reason={}", material.getId(), e.getMessage());
-            logService.recordRagError(
-                    "material",
-                    "index",
-                    "material_index_file_failed",
-                    resolveRagErrorCode(e),
-                    "文件学习资料索引失败",
-                    e,
-                    errorContext(material, e)
-            );
-            markFailed(material, e.getMessage());
-        }
+        scheduleAfterCommit(() -> ragIndexWorker.indexStoredMaterial(
+                material.getId(),
+                scopedUserId,
+                Boolean.TRUE.equals(highPrecision)
+        ));
         return convertToVO(material);
     }
 
@@ -335,56 +320,11 @@ public class RagServiceImpl implements RagService {
                 startContext
         );
 
-        try {
-            PythonRagClient.IndexResult result;
-            if (isVideoDocumentType(material.getDocumentType())) {
-                result = pythonRagClient.indexVideoSource(
-                        material.getId(),
-                        scopedUserId,
-                        material,
-                        material.getOriginalFilename(),
-                        null,
-                        Boolean.TRUE.equals(highPrecision)
-                );
-            } else {
-                ObjectStorageService.LoadedObject loadedObject = objectStorageService.load(
-                        material.getStorageType(),
-                        material.getOriginalFilePath(),
-                        material.getObjectKey(),
-                        material.getOriginalFilename()
-                );
-                result = pythonRagClient.indexFileBytes(
-                        material.getId(),
-                        scopedUserId,
-                        material,
-                        loadedObject.content(),
-                        loadedObject.filename(),
-                        loadedObject.contentType(),
-                        Boolean.TRUE.equals(highPrecision)
-                );
-            }
-            recordIndexResultAnomalies(material, result);
-            applyIndexResult(material, result);
-            logService.recordRagEvent(
-                    "material",
-                    "reindex",
-                    "material_reindex_result",
-                    "学习资料索引重建完成",
-                    indexResultContext(material, result)
-            );
-        } catch (Exception e) {
-            log.warn("资料重建索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
-            logService.recordRagError(
-                    "material",
-                    "reindex",
-                    "material_reindex_failed",
-                    resolveRagErrorCode(e),
-                    "学习资料重建索引失败",
-                    e,
-                    errorContext(material, e)
-            );
-            markFailed(material, e.getMessage());
-        }
+        scheduleAfterCommit(() -> ragIndexWorker.reindexStoredMaterial(
+                material.getId(),
+                scopedUserId,
+                Boolean.TRUE.equals(highPrecision)
+        ));
         return convertToVO(material);
     }
 
@@ -434,44 +374,11 @@ public class RagServiceImpl implements RagService {
         learningMaterialMapper.insert(material);
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
-        try {
-            PythonRagClient.IndexResult result;
-            if (isVideoDocumentType(documentType)) {
-                result = pythonRagClient.indexVideoSource(
-                        material.getId(),
-                        userId,
-                        material,
-                        filename,
-                        contentType,
-                        Boolean.TRUE.equals(highPrecision)
-                );
-            } else {
-                byte[] content = Files.readAllBytes(mergedPath);
-                result = pythonRagClient.indexFileBytes(
-                        material.getId(),
-                        userId,
-                        material,
-                        content,
-                        filename,
-                        contentType,
-                        Boolean.TRUE.equals(highPrecision)
-                );
-            }
-            recordIndexResultAnomalies(material, result);
-            applyIndexResult(material, result);
-        } catch (Exception e) {
-            log.warn("分片上传资料解析入库失败: materialId={}, reason={}", material.getId(), e.getMessage());
-            logService.recordRagError(
-                    "material",
-                    "index",
-                    "material_chunk_index_failed",
-                    resolveRagErrorCode(e),
-                    "分片上传资料索引失败",
-                    e,
-                    errorContext(material, e)
-            );
-            markFailed(material, e.getMessage());
-        }
+        scheduleAfterCommit(() -> ragIndexWorker.indexStoredMaterial(
+                material.getId(),
+                userId,
+                Boolean.TRUE.equals(highPrecision)
+        ));
         return convertToVO(material);
     }
 
@@ -524,6 +431,7 @@ public class RagServiceImpl implements RagService {
      * 将资料实体转换为前端展示对象。
      */
     private LearningMaterialVO convertToVO(LearningMaterial material) {
+        List<RagProgressVO> progressEvents = progressEvents(material.getId());
         return LearningMaterialVO.builder()
                 .id(material.getId())
                 .title(material.getTitle())
@@ -539,9 +447,87 @@ public class RagServiceImpl implements RagService {
                 .storageType(material.getStorageType())
                 .objectKey(material.getObjectKey())
                 .publicUrl(material.getPublicUrl())
+                .latestProgress(progressEvents.isEmpty() ? null : progressEvents.get(0))
+                .progressEvents(progressEvents)
                 .createdAt(material.getCreatedAt())
                 .updatedAt(material.getUpdatedAt())
                 .build();
+    }
+
+    /**
+     * 查询指定资料最近的 RAG 进度事件。
+     */
+    private List<RagProgressVO> progressEvents(Long materialId) {
+        if (materialId == null) {
+            return List.of();
+        }
+        try {
+            return logEventMapper.findRecentProgressByMaterialId(materialId, 8).stream()
+                    .map(this::toProgressVO)
+                    .toList();
+        } catch (Exception e) {
+            log.debug("读取资料进度事件失败: materialId={}, reason={}", materialId, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * 将日志事件转换为前端进度对象。
+     */
+    private RagProgressVO toProgressVO(LogEvent event) {
+        JsonNode context = parseContext(event.getContextJson());
+        return RagProgressVO.builder()
+                .stageCode(defaultText(text(context, "stageCode"), event.getStage()))
+                .stageLabel(text(context, "stageLabel"))
+                .message(defaultText(text(context, "message"), event.getMessage()))
+                .status(defaultText(text(context, "status"), Boolean.TRUE.equals(event.getSuccess()) ? "RUNNING" : "FAILED"))
+                .currentStep(integer(context, "currentStep"))
+                .totalSteps(integer(context, "totalSteps"))
+                .currentChunk(integer(context, "currentChunk"))
+                .totalChunks(integer(context, "totalChunks"))
+                .chunkId(text(context, "chunkId"))
+                .blockId(text(context, "blockId"))
+                .percent(integer(context, "percent"))
+                .detail(text(context, "detail"))
+                .createdAt(event.getCreatedAt() == null ? null : event.getCreatedAt().toLocalDateTime())
+                .build();
+    }
+
+    /**
+     * 解析进度上下文 JSON。
+     */
+    private JsonNode parseContext(String contextJson) {
+        if (contextJson == null || contextJson.isBlank()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            return objectMapper.readTree(contextJson);
+        } catch (Exception e) {
+            return objectMapper.createObjectNode();
+        }
+    }
+
+    /**
+     * 读取 JSON 文本字段。
+     */
+    private String text(JsonNode node, String fieldName) {
+        JsonNode value = node == null ? null : node.get(fieldName);
+        return value == null || value.isNull() ? null : value.asText();
+    }
+
+    /**
+     * 读取 JSON 整数字段。
+     */
+    private Integer integer(JsonNode node, String fieldName) {
+        JsonNode value = node == null ? null : node.get(fieldName);
+        return value == null || value.isNull() ? null : value.asInt();
+    }
+
+    /**
+     * 为空文本提供默认值。
+     */
+    private String defaultText(String value, String defaultValue) {
+        return value == null || value.isBlank() ? defaultValue : value;
     }
 
     /**
@@ -754,6 +740,22 @@ public class RagServiceImpl implements RagService {
             throw new IllegalArgumentException("登录状态已失效");
         }
         return userId.trim();
+    }
+
+    /**
+     * 在当前事务提交后执行后台动作，确保异步线程能读取到资料记录。
+     */
+    private void scheduleAfterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    action.run();
+                }
+            });
+            return;
+        }
+        action.run();
     }
 
     /**

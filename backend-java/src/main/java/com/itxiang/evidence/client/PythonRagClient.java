@@ -7,6 +7,7 @@ import com.itxiang.evidence.dto.JdAnalysisRequestDTO;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.vo.RagProgressVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.extern.slf4j.Slf4j;
@@ -174,6 +175,7 @@ public class PythonRagClient {
                 .expandedQueries(readTextArray(root.get("expandedQueries")))
                 .evidences(evidences)
                 .diagnostics(readObjectMap(root.get("diagnostics")))
+                .progressEvents(readProgressVOs(root.get("progressEvents")))
                 .build();
     }
 
@@ -295,7 +297,8 @@ public class PythonRagClient {
                 text(root, "parser"),
                 text(root, "documentSummary"),
                 root.path("chunkCount").asInt(0),
-                readParseQualityMessages(root)
+                readParseQualityMessages(root),
+                readProgressEvents(root.get("progressEvents"))
         );
     }
 
@@ -305,6 +308,55 @@ public class PythonRagClient {
     private List<String> readParseQualityMessages(JsonNode root) {
         JsonNode messages = root == null ? null : root.path("parseQuality").path("messages");
         return readTextArray(messages);
+    }
+
+    /**
+     * 读取 Python 返回的 RAG 进度事件。
+     */
+    private List<ProgressResult> readProgressEvents(JsonNode node) {
+        List<ProgressResult> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            result.add(new ProgressResult(
+                    text(item, "stageCode"),
+                    text(item, "stageLabel"),
+                    text(item, "message"),
+                    text(item, "status"),
+                    nullableInt(item, "currentStep"),
+                    nullableInt(item, "totalSteps"),
+                    nullableInt(item, "currentChunk"),
+                    nullableInt(item, "totalChunks"),
+                    text(item, "chunkId"),
+                    text(item, "blockId"),
+                    nullableInt(item, "percent"),
+                    text(item, "detail")
+            ));
+        }
+        return result;
+    }
+
+    /**
+     * 读取查询接口返回的 RAG 阶段事件。
+     */
+    private List<RagProgressVO> readProgressVOs(JsonNode node) {
+        return readProgressEvents(node).stream()
+                .map(item -> RagProgressVO.builder()
+                        .stageCode(item.stageCode())
+                        .stageLabel(item.stageLabel())
+                        .message(item.message())
+                        .status(item.status())
+                        .currentStep(item.currentStep())
+                        .totalSteps(item.totalSteps())
+                        .currentChunk(item.currentChunk())
+                        .totalChunks(item.totalChunks())
+                        .chunkId(item.chunkId())
+                        .blockId(item.blockId())
+                        .percent(item.percent())
+                        .detail(item.detail())
+                        .build())
+                .toList();
     }
 
     /**
@@ -466,7 +518,27 @@ public class PythonRagClient {
             String parser,
             String documentSummary,
             Integer chunkCount,
-            List<String> parseQualityMessages
+            List<String> parseQualityMessages,
+            List<ProgressResult> progressEvents
+    ) {
+    }
+
+    /**
+     * Python 返回的单条 RAG 进度事件。
+     */
+    public record ProgressResult(
+            String stageCode,
+            String stageLabel,
+            String message,
+            String status,
+            Integer currentStep,
+            Integer totalSteps,
+            Integer currentChunk,
+            Integer totalChunks,
+            String chunkId,
+            String blockId,
+            Integer percent,
+            String detail
     ) {
     }
 

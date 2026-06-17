@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离和 1024 维百炼 embedding。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding 和 RAG 进度事件。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
 
 边界约定：
 
@@ -12,6 +12,7 @@
 - Java 负责资料记录、文件上传、阿里 OSS 对象存储、原始文件路径、解析状态、登录用户边界、统一 `Result<T>` 响应和调用 Python。
 - Python FastAPI 负责多格式解析路由、原始视频处理、MinerU/OCR 降级、`DocumentBlock` 统一模型、解析质量评分、递归切块、BM25、百炼 `text-embedding-v4` 1024 维向量索引、RRF/RAG-Fusion、百炼 rerank、百炼 LLM 回答生成和 evidence 引用。
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
+- RAG 进度事件复用 `log_event` 表，`event_type=rag_progress`，不新增独立进度表；Git 提交时只维护 `infra/sql/init.sql`，本地增量迁移目录不作为必须提交内容。
 
 鉴权约定：
 
@@ -31,6 +32,64 @@
 | `REINDEXING` | 资料重新解析/重新索引中 | 重建索引 |
 
 `PARTIAL` 不是接口失败。Java 应保存该状态并返回资料摘要、切块数和可检索 evidence；前端应提示“部分完成”，允许用户继续检索。
+
+## RAG 进度事件
+
+RAG 进度事件按现有代码链路拆分，不使用临时示例阶段名。前端展示时优先读取 `LearningMaterialVO.latestProgress`，需要历史时读取 `progressEvents`。
+
+索引链路阶段：
+
+| 阶段码 | 含义 | 典型展示 |
+| --- | --- | --- |
+| `index.request` | Python 已接收索引请求 | 已接收索引任务 |
+| `parse.route` | 根据文件名、documentType 和 contentType 选择解析路线 | 已识别资料类型 |
+| `parse.pdf` | PDF 解析，优先 MinerU，失败后 native/OCR 降级 | 正在解析 PDF |
+| `parse.docx` | Word 原生解析，必要时 LibreOffice PDF 补充 | 正在解析 Word |
+| `parse.pptx` | PPT 原生解析，必要时 LibreOffice PDF 补充 | 正在解析 PPT |
+| `parse.spreadsheet` | openpyxl/pandas 解析表格资料 | 正在解析表格 |
+| `parse.image.ocr` | 图片 OCR 解析 | 正在进行图片 OCR |
+| `parse.video` | 视频处理入口，包含 ASR、关键帧、OCR 和片段摘要 | 正在处理视频 |
+| `parse.text` | Markdown、字幕或普通文本结构解析 | 正在解析文本 |
+| `parse.completed` | 解析完成，已得到 DocumentBlock 和解析质量 | 解析完成 |
+| `sanitize.blocks` | 入库前清洗正文、元数据和 PostgreSQL 不支持字符 | 正在清洗文本 |
+| `chunk.recursive` | 执行递归切块 | 当前文件被切分为 xx 块 |
+| `summary.index` | 生成文档摘要和章节摘要 | 正在生成摘要索引 |
+| `embedding.chunk` | 对当前 chunk 生成 embedding | 第 x/y 块：生成 embedding |
+| `vector.upsert.chunk` | 当前 chunk 写入 BM25 词频、metadata 和 pgvector | 第 x/y 块：写入向量数据库 |
+| `memory.upsert.chunk` | 本地内存检索兜底模式写入 chunk、BM25 词频和 embedding | 第 x/y 块：写入内存检索索引 |
+| `index.completed` | 文档、摘要、切块和向量索引写入完成 | 索引完成 |
+| `index.failed` | 索引过程失败 | 索引失败 |
+
+查询链路阶段：
+
+| 阶段码 | 含义 |
+| --- | --- |
+| `query.expand` | Multi-Query 生成查询变体 |
+| `query.filter` | 根据 userId、visibilityScope、documentType 等过滤候选块 |
+| `query.bm25` | BM25 关键词召回 |
+| `query.vector` | 向量召回 |
+| `query.fusion` | RRF/RAG-Fusion 排序融合 |
+| `query.rerank` | rerank 重排 |
+| `query.answer` | 生成带 evidence 引用的回答 |
+
+`RagProgressVO`：
+
+```json
+{
+  "stageCode": "embedding.chunk",
+  "stageLabel": "生成 embedding",
+  "message": "第 12/80 块：生成 embedding",
+  "status": "RUNNING",
+  "currentStep": 7,
+  "totalSteps": 9,
+  "currentChunk": 12,
+  "totalChunks": 80,
+  "chunkId": "material-1-11",
+  "percent": 42,
+  "detail": "BM25 词频已准备，正在调用 embedding 模型",
+  "createdAt": "2026-06-17T10:01:12"
+}
+```
 
 ## Java 对外接口
 
@@ -69,6 +128,14 @@
   "storageType": "oss",
   "objectKey": "learning-evidence/1/pdf/20260617/uuid-系统设计笔记.pdf",
   "publicUrl": "https://example-cdn/learning-evidence/1/pdf/20260617/uuid-系统设计笔记.pdf",
+  "latestProgress": {
+    "stageCode": "vector.upsert.chunk",
+    "message": "第 12/18 块：写入向量数据库",
+    "currentChunk": 12,
+    "totalChunks": 18,
+    "percent": 78
+  },
+  "progressEvents": [],
   "createdAt": "2026-06-16T10:00:00",
   "updatedAt": "2026-06-16T10:01:12"
 }
@@ -114,10 +181,12 @@
 
 1. Java 按 `evidence.storage.provider` 保存原始文件。生产建议使用 `oss` 上传到阿里 OSS；本地测试默认使用 `local` 写入 `uploads/` 忽略目录。
 2. Java 创建 `learning_material` 记录，初始状态 `PENDING`。
-3. Java 调用 Python `/internal/rag/documents/index-file`，传入原始路径和高精度参数。
-4. Python 按格式选择原生解析器；视频文件会先尝试 FFmpeg 抽音频、百炼 ASR 生成带时间戳字幕，再做候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要；其他复杂版式必要时补跑 PDF + MinerU/OCR。
-5. Python 返回 `READY/PARTIAL/FAILED`、切块数、解析器和摘要。
-6. Java 回写资料状态并返回统一响应。
+3. Java 将资料状态更新为 `PARSING` 后立即返回资料记录，前端开始轮询 `/api/rag/materials/{id}` 或资料列表。
+4. Java 后台调用 Python `/internal/rag/documents/index-file` 或 `/internal/rag/documents/index-video-source`，传入原始路径和高精度参数。
+5. Python 按格式选择原生解析器；视频文件会先尝试 FFmpeg 抽音频、百炼 ASR 生成带时间戳字幕，再做候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要；其他复杂版式必要时补跑 PDF + MinerU/OCR。
+6. Python 在解析、递归切块、摘要、embedding 和 pgvector 写入阶段持续写入 `rag_progress` 事件。
+7. Python 返回 `READY/PARTIAL/FAILED`、切块数、解析器、摘要和末次进度事件。
+8. Java 回写资料最终状态；前端轮询到 `READY/PARTIAL/FAILED` 后停止展示运行中进度。
 
 ### 分片上传并解析长视频
 
@@ -132,7 +201,7 @@
 | 分片约束 | 前端默认 20MB 一片，后端按 `uploadId` 暂存到 `uploads/chunks` |
 | 响应 | `Result<MaterialUploadChunkVO>` |
 
-`chunkIndex` 从 `0` 开始。首片可以不传 `uploadId`，Java 会生成并返回；后续分片必须沿用同一个 `uploadId`。当 `receivedChunks < totalChunks` 时，响应中的 `completed=false`，`material=null`；全部分片到齐后 Java 合并文件、写入对象存储、创建 `learning_material`，再触发索引并返回 `completed=true` 和 `material`。
+`chunkIndex` 从 `0` 开始。首片可以不传 `uploadId`，Java 会生成并返回；后续分片必须沿用同一个 `uploadId`。当 `receivedChunks < totalChunks` 时，响应中的 `completed=false`，`material=null`；全部分片到齐后 Java 合并文件、写入对象存储、创建 `learning_material`，将状态置为 `PARSING` 并触发后台索引，随后返回 `completed=true` 和 `material`。前端继续轮询资料状态读取 Python 写入的 `rag_progress`。
 
 响应示例：
 
@@ -387,7 +456,18 @@ Python `IndexResponse`：
       "video.audio.extract: FFmpeg 提取音频失败: ...",
       "video.frame_ocr[2]: Bailian OCR returned empty text"
     ]
-  }
+  },
+  "progressEvents": [
+    {
+      "stageCode": "chunk.recursive",
+      "stageLabel": "递归切块",
+      "message": "当前文件被切分为 18 块",
+      "status": "COMPLETED",
+      "currentChunk": 0,
+      "totalChunks": 18,
+      "percent": 35
+    }
+  ]
 }
 ```
 
@@ -568,7 +648,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 原始文件
 -> 解析路由
 -> DocumentBlock
--> 内容清洗
+-> 内容清洗（删除 PostgreSQL 不支持的 NUL/0x00 字符，覆盖正文、章节名、来源路径和 metadata）
 -> 递归切块
 -> 文档/章节/表格/图片摘要
 -> BM25 索引

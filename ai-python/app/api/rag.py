@@ -2,6 +2,7 @@
 
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
+from rag.progress import RagProgressReporter
 from rag.retrievers.retrieval import create_rag_store
 from app.schemas.rag import (
     EvidenceListResponse,
@@ -31,6 +32,8 @@ store = create_rag_store()
 def index_text(request: IndexTextRequest) -> IndexResponse:
     if not request.content.strip():
         raise HTTPException(status_code=400, detail="content is empty")
+    progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
+    progress.emit("index.request", "已接收文本资料索引请求", current_step=1, total_steps=8, percent=5)
     parsed = parser_router.parse_text(
         document_id=request.documentId,
         title=request.title,
@@ -38,6 +41,7 @@ def index_text(request: IndexTextRequest) -> IndexResponse:
         source_path=request.sourcePath,
         content=request.content,
         parser=request.parser,
+        progress_reporter=progress,
     )
     return store.index_blocks(
         document_id=request.documentId,
@@ -52,6 +56,7 @@ def index_text(request: IndexTextRequest) -> IndexResponse:
         parse_quality=parsed.parse_quality,
         status=parsed.status,
         source_path=request.sourcePath,
+        progress_reporter=progress,
     )
 
 
@@ -59,6 +64,8 @@ def index_text(request: IndexTextRequest) -> IndexResponse:
 def index_video_source(request: IndexVideoSourceRequest) -> IndexResponse:
     if not request.sourcePath.strip():
         raise HTTPException(status_code=400, detail="sourcePath is empty")
+    progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
+    progress.emit("index.request", "已接收视频源索引请求", current_step=1, total_steps=8, percent=5)
     parsed = parser_router.parse_video_source(
         document_id=request.documentId,
         title=request.title,
@@ -70,6 +77,7 @@ def index_video_source(request: IndexVideoSourceRequest) -> IndexResponse:
         filename=request.filename,
         content_type=request.contentType,
         high_precision=request.highPrecision,
+        progress_reporter=progress,
     )
     return store.index_blocks(
         document_id=request.documentId,
@@ -84,6 +92,7 @@ def index_video_source(request: IndexVideoSourceRequest) -> IndexResponse:
         parse_quality=parsed.parse_quality,
         status=parsed.status,
         source_path=request.sourcePath,
+        progress_reporter=progress,
     )
 
 
@@ -100,6 +109,8 @@ async def index_file(
     high_precision: bool = Form(False),
 ) -> IndexResponse:
     content = await file.read()
+    progress = RagProgressReporter(document_id=document_id, user_id=user_id)
+    progress.emit("index.request", "已接收上传文件索引请求", current_step=1, total_steps=8, percent=5)
     parsed = parser_router.parse_bytes(
         content=content,
         filename=file.filename or title,
@@ -109,6 +120,7 @@ async def index_file(
         content_type=file.content_type,
         source_path=source_path,
         high_precision=high_precision,
+        progress_reporter=progress,
     )
     return store.index_blocks(
         document_id=document_id,
@@ -123,6 +135,7 @@ async def index_file(
         parse_quality=parsed.parse_quality,
         status=parsed.status,
         source_path=source_path,
+        progress_reporter=progress,
     )
 
 

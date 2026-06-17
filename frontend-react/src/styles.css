@@ -974,6 +974,50 @@ input:disabled {
   gap: 6px;
 }
 
+.material-progress {
+  width: min(560px, 100%);
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.material-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+}
+
+.material-progress-head span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.material-progress-head strong {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--primary);
+}
+
+.material-progress-bar {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5e7eb;
+}
+
+.material-progress-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2563eb, #0f766e);
+  transition: width 180ms ease;
+}
+
 .empty-state {
   padding: 28px;
   text-align: center;

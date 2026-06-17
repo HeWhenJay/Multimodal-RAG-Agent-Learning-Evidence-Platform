@@ -21,6 +21,11 @@ public interface LogEventMapper {
     List<LogEvent> findRecent(@Param("limit") Integer limit);
 
     /**
+     * 查询指定资料最近的 RAG 进度事件。
+     */
+    List<LogEvent> findRecentProgressByMaterialId(@Param("materialId") Long materialId, @Param("limit") Integer limit);
+
+    /**
      * 统计指定时间后的业务事件数量。
      */
     Long countSince(@Param("startTime") LocalDateTime startTime);

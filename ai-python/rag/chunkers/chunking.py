@@ -4,6 +4,7 @@ import re
 from dataclasses import replace
 
 from rag.models import Chunk
+from rag.text_sanitizer import clean_postgres_text, sanitize_for_postgres
 from app.schemas.rag import DocumentBlock
 
 
@@ -17,11 +18,11 @@ class RecursiveChunker:
         self.separators = ["\n## ", "\n### ", "\n\n", "\n", "\u3002", "\uff1b", ";", ".", "\uff0c", ",", " "]
 
     def split(self, text: str, document_id: str, metadata: dict | None = None) -> list[Chunk]:
-        metadata = metadata or {}
+        metadata = sanitize_for_postgres(metadata or {})
         cleaned = self._normalize(text)
         raw_chunks = self._split_recursive(cleaned, self.separators)
         chunks: list[Chunk] = []
-        current_section = metadata.get("sectionName") or "\u5168\u6587"
+        current_section = clean_postgres_text(str(metadata.get("sectionName") or "\u5168\u6587"))
         for index, raw in enumerate(raw_chunks):
             chunk_text = raw.strip()
             if not chunk_text:
@@ -29,11 +30,11 @@ class RecursiveChunker:
             heading = self._detect_heading(chunk_text)
             if heading:
                 current_section = heading
-            chunk_metadata = {
+            chunk_metadata = sanitize_for_postgres({
                 **metadata,
                 "chunkPosition": index,
                 "sectionName": current_section,
-            }
+            })
             chunks.append(
                 Chunk(
                     chunk_id=f"{document_id}-{index}",
@@ -50,9 +51,9 @@ class RecursiveChunker:
         document_id: str,
         metadata: dict | None = None,
     ) -> list[Chunk]:
-        metadata = metadata or {}
+        metadata = sanitize_for_postgres(metadata or {})
         chunks: list[Chunk] = []
-        current_section = metadata.get("sectionName") or "全文"
+        current_section = clean_postgres_text(str(metadata.get("sectionName") or "全文"))
         position = 0
 
         for block in blocks:
@@ -61,15 +62,15 @@ class RecursiveChunker:
                 continue
 
             if block.sectionTitle:
-                current_section = block.sectionTitle
+                current_section = clean_postgres_text(block.sectionTitle)
             if block.blockType == "heading":
                 current_section = block_text.strip("# :：") or current_section
 
-            block_metadata = {
+            block_metadata = sanitize_for_postgres({
                 **metadata,
                 **document_block_metadata(block),
                 "sectionName": current_section,
-            }
+            })
             if block.blockType in ATOMIC_BLOCK_TYPES:
                 chunks.append(
                     Chunk(
@@ -106,6 +107,7 @@ class RecursiveChunker:
         return chunks
 
     def _normalize(self, text: str) -> str:
+        text = clean_postgres_text(text)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)

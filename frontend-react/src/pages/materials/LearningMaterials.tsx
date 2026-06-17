@@ -30,6 +30,16 @@ export function LearningMaterials() {
     return () => window.removeEventListener(MATERIAL_UPLOADED_EVENT, handleUploaded);
   }, [refresh]);
 
+  useEffect(() => {
+    if (!materials.some((item) => isProcessingStatus(item.status))) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [materials, refresh]);
+
   // 提交文本资料并等待索引结果。
   async function submitText() {
     if (!title.trim() || !content.trim()) {
@@ -139,6 +149,25 @@ export function LearningMaterials() {
                 <span>{formatDocumentType(item.documentType)} · {formatSource(item.source)} · {formatStorage(item.storageType)} · {item.parser || '等待解析'}</span>
                 <p>{item.documentSummary || '等待索引摘要'}</p>
                 {(item.publicUrl || item.originalFilePath || item.originalFilename) && <p>{item.publicUrl || item.originalFilePath || item.originalFilename}</p>}
+                {item.latestProgress && (
+                  <div className="material-progress">
+                    <div className="material-progress-head">
+                      <span>{formatProgressTitle(item)}</span>
+                      <strong>{progressPercent(item)}%</strong>
+                    </div>
+                    <div
+                      className="material-progress-bar"
+                      role="progressbar"
+                      aria-label="RAG 处理进度"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={progressPercent(item)}
+                    >
+                      <span style={{ width: `${progressPercent(item)}%` }} />
+                    </div>
+                    {item.latestProgress.detail && <p>{item.latestProgress.detail}</p>}
+                  </div>
+                )}
               </div>
               <div className="material-meta">
                 <span className={`status-pill ${item.status === 'READY' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
@@ -161,6 +190,11 @@ export function LearningMaterials() {
       </section>
     </div>
   );
+}
+
+// 判断资料是否仍处于后台解析或重建中。
+function isProcessingStatus(status: string) {
+  return ['PENDING', 'PARSING', 'REINDEXING'].includes(status);
 }
 
 // 将资料类型转换为中文展示文本。
@@ -193,4 +227,26 @@ function formatStatus(status: string) {
   if (status === 'REINDEXING') return '重建索引';
   if (status === 'FAILED') return '解析失败';
   return status;
+}
+
+// 生成资料行中的当前进度标题。
+function formatProgressTitle(item: LearningMaterial) {
+  const progress = item.latestProgress;
+  if (!progress) return '等待 RAG 进度';
+  const message = progress.message || progress.stageLabel || progress.stageCode;
+  const chunkLabel = progress.currentChunk && progress.totalChunks
+    ? `第 ${progress.currentChunk}/${progress.totalChunks} 块`
+    : '';
+  return `${message}${chunkLabel && !message.includes(chunkLabel) ? ` · ${chunkLabel}` : ''}`;
+}
+
+// 读取后端进度百分比，缺省时按状态兜底。
+function progressPercent(item: LearningMaterial) {
+  const value = item.latestProgress?.percent;
+  if (typeof value === 'number') {
+    return Math.max(0, Math.min(100, Math.round(value)));
+  }
+  if (item.status === 'READY' || item.status === 'PARTIAL') return 100;
+  if (item.status === 'FAILED') return 0;
+  return 12;
 }

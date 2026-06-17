@@ -1,11 +1,14 @@
 package com.itxiang.evidence;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
+import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
+import com.itxiang.evidence.service.Impl.RagIndexWorker;
 import com.itxiang.evidence.service.Impl.RagServiceImpl;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import org.junit.jupiter.api.Test;
@@ -34,6 +37,9 @@ class RagServiceImplTests {
     private LearningMaterialMapper learningMaterialMapper;
 
     @Mock
+    private LogEventMapper logEventMapper;
+
+    @Mock
     private PythonRagClient pythonRagClient;
 
     @Mock
@@ -41,6 +47,12 @@ class RagServiceImplTests {
 
     @Mock
     private ObjectStorageService objectStorageService;
+
+    @Mock
+    private RagIndexWorker ragIndexWorker;
+
+    @Mock
+    private ObjectMapper objectMapper;
 
     @InjectMocks
     private RagServiceImpl ragService;
@@ -66,7 +78,8 @@ class RagServiceImplTests {
                         "video+bailian-asr+keyframe-ocr",
                         "部分完成",
                         3,
-                        List.of("video.frame_ocr[1]: Bailian OCR returned empty text")
+                        List.of("video.frame_ocr[1]: Bailian OCR returned empty text"),
+                        List.of()
                 )
         );
 

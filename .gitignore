@@ -49,3 +49,6 @@ tmp/
 *.mkv
 *.wav
 *.mp3
+
+# Local database migration drafts
+infra/sql/alter-database/

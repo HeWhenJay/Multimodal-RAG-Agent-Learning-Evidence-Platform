@@ -37,7 +37,7 @@ export function useMaterialUpload({ highPrecision = false, onUploaded }: UseMate
       const material = shouldUseChunkUpload(file)
         ? await uploadVideoInChunks(file, highPrecision, setUploadMessage)
         : await uploadMaterial(file, highPrecision);
-      setUploadMessage(`已上传并索引：${file.name}`);
+      setUploadMessage(`已上传，正在后台解析：${file.name}`);
       publishMaterialUploaded(material);
       await onUploaded?.(material);
       return material;

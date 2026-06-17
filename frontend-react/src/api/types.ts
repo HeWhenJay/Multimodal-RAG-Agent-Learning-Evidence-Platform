@@ -26,6 +26,22 @@ export interface RagOverview {
   lastIndexedTitle?: string | null;
 }
 
+export interface RagProgress {
+  stageCode: string;
+  stageLabel?: string | null;
+  message: string;
+  status?: string | null;
+  currentStep?: number | null;
+  totalSteps?: number | null;
+  currentChunk?: number | null;
+  totalChunks?: number | null;
+  chunkId?: string | null;
+  blockId?: string | null;
+  percent?: number | null;
+  detail?: string | null;
+  createdAt?: string | null;
+}
+
 export interface LearningMaterial {
   id: number;
   title: string;
@@ -41,6 +57,8 @@ export interface LearningMaterial {
   storageType?: string | null;
   objectKey?: string | null;
   publicUrl?: string | null;
+  latestProgress?: RagProgress | null;
+  progressEvents?: RagProgress[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -86,6 +104,7 @@ export interface RagQueryResult {
   expandedQueries: string[];
   evidences: RagEvidence[];
   diagnostics?: Record<string, unknown>;
+  progressEvents?: RagProgress[];
 }
 
 export interface VideoSlice {

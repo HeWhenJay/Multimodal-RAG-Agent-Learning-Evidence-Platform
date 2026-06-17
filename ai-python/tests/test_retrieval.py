@@ -7,6 +7,20 @@ from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from app.schemas.rag import DocumentBlock, IndexTextRequest, QueryRequest
 
 
+def assert_no_postgres_nul(value):
+    """递归确认测试数据中没有真实 NUL 字符。"""
+    nul = chr(0)
+    if isinstance(value, str):
+        assert nul not in value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            assert_no_postgres_nul(key)
+            assert_no_postgres_nul(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            assert_no_postgres_nul(item)
+
+
 def test_rag_store_indexes_and_queries_with_evidence():
     store = InMemoryRagStore()
     store.index_text(
@@ -217,3 +231,43 @@ def test_video_metadata_filter_matches_promoted_block_metadata():
     assert response.evidences
     assert response.evidences[0].startTime == "00:00:10"
     assert response.evidences[0].playbackUrl == "https://example.com/rag-course.mp4#t=10"
+
+
+def test_index_blocks_removes_postgres_nul_before_storage():
+    nul = chr(0)
+    store = InMemoryRagStore()
+    block = DocumentBlock(
+        documentId="doc-nul",
+        blockId="doc-nul-block",
+        fileType="pptx",
+        blockType="text",
+        sectionTitle=f"NaiveRAG{nul}流程",
+        contentText=f"PPTX 解析文本中可能夹带{nul}空字符。",
+        parseEngine=f"unit-test{nul}",
+        sourceTitle=f"课程{nul}PPT",
+        sourcePath=f"uploads/rag/course{nul}.pptx",
+        metadata={"slideTitle": f"标题{nul}", "nested": {"note": f"备注{nul}"}},
+    )
+    store.index_blocks(
+        document_id="doc-nul",
+        title=f"课程{nul}PPT",
+        document_type="pptx",
+        source="unit-test",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser=f"unit-test{nul}",
+        blocks=[block],
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=len(block.contentText))).model_copy(
+            update={"messages": [f"warning{nul}"]}
+        ),
+        status="READY",
+        source_path=f"uploads/rag/course{nul}.pptx",
+    )
+
+    document = store.documents["doc-nul"]
+    chunk = next(iter(store.chunks.values()))
+
+    assert nul not in chunk.text
+    assert_no_postgres_nul(document)
+    assert_no_postgres_nul(chunk.metadata)

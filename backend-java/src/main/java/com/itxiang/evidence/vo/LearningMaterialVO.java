@@ -4,6 +4,7 @@ import lombok.Builder;
 import lombok.Data;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 @Data
 @Builder
@@ -23,6 +24,8 @@ public class LearningMaterialVO {
     private String storageType;
     private String objectKey;
     private String publicUrl;
+    private RagProgressVO latestProgress;
+    private List<RagProgressVO> progressEvents;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

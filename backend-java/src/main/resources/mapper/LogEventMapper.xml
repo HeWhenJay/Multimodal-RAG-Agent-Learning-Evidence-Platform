@@ -118,6 +118,41 @@
         LIMIT #{limit}
     </select>
 
+    <select id="findRecentProgressByMaterialId" resultMap="LogEventResultMap">
+        SELECT
+            id,
+            trace_id,
+            session_id,
+            user_id,
+            source,
+            domain,
+            level,
+            module,
+            stage,
+            event_type,
+            action,
+            message,
+            route,
+            http_method,
+            request_path,
+            status_code,
+            success,
+            duration_ms,
+            material_id,
+            document_id,
+            parser,
+            client_time,
+            server_time,
+            context_json,
+            created_at
+        FROM log_event
+        WHERE domain = 'rag'
+          AND event_type = 'rag_progress'
+          AND material_id = #{materialId}
+        ORDER BY created_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
     <select id="countSince" resultType="long">
         SELECT COUNT(1)
         FROM log_event

@@ -14,4 +14,5 @@ public class RagQueryVO {
     private List<String> expandedQueries;
     private List<RagEvidenceVO> evidences;
     private Map<String, Object> diagnostics;
+    private List<RagProgressVO> progressEvents;
 }
