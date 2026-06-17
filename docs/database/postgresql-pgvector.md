@@ -26,12 +26,12 @@
 - RAG 元数据 GIN 索引
 - pgvector HNSW 余弦索引
 
-默认管理员账号：`admin@evidence.ai / 123456`。密码以 PBKDF2 哈希种子写入，不保存明文。
+默认管理员账号：`admin / 123456`。密码以 PBKDF2 哈希种子写入，不保存明文。
 
 在 PowerShell 中执行初始化：
 
 ```powershell
-Get-Content infra\sql\init.sql |
+Get-Content infra\sql\init.sql -Encoding UTF8 |
   docker exec -i -e PGPASSWORD=123456 pgvector-postgres `
   psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 ```

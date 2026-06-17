@@ -95,7 +95,7 @@ class RagErrorHandlingTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
-                                  "account": "admin@evidence.ai",
+                                  "account": "admin",
                                   "password": "123456",
                                   "remember": false
                                 }

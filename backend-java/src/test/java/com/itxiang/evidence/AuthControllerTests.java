@@ -32,7 +32,7 @@ class AuthControllerTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
-                                  "account": "admin@evidence.ai",
+                                  "account": "admin",
                                   "password": "123456",
                                   "remember": true
                                 }
@@ -40,7 +40,7 @@ class AuthControllerTests {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(1))
                 .andExpect(jsonPath("$.data.token", not(blankOrNullString())))
-                .andExpect(jsonPath("$.data.user.account").value("admin@evidence.ai"))
+                .andExpect(jsonPath("$.data.user.account").value("admin"))
                 .andReturn();
 
         JsonNode root = objectMapper.readTree(loginResult.getResponse().getContentAsString());
@@ -50,7 +50,7 @@ class AuthControllerTests {
                         .header("Authorization", "Bearer " + token))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.code").value(1))
-                .andExpect(jsonPath("$.data.account").value("admin@evidence.ai"));
+                .andExpect(jsonPath("$.data.account").value("admin"));
 
         mockMvc.perform(post("/api/auth/logout")
                         .header("Authorization", "Bearer " + token))
@@ -69,7 +69,7 @@ class AuthControllerTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
-                                  "account": "admin@evidence.ai",
+                                  "account": "admin",
                                   "password": "bad-password",
                                   "remember": false
                                 }

@@ -11,7 +11,7 @@ MERGE INTO app_user (
 )
 KEY(account)
 VALUES (
-    'admin@evidence.ai',
+    'admin',
     'admin@evidence.ai',
     '系统管理员',
     'ADMIN',

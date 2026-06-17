@@ -4,7 +4,23 @@ CREATE SCHEMA IF NOT EXISTS learning_evidence AUTHORIZATION postgres;
 GRANT USAGE, CREATE ON SCHEMA learning_evidence TO postgres;
 SET search_path TO learning_evidence, public;
 
-CREATE TABLE IF NOT EXISTS learning_evidence.app_user (
+-- 初始建表脚本会重建业务表，仅保留默认管理员种子数据。
+DROP TABLE IF EXISTS learning_evidence.rag_chunk;
+DROP TABLE IF EXISTS learning_evidence.rag_document;
+DROP TABLE IF EXISTS learning_evidence.jd_learning_plan_item;
+DROP TABLE IF EXISTS learning_evidence.jd_analysis_skill;
+DROP TABLE IF EXISTS learning_evidence.jd_analysis_report;
+DROP TABLE IF EXISTS learning_evidence.resume_evidence_alignment;
+DROP TABLE IF EXISTS learning_evidence.video_slice;
+DROP TABLE IF EXISTS learning_evidence.log_error;
+DROP TABLE IF EXISTS learning_evidence.log_event;
+DROP TABLE IF EXISTS learning_evidence.learning_material;
+DROP TABLE IF EXISTS learning_evidence.auth_login_record;
+DROP TABLE IF EXISTS learning_evidence.auth_session;
+DROP TABLE IF EXISTS learning_evidence.system_setting;
+DROP TABLE IF EXISTS learning_evidence.app_user;
+
+CREATE TABLE learning_evidence.app_user (
     id BIGSERIAL PRIMARY KEY,
     account VARCHAR(120) NOT NULL,
     email VARCHAR(160),
@@ -21,7 +37,7 @@ CREATE TABLE IF NOT EXISTS learning_evidence.app_user (
     CONSTRAINT uk_app_user_account UNIQUE (account)
 );
 
-CREATE INDEX IF NOT EXISTS idx_app_user_status
+CREATE INDEX idx_app_user_status
     ON learning_evidence.app_user(status);
 
 INSERT INTO learning_evidence.app_user (
@@ -36,7 +52,7 @@ INSERT INTO learning_evidence.app_user (
     status
 )
 VALUES (
-    'admin@evidence.ai',
+    'admin',
     'admin@evidence.ai',
     '系统管理员',
     'ADMIN',
@@ -57,7 +73,7 @@ ON CONFLICT (account) DO UPDATE SET
     status = EXCLUDED.status,
     updated_at = CURRENT_TIMESTAMP;
 
-CREATE TABLE IF NOT EXISTS learning_evidence.auth_session (
+CREATE TABLE learning_evidence.auth_session (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES learning_evidence.app_user(id) ON DELETE CASCADE,
     token_hash VARCHAR(128) NOT NULL,
@@ -69,13 +85,13 @@ CREATE TABLE IF NOT EXISTS learning_evidence.auth_session (
     CONSTRAINT uk_auth_session_token_hash UNIQUE (token_hash)
 );
 
-CREATE INDEX IF NOT EXISTS idx_auth_session_user_id
+CREATE INDEX idx_auth_session_user_id
     ON learning_evidence.auth_session(user_id);
 
-CREATE INDEX IF NOT EXISTS idx_auth_session_expires_at
+CREATE INDEX idx_auth_session_expires_at
     ON learning_evidence.auth_session(expires_at);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.auth_login_record (
+CREATE TABLE learning_evidence.auth_login_record (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES learning_evidence.app_user(id) ON DELETE SET NULL,
     account VARCHAR(120) NOT NULL,
@@ -86,13 +102,13 @@ CREATE TABLE IF NOT EXISTS learning_evidence.auth_login_record (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_auth_login_record_account
+CREATE INDEX idx_auth_login_record_account
     ON learning_evidence.auth_login_record(account);
 
-CREATE INDEX IF NOT EXISTS idx_auth_login_record_created_at
+CREATE INDEX idx_auth_login_record_created_at
     ON learning_evidence.auth_login_record(created_at DESC);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.learning_material (
+CREATE TABLE learning_evidence.learning_material (
     id BIGSERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     user_id VARCHAR(120) NOT NULL,
@@ -111,16 +127,16 @@ CREATE TABLE IF NOT EXISTS learning_evidence.learning_material (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_learning_material_status
+CREATE INDEX idx_learning_material_status
     ON learning_evidence.learning_material(status);
 
-CREATE INDEX IF NOT EXISTS idx_learning_material_document_type
+CREATE INDEX idx_learning_material_document_type
     ON learning_evidence.learning_material(document_type);
 
-CREATE INDEX IF NOT EXISTS idx_learning_material_user_updated
+CREATE INDEX idx_learning_material_user_updated
     ON learning_evidence.learning_material(user_id, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.log_event (
+CREATE TABLE learning_evidence.log_event (
     id BIGSERIAL PRIMARY KEY,
     trace_id VARCHAR(80) NOT NULL,
     session_id VARCHAR(120),
@@ -148,19 +164,19 @@ CREATE TABLE IF NOT EXISTS learning_evidence.log_event (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_log_event_created_at
+CREATE INDEX idx_log_event_created_at
     ON learning_evidence.log_event(created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_log_event_domain_module
+CREATE INDEX idx_log_event_domain_module
     ON learning_evidence.log_event(domain, module);
 
-CREATE INDEX IF NOT EXISTS idx_log_event_trace_id
+CREATE INDEX idx_log_event_trace_id
     ON learning_evidence.log_event(trace_id);
 
-CREATE INDEX IF NOT EXISTS idx_log_event_material_id
+CREATE INDEX idx_log_event_material_id
     ON learning_evidence.log_event(material_id);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.log_error (
+CREATE TABLE learning_evidence.log_error (
     id BIGSERIAL PRIMARY KEY,
     trace_id VARCHAR(80) NOT NULL,
     session_id VARCHAR(120),
@@ -195,28 +211,28 @@ CREATE TABLE IF NOT EXISTS learning_evidence.log_error (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uk_log_error_fingerprint
+CREATE UNIQUE INDEX uk_log_error_fingerprint
     ON learning_evidence.log_error(fingerprint);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_created_at
+CREATE INDEX idx_log_error_created_at
     ON learning_evidence.log_error(created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_last_seen_at
+CREATE INDEX idx_log_error_last_seen_at
     ON learning_evidence.log_error(last_seen_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_domain_module
+CREATE INDEX idx_log_error_domain_module
     ON learning_evidence.log_error(domain, module);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_status_severity
+CREATE INDEX idx_log_error_status_severity
     ON learning_evidence.log_error(status, severity);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_trace_id
+CREATE INDEX idx_log_error_trace_id
     ON learning_evidence.log_error(trace_id);
 
-CREATE INDEX IF NOT EXISTS idx_log_error_material_id
+CREATE INDEX idx_log_error_material_id
     ON learning_evidence.log_error(material_id);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.video_slice (
+CREATE TABLE learning_evidence.video_slice (
     id BIGSERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     topic VARCHAR(255) NOT NULL,
@@ -228,10 +244,10 @@ CREATE TABLE IF NOT EXISTS learning_evidence.video_slice (
     CONSTRAINT uk_video_slice_title_start UNIQUE (title, start_time)
 );
 
-CREATE INDEX IF NOT EXISTS idx_video_slice_updated_at
+CREATE INDEX idx_video_slice_updated_at
     ON learning_evidence.video_slice(updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.resume_evidence_alignment (
+CREATE TABLE learning_evidence.resume_evidence_alignment (
     id BIGSERIAL PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
     requirement VARCHAR(255) NOT NULL,
@@ -242,13 +258,13 @@ CREATE TABLE IF NOT EXISTS learning_evidence.resume_evidence_alignment (
     CONSTRAINT uk_resume_evidence_user_requirement UNIQUE (user_id, requirement)
 );
 
-CREATE INDEX IF NOT EXISTS idx_resume_evidence_status
+CREATE INDEX idx_resume_evidence_status
     ON learning_evidence.resume_evidence_alignment(status);
 
-CREATE INDEX IF NOT EXISTS idx_resume_evidence_user_updated
+CREATE INDEX idx_resume_evidence_user_updated
     ON learning_evidence.resume_evidence_alignment(user_id, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.jd_analysis_report (
+CREATE TABLE learning_evidence.jd_analysis_report (
     id BIGSERIAL PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
     report_key VARCHAR(80) NOT NULL,
@@ -262,7 +278,7 @@ CREATE TABLE IF NOT EXISTS learning_evidence.jd_analysis_report (
     CONSTRAINT uk_jd_analysis_report_key UNIQUE (report_key)
 );
 
-CREATE TABLE IF NOT EXISTS learning_evidence.jd_analysis_skill (
+CREATE TABLE learning_evidence.jd_analysis_skill (
     id BIGSERIAL PRIMARY KEY,
     report_id BIGINT NOT NULL REFERENCES learning_evidence.jd_analysis_report(id) ON DELETE CASCADE,
     skill_name VARCHAR(160) NOT NULL,
@@ -271,10 +287,10 @@ CREATE TABLE IF NOT EXISTS learning_evidence.jd_analysis_skill (
     CONSTRAINT uk_jd_analysis_skill UNIQUE (report_id, skill_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_jd_analysis_report_user_updated
+CREATE INDEX idx_jd_analysis_report_user_updated
     ON learning_evidence.jd_analysis_report(user_id, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS learning_evidence.jd_learning_plan_item (
+CREATE TABLE learning_evidence.jd_learning_plan_item (
     id BIGSERIAL PRIMARY KEY,
     report_id BIGINT NOT NULL REFERENCES learning_evidence.jd_analysis_report(id) ON DELETE CASCADE,
     step_no INTEGER NOT NULL,
@@ -284,7 +300,7 @@ CREATE TABLE IF NOT EXISTS learning_evidence.jd_learning_plan_item (
     CONSTRAINT uk_jd_learning_plan_item UNIQUE (report_id, step_no)
 );
 
-CREATE TABLE IF NOT EXISTS learning_evidence.system_setting (
+CREATE TABLE learning_evidence.system_setting (
     setting_key VARCHAR(120) PRIMARY KEY,
     setting_group VARCHAR(80) NOT NULL,
     label VARCHAR(120) NOT NULL,
@@ -293,7 +309,7 @@ CREATE TABLE IF NOT EXISTS learning_evidence.system_setting (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS learning_evidence.rag_document (
+CREATE TABLE learning_evidence.rag_document (
     document_id VARCHAR(120) PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     document_type VARCHAR(50) NOT NULL,
@@ -309,7 +325,7 @@ CREATE TABLE IF NOT EXISTS learning_evidence.rag_document (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS learning_evidence.rag_chunk (
+CREATE TABLE learning_evidence.rag_chunk (
     chunk_id VARCHAR(180) PRIMARY KEY,
     document_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.rag_document(document_id) ON DELETE CASCADE,
     chunk_position INTEGER NOT NULL,
@@ -322,17 +338,17 @@ CREATE TABLE IF NOT EXISTS learning_evidence.rag_chunk (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_rag_document_type
+CREATE INDEX idx_rag_document_type
     ON learning_evidence.rag_document(document_type);
 
-CREATE INDEX IF NOT EXISTS idx_rag_document_user_visibility
+CREATE INDEX idx_rag_document_user_visibility
     ON learning_evidence.rag_document(user_id, visibility_scope);
 
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_document_position
+CREATE INDEX idx_rag_chunk_document_position
     ON learning_evidence.rag_chunk(document_id, chunk_position);
 
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_metadata_gin
+CREATE INDEX idx_rag_chunk_metadata_gin
     ON learning_evidence.rag_chunk USING GIN (metadata);
 
-CREATE INDEX IF NOT EXISTS idx_rag_chunk_embedding_hnsw
+CREATE INDEX idx_rag_chunk_embedding_hnsw
     ON learning_evidence.rag_chunk USING hnsw (embedding vector_cosine_ops);
