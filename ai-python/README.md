@@ -1,17 +1,84 @@
 # Python RAG 服务
 
+## 环境变量配置
+
+真实联调前必须自行补填且不能暴露的变量：
+
+| 环境变量 | 必填场景 | 说明 |
+| --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 真实 RAG 联调必填 | 百炼 embedding、rerank、LLM、OCR、ASR 共用。推荐配置为系统环境变量，不要写入 Git。 |
+| `MINERU_TOKEN` / `MINERU_API_TOKEN` / `MINERU_API_KEY` | 使用 MinerU 云端能力时必填 | 仅在 MinerU 命令或封装需要云端鉴权时配置。 |
+
+可暴露的必填联调项和选填项已集中放在 `ai-python/config/application.yml`，格式与 Java `application.yml` 保持一致：
+
+```yaml
+server:
+  port: ${AI_SERVICE_PORT:8090}
+rag:
+  database:
+    url: ${RAG_DATABASE_URL:postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic}
+dashscope:
+  api-key: ${DASHSCOPE_API_KEY:}
+```
+
+常用默认值：
+
+- `AI_SERVICE_PORT`：默认 `8090`，Java 后端默认访问 `http://127.0.0.1:8090`
+- `RAG_STORE_BACKEND`：默认 `pgvector`
+- `RAG_DATABASE_SCHEMA`：默认 `learning_evidence`
+- `RAG_VECTOR_DIMENSIONS`：默认 `1024`
+- `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
+- `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
+- `RAG_LLM_MODEL`：默认 `qwen-plus`
+
+本机覆盖时复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 后修改。`application.local.yml` 已加入 `.gitignore`，可用于填写本机路径或临时离线模式。
+
 ## 启动
+
+### PyCharm 单文件启动
+
+推荐直接运行：
+
+```text
+ai-python/run.py
+```
+
+PyCharm 配置：
+
+- Script path：`C:\Users\WhenJayHe\IdeaProjects\Multimodal-RAG-Agent-Learning-Evidence-Platform-React-Java-Python\ai-python\run.py`
+- Working directory：`C:\Users\WhenJayHe\IdeaProjects\Multimodal-RAG-Agent-Learning-Evidence-Platform-React-Java-Python\ai-python`
+- Python interpreter：`C:\Users\WhenJayHe\miniforge3\envs\learning-evidence-rag\python.exe`
+
+如需直接运行 `ai-python/app/main.py`，当前也已支持，效果等同于调用 `run.py`。启动后访问 `http://127.0.0.1:8090/health` 检查服务状态。
+
+默认会加载：
+
+- `ai-python/config/application.yml`
+- `ai-python/config/application.local.yml`，如果文件存在
+
+配置优先级从高到低：
+
+1. PyCharm Environment variables / 系统环境变量
+2. 启动参数 `--config` 指定的配置文件
+3. `application.local.yml`
+4. `application.yml`
+
+因此已经配置系统级 `DASHSCOPE_API_KEY` 时，不需要在 PyCharm 中重复配置。Windows 新增或修改系统环境变量后，需要重启 PyCharm 才能继承最新值。
+
+如需创建本机覆盖配置，复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 后修改。`application.local.yml` 已被 `.gitignore` 忽略，不要提交真实密钥。
+
+PyCharm 的 Parameters 可以留空；如需额外指定配置文件，可填写：
+
+```text
+--config config/application.local.yml
+```
+
+### 命令行启动
 
 ```powershell
 conda env create -f ai-python/environment.yml
 conda activate learning-evidence-rag
-$env:PYTHONPATH='ai-python'
-$env:RAG_STORE_BACKEND='pgvector'
-$env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic'
-$env:RAG_DATABASE_SCHEMA='learning_evidence'
-$env:RAG_VECTOR_DIMENSIONS='1024'
-$env:RAG_EMBEDDING_MODEL='text-embedding-v4'
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
+python ai-python/run.py
 ```
 
 已创建过环境时，使用 `conda env update -f ai-python/environment.yml --prune` 同步依赖。`requirements.txt` 只作为 pip 兼容依赖清单保留。

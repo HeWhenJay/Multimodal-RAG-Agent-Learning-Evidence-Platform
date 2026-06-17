@@ -24,3 +24,4 @@ dependencies:
       - "pillow>=10.4,<12.0"
       - "pytesseract>=0.3,<1.0"
       - "psycopg[binary]>=3.2,<4.0"
+      - "PyYAML>=6.0,<7.0"

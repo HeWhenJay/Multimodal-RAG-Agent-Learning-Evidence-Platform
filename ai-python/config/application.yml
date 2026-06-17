@@ -1,0 +1,84 @@
+# Python AI 服务本地联调配置。
+# 规则对齐 Java application.yml：可暴露配置写默认值，敏感配置只通过 ${环境变量:默认值} 注入。
+
+server:
+  host: ${AI_SERVICE_HOST:127.0.0.1}
+  port: ${AI_SERVICE_PORT:8090}
+  reload: ${AI_SERVICE_RELOAD:true}
+
+rag:
+  store:
+    backend: ${RAG_STORE_BACKEND:pgvector}
+  database:
+    url: ${RAG_DATABASE_URL:postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic}
+    schema: ${RAG_DATABASE_SCHEMA:learning_evidence}
+  vector:
+    dimensions: ${RAG_VECTOR_DIMENSIONS:1024}
+  embedding:
+    provider: ${RAG_EMBEDDING_PROVIDER:dashscope}
+    model: ${RAG_EMBEDDING_MODEL:text-embedding-v4}
+    base-url: ${RAG_EMBEDDING_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    timeout-seconds: ${RAG_EMBEDDING_TIMEOUT_SECONDS:30}
+  rerank:
+    provider: ${RAG_RERANK_PROVIDER:auto}
+    model: ${RAG_RERANK_MODEL:qwen3-rerank}
+    base-url: ${RAG_RERANK_BASE_URL:https://dashscope.aliyuncs.com}
+    timeout-seconds: ${RAG_RERANK_TIMEOUT_SECONDS:30}
+  llm:
+    provider: ${RAG_ANSWER_PROVIDER:auto}
+    model: ${RAG_LLM_MODEL:qwen-plus}
+    base-url: ${RAG_LLM_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    timeout-seconds: ${RAG_LLM_TIMEOUT_SECONDS:45}
+    temperature: ${RAG_LLM_TEMPERATURE:0.2}
+
+dashscope:
+  api-key: ${DASHSCOPE_API_KEY:}
+
+mineru:
+  command: ${MINERU_COMMAND:}
+  token: ${MINERU_TOKEN:}
+  api-token: ${MINERU_API_TOKEN:}
+  api-key: ${MINERU_API_KEY:}
+
+ocr:
+  lang: ${OCR_LANG:chi_sim+eng}
+  bailian:
+    enabled: ${BAILIAN_OCR_ENABLED:auto}
+    model: ${BAILIAN_OCR_MODEL:qwen3.5-ocr}
+    base-url: ${BAILIAN_OCR_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    timeout-seconds: ${BAILIAN_OCR_TIMEOUT_SECONDS:60}
+    max-image-bytes: ${BAILIAN_OCR_MAX_IMAGE_BYTES:10485760}
+
+asr:
+  provider: ${RAG_ASR_PROVIDER:auto}
+  base-url: ${RAG_ASR_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+  task-base-url: ${RAG_ASR_TASK_BASE_URL:https://dashscope.aliyuncs.com/api/v1}
+  model: ${RAG_ASR_MODEL:qwen3-asr-flash}
+  filetrans-model: ${RAG_ASR_FILETRANS_MODEL:qwen3-asr-flash-filetrans}
+  filetrans-enabled: ${RAG_ASR_FILETRANS_ENABLED:auto}
+  enable-words: ${RAG_ASR_ENABLE_WORDS:false}
+  timeout-seconds: ${RAG_ASR_TIMEOUT_SECONDS:120}
+  max-audio-bytes: ${RAG_ASR_MAX_AUDIO_BYTES:10485760}
+  filetrans-max-polls: ${RAG_ASR_FILETRANS_MAX_POLLS:30}
+  filetrans-poll-interval-seconds: ${RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS:2}
+
+video:
+  ffmpeg-command: ${FFMPEG_COMMAND:}
+  ffprobe-command: ${FFPROBE_COMMAND:}
+  frame-sample-interval-seconds: ${RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS:5}
+  frame-interval-seconds: ${RAG_VIDEO_FRAME_INTERVAL_SECONDS:30}
+  max-frames: ${RAG_VIDEO_MAX_FRAMES:20}
+  frame-max-candidates: ${RAG_VIDEO_FRAME_MAX_CANDIDATES:120}
+  ppt-flip-diff-threshold: ${RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD:0.08}
+  segment-seconds: ${RAG_VIDEO_SEGMENT_SECONDS:120}
+  segment-max-cues: ${RAG_VIDEO_SEGMENT_MAX_CUES:6}
+
+document:
+  convert:
+    libreoffice-command: ${LIBREOFFICE_COMMAND:}
+    soffice-command: ${SOFFICE_COMMAND:}
+
+environment:
+  DATABASE_URL: ${DATABASE_URL:}
+  DASHSCOPE_EMBEDDING_MODEL: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
+  DASHSCOPE_EMBEDDING_BASE_URL: ${DASHSCOPE_EMBEDDING_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}

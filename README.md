@@ -1,5 +1,57 @@
 # 学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
 
+## 启动前环境变量
+
+### 必须补填且不能暴露
+
+这些值不要写进 Git，也不要直接提交到 `application.yml`。推荐配置为 Windows 系统环境变量；如果用 PyCharm 启动 Python AI 服务，新增或修改系统环境变量后需要重启 PyCharm。
+
+| 环境变量 | 必填场景 | 用途 | 当前配置写法 |
+| --- | --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 真实 RAG 联调必填 | Python AI 调用百炼 embedding、rerank、LLM、OCR 和 ASR | `ai-python/config/application.yml` 中为 `${DASHSCOPE_API_KEY:}` |
+| `MINERU_TOKEN` / `MINERU_API_TOKEN` / `MINERU_API_KEY` | 使用 MinerU 云端能力时必填 | MinerU 命令或第三方封装读取鉴权 | `ai-python/config/application.yml` 中默认留空 |
+| `ALIYUN_OSS_ACCESS_KEY_ID` / `ALIYUN_OSS_ACCESS_KEY_SECRET` | Java 存储切到 `oss` 时必填 | Java 后端上传原始资料到阿里云 OSS | `backend-java/src/main/resources/application.yml` 中默认读取环境变量 |
+| `EVIDENCE_INTERNAL_LOG_TOKEN` | 需要保护内部日志上报接口时填写 | Java 内部日志接口鉴权 token | `backend-java/src/main/resources/application.yml` 中默认读取环境变量 |
+
+本地开发如果继续使用 `local` 文件存储，只需要先确认 `DASHSCOPE_API_KEY` 已在系统环境变量中配置。数据库密码当前使用本地默认值 `123456`，只适合本机开发；部署或共享环境应改为环境变量。
+
+### 选填变量与可暴露默认值
+
+Python AI 服务现在使用类似 Java 的配置格式，默认读取 `ai-python/config/application.yml`，可复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 做本机覆盖。`application.local.yml` 已被 `.gitignore` 忽略。
+
+已在 Python 默认配置中填好的可暴露联调值：
+
+| 配置项 | 默认值 | 修改方式 |
+| --- | --- | --- |
+| `server.port` / `AI_SERVICE_PORT` | `8090` | 修改 `ai-python/config/application.yml`，或设置环境变量 `AI_SERVICE_PORT` |
+| `rag.store.backend` / `RAG_STORE_BACKEND` | `pgvector` | 离线演示可改为 `memory` |
+| `rag.database.url` / `RAG_DATABASE_URL` | `postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic` | 本机 PostgreSQL 端口、账号或 schema 不同时修改 |
+| `rag.database.schema` / `RAG_DATABASE_SCHEMA` | `learning_evidence` | 与数据库 schema 保持一致 |
+| `rag.vector.dimensions` / `RAG_VECTOR_DIMENSIONS` | `1024` | 必须与 pgvector 表中 `VECTOR(1024)` 一致 |
+| `rag.embedding.model` / `RAG_EMBEDDING_MODEL` | `text-embedding-v4` | 更换百炼 embedding 模型时修改 |
+| `rag.rerank.model` / `RAG_RERANK_MODEL` | `qwen3-rerank` | 更换百炼 rerank 模型时修改 |
+| `rag.llm.model` / `RAG_LLM_MODEL` | `qwen-plus` | 更换回答生成模型时修改 |
+
+常用选填项：
+
+| 配置项 | 默认值 | 何时修改 |
+| --- | --- | --- |
+| `mineru.command` / `MINERU_COMMAND` | 空 | 安装 MinerU 并希望优先用 MinerU 解析 PDF 时填写，例如 `mineru -p {input} -o {output}` |
+| `video.ffmpeg-command` / `FFMPEG_COMMAND` | 空 | `ffmpeg` 不在 PATH 时填写完整路径 |
+| `video.ffprobe-command` / `FFPROBE_COMMAND` | 空 | `ffprobe` 不在 PATH 时填写完整路径 |
+| `document.convert.libreoffice-command` / `LIBREOFFICE_COMMAND` | 空 | LibreOffice 不在 PATH 且需要 DOC/PPT 转 PDF 补充解析时填写 |
+| `ocr.lang` / `OCR_LANG` | `chi_sim+eng` | 本地 OCR 语言包不同时修改 |
+
+配置占位符格式与 Java 保持一致，例如：
+
+```yaml
+rag:
+  database:
+    url: ${RAG_DATABASE_URL:postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic}
+dashscope:
+  api-key: ${DASHSCOPE_API_KEY:}
+```
+
 英文标识：Multimodal RAG Agent Learning Evidence Platform
 
 技术栈：React + Java Spring Boot + Python FastAPI + RAG。当前阶段完成到 RAG，暂不实现 Agent 任务编排。

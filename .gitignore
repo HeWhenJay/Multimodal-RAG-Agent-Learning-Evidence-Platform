@@ -38,6 +38,7 @@ __pycache__/
 venv/
 .conda/
 conda-meta/
+ai-python/config/application.local.yml
 
 # Local storage
 uploads/
