@@ -157,6 +157,17 @@ class InMemoryRagStore:
         )
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
+            process_event(
+                stage="embedding.chunk",
+                action="memory_embedding_chunk",
+                message=f"第 {index}/{total_chunks} 块：生成 embedding",
+                context={
+                    "chunkIndex": index,
+                    "totalChunks": total_chunks,
+                    "chunkId": chunk.chunk_id,
+                    "documentId": document_id,
+                },
+            )
             if progress_reporter:
                 progress_reporter.emit(
                     "embedding.chunk",
@@ -174,6 +185,18 @@ class InMemoryRagStore:
             self.term_freqs[chunk.chunk_id] = token_counts
             self.doc_freq.update(set(token_counts))
             self.embeddings[chunk.chunk_id] = embed_text(chunk.text)
+            process_event(
+                stage="memory.upsert.chunk",
+                action="memory_upsert_chunk",
+                message=f"第 {index}/{total_chunks} 块：写入内存检索索引",
+                context={
+                    "chunkIndex": index,
+                    "totalChunks": total_chunks,
+                    "chunkId": chunk.chunk_id,
+                    "tokenCount": sum(token_counts.values()),
+                    "documentId": document_id,
+                },
+            )
             if progress_reporter:
                 progress_reporter.emit(
                     "memory.upsert.chunk",

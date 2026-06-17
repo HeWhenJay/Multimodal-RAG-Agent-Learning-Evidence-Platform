@@ -31,86 +31,112 @@ store = create_rag_store()
 
 @router.post("/documents/index-text", response_model=IndexResponse)
 def index_text(request: IndexTextRequest) -> IndexResponse:
-    if not request.content.strip():
-        raise HTTPException(status_code=400, detail="content is empty")
     process_logger = RagProcessLogger(document_id=request.documentId, user_id=request.userId)
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.index-text",
-            action="index_text_received",
-            message="Python 已接收文本资料索引请求",
+        with process_logger.step(
+            "api.index-text",
+            "index_text_pipeline",
+            "处理文本资料索引请求",
             context={"title": request.title, "documentType": request.documentType},
-        )
-        progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
-        progress.emit("index.request", "已接收文本资料索引请求", current_step=1, total_steps=8, percent=5)
-        parsed = parser_router.parse_text(
-            document_id=request.documentId,
-            title=request.title,
-            document_type=request.documentType,
-            source_path=request.sourcePath,
-            content=request.content,
-            parser=request.parser,
-            progress_reporter=progress,
-        )
-        return store.index_blocks(
-            document_id=request.documentId,
-            title=request.title,
-            document_type=request.documentType,
-            source=request.source,
-            user_id=request.userId,
-            visibility_scope=request.visibilityScope,
-            language=request.language,
-            parser=parsed.parser,
-            blocks=parsed.blocks,
-            parse_quality=parsed.parse_quality,
-            status=parsed.status,
-            source_path=request.sourcePath,
-            progress_reporter=progress,
-        )
+        ):
+            process_event(
+                stage="api.index-text",
+                action="index_text_received",
+                message="Python 已接收文本资料索引请求",
+                context={"title": request.title, "documentType": request.documentType},
+            )
+            if not request.content.strip():
+                process_event(
+                    stage="api.index-text",
+                    action="index_text_rejected",
+                    message="文本资料内容为空，已拒绝索引",
+                    level="WARN",
+                    context={"title": request.title, "documentType": request.documentType},
+                )
+                raise HTTPException(status_code=400, detail="content is empty")
+            progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
+            progress.emit("index.request", "已接收文本资料索引请求", current_step=1, total_steps=8, percent=5)
+            parsed = parser_router.parse_text(
+                document_id=request.documentId,
+                title=request.title,
+                document_type=request.documentType,
+                source_path=request.sourcePath,
+                content=request.content,
+                parser=request.parser,
+                progress_reporter=progress,
+            )
+            return store.index_blocks(
+                document_id=request.documentId,
+                title=request.title,
+                document_type=request.documentType,
+                source=request.source,
+                user_id=request.userId,
+                visibility_scope=request.visibilityScope,
+                language=request.language,
+                parser=parsed.parser,
+                blocks=parsed.blocks,
+                parse_quality=parsed.parse_quality,
+                status=parsed.status,
+                source_path=request.sourcePath,
+                progress_reporter=progress,
+            )
 
 
 @router.post("/documents/index-video-source", response_model=IndexResponse)
 def index_video_source(request: IndexVideoSourceRequest) -> IndexResponse:
-    if not request.sourcePath.strip():
-        raise HTTPException(status_code=400, detail="sourcePath is empty")
     process_logger = RagProcessLogger(document_id=request.documentId, user_id=request.userId)
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.index-video-source",
-            action="index_video_source_received",
-            message="Python 已接收视频源索引请求",
+        with process_logger.step(
+            "api.index-video-source",
+            "index_video_source_pipeline",
+            "处理视频源索引请求",
             context={"title": request.title, "documentType": request.documentType, "sourcePath": request.sourcePath},
-        )
-        progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
-        progress.emit("index.request", "已接收视频源索引请求", current_step=1, total_steps=8, percent=5)
-        parsed = parser_router.parse_video_source(
-            document_id=request.documentId,
-            title=request.title,
-            document_type=request.documentType,
-            source=request.source,
-            user_id=request.userId,
-            visibility_scope=request.visibilityScope,
-            source_path=request.sourcePath,
-            filename=request.filename,
-            content_type=request.contentType,
-            high_precision=request.highPrecision,
-            progress_reporter=progress,
-        )
-        return store.index_blocks(
-            document_id=request.documentId,
-            title=request.title,
-            document_type=request.documentType,
-            source=request.source,
-            user_id=request.userId,
-            visibility_scope=request.visibilityScope,
-            language=request.language,
-            parser=parsed.parser,
-            blocks=parsed.blocks,
-            parse_quality=parsed.parse_quality,
-            status=parsed.status,
-            source_path=request.sourcePath,
-            progress_reporter=progress,
-        )
+        ):
+            process_event(
+                stage="api.index-video-source",
+                action="index_video_source_received",
+                message="Python 已接收视频源索引请求",
+                context={"title": request.title, "documentType": request.documentType, "sourcePath": request.sourcePath},
+            )
+            if not request.sourcePath.strip():
+                process_event(
+                    stage="api.index-video-source",
+                    action="index_video_source_rejected",
+                    message="视频源路径为空，已拒绝索引",
+                    level="WARN",
+                    context={"title": request.title, "documentType": request.documentType},
+                )
+                raise HTTPException(status_code=400, detail="sourcePath is empty")
+            progress = RagProgressReporter(document_id=request.documentId, user_id=request.userId)
+            progress.emit("index.request", "已接收视频源索引请求", current_step=1, total_steps=8, percent=5)
+            parsed = parser_router.parse_video_source(
+                document_id=request.documentId,
+                title=request.title,
+                document_type=request.documentType,
+                source=request.source,
+                user_id=request.userId,
+                visibility_scope=request.visibilityScope,
+                source_path=request.sourcePath,
+                filename=request.filename,
+                content_type=request.contentType,
+                high_precision=request.highPrecision,
+                progress_reporter=progress,
+            )
+            return store.index_blocks(
+                document_id=request.documentId,
+                title=request.title,
+                document_type=request.documentType,
+                source=request.source,
+                user_id=request.userId,
+                visibility_scope=request.visibilityScope,
+                language=request.language,
+                parser=parsed.parser,
+                blocks=parsed.blocks,
+                parse_quality=parsed.parse_quality,
+                status=parsed.status,
+                source_path=request.sourcePath,
+                progress_reporter=progress,
+            )
 
 
 @router.post("/documents/index-file", response_model=IndexResponse)
@@ -125,50 +151,74 @@ async def index_file(
     source_path: str | None = Form(None),
     high_precision: bool = Form(False),
 ) -> IndexResponse:
-    content = await file.read()
     process_logger = RagProcessLogger(document_id=document_id, user_id=user_id)
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.index-file",
-            action="index_file_received",
-            message="Python 已接收上传文件索引请求",
+        with process_logger.step(
+            "api.index-file",
+            "index_file_pipeline",
+            "处理上传文件索引请求",
             context={
                 "title": title,
                 "filename": file.filename,
                 "documentType": document_type,
                 "contentType": file.content_type,
-                "size": len(content),
                 "highPrecision": high_precision,
             },
-        )
-        progress = RagProgressReporter(document_id=document_id, user_id=user_id)
-        progress.emit("index.request", "已接收上传文件索引请求", current_step=1, total_steps=8, percent=5)
-        parsed = parser_router.parse_bytes(
-            content=content,
-            filename=file.filename or title,
-            document_id=document_id,
-            source_title=title,
-            document_type=document_type,
-            content_type=file.content_type,
-            source_path=source_path,
-            high_precision=high_precision,
-            progress_reporter=progress,
-        )
-        return store.index_blocks(
-            document_id=document_id,
-            title=title,
-            document_type=document_type,
-            source=source,
-            user_id=user_id,
-            visibility_scope=visibility_scope,
-            language="zh-CN",
-            parser=parsed.parser,
-            blocks=parsed.blocks,
-            parse_quality=parsed.parse_quality,
-            status=parsed.status,
-            source_path=source_path,
-            progress_reporter=progress,
-        )
+        ):
+            process_event(
+                stage="api.index-file",
+                action="index_file_received",
+                message="Python 已接收上传文件索引请求，准备读取文件字节",
+                context={
+                    "title": title,
+                    "filename": file.filename,
+                    "documentType": document_type,
+                    "contentType": file.content_type,
+                    "highPrecision": high_precision,
+                },
+            )
+            content = await file.read()
+            process_event(
+                stage="api.index-file",
+                action="index_file_read_completed",
+                message="上传文件字节读取完成",
+                context={
+                    "title": title,
+                    "filename": file.filename,
+                    "documentType": document_type,
+                    "contentType": file.content_type,
+                    "size": len(content),
+                    "highPrecision": high_precision,
+                },
+            )
+            progress = RagProgressReporter(document_id=document_id, user_id=user_id)
+            progress.emit("index.request", "已接收上传文件索引请求", current_step=1, total_steps=8, percent=5)
+            parsed = parser_router.parse_bytes(
+                content=content,
+                filename=file.filename or title,
+                document_id=document_id,
+                source_title=title,
+                document_type=document_type,
+                content_type=file.content_type,
+                source_path=source_path,
+                high_precision=high_precision,
+                progress_reporter=progress,
+            )
+            return store.index_blocks(
+                document_id=document_id,
+                title=title,
+                document_type=document_type,
+                source=source,
+                user_id=user_id,
+                visibility_scope=visibility_scope,
+                language="zh-CN",
+                parser=parsed.parser,
+                blocks=parsed.blocks,
+                parse_quality=parsed.parse_quality,
+                status=parsed.status,
+                source_path=source_path,
+                progress_reporter=progress,
+            )
 
 
 @router.get("/documents/{document_id}/evidences", response_model=EvidenceListResponse)
@@ -176,98 +226,131 @@ def list_document_evidences(document_id: str, limit: int = 20) -> EvidenceListRe
     safe_limit = min(max(limit, 1), 100)
     process_logger = RagProcessLogger(document_id=document_id, module="evidence")
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.evidences",
-            action="list_document_evidences_received",
-            message="Python 已接收文档 evidence 查询请求",
+        with process_logger.step(
+            "api.evidences",
+            "list_document_evidences_pipeline",
+            "处理文档 evidence 查询请求",
             context={"limit": safe_limit},
-        )
-        return EvidenceListResponse(documentId=document_id, evidences=store.list_evidences(document_id, safe_limit))
+        ):
+            process_event(
+                stage="api.evidences",
+                action="list_document_evidences_received",
+                message="Python 已接收文档 evidence 查询请求",
+                context={"limit": safe_limit},
+            )
+            return EvidenceListResponse(documentId=document_id, evidences=store.list_evidences(document_id, safe_limit))
 
 
 @router.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest) -> QueryResponse:
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="question is empty")
     user_id = str((request.metadataFilter or {}).get("userId") or "anonymous")
     process_logger = RagProcessLogger(document_id="query", user_id=user_id, module="query")
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.query",
-            action="query_received",
-            message="Python 已接收 RAG 检索问答请求",
+        with process_logger.step(
+            "api.query",
+            "query_pipeline",
+            "处理 RAG 检索问答请求",
             context={"topK": request.topK, "metadataFilter": request.metadataFilter},
-        )
-        response = store.query(request)
-        if not response.evidences:
-            response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
-        return response
+        ):
+            process_event(
+                stage="api.query",
+                action="query_received",
+                message="Python 已接收 RAG 检索问答请求",
+                context={"topK": request.topK, "metadataFilter": request.metadataFilter},
+            )
+            if not request.question.strip():
+                process_event(
+                    stage="api.query",
+                    action="query_rejected",
+                    message="检索问题为空，已拒绝请求",
+                    level="WARN",
+                    context={"topK": request.topK, "metadataFilter": request.metadataFilter},
+                )
+                raise HTTPException(status_code=400, detail="question is empty")
+            response = store.query(request)
+            if not response.evidences:
+                response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
+            return response
 
 
 @router.post("/jd-analysis", response_model=JdAnalyzeResponse)
 def analyze_jd(request: JdAnalyzeRequest) -> JdAnalyzeResponse:
-    if not request.jobDescription.strip():
-        raise HTTPException(status_code=400, detail="jobDescription is empty")
     process_logger = RagProcessLogger(document_id="jd-analysis", user_id=request.userId, module="jd-analysis")
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.jd-analysis",
-            action="jd_analysis_received",
-            message="Python 已接收 JD 适配分析请求",
+        with process_logger.step(
+            "api.jd-analysis",
+            "jd_analysis_pipeline",
+            "处理 JD 适配分析请求",
             context={"topK": request.topK},
-        )
-        skills = extract_jd_skills(request.jobDescription)
-        skill_results: list[JdSkillResult] = []
-        alignments: list[ResumeAlignmentResult] = []
-        for skill in skills:
-            query_response = store.query(
-                QueryRequest(
-                    question=f"{skill} 项目经验 学习证据 课程笔记",
-                    topK=request.topK,
-                    metadataFilter={"userId": request.userId, "visibilityScope": "private"},
-                )
+        ):
+            process_event(
+                stage="api.jd-analysis",
+                action="jd_analysis_received",
+                message="Python 已接收 JD 适配分析请求",
+                context={"topK": request.topK},
             )
-            status = classify_skill(skill, query_response.evidences, request.resumeText or "")
-            skill_results.append(JdSkillResult(skillName=skill, status=status, evidences=query_response.evidences))
-            alignments.append(
-                ResumeAlignmentResult(
-                    requirement=skill,
-                    evidence=build_alignment_text(skill, query_response.evidences, request.resumeText or ""),
-                    status=status,
+            if not request.jobDescription.strip():
+                process_event(
+                    stage="api.jd-analysis",
+                    action="jd_analysis_rejected",
+                    message="JD 文本为空，已拒绝请求",
+                    level="WARN",
+                    context={"topK": request.topK},
                 )
+                raise HTTPException(status_code=400, detail="jobDescription is empty")
+            skills = extract_jd_skills(request.jobDescription)
+            skill_results: list[JdSkillResult] = []
+            alignments: list[ResumeAlignmentResult] = []
+            for skill in skills:
+                query_response = store.query(
+                    QueryRequest(
+                        question=f"{skill} 项目经验 学习证据 课程笔记",
+                        topK=request.topK,
+                        metadataFilter={"userId": request.userId, "visibilityScope": "private"},
+                    )
+                )
+                status = classify_skill(skill, query_response.evidences, request.resumeText or "")
+                skill_results.append(JdSkillResult(skillName=skill, status=status, evidences=query_response.evidences))
+                alignments.append(
+                    ResumeAlignmentResult(
+                        requirement=skill,
+                        evidence=build_alignment_text(skill, query_response.evidences, request.resumeText or ""),
+                        status=status,
+                    )
+                )
+
+            mastered = sum(1 for item in skill_results if item.status == "supported")
+            partial = sum(1 for item in skill_results if item.status == "weak")
+            missing = sum(1 for item in skill_results if item.status == "missing")
+            total = max(len(skill_results), 1)
+            mastered_percent = round(mastered * 100 / total)
+            partial_percent = round(partial * 100 / total)
+            gap_percent = max(0, 100 - mastered_percent - partial_percent)
+            match_score = min(100, mastered_percent + round(partial_percent * 0.5))
+
+            return JdAnalyzeResponse(
+                jobDescription=request.jobDescription,
+                matchScore=match_score,
+                masteredPercent=mastered_percent,
+                partialPercent=partial_percent,
+                gapPercent=gap_percent,
+                skills=skill_results,
+                learningPlan=build_learning_plan(skill_results),
+                resumeAlignments=alignments,
             )
-
-        mastered = sum(1 for item in skill_results if item.status == "supported")
-        partial = sum(1 for item in skill_results if item.status == "weak")
-        missing = sum(1 for item in skill_results if item.status == "missing")
-        total = max(len(skill_results), 1)
-        mastered_percent = round(mastered * 100 / total)
-        partial_percent = round(partial * 100 / total)
-        gap_percent = max(0, 100 - mastered_percent - partial_percent)
-        match_score = min(100, mastered_percent + round(partial_percent * 0.5))
-
-        return JdAnalyzeResponse(
-            jobDescription=request.jobDescription,
-            matchScore=match_score,
-            masteredPercent=mastered_percent,
-            partialPercent=partial_percent,
-            gapPercent=gap_percent,
-            skills=skill_results,
-            learningPlan=build_learning_plan(skill_results),
-            resumeAlignments=alignments,
-        )
 
 
 @router.get("/overview", response_model=OverviewResponse)
 def overview() -> OverviewResponse:
     process_logger = RagProcessLogger(document_id="overview", module="overview")
     with use_process_logger(process_logger):
-        process_event(
-            stage="api.overview",
-            action="overview_received",
-            message="Python 已接收 RAG 概览请求",
-        )
-        return store.overview()
+        with process_logger.step("api.overview", "overview_pipeline", "处理 RAG 概览请求"):
+            process_event(
+                stage="api.overview",
+                action="overview_received",
+                message="Python 已接收 RAG 概览请求",
+            )
+            return store.overview()
 
 
 @logged_rag_method("jd.extract", "extract_jd_skills", "从 JD 文本抽取技能项")

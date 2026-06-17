@@ -212,6 +212,17 @@ class PgVectorRagStore:
                 )
                 total_chunks = len(chunks)
                 for index, chunk in enumerate(chunks, start=1):
+                    process_event(
+                        stage="embedding.chunk",
+                        action="pgvector_embedding_chunk",
+                        message=f"第 {index}/{total_chunks} 块：生成 embedding",
+                        context={
+                            "chunkIndex": index,
+                            "totalChunks": total_chunks,
+                            "chunkId": chunk.chunk_id,
+                            "documentId": document_id,
+                        },
+                    )
                     if progress_reporter:
                         progress_reporter.emit(
                             "embedding.chunk",
@@ -225,6 +236,18 @@ class PgVectorRagStore:
                         )
                     token_counts = Counter(tokenize(chunk.text))
                     embedding = embed_text(chunk.text, dimensions=self.dimensions)
+                    process_event(
+                        stage="vector.upsert.chunk",
+                        action="pgvector_upsert_chunk",
+                        message=f"第 {index}/{total_chunks} 块：写入向量数据库",
+                        context={
+                            "chunkIndex": index,
+                            "totalChunks": total_chunks,
+                            "chunkId": chunk.chunk_id,
+                            "tokenCount": sum(token_counts.values()),
+                            "documentId": document_id,
+                        },
+                    )
                     if progress_reporter:
                         progress_reporter.emit(
                             "vector.upsert.chunk",

@@ -7,9 +7,11 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
 from rag.loaders.mineru_loader import MineruDocumentLoader
@@ -430,14 +432,33 @@ class DocumentParserRouter:
         source_path: str | None,
         high_precision: bool,
     ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
-        blocks, quality, warnings = parse_pptx_blocks(
-            content=content,
-            document_id=document_id,
-            source_title=source_title,
-            source_path=source_path,
-            high_precision=high_precision,
-        )
-        parser = "python-pptx"
+        try:
+            blocks, quality, warnings = parse_pptx_blocks(
+                content=content,
+                document_id=document_id,
+                source_title=source_title,
+                source_path=source_path,
+                high_precision=high_precision,
+            )
+            parser = "python-pptx"
+        except Exception as exc:
+            process_event(
+                stage="parse.pptx",
+                action="parse_pptx_native_fallback",
+                message="python-pptx 原生解析不可用，切换到 PPTX XML 降级解析",
+                level="WARN",
+                context={"filename": filename, "errorType": exc.__class__.__name__, "errorMessage": str(exc)},
+            )
+            blocks, quality, xml_warnings = parse_pptx_xml_blocks(
+                content=content,
+                document_id=document_id,
+                source_title=source_title,
+                source_path=source_path,
+                high_precision=high_precision,
+                native_error=exc,
+            )
+            parser = "pptx-xml-fallback"
+            warnings = [f"python-pptx parser failed: {exc}", *xml_warnings]
         if quality.needsSupplement:
             supplement, supplement_quality, supplement_warnings = self._parse_office_pdf_supplement(
                 content,
@@ -450,7 +471,7 @@ class DocumentParserRouter:
             if supplement:
                 blocks.extend(mark_supplemental_blocks(supplement))
                 quality = merge_quality(quality, supplement_quality)
-                parser = "python-pptx+libreoffice-pdf"
+                parser = f"{parser}+libreoffice-pdf"
             else:
                 warnings.extend(supplement_warnings)
         return blocks, quality, parser, warnings
@@ -767,10 +788,18 @@ class DocumentParserRouter:
         text_blocks = [block for block in normalized_blocks if block.contentText.strip()]
         if not text_blocks:
             status = "FAILED"
-        elif warnings or quality.score < 0.68 or any(block.confidence < 0.4 for block in text_blocks):
-            status = "PARTIAL"
         else:
-            status = "READY"
+            confidence_sensitive_blocks = [
+                block
+                for block in text_blocks
+                if block.blockType in {"text", "heading", "table", "list", "code"}
+            ]
+            if quality.score < 0.68 or any(block.confidence < 0.4 for block in confidence_sensitive_blocks):
+                status = "PARTIAL"
+            elif warnings and quality.score < 1.0:
+                status = "PARTIAL"
+            else:
+                status = "READY"
 
         chunks_for_summary = [
             _summary_chunk(document_id, index, block)
@@ -1666,6 +1695,7 @@ def parse_docx_blocks(
     return blocks, quality, warnings
 
 
+@logged_rag_method("parse.pptx", "parse_pptx_blocks", "提取 PPTX 原生结构")
 def parse_pptx_blocks(
     *,
     content: bytes,
@@ -1812,6 +1842,212 @@ def parse_pptx_blocks(
         high_precision=high_precision,
     )
     return blocks, quality, warnings
+
+
+@logged_rag_method("parse.pptx", "parse_pptx_xml_blocks", "使用 PPTX XML 降级提取幻灯片文本")
+def parse_pptx_xml_blocks(
+    *,
+    content: bytes,
+    document_id: str,
+    source_title: str,
+    source_path: str | None,
+    high_precision: bool,
+    native_error: Exception | None = None,
+) -> tuple[list[DocumentBlock], ParseQuality, list[str]]:
+    """在 python-pptx 不可用时直接读取 OOXML，避免把 PPTX 二进制误当文本切块。"""
+    warnings: list[str] = []
+    blocks: list[DocumentBlock] = []
+    text_chars = 0
+    text_box_count = 0
+    shape_count = 0
+
+    try:
+        archive = zipfile.ZipFile(BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        quality = evaluate_parse_quality(QualitySignals(), high_precision=high_precision)
+        return [], quality, [f"pptx.xml: PPTX zip 结构不可读取: {exc}"]
+
+    with archive:
+        slide_names = sorted(
+            (name for name in archive.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", name)),
+            key=pptx_part_index,
+        )
+        notes_by_slide: dict[int, list[str]] = {}
+        for name in archive.namelist():
+            if not re.match(r"ppt/notesSlides/notesSlide\d+\.xml$", name):
+                continue
+            try:
+                notes_by_slide[pptx_part_index(name)] = extract_ooxml_texts(archive.read(name))
+            except ElementTree.ParseError as exc:
+                warnings.append(f"pptx.xml: 备注页 XML 解析失败: {exc}")
+        for fallback_index, slide_name in enumerate(slide_names, start=1):
+            slide_index = pptx_part_index(slide_name) or fallback_index
+            try:
+                text_lines = extract_ooxml_texts(archive.read(slide_name))
+            except ElementTree.ParseError as exc:
+                warnings.append(f"pptx.xml: 幻灯片 {slide_index} XML 解析失败: {exc}")
+                continue
+            if not text_lines:
+                continue
+
+            shape_count += len(text_lines)
+            section_title = choose_pptx_xml_title(text_lines, slide_index)
+            if section_title:
+                blocks.append(
+                    DocumentBlock(
+                        documentId=document_id,
+                        blockId=f"{document_id}-pptx-xml-s{slide_index}-title",
+                        fileType="pptx",
+                        blockType="heading",
+                        slideIndex=slide_index,
+                        sectionTitle=section_title,
+                        contentText=section_title,
+                        parseEngine="pptx-xml-fallback",
+                        confidence=0.82,
+                        sourceTitle=source_title,
+                        sourcePath=source_path,
+                        metadata={
+                            "slideIndex": slide_index,
+                            "role": "title",
+                            "parserFallback": True,
+                            "nativeParserError": native_error.__class__.__name__ if native_error else None,
+                        },
+                    )
+                )
+                text_chars += len(section_title)
+                process_event(
+                    stage="parse.pptx",
+                    action="parse_pptx_xml_title",
+                    message=f"幻灯片 {slide_index} 标题已提取",
+                    context={"slideIndex": slide_index, "titleLength": len(section_title)},
+                )
+
+            body_lines = text_lines[1:] if text_lines and text_lines[0] == section_title else text_lines
+            body_text = normalize_text("\n".join(line for line in body_lines if line != section_title))
+            if body_text:
+                text_box_count += 1
+                blocks.append(
+                    DocumentBlock(
+                        documentId=document_id,
+                        blockId=f"{document_id}-pptx-xml-s{slide_index}-body",
+                        fileType="pptx",
+                        blockType="text",
+                        slideIndex=slide_index,
+                        sectionTitle=section_title,
+                        contentText=body_text,
+                        parseEngine="pptx-xml-fallback",
+                        confidence=0.82,
+                        sourceTitle=source_title,
+                        sourcePath=source_path,
+                        metadata={
+                            "slideIndex": slide_index,
+                            "parserFallback": True,
+                            "nativeParserError": native_error.__class__.__name__ if native_error else None,
+                        },
+                    )
+                )
+                text_chars += len(body_text)
+                process_event(
+                    stage="parse.pptx",
+                    action="parse_pptx_xml_body",
+                    message=f"幻灯片 {slide_index} 正文已提取",
+                    context={"slideIndex": slide_index, "bodyLength": len(body_text)},
+                )
+
+            notes_lines = notes_by_slide.get(slide_index) or []
+            notes_text = normalize_text("\n".join(line for line in notes_lines if line not in text_lines))
+            if notes_text:
+                text_box_count += 1
+                blocks.append(
+                    DocumentBlock(
+                        documentId=document_id,
+                        blockId=f"{document_id}-pptx-xml-s{slide_index}-notes",
+                        fileType="pptx",
+                        blockType="text",
+                        slideIndex=slide_index,
+                        sectionTitle=section_title,
+                        contentText=notes_text,
+                        parseEngine="pptx-xml-fallback",
+                        confidence=0.78,
+                        sourceTitle=source_title,
+                        sourcePath=source_path,
+                        metadata={
+                            "slideIndex": slide_index,
+                            "role": "notes",
+                            "parserFallback": True,
+                            "nativeParserError": native_error.__class__.__name__ if native_error else None,
+                        },
+                    )
+                )
+                text_chars += len(notes_text)
+                process_event(
+                    stage="parse.pptx",
+                    action="parse_pptx_xml_notes",
+                    message=f"幻灯片 {slide_index} 备注已提取",
+                    context={"slideIndex": slide_index, "notesLength": len(notes_text)},
+                )
+
+    if not blocks:
+        warnings.append("pptx.xml: 未从 PPTX XML 提取到可索引文本")
+
+    quality = evaluate_parse_quality(
+        QualitySignals(
+            native_text_chars=text_chars,
+            paragraph_count=text_box_count,
+            shape_count=shape_count,
+            text_box_count=text_box_count,
+        ),
+        high_precision=high_precision,
+    )
+    process_event(
+        stage="parse.pptx",
+        action="parse_pptx_xml_result",
+        message=f"PPTX XML 降级解析完成，得到 {len(blocks)} 个块",
+        context={
+            "blockCount": len(blocks),
+            "textChars": text_chars,
+            "warningCount": len(warnings),
+            "nativeErrorType": native_error.__class__.__name__ if native_error else None,
+        },
+    )
+    return blocks, quality, warnings
+
+
+def extract_ooxml_texts(xml_bytes: bytes) -> list[str]:
+    """提取 OOXML DrawingML 文本节点，并去掉连续重复空白。"""
+    root = ElementTree.fromstring(xml_bytes)
+    result: list[str] = []
+    for node in root.iter():
+        tag = str(node.tag)
+        if not (tag == "t" or tag.endswith("}t")):
+            continue
+        text = normalize_text(node.text or "")
+        if text:
+            result.append(text)
+    return dedupe_consecutive_texts(result)
+
+
+def dedupe_consecutive_texts(lines: list[str]) -> list[str]:
+    """清理连续重复文本，保留 PPT 每页的原始阅读顺序。"""
+    result: list[str] = []
+    for line in lines:
+        if result and result[-1] == line:
+            continue
+        result.append(line)
+    return result
+
+
+def choose_pptx_xml_title(text_lines: list[str], slide_index: int) -> str:
+    """从 XML 文本行中选择幻灯片标题，没有明确标题时使用页码标题。"""
+    for line in text_lines:
+        if 1 <= len(line) <= 120:
+            return line
+    return f"幻灯片 {slide_index}"
+
+
+def pptx_part_index(name: str) -> int:
+    match = re.search(r"(\d+)(?=\.xml$)", name)
+    return int(match.group(1)) if match else 0
 
 
 def parse_openpyxl_blocks(

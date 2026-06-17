@@ -46,6 +46,7 @@ class TranscriptCue:
 @dataclass(frozen=True)
 class VideoProcessingResult:
     transcript_text: str = ""
+    transcript_parser: str = "bailian-asr-transcript"
     frame_blocks: list[DocumentBlock] = field(default_factory=list)
     parser: str = "video-processor"
     warnings: list[str] = field(default_factory=list)
@@ -148,7 +149,7 @@ def process_video_input(
     warnings: list[str] = []
     with tempfile.TemporaryDirectory(prefix="rag-video-work-") as tmp:
         tmp_dir = Path(tmp)
-        transcript_text, asr_warnings = transcribe_video_input(video_input, tmp_dir, source_path)
+        transcript_text, transcript_parser, asr_warnings = transcribe_video_input(video_input, tmp_dir, source_path)
         warnings.extend(asr_warnings)
 
         frames, frame_warnings = extract_keyframes(video_input, tmp_dir)
@@ -163,7 +164,7 @@ def process_video_input(
         )
         warnings.extend(ocr_warnings)
 
-    if transcript_text and source_path:
+    if transcript_text and source_path and is_public_url(source_path):
         transcript_text = prepend_video_url_header(transcript_text, source_path)
 
     if not transcript_text and not frame_blocks:
@@ -172,13 +173,19 @@ def process_video_input(
 
     parser_parts = ["video"]
     if transcript_text:
-        parser_parts.append("bailian-asr")
+        if transcript_parser.startswith("sidecar-subtitle"):
+            parser_parts.append("subtitle")
+        elif transcript_parser.startswith("estimated-srt"):
+            parser_parts.append("estimated-srt")
+        else:
+            parser_parts.append("bailian-asr")
     if frame_blocks:
         parser_parts.append("keyframe-ocr")
     if any(block.metadata.get("frameTrigger") == "ppt_flip" for block in frame_blocks):
         parser_parts.append("ppt-flip-detect")
     return VideoProcessingResult(
         transcript_text=transcript_text,
+        transcript_parser=transcript_parser,
         frame_blocks=frame_blocks,
         parser="+".join(parser_parts),
         warnings=warnings,
@@ -186,7 +193,7 @@ def process_video_input(
 
 
 @logged_rag_method("parse.video.asr", "transcribe_video_input", "执行视频 ASR 转写")
-def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | None) -> tuple[str, list[str]]:
+def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | None) -> tuple[str, str | None, list[str]]:
     """对视频输入执行 ASR；公开视频优先 filetrans，本地视频走重叠音频分段。"""
     client = BailianAsrClient()
     warnings: list[str] = []
@@ -194,12 +201,17 @@ def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | N
         transcript_text, filetrans_warnings = client.transcribe_source_url(str(source_path))
         warnings.extend(stage_warning("video.asr", warning) for warning in filetrans_warnings)
         if transcript_text:
-            return transcript_text, warnings
+            return transcript_text, "bailian-asr-transcript", warnings
+
+    subtitle_text, subtitle_source, subtitle_warnings = load_sidecar_subtitle(video_input, source_path)
+    warnings.extend(subtitle_warnings)
+    if subtitle_text:
+        return subtitle_text, "sidecar-subtitle-transcript", warnings
 
     segments, segment_warnings = extract_audio_segments(video_input, tmp_dir)
     warnings.extend(segment_warnings)
     if not segments:
-        return "", warnings
+        return "", None, warnings
 
     cues: list[TranscriptCue] = []
     plain_parts: list[str] = []
@@ -222,11 +234,71 @@ def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | N
 
     merged = merge_transcript_cues(cues, overlap_seconds=audio_overlap_seconds())
     if merged:
-        return cues_to_srt(merged), warnings
+        return cues_to_srt(merged), "bailian-asr-transcript", warnings
     if plain_parts:
         duration = probe_media_duration(video_input)
-        return estimate_srt_from_transcript(" ".join(plain_parts), duration), warnings
-    return "", warnings
+        return estimate_srt_from_transcript(" ".join(plain_parts), duration), "estimated-srt-transcript", warnings
+    return "", None, warnings
+
+
+@logged_rag_method("parse.video.subtitle", "load_sidecar_subtitle", "加载视频同目录字幕")
+def load_sidecar_subtitle(video_input: str, source_path: str | None) -> tuple[str, str | None, list[str]]:
+    """优先读取同名 .srt/.vtt 侧车字幕，作为无 FFmpeg 时的视频时间戳证据来源。"""
+    warnings: list[str] = []
+    candidates = sidecar_subtitle_candidates(video_input, source_path)
+    for candidate in candidates:
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = candidate.read_text(encoding="gb18030", errors="ignore")
+        normalized = normalize_text(text.replace("\ufeff", ""))
+        if not normalized:
+            continue
+        if candidate.suffix.lower() not in {".srt", ".vtt"}:
+            continue
+        if candidate.suffix.lower() == ".vtt" and not normalized.lstrip().startswith("webvtt"):
+            normalized = f"WEBVTT\n\n{normalized}"
+        warnings.append(stage_warning("video.subtitle", f"已加载侧车字幕: {candidate.name}"))
+        return normalized, str(candidate), warnings
+    return "", None, warnings
+
+
+def sidecar_subtitle_candidates(video_input: str, source_path: str | None) -> list[Path]:
+    """生成视频侧车字幕候选路径，兼容同目录同名和扩展名替换。"""
+    candidates: list[Path] = []
+    if source_path:
+        base = Path(source_path)
+        for stem in subtitle_stems(base.stem):
+            candidates.append(base.with_name(f"{stem}.srt"))
+            candidates.append(base.with_name(f"{stem}.vtt"))
+    input_path = Path(video_input)
+    for stem in subtitle_stems(input_path.stem):
+        candidates.append(input_path.with_name(f"{stem}.srt"))
+        candidates.append(input_path.with_name(f"{stem}.vtt"))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = str(candidate)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(candidate)
+    return unique
+
+
+def subtitle_stems(stem: str) -> list[str]:
+    """生成视频同名字幕候选 stem，兼容 *.subtitled.mp4 -> *.srt 这类命名。"""
+    stems = [stem]
+    stripped = stem
+    for suffix in (".subtitled", ".subtitle", ".withsubtitles", "_subtitled", "_subtitle"):
+        if stripped.endswith(suffix):
+            stripped = stripped[: -len(suffix)]
+            stems.append(stripped)
+    if stripped and stripped not in stems:
+        stems.append(stripped)
+    return list(dict.fromkeys(stems))
 
 
 @logged_rag_method("parse.video.audio", "extract_audio_segments", "抽取视频音频分段")

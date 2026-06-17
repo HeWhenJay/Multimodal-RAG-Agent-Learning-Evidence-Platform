@@ -123,10 +123,13 @@ class RagProcessLogger:
             safe_context["durationMs"] = duration_ms
 
         log_message = "Python RAG 处理日志: documentId=%s stage=%s action=%s message=%s"
-        if success:
-            logger.info(log_message, self.document_id, stage, action, message)
-        else:
+        normalized_level = level.upper()
+        if not success or normalized_level == "ERROR":
             logger.error(log_message, self.document_id, stage, action, message)
+        elif normalized_level in {"WARN", "WARNING"}:
+            logger.warning(log_message, self.document_id, stage, action, message)
+        else:
+            logger.info(log_message, self.document_id, stage, action, message)
 
         if not self.persist:
             return
