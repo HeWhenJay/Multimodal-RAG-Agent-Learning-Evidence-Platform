@@ -538,6 +538,20 @@ public class RagServiceImpl implements RagService {
                     indexResultContext(material, result)
             );
         }
+        if ("PARTIAL".equals(result.status()) && result.parseQualityMessages() != null && !result.parseQualityMessages().isEmpty()) {
+            Map<String, Object> context = indexResultContext(material, result);
+            context.put("errorLocation", result.parseQualityMessages());
+            context.put("warningCount", result.parseQualityMessages().size());
+            logService.recordRagError(
+                    "material",
+                    "index",
+                    "material_index_partial_warning",
+                    "RAG_INDEX_PARTIAL",
+                    "Python 返回 PARTIAL 状态并携带阶段告警",
+                    null,
+                    context
+            );
+        }
         if ("READY".equals(result.status()) && (result.chunkCount() == null || result.chunkCount() <= 0)) {
             logService.recordRagError(
                     "material",
@@ -607,6 +621,10 @@ public class RagServiceImpl implements RagService {
         context.put("parser", result.parser());
         context.put("chunkCount", result.chunkCount());
         context.put("documentSummaryLength", result.documentSummary() == null ? 0 : result.documentSummary().length());
+        context.put("parseQualityMessages", result.parseQualityMessages());
+        if (result.parseQualityMessages() != null && !result.parseQualityMessages().isEmpty()) {
+            context.put("errorLocation", result.parseQualityMessages());
+        }
         return context;
     }
 

@@ -269,8 +269,17 @@ public class PythonRagClient {
                 text(root, "status"),
                 text(root, "parser"),
                 text(root, "documentSummary"),
-                root.path("chunkCount").asInt(0)
+                root.path("chunkCount").asInt(0),
+                readParseQualityMessages(root)
         );
+    }
+
+    /**
+     * 读取 Python 解析质量中的阶段告警，供 Java 侧日志定位。
+     */
+    private List<String> readParseQualityMessages(JsonNode root) {
+        JsonNode messages = root == null ? null : root.path("parseQuality").path("messages");
+        return readTextArray(messages);
     }
 
     /**
@@ -431,7 +440,8 @@ public class PythonRagClient {
             String status,
             String parser,
             String documentSummary,
-            Integer chunkCount
+            Integer chunkCount,
+            List<String> parseQualityMessages
     ) {
     }
 

@@ -16,7 +16,7 @@ from rag.mineru_loader import MineruDocumentLoader
 from rag.models import ParsedBlockDocument
 from rag.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
 from rag.summary_index import SummaryIndex
-from rag.video_processing import VIDEO_FILE_TYPES, process_video_bytes
+from rag.video_processing import VIDEO_FILE_TYPES, build_video_segment_summary_blocks, process_video_bytes
 from schemas.rag import DocumentBlock, ParseQuality
 
 
@@ -544,19 +544,32 @@ class DocumentParserRouter:
             ocr_client=self.ocr_client,
         )
         blocks: list[DocumentBlock] = []
+        transcript_blocks: list[DocumentBlock] = []
         parser = artifacts.parser
+        warnings = list(artifacts.warnings)
+        file_type = Path(filename).suffix.lower().lstrip(".") or "video"
         if artifacts.transcript_text:
-            blocks.extend(
-                parse_transcript_blocks(
-                    text=artifacts.transcript_text,
-                    document_id=document_id,
-                    file_type=Path(filename).suffix.lower().lstrip(".") or "video",
-                    source_title=source_title,
-                    source_path=source_path,
-                    parse_engine="bailian-asr-transcript",
-                )
+            transcript_blocks = parse_transcript_blocks(
+                text=artifacts.transcript_text,
+                document_id=document_id,
+                file_type=file_type,
+                source_title=source_title,
+                source_path=source_path,
+                parse_engine="bailian-asr-transcript",
             )
-        blocks.extend(artifacts.frame_blocks)
+            blocks.extend(transcript_blocks)
+        frame_blocks = artifacts.frame_blocks
+        blocks.extend(frame_blocks)
+        summary_blocks, summary_warnings = build_video_segment_summary_blocks(
+            document_id=document_id,
+            file_type=file_type,
+            source_title=source_title,
+            source_path=source_path,
+            transcript_blocks=transcript_blocks,
+            frame_blocks=frame_blocks,
+        )
+        blocks.extend(summary_blocks)
+        warnings.extend(summary_warnings)
         text_chars = sum(len(block.contentText) for block in blocks)
         quality = evaluate_parse_quality(
             QualitySignals(
@@ -568,7 +581,7 @@ class DocumentParserRouter:
         )
         if blocks and text_chars > 0:
             quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
-        return blocks, quality, parser, artifacts.warnings
+        return blocks, quality, parser, warnings
 
     def _finalize(
         self,

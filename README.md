@@ -23,8 +23,8 @@
 
 ```mermaid
 flowchart LR
-    A["资料上传<br/>文档、图片、字幕、转写文本"] --> B["文档 / 字幕 / 转写文本解析<br/>MinerU、OCR、结构化解析"]
-    B --> C["结构化切块<br/>标题、章节、页面、字幕时间段"]
+    A["资料上传<br/>文档、图片、字幕、转写文本、原始视频"] --> B["文档 / 视频解析<br/>MinerU、ASR、PPT 翻页检测、OCR"]
+    B --> C["结构化切块<br/>标题、章节、页面、字幕时间段、片段摘要"]
     C --> D["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RAG-Fusion"]
     D --> E["JD 分析<br/>按当前用户知识库检索岗位技能证据"]
     E --> F["输出结果<br/>已掌握 / 半掌握 / 缺口 / 学习计划 / 证据引用"]
@@ -32,83 +32,117 @@ flowchart LR
 
 ### 视频 RAG 第一阶段
 
-当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储，Python 再基于本次上传文件字节执行 FFmpeg 抽音频、百炼 ASR 生成字幕、关键帧抽取和 OCR，最终把字幕 evidence 与画面 OCR evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
+当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储，Python 再基于本次上传文件字节执行 FFmpeg 抽音频、百炼 ASR 生成字幕、候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要，最终把字幕 evidence、画面 OCR evidence 与片段摘要 evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
 
-典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR 或 OCR 未配置，视频会进入 `PARTIAL`，并保留可追踪的视频元数据 evidence；补配环境后可在资料列表触发“重建索引”或“高精度补跑”，重新生成字幕和画面 OCR evidence。
+典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT 翻页画面的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR、PPT 翻页检测、OCR 或片段摘要任一环节报错，Python 会把 `video.audio.extract`、`video.asr`、`video.frame.extract`、`video.slide_detect`、`video.frame_ocr[n]`、`video.segment_summary`、`video.fallback` 等位置写入 `parseQuality.messages`；Java 在 `PARTIAL` 时写入 `log_error.contextJson.errorLocation`，并保留可追踪的视频元数据 evidence。补配环境后可在资料列表触发“重建索引”或“高精度补跑”，重新生成字幕、画面 OCR 和片段摘要 evidence。
 
 ### 完整视频 RAG 技术路线
 
-下面是原始视频 RAG 的完整业务流程。当前代码已覆盖上传保存、音频抽取、百炼 ASR、关键帧抽取、画面 OCR、时间戳 evidence 和播放定位；仍不在本阶段启动 Agent 自主处理。
+下面是原始视频 RAG 的完整业务流程。当前代码已覆盖上传保存、音频抽取、百炼 ASR、候选帧采样、PPT 翻页检测、关键帧 OCR、视频片段摘要、时间戳 evidence、错误位置日志和播放定位；仍不在本阶段启动 Agent 自主处理。
 
 ```mermaid
 flowchart TD
     V0["上传视频或课程资料包"] --> V1["保存视频文件和元数据<br/>课程名、来源、用户、可见范围"]
     V1 --> V2["FFmpeg 音频轨提取"]
     V2 --> V3["百炼语音识别 ASR<br/>输出带时间戳转写文本"]
-    V1 --> V4["关键帧抽取<br/>按时间窗口或场景变化采样"]
-    V4 --> V5["百炼 Qwen-OCR / 多模态 OCR<br/>识别板书、PPT、代码和图表文字"]
+    V1 --> V4["候选帧采样<br/>默认每 5 秒抽一帧"]
+    V4 --> V4A["PPT 翻页检测<br/>缩略图差异超过阈值保留为 ppt_flip"]
+    V4A --> V5["百炼 Qwen-OCR / 本地 OCR<br/>识别板书、PPT、代码和图表文字"]
     V3 --> V6["字幕 / 转写文本解析<br/>生成 startTime、endTime"]
     V5 --> V7["画面文字块<br/>绑定 frameTime 和 sourcePath"]
-    V6 --> V8["结构化切块<br/>保留时间戳、章节、来源"]
+    V6 --> V8["视频片段摘要<br/>合并字幕要点和画面 OCR"]
     V7 --> V8
-    V8 --> V9["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RRF"]
-    V9 --> V10["回答与证据引用<br/>视频时间段、字幕片段、画面 OCR、相关 PPT/PDF"]
-    V10 --> V11["播放定位<br/>videoUrl#t=秒 或视频复习页定位"]
+    V8 --> V9["结构化切块<br/>保留时间戳、章节、来源"]
+    V2 -.报错.-> VERR["阶段告警<br/>parseQuality.messages 带 video.* 位置"]
+    V3 -.报错.-> VERR
+    V4 -.报错.-> VERR
+    V4A -.报错.-> VERR
+    V5 -.报错.-> VERR
+    V6 -.报错.-> VERR
+    V8 -.报错.-> VERR
+    VERR --> VLOG["Java 记录 RAG_INDEX_PARTIAL<br/>errorLocation 可定位报错环节"]
+    V9 --> V10["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RRF"]
+    V10 --> V11["回答与证据引用<br/>视频时间段、字幕片段、画面 OCR、片段摘要"]
+    V11 --> V12["播放定位<br/>videoUrl#t=秒 或视频复习页定位"]
 ```
 
 技术选型：
 
 - ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型；有公开视频 URL 时优先使用 `qwen3-asr-flash-filetrans` 异步文件转写获取句级时间戳，失败后降级 `qwen3-asr-flash` 同步转写；同步转写只返回纯文本时会按视频时长生成估算 SRT 时间段。
-- 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。
+- 关键帧和翻页：Python 先按候选帧间隔抽样，再用 Pillow 缩略图差异检测 PPT 翻页；首帧、翻页帧和固定间隔兜底帧会进入 OCR。
+- 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。每个 OCR 失败都会带 `video.frame_ocr[n]` 位置。
+- 片段摘要：Python 将字幕 cue 与同时间段关键帧 OCR 合并为 `evidenceChannel=video_segment_summary` 的片段摘要块，再进入递归切块和索引。
 - Embedding：统一使用百炼 `text-embedding-v4` 1024 维向量，pgvector 使用 HNSW + cosine。
-- 检索：字幕、转写文本、PPT/PDF OCR 和文档切块进入同一 RAG 仓库，查询时通过 Multi-Query、BM25、向量召回和 RRF/RAG-Fusion 融合排序。
+- 检索：字幕、转写文本、关键帧 OCR、视频片段摘要、PPT/PDF OCR 和文档切块进入同一 RAG 仓库，查询时通过 Multi-Query、BM25、向量召回和 RRF/RAG-Fusion 融合排序。
 - 播放定位：evidence 保留 `startTime/endTime/playbackUrl`；有真实视频地址时使用 `videoUrl#t=秒`，无真实视频地址时跳到视频复习页展示定位信息。
+- 错误定位：Python 所有视频阶段告警写入 `parseQuality.messages`，Java 读取后在 `PARTIAL` 时写入 `log_error.contextJson.errorLocation`。
 - 补跑修复：资料列表提供重建索引和高精度补跑入口，Java 会从本地上传目录或阿里 OSS 重新读取原始文件，再调用 Python 重建同一 `documentId` 的 RAG 索引。
 
 ### 整体业务流程图
 
+下面的总图按当前代码实现整理：前端只访问 Java API；Java 负责登录用户、资料状态、对象存储、页面聚合、统一响应和日志；Python FastAPI 负责 RAG 计算、视频解析、检索重排、回答生成和 JD 适配分析。当前阶段仍不启动 Agent 自主规划、工具调用或长任务编排。
+
 ```mermaid
 flowchart TD
-    U["用户：上传资料、粘贴笔记或输入问题"] --> FE["React 前端"]
+    U["用户登录并进入后台"] --> FE["React + Vite 前端<br/>工作台 / 学习资料 / 知识库 / JD 分析 / 简历适配 / 视频复习"]
 
-    FE -->|"资料上传 / 文本索引"| JC["Java RAG 控制器"]
-    JC --> JS["RAG 业务服务创建学习资料记录"]
-    JS --> DB["MyBatis 持久层写入资料表<br/>PENDING -> PARSING"]
-    JS --> PC["Python 服务调用客户端<br/>转发到 FastAPI"]
-    JS -->|"关键状态 / RAG 错误"| LOG["通用日志服务<br/>domain=rag，可复用到 Agent"]
-    PC -->|"Python 调用失败"| LOG
+    FE -->|"登录、当前用户"| AUTH["Java AuthController<br/>/api/auth/*"]
+    AUTH --> AUTHDB["app_user / auth_session / auth_login_record"]
 
-    PC --> PYI{"Python 解析入库入口"}
-    PYI -->|"解析 / OCR / 索引异常内部上报"| LOG
-    PYI -->|"文件"| ROUTE["多格式解析路由<br/>原生结构解析优先"]
-    PYI -->|"文本"| TXT["转换为 DocumentBlock"]
-    ROUTE --> BLOCK["统一 DocumentBlock<br/>页码/幻灯片/sheet/cell range"]
-    BLOCK --> CH["递归切块<br/>标题 / 章节 / 页面 / 段落 / 句子"]
-    TXT --> CH
-    CH --> META["补充 evidence 元数据<br/>blockId、来源、解析器、置信度"]
-    META --> SUM["摘要索引<br/>资料摘要 + 章节摘要"]
-    SUM --> IDX["写入 PostgreSQL/pgvector<br/>BM25 词项统计 + 向量列"]
-    IDX --> IR["返回 READY / PARTIAL / FAILED<br/>切块数、解析器、摘要"]
-    IR --> JU["Java 更新资料记录"]
-    JU --> FEI["前端展示解析状态、切块数和摘要"]
+    FE -->|"上传文件、粘贴文本、重建索引"| RAGAPI["Java RagController<br/>/api/rag/materials/*"]
+    RAGAPI --> RAGSVC["RagService<br/>校验用户、资料归属和状态机"]
+    RAGSVC --> STORE["ObjectStorageService<br/>本地 uploads 或阿里 OSS"]
+    RAGSVC --> LMDB["learning_material<br/>PENDING / PARSING / REINDEXING"]
+    RAGSVC --> PYIDX["Python 索引入口<br/>/internal/rag/documents/index-file 或 index-text"]
+    STORE -->|"原始文件字节、sourcePath"| PYIDX
+    PYIDX --> TYPE{"资料类型判断"}
+    TYPE -->|"原始视频"| VIDEOFLOW["视频处理链<br/>音频 ASR / 候选帧采样 / PPT 翻页检测 / OCR / 片段摘要"]
+    TYPE -->|"文档、图片、字幕、文本"| PARSE["多格式解析路由<br/>MinerU / 原生解析 / OCR / 字幕解析"]
+    PARSE --> BLOCK["DocumentBlock 统一模型<br/>页码、幻灯片、sheet、字幕时间、播放地址"]
+    VIDEOFLOW --> BLOCK
+    VIDEOFLOW -->|"阶段 warning"| VMSG["parseQuality.messages<br/>video.audio.extract / frame_ocr[n] / segment_summary"]
+    BLOCK --> CHUNK["递归切块 + 摘要索引<br/>标题、章节、段落、句子和原子块"]
+    CHUNK --> RAGDB["PostgreSQL/pgvector<br/>rag_document / rag_chunk / BM25 / 1024 维向量"]
+    RAGDB --> IDXRES["IndexResponse<br/>READY / PARTIAL / FAILED、parser、summary、chunkCount"]
+    VMSG --> IDXRES
+    IDXRES --> RAGSVC
+    RAGSVC --> LMDB
+    RAGSVC --> FE
 
-    FE -->|"RAG 提问"| JQ["Java 查询接口"]
-    JQ -->|"查询开始 / 失败 / 无证据"| LOG
-    JQ --> PQ["Python 查询入口"]
-    PQ --> MQ["Multi-Query 扩展问题"]
-    MQ --> FILTER["按元数据过滤条件筛选候选切块"]
-    FILTER --> RET["BM25 + pgvector 并行召回"]
-    RET --> FUSE["RRF / RAG-Fusion 融合排序"]
-    FUSE --> EV["选择优先证据<br/>片段、来源、章节、分数"]
-    EV --> ANS["生成带引用意识的回答摘要"]
-    ANS --> JR["Java 封装统一响应对象"]
-    JR --> UI["前端展示回答、扩展问题和证据引用"]
-    LOG --> LDB["log_event / log_error<br/>traceId、stage、errorCode、contextJson"]
+    FE -->|"RAG 提问"| QUERYAPI["Java 查询接口<br/>/api/rag/query"]
+    QUERYAPI -->|"覆盖 userId 与 visibilityScope"| PYQ["Python 查询入口<br/>/internal/rag/query"]
+    PYQ --> RET["Multi-Query<br/>BM25 + pgvector 召回<br/>RRF/RAG-Fusion + rerank"]
+    RET --> ANS["百炼 LLM 或本地规则化降级<br/>只基于 evidence 生成回答"]
+    ANS --> QRES["RagQueryVO<br/>answer、expandedQueries、evidences、diagnostics"]
+    QRES --> FE
+
+    FE -->|"查看单个资料 evidence"| EVAPI["Java evidence 接口<br/>/api/rag/materials/{id}/evidences"]
+    EVAPI --> PYE["Python evidence 列表<br/>/internal/rag/documents/{document_id}/evidences"]
+    PYE --> FE
+
+    FE -->|"提交 JD + 简历文本"| JDAPI["Java PageDataController<br/>/api/page-data/jd-analysis/analyze"]
+    JDAPI --> PYJD["Python JD 分析<br/>/internal/rag/jd-analysis"]
+    PYJD --> JDR["技能抽取 + 用户知识库检索<br/>supported / weak / missing"]
+    JDR --> JDTABLE["jd_analysis_report / jd_analysis_skill<br/>jd_learning_plan_item / resume_evidence_alignment"]
+    JDTABLE --> FE
+
+    FE -->|"工作台、简历适配、视频复习、设置"| PAGEAPI["Java PageDataController<br/>/api/page-data/*"]
+    PAGEAPI --> APPDB["业务库聚合<br/>资料、视频切片、JD 报告、简历证据、系统设置"]
+    APPDB --> FE
+
+    RAGAPI --> LOG["LogService<br/>domain=rag"]
+    QUERYAPI --> LOG
+    EVAPI --> LOG
+    JDAPI --> LOG
+    IDXRES -->|"PARTIAL/FAILED + errorLocation"| LOG
+    LOG --> LOGDB["log_event / log_error<br/>stage、action、errorCode、contextJson"]
+
+    FE --> UI["前端展示<br/>资料状态、证据卡片、视频播放定位、JD 匹配矩阵和学习计划"]
 ```
 
 ### 细分 RAG 流程图
 
-这里把 RAG 拆成“索引流程”“查询流程”“检索流程”三张图。查询流程解决“用户问题如何进入 RAG 并形成响应”，检索流程解决“候选切块如何被召回、融合、排序并变成证据”。Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
+这里把 RAG 拆成“索引流程”“查询流程”“检索流程”三张图。查询流程解决“用户问题如何进入 RAG 并形成响应”，检索流程解决“候选切块如何被召回、融合、重排并变成证据”。Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
 
 #### 索引流程图：资料到可检索证据
 
@@ -120,8 +154,19 @@ flowchart TD
     A3 --> A4["MyBatis 持久层<br/>保存资料记录"]
     A3 --> A5["Python 服务调用客户端<br/>按接口契约转发资料"]
     A5 --> A6{"输入是文件还是文本"}
-    A6 -->|"文件"| A7["按格式选择解析器<br/>PDF / DOCX / PPTX / MD / XLSX / 图片 / TXT"]
-    A7 --> A8{"原生解析质量是否足够"}
+    A6 -->|"文件"| A7["按格式选择解析器<br/>PDF / DOCX / PPTX / MD / XLSX / 图片 / TXT / 视频"]
+    A7 --> AV0{"是否原始视频文件"}
+    AV0 -->|"是"| AV1["FFmpeg 抽音频<br/>百炼 ASR 或本地降级"]
+    AV1 --> AV2["候选帧采样<br/>PPT 翻页检测保留关键帧"]
+    AV2 --> AV3["关键帧 OCR 入库<br/>evidenceChannel=frame_ocr"]
+    AV3 --> AV4["视频片段摘要<br/>evidenceChannel=video_segment_summary"]
+    AV4 --> A10
+    AV1 -.报错.-> AVE["阶段告警<br/>video.audio.extract / video.asr / video.frame_ocr[n] / video.segment_summary / video.fallback"]
+    AV2 -.报错.-> AVE
+    AV3 -.报错.-> AVE
+    AV4 -.报错.-> AVE
+    AVE --> A18
+    AV0 -->|"否"| A8{"原生解析质量是否足够"}
     A8 -->|"否或高精度"| A9["LibreOffice 转 PDF<br/>补跑 MinerU / OCR"]
     A8 -->|"是"| A10["统一 DocumentBlock<br/>保留结构和来源定位"]
     A9 --> A10
@@ -134,8 +179,10 @@ flowchart TD
     A14 --> A16["pgvector 向量索引<br/>真实 PostgreSQL 向量列"]
     A15 --> A17["PostgreSQL/pgvector 检索仓库<br/>资料、切块、词项统计、向量"]
     A16 --> A17
-    A17 --> A18["Python 返回解析入库结果<br/>READY / PARTIAL / FAILED"]
+    A17 --> A18["Python 返回解析入库结果<br/>READY / PARTIAL / FAILED<br/>parseQuality.messages 保留报错位置"]
     A18 --> A19["Java 回写资料状态<br/>完成、部分完成或失败"]
+    A18 -->|"PARTIAL 且有 messages"| A19E["Java 写入 log_error<br/>errorLocation 指向具体视频阶段"]
+    A19E --> A20
     A19 --> A20["前端刷新资料列表<br/>展示状态、切块数、摘要或错误"]
 ```
 
@@ -150,21 +197,25 @@ flowchart TD
     B4 --> B5["查询规范化<br/>去除空白、保留原问题、限制返回数量"]
     B5 --> B6["Multi-Query 扩展<br/>原问题、关键证据、学习资料、JD 或简历变体"]
     B6 --> B7["生成检索任务<br/>扩展问题列表 + 元数据过滤条件 + 返回数量"]
-    B7 --> B8["进入检索流程<br/>执行召回、融合、排序"]
+    B7 --> B8["进入检索流程<br/>执行召回、融合、重排"]
     B8 --> B9{"是否命中证据"}
     B9 -->|"否"| B10["空结果响应<br/>提示先上传资料或放宽过滤条件"]
-    B9 -->|"是"| B11["回答生成策略选择"]
-    B11 -->|"当前阶段"| B12["确定性回答摘要<br/>说明命中证据和推荐引用"]
-    B11 -->|"后续扩展"| B13["LLM 提示词组装<br/>问题 + 证据 + 引用约束"]
-    B13 --> B14["带引用答案<br/>只基于证据回答并保留出处"]
-    B12 --> B15["Python 组装查询响应<br/>回答、扩展问题、证据、诊断信息"]
+    B9 -->|"是"| B11["后检索重排<br/>百炼 qwen3-rerank 或本地确定性重排"]
+    B11 --> B12["回答生成策略选择"]
+    B12 -->|"已配置百炼 Key"| B13["百炼 LLM 提示词组装<br/>问题 + evidence + 引用约束"]
+    B12 -->|"未配置或调用失败"| B14["本地规则化降级回答<br/>保留 evidenceId 引用"]
+    B13 --> B15["带引用答案<br/>只基于 evidence 回答并保留出处"]
     B14 --> B15
-    B10 --> B15
-    B15 --> B16["Java 统一响应封装<br/>成功结果或错误映射"]
-    B16 --> B17["React 展示结果<br/>回答、扩展问题、证据卡片、来源章节"]
+    B15 --> B16["程序化追加证据引用摘要<br/>资料、章节或视频时间、来源、分数"]
+    B16 --> B17["Python 组装查询响应<br/>回答、扩展问题、证据、诊断信息"]
+    B10 --> B17
+    B17 --> B18["Java 统一响应封装<br/>成功结果或错误映射"]
+    B18 --> B19{"是否包含视频 evidence"}
+    B19 -->|"是"| B20["React 展示视频证据卡片<br/>字幕、画面 OCR、片段摘要、startTime / endTime / playbackUrl"]
+    B19 -->|"否"| B21["React 展示普通证据卡片<br/>来源、章节、页码、分数"]
 ```
 
-#### 检索流程图：召回、融合、排序到证据
+#### 检索流程图：召回、融合、重排到证据
 
 ```mermaid
 flowchart TD
@@ -182,10 +233,12 @@ flowchart TD
     C10 --> C11
     C11 --> C12["RRF / RAG-Fusion 融合<br/>按 1/(60 + 排名) 累加得分"]
     C12 --> C13["去重并重新排序<br/>同一切块只保留一个融合分数"]
-    C13 --> C14["按返回数量截取切块<br/>形成最终证据候选"]
-    C14 --> C15["证据字段构造<br/>证据ID、资料ID、标题、片段、来源、章节、类型、分数"]
-    C15 --> C16["片段压缩<br/>清理空白，超过 220 字符则截断"]
-    C16 --> C17["返回证据列表和诊断信息<br/>扩展问题、过滤后切块数量"]
+    C13 --> C14["保留 topK*3 候选证据<br/>为后检索重排留出候选池"]
+    C14 --> C15["百炼 qwen3-rerank<br/>不可用时本地确定性重排"]
+    C15 --> C16["按返回数量截取证据<br/>形成最终 evidence 列表"]
+    C16 --> C17["证据字段构造<br/>证据ID、资料ID、标题、片段、来源、章节、类型、分数"]
+    C17 --> C18["片段压缩<br/>清理空白，超过 220 字符则截断"]
+    C18 --> C19["返回证据列表和诊断信息<br/>扩展问题、过滤后切块数量、rerank provider"]
 ```
 
 ### 索引阶段：把学习资料变成可检索证据
@@ -210,15 +263,15 @@ flowchart TD
 4. Python 按元数据过滤条件过滤候选切块。当前登录态由 Java `/api/auth/login` 处理，前端请求自动携带 Bearer Token；Java 将当前用户 ID 写入资料记录、Python 索引 metadata 和查询 `metadataFilter.userId`，默认管理员账号为 `admin / 123456`。
 5. 每个查询变体同时走两路召回：BM25 负责关键词精确匹配，pgvector 负责向量相似度召回。
 6. 多个查询变体、多个召回器的结果通过 RRF 做 RAG-Fusion 融合排序，避免单一路径漏召回。
-7. 系统按返回数量选择证据，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和融合分数。
-8. 当前阶段生成的是确定性回答摘要：说明检索到几条证据、优先参考哪些资料和章节，并提醒正式输出保留证据引用。后续可以把这一步替换为真实 LLM 生成，但证据结构不需要改。
+7. 系统先保留 RAG-Fusion 候选证据，再通过百炼 `qwen3-rerank` 或本地确定性重排截取最终 evidence，并返回证据 ID、资料 ID、标题、片段、来源、章节、资料类型和分数。
+8. 回答生成优先使用百炼 LLM 的 evidence 约束提示词，要求只基于证据回答并保留 `[evidenceId]` 引用；未配置 Key、调用失败或测试环境会降级为本地规则化摘要。
 
 ### 当前实现边界
 
 - 当前 Python RAG 正式存储使用 PostgreSQL/pgvector，`rag_document` 保存资料摘要，`rag_chunk` 保存递归切块、元数据、BM25 词项统计和 `VECTOR(1024)` 向量，HNSW 索引使用 cosine 距离。
 - 当前向量生成使用阿里云百炼 / DashScope `text-embedding-v4`，默认 1024 维，统一通过 `DASHSCOPE_API_KEY` 调用；单元测试可通过 `RAG_EMBEDDING_PROVIDER=hash` 使用离线确定性向量，生产环境不建议使用 hash provider。
 - 当前 OCR 优先使用百炼 Qwen-OCR，未配置或失败时降级 `pytesseract`；Embedding 与 OCR 都收敛在 Python RAG 服务内，Java 不持有模型 Key。
-- 当前视频 RAG 支持字幕 / ASR 转写文本，也支持原始视频经过 FFmpeg + 百炼 ASR + 关键帧 OCR 后入库；时间戳证据通过 `startTime/endTime/playbackUrl` 返回。
+- 当前视频 RAG 支持字幕 / ASR 转写文本，也支持原始视频经过 FFmpeg + 百炼 ASR、候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要后入库；时间戳证据通过 `startTime/endTime/playbackUrl` 返回。
 - 当前回答生成已接入百炼 LLM 的 evidence 约束回答，未配置 Key 或测试环境会降级为规则化摘要；无证据时拒答并提示补充资料。
 - 当前 Agent 任务只保留页面入口，不实现自主规划、工具调用或长任务编排。
 
