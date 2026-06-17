@@ -38,6 +38,9 @@ export interface LearningMaterial {
   chunkCount: number;
   originalFilename?: string | null;
   originalFilePath?: string | null;
+  storageType?: string | null;
+  objectKey?: string | null;
+  publicUrl?: string | null;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -72,6 +75,7 @@ export interface RagQueryResult {
   answer: string;
   expandedQueries: string[];
   evidences: RagEvidence[];
+  diagnostics?: Record<string, unknown>;
 }
 
 export interface VideoSlice {

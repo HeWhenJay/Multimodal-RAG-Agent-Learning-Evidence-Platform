@@ -604,6 +604,24 @@ button {
   border: 0;
 }
 
+.query-filter-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.query-filter-row select {
+  min-width: 0;
+  height: 40px;
+  padding: 0 34px 0 12px;
+  color: #334155;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: 0;
+}
+
 .answer-box {
   margin-top: 14px;
   padding: 14px;
@@ -984,6 +1002,18 @@ button {
   line-height: 1.6;
 }
 
+.video-player-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.video-player {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #111827;
+}
+
 .video-thumb {
   height: 170px;
   display: grid;
@@ -1120,6 +1150,7 @@ button {
   .side-nav,
   .metric-grid,
   .dashboard-grid,
+  .query-filter-row,
   .two-column,
   .video-grid,
   .agent-placeholder,

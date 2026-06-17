@@ -8,6 +8,9 @@ export function KnowledgeBase() {
   const [question, setQuestion] = useState('');
   const [result, setResult] = useState<RagQueryResult | null>(null);
   const [error, setError] = useState('');
+  const [documentType, setDocumentType] = useState('');
+  const [mediaType, setMediaType] = useState('');
+  const [evidenceChannel, setEvidenceChannel] = useState('');
 
   // 提交问题并刷新 RAG 检索结果。
   async function submit() {
@@ -17,7 +20,11 @@ export function KnowledgeBase() {
       return;
     }
     try {
-      setResult(await queryRag({ question, topK: 6 }));
+      const metadataFilter: Record<string, string> = {};
+      if (documentType) metadataFilter.documentType = documentType;
+      if (mediaType) metadataFilter.mediaType = mediaType;
+      if (evidenceChannel) metadataFilter.evidenceChannel = evidenceChannel;
+      setResult(await queryRag({ question, topK: 6, metadataFilter }));
     } catch (err) {
       setError(err instanceof Error ? err.message : '检索失败');
     }
@@ -43,6 +50,28 @@ export function KnowledgeBase() {
             <Send size={18} />
           </button>
         </div>
+        <div className="query-filter-row">
+          <select value={documentType} onChange={(event) => setDocumentType(event.target.value)} aria-label="资料类型过滤">
+            <option value="">全部资料类型</option>
+            <option value="pdf">PDF</option>
+            <option value="pptx">PPTX</option>
+            <option value="markdown">Markdown</option>
+            <option value="srt">字幕 SRT</option>
+            <option value="vtt">字幕 VTT</option>
+            <option value="mp4">视频 MP4</option>
+            <option value="webm">视频 WEBM</option>
+          </select>
+          <select value={mediaType} onChange={(event) => setMediaType(event.target.value)} aria-label="媒体类型过滤">
+            <option value="">全部媒体类型</option>
+            <option value="video">视频</option>
+          </select>
+          <select value={evidenceChannel} onChange={(event) => setEvidenceChannel(event.target.value)} aria-label="证据通道过滤">
+            <option value="">全部证据通道</option>
+            <option value="subtitle">字幕 / ASR</option>
+            <option value="frame_ocr">关键帧 OCR</option>
+            <option value="video_metadata">视频元数据</option>
+          </select>
+        </div>
         {error && <p className="form-message danger">{error}</p>}
       </section>
 
@@ -57,6 +86,13 @@ export function KnowledgeBase() {
             <div className="query-tags">
               {result.expandedQueries.map((query) => <span key={query}>{query}</span>)}
             </div>
+            {result.diagnostics && (
+              <div className="query-tags diagnostics-tags">
+                <span>回答：{String(result.diagnostics.answerProvider || '未知')}</span>
+                <span>模型：{String(result.diagnostics.answerModel || '未返回')}</span>
+                <span>重排：{String(result.diagnostics.rerankProvider || '未知')}</span>
+              </div>
+            )}
           </article>
 
           <article className="panel">

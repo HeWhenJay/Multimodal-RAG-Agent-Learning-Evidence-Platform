@@ -99,3 +99,23 @@ def test_subtitle_file_preserves_video_url_header():
     )
 
     assert parsed.blocks[0].metadata["videoUrl"] == "https://example.com/course.mp4"
+
+
+def test_raw_video_file_creates_traceable_partial_metadata(monkeypatch):
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "local")
+    parser = DocumentParserRouter()
+
+    parsed = parser.parse_bytes(
+        content=b"not-a-real-video",
+        filename="course-rag.mp4",
+        document_id="doc-raw-video",
+        source_title="课程原始视频",
+        document_type="mp4",
+        source_path="https://example.com/course-rag.mp4",
+    )
+
+    assert parsed.status == "PARTIAL"
+    assert parsed.blocks
+    assert parsed.blocks[0].metadata["mediaType"] == "video"
+    assert parsed.blocks[0].metadata["evidenceChannel"] == "video_metadata"
+    assert parsed.blocks[0].metadata["videoUrl"] == "https://example.com/course-rag.mp4"

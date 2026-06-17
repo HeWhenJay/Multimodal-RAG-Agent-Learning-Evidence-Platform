@@ -32,18 +32,18 @@ flowchart LR
 
 ### 视频 RAG 第一阶段
 
-当前视频 RAG 不直接处理原始视频流，而是把视频对应的字幕或 ASR 转写文本作为学习证据入库。支持 `.srt`、`.vtt` 和带时间戳的 `.txt`，Python 会解析字幕时间段并写入 evidence 的 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
+当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储，Python 再基于本次上传文件字节执行 FFmpeg 抽音频、百炼 ASR 生成字幕、关键帧抽取和 OCR，最终把字幕 evidence 与画面 OCR evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
 
-典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 当前已完成字幕/转写文本时间戳证据、播放定位链接和文档/PPT OCR 证据闭环；原始视频自动 ASR、帧抽取、关键帧识别和内嵌播放器播放真实视频文件属于后续阶段。
+典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT/PDF 的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR 或 OCR 未配置，视频会进入 `PARTIAL`，并保留可追踪的视频元数据 evidence，方便后续补配环境后重建索引。
 
 ### 完整视频 RAG 技术路线
 
-下面是后续接入原始视频后的完整业务流程。当前代码只实现了其中“字幕 / ASR 转写文本解析 -> 时间戳 evidence -> RAG 检索 -> 播放定位”的第一阶段，不在本阶段启动长任务编排或 Agent 自主处理。
+下面是原始视频 RAG 的完整业务流程。当前代码已覆盖上传保存、音频抽取、百炼 ASR、关键帧抽取、画面 OCR、时间戳 evidence 和播放定位；仍不在本阶段启动 Agent 自主处理。
 
 ```mermaid
 flowchart TD
     V0["上传视频或课程资料包"] --> V1["保存视频文件和元数据<br/>课程名、来源、用户、可见范围"]
-    V1 --> V2["音频轨提取"]
+    V1 --> V2["FFmpeg 音频轨提取"]
     V2 --> V3["百炼语音识别 ASR<br/>输出带时间戳转写文本"]
     V1 --> V4["关键帧抽取<br/>按时间窗口或场景变化采样"]
     V4 --> V5["百炼 Qwen-OCR / 多模态 OCR<br/>识别板书、PPT、代码和图表文字"]
@@ -58,7 +58,7 @@ flowchart TD
 
 技术选型：
 
-- ASR：后续通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型，模型名保持配置化，输出优先转换为 `.srt/.vtt` 或带时间戳的 `.txt`。
+- ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型，模型名保持配置化，输出优先转换为 `.srt/.vtt` 或带时间戳的 `.txt`。
 - 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。
 - Embedding：统一使用百炼 `text-embedding-v4` 1024 维向量，pgvector 使用 HNSW + cosine。
 - 检索：字幕、转写文本、PPT/PDF OCR 和文档切块进入同一 RAG 仓库，查询时通过 Multi-Query、BM25、向量召回和 RRF/RAG-Fusion 融合排序。
@@ -217,8 +217,8 @@ flowchart TD
 - 当前 Python RAG 正式存储使用 PostgreSQL/pgvector，`rag_document` 保存资料摘要，`rag_chunk` 保存递归切块、元数据、BM25 词项统计和 `VECTOR(1024)` 向量，HNSW 索引使用 cosine 距离。
 - 当前向量生成使用阿里云百炼 / DashScope `text-embedding-v4`，默认 1024 维，统一通过 `DASHSCOPE_API_KEY` 调用；单元测试可通过 `RAG_EMBEDDING_PROVIDER=hash` 使用离线确定性向量，生产环境不建议使用 hash provider。
 - 当前 OCR 优先使用百炼 Qwen-OCR，未配置或失败时降级 `pytesseract`；Embedding 与 OCR 都收敛在 Python RAG 服务内，Java 不持有模型 Key。
-- 当前视频 RAG 第一阶段采用字幕 / ASR 转写文本入库，而不是直接解析原始视频；时间戳证据通过 `startTime/endTime/playbackUrl` 返回。
-- 当前回答生成是规则化摘要，不调用大模型；后续接 LLM 时应继续保留 evidence 引用和检索诊断。
+- 当前视频 RAG 支持字幕 / ASR 转写文本，也支持原始视频经过 FFmpeg + 百炼 ASR + 关键帧 OCR 后入库；时间戳证据通过 `startTime/endTime/playbackUrl` 返回。
+- 当前回答生成已接入百炼 LLM 的 evidence 约束回答，未配置 Key 或测试环境会降级为规则化摘要；无证据时拒答并提示补充资料。
 - 当前 Agent 任务只保留页面入口，不实现自主规划、工具调用或长任务编排。
 
 ## 目录结构
@@ -258,6 +258,18 @@ Java 后端：
 ```powershell
 cd backend-java
 mvn spring-boot:run
+```
+
+文件上传默认使用本地 `uploads/rag`；生产上传到阿里 OSS 时配置以下环境变量，密钥不要写入仓库：
+
+```powershell
+$env:EVIDENCE_STORAGE_PROVIDER='oss'
+$env:ALIYUN_OSS_BUCKET='<your-bucket>'
+$env:ALIYUN_OSS_ENDPOINT='https://oss-cn-chengdu.aliyuncs.com'
+$env:ALIYUN_OSS_ACCESS_KEY_ID='<your-access-key-id>'
+$env:ALIYUN_OSS_ACCESS_KEY_SECRET='<your-access-key-secret>'
+$env:ALIYUN_OSS_OBJECT_PREFIX='learning-evidence'
+$env:ALIYUN_OSS_PUBLIC_BASE_URL='https://<your-bucket>.oss-cn-chengdu.aliyuncs.com'
 ```
 
 React 前端：

@@ -34,3 +34,13 @@ evidence:
     max-stack-trace-bytes: 20480
     retention-days: 30
     internal-token: ${EVIDENCE_INTERNAL_LOG_TOKEN:}
+  storage:
+    provider: ${EVIDENCE_STORAGE_PROVIDER:local}
+    local-root: ${EVIDENCE_UPLOAD_ROOT:uploads/rag}
+    oss:
+      endpoint: ${ALIYUN_OSS_ENDPOINT:}
+      bucket: ${ALIYUN_OSS_BUCKET:}
+      access-key-id: ${ALIYUN_OSS_ACCESS_KEY_ID:}
+      access-key-secret: ${ALIYUN_OSS_ACCESS_KEY_SECRET:}
+      object-prefix: ${ALIYUN_OSS_OBJECT_PREFIX:learning-evidence}
+      public-base-url: ${ALIYUN_OSS_PUBLIC_BASE_URL:}

@@ -16,6 +16,7 @@ from rag.mineru_loader import MineruDocumentLoader
 from rag.models import ParsedBlockDocument
 from rag.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
 from rag.summary_index import SummaryIndex
+from rag.video_processing import VIDEO_FILE_TYPES, process_video_bytes
 from schemas.rag import DocumentBlock, ParseQuality
 
 
@@ -33,6 +34,7 @@ SUPPORTED_FILE_TYPES = {
     "xls",
     *TEXT_FILE_TYPES,
     *IMAGE_FILE_TYPES,
+    *VIDEO_FILE_TYPES,
 }
 ATOMIC_BLOCK_TYPES = {"table", "image", "chart", "formula", "code"}
 
@@ -130,6 +132,10 @@ class DocumentParserRouter:
             elif file_type in IMAGE_FILE_TYPES:
                 blocks, quality, parser, warnings = self._parse_image(
                     content, filename, document_id, source_title, source_path, file_type
+                )
+            elif file_type in VIDEO_FILE_TYPES:
+                blocks, quality, parser, warnings = self._parse_video(
+                    content, filename, document_id, source_title, source_path
                 )
             else:
                 text = decode_text(content)
@@ -521,6 +527,49 @@ class DocumentParserRouter:
             return self.ocr_client.recognize_image_bytes(image_bytes=content, filename=filename)
         return OcrResult(text="", parser="bailian-qwen-ocr-disabled")
 
+    def _parse_video(
+        self,
+        content: bytes,
+        filename: str,
+        document_id: str,
+        source_title: str,
+        source_path: str | None,
+    ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
+        artifacts = process_video_bytes(
+            content=content,
+            filename=filename,
+            document_id=document_id,
+            source_title=source_title,
+            source_path=source_path,
+            ocr_client=self.ocr_client,
+        )
+        blocks: list[DocumentBlock] = []
+        parser = artifacts.parser
+        if artifacts.transcript_text:
+            blocks.extend(
+                parse_transcript_blocks(
+                    text=artifacts.transcript_text,
+                    document_id=document_id,
+                    file_type=Path(filename).suffix.lower().lstrip(".") or "video",
+                    source_title=source_title,
+                    source_path=source_path,
+                    parse_engine="bailian-asr-transcript",
+                )
+            )
+        blocks.extend(artifacts.frame_blocks)
+        text_chars = sum(len(block.contentText) for block in blocks)
+        quality = evaluate_parse_quality(
+            QualitySignals(
+                native_text_chars=text_chars,
+                paragraph_count=sum(1 for block in blocks if block.blockType == "text"),
+                image_count=sum(1 for block in blocks if block.blockType == "image"),
+            ),
+            high_precision=False,
+        )
+        if blocks and text_chars > 0:
+            quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
+        return blocks, quality, parser, artifacts.warnings
+
     def _finalize(
         self,
         document_id: str,
@@ -566,6 +615,8 @@ def detect_file_type(filename: str, document_type: str | None, content_type: str
     if suffix:
         return "md" if suffix == "markdown" else suffix
     if content_type and content_type.startswith("image/"):
+        return content_type.split("/", 1)[1].lower()
+    if content_type and content_type.startswith("video/"):
         return content_type.split("/", 1)[1].lower()
     if content_type == "application/pdf":
         return "pdf"

@@ -6,6 +6,7 @@ import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.service.LogService;
+import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.RagService;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
@@ -17,28 +18,20 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.UUID;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class RagServiceImpl implements RagService {
 
-    private static final Path UPLOAD_ROOT = Path.of("uploads", "rag");
-    private static final DateTimeFormatter DATE_PATH_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
-
     private final LearningMaterialMapper learningMaterialMapper;
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
+    private final ObjectStorageService objectStorageService;
 
     /**
      * 汇总 Java 资料记录和 Python 向量仓库概览。
@@ -123,6 +116,7 @@ public class RagServiceImpl implements RagService {
         material.setSource(blankToDefault(dto.getSource(), "manual"));
         material.setStatus("PENDING");
         material.setChunkCount(0);
+        material.setStorageType("manual");
         learningMaterialMapper.insert(material);
         logService.recordRagEvent(
                 "material",
@@ -169,9 +163,10 @@ public class RagServiceImpl implements RagService {
     public LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision, String userId) {
         String scopedUserId = requireUserId(userId);
         String filename = file.getOriginalFilename() == null ? "未命名资料" : file.getOriginalFilename();
-        Path savedPath;
+        String documentType = detectDocumentType(filename);
+        ObjectStorageService.StoredObject storedObject;
         try {
-            savedPath = saveUploadFile(file, filename);
+            storedObject = objectStorageService.store(file, filename, scopedUserId, documentType);
         } catch (Exception e) {
             logService.recordRagError(
                     "material",
@@ -187,20 +182,25 @@ public class RagServiceImpl implements RagService {
         LearningMaterial material = new LearningMaterial();
         material.setTitle(filename);
         material.setUserId(scopedUserId);
-        material.setDocumentType(detectDocumentType(filename));
+        material.setDocumentType(documentType);
         material.setSource("upload");
         material.setStatus("PENDING");
         material.setChunkCount(0);
         material.setOriginalFilename(filename);
-        material.setOriginalFilePath(savedPath.toString());
+        material.setOriginalFilePath(storedObject.sourcePath());
+        material.setStorageType(storedObject.storageType());
+        material.setObjectKey(storedObject.objectKey());
+        material.setPublicUrl(storedObject.publicUrl());
         learningMaterialMapper.insert(material);
         Map<String, Object> startContext = materialContext(material);
         startContext.put("highPrecision", Boolean.TRUE.equals(highPrecision));
+        startContext.put("storageType", storedObject.storageType());
+        startContext.put("objectKey", storedObject.objectKey());
         logService.recordRagEvent(
                 "material",
                 "upload",
-                "material_upload_saved",
-                "学习资料文件已保存并创建记录",
+                "material_upload_stored",
+                "学习资料文件已保存到对象存储并创建记录",
                 startContext
         );
 
@@ -300,6 +300,9 @@ public class RagServiceImpl implements RagService {
                 .chunkCount(material.getChunkCount() == null ? 0 : material.getChunkCount())
                 .originalFilename(material.getOriginalFilename())
                 .originalFilePath(material.getOriginalFilePath())
+                .storageType(material.getStorageType())
+                .objectKey(material.getObjectKey())
+                .publicUrl(material.getPublicUrl())
                 .createdAt(material.getCreatedAt())
                 .updatedAt(material.getUpdatedAt())
                 .build();
@@ -351,6 +354,24 @@ public class RagServiceImpl implements RagService {
         }
         if (lower.endsWith(".webp")) {
             return "webp";
+        }
+        if (lower.endsWith(".mp4")) {
+            return "mp4";
+        }
+        if (lower.endsWith(".mov")) {
+            return "mov";
+        }
+        if (lower.endsWith(".m4v")) {
+            return "m4v";
+        }
+        if (lower.endsWith(".webm")) {
+            return "webm";
+        }
+        if (lower.endsWith(".mkv")) {
+            return "mkv";
+        }
+        if (lower.endsWith(".avi")) {
+            return "avi";
         }
         return "text";
     }
@@ -480,39 +501,6 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 按日期目录保存上传文件。
-     */
-    private Path saveUploadFile(MultipartFile file, String filename) {
-        if (file.isEmpty()) {
-            throw new IllegalArgumentException("上传文件不能为空");
-        }
-        String datePath = LocalDate.now().format(DATE_PATH_FORMATTER);
-        Path directory = UPLOAD_ROOT.resolve(datePath);
-        String safeFilename = sanitizeFilename(filename);
-        Path target = directory.resolve(UUID.randomUUID() + "-" + safeFilename);
-        try {
-            Files.createDirectories(directory);
-            try (var inputStream = file.getInputStream()) {
-                Files.copy(inputStream, target);
-            }
-            return target;
-        } catch (IOException e) {
-            throw new IllegalStateException("保存上传文件失败: " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 清理文件名中的路径分隔符和空白字符。
-     */
-    private String sanitizeFilename(String filename) {
-        String fallback = filename == null || filename.isBlank() ? "material" : filename;
-        return fallback
-                .replaceAll("[\\\\/:*?\"<>|]+", "_")
-                .replaceAll("\\s+", "_")
-                .toLowerCase(Locale.ROOT);
-    }
-
-    /**
      * 截断过长文本。
      */
     private String truncate(String value, int maxLength) {
@@ -588,6 +576,7 @@ public class RagServiceImpl implements RagService {
         if (result != null) {
             context.put("expandedQueryCount", result.getExpandedQueries() == null ? 0 : result.getExpandedQueries().size());
             context.put("evidenceCount", result.getEvidences() == null ? 0 : result.getEvidences().size());
+            context.put("diagnosticKeys", result.getDiagnostics() == null ? List.of() : result.getDiagnostics().keySet().stream().toList());
         }
         if (elapsedMs != null) {
             context.put("elapsedMs", elapsedMs);

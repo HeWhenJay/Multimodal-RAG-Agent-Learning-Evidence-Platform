@@ -62,7 +62,7 @@ export function LearningMaterials() {
       <section className="page-heading">
         <div>
           <h2>学习资料</h2>
-          <p>Markdown、PDF、Word、PPT、字幕与转写文本入口</p>
+          <p>Markdown、PDF、Word、PPT、字幕、转写文本与课程视频入口</p>
         </div>
         <button className="ghost-action" onClick={refresh}>
           <RefreshCw size={17} />
@@ -92,9 +92,9 @@ export function LearningMaterials() {
           </div>
           <label className="file-drop">
             <FileUp size={30} />
-            <strong>PDF / DOC / DOCX / PPT / PPTX / MD / XLSX / TXT / SRT / VTT / 图片</strong>
-            <span>原生结构解析优先，复杂版式再补跑 PDF + MinerU / OCR</span>
-            <input type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp" onChange={(event) => submitFile(event.target.files?.[0] || null)} />
+            <strong>PDF / DOC / PPT / XLSX / TXT / SRT / VTT / 图片 / 视频</strong>
+            <span>文件先进入配置的对象存储，视频会继续抽取字幕和关键帧 evidence</span>
+            <input type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp,.mp4,.mov,.m4v,.webm,.mkv,.avi" onChange={(event) => submitFile(event.target.files?.[0] || null)} />
           </label>
           <label className="toggle-row">
             <input type="checkbox" checked={highPrecision} onChange={(event) => setHighPrecision(event.target.checked)} />
@@ -113,9 +113,9 @@ export function LearningMaterials() {
             <div className="material-row" key={item.id}>
               <div>
                 <strong>{item.title}</strong>
-                <span>{formatDocumentType(item.documentType)} · {formatSource(item.source)} · {item.parser || '等待解析'}</span>
+                <span>{formatDocumentType(item.documentType)} · {formatSource(item.source)} · {formatStorage(item.storageType)} · {item.parser || '等待解析'}</span>
                 <p>{item.documentSummary || '等待索引摘要'}</p>
-                {(item.originalFilePath || item.originalFilename) && <p>{item.originalFilePath || item.originalFilename}</p>}
+                {(item.publicUrl || item.originalFilePath || item.originalFilename) && <p>{item.publicUrl || item.originalFilePath || item.originalFilename}</p>}
               </div>
               <div className="material-meta">
                 <span className={`status-pill ${item.status === 'READY' ? 'indexed' : ''}`}>{formatStatus(item.status)}</span>
@@ -142,6 +142,13 @@ function formatDocumentType(type: string) {
 function formatSource(source: string) {
   if (source === 'manual') return '手动录入';
   return source;
+}
+
+// 将资料存储位置转换为中文展示文本。
+function formatStorage(storageType?: string | null) {
+  if (storageType === 'oss') return '阿里 OSS';
+  if (storageType === 'manual') return '手动资料';
+  return '本地存储';
 }
 
 // 将资料解析状态转换为中文展示文本。

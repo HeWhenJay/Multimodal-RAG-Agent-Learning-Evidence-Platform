@@ -173,7 +173,7 @@ def update_chunk_metadata(chunks: list[Chunk], metadata: dict) -> list[Chunk]:
 
 
 def document_block_metadata(block: DocumentBlock) -> dict:
-    return {
+    block_metadata = {
         "blockId": block.blockId,
         "fileType": block.fileType,
         "blockType": block.blockType,
@@ -192,3 +192,8 @@ def document_block_metadata(block: DocumentBlock) -> dict:
         "sourcePath": block.sourcePath,
         "blockMetadata": block.metadata,
     }
+    for key in ("mediaType", "evidenceChannel", "videoUrl", "playbackUrl", "mediaUrl", "sourceVideoUrl"):
+        value = block.metadata.get(key)
+        if value is not None and value != "":
+            block_metadata[key] = value
+    return block_metadata

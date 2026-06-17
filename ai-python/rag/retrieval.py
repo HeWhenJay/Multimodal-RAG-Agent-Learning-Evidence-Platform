@@ -9,9 +9,11 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 from typing import Any
 
+from rag.bailian_llm import generate_grounded_answer
 from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.reranking import rerank_evidences
 from rag.summary_index import SummaryIndex
 from schemas.rag import (
     DocumentBlock,
@@ -144,13 +146,19 @@ class InMemoryRagStore:
             ranked_lists.append(self._vector_search(query_text, filtered_chunks, limit=max(request.topK * 3, 10)))
 
         fused = reciprocal_rank_fusion(ranked_lists)
-        selected = fused[: request.topK]
-        evidences = [self._to_evidence(chunk_id, score, retrieval_source="fusion") for chunk_id, score in selected]
-        answer = build_answer(request.question, evidences)
+        candidates = fused[: max(request.topK * 3, request.topK)]
+        candidate_evidences = [
+            self._to_evidence(chunk_id, score, retrieval_source="fusion")
+            for chunk_id, score in candidates
+        ]
+        reranked = rerank_evidences(request.question, candidate_evidences, request.topK)
+        diagnostics.update(reranked.diagnostics())
+        generated = generate_grounded_answer(request.question, reranked.evidences)
+        diagnostics.update(generated.diagnostics())
         return QueryResponse(
-            answer=answer,
+            answer=generated.answer,
             expandedQueries=expanded_queries,
-            evidences=evidences,
+            evidences=reranked.evidences,
             diagnostics=diagnostics,
         )
 
@@ -306,6 +314,10 @@ def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]
         return None
     start_seconds = timestamp_to_seconds(start_time)
     media_url = first_present(metadata, "playbackUrl", "videoUrl", "mediaUrl", "sourceVideoUrl")
+    if not media_url:
+        source_path = as_optional_str(metadata.get("sourcePath"))
+        if source_path and is_video_url(source_path):
+            media_url = source_path
     if media_url:
         base_url = media_url.split("#", 1)[0]
         return f"{base_url}#t={start_seconds}"
@@ -321,6 +333,10 @@ def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]
     if source_path:
         params["sourcePath"] = source_path
     return f"/videos?{urlencode(params, quote_via=quote)}"
+
+
+def is_video_url(value: str) -> bool:
+    return bool(re.match(r"^https?://.+\.(mp4|mov|m4v|webm|mkv|avi)(\?.*)?$", value, re.IGNORECASE))
 
 
 def first_present(metadata: dict[str, Any], *keys: str) -> str | None:

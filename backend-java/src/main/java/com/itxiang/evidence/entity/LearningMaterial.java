@@ -18,6 +18,9 @@ public class LearningMaterial {
     private Integer chunkCount;
     private String originalFilename;
     private String originalFilePath;
+    private String storageType;
+    private String objectKey;
+    private String publicUrl;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

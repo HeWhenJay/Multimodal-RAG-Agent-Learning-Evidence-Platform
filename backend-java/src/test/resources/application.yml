@@ -22,3 +22,6 @@ evidence:
     query-timeout-seconds: 1
     index-timeout-seconds: 1
     overview-timeout-seconds: 1
+  storage:
+    provider: local
+    local-root: target/test-uploads/rag

@@ -1,7 +1,10 @@
 from rag.retrieval import cached_embedding, embed_text, embedding_provider_name
 from rag.retrieval import InMemoryRagStore
+from rag.bailian_llm import deterministic_grounded_answer
 from rag.pgvector_store import build_filter_clause, vector_literal
-from schemas.rag import IndexTextRequest, QueryRequest
+from rag.reranking import local_rerank
+from rag.parse_quality import QualitySignals, evaluate_parse_quality
+from schemas.rag import DocumentBlock, IndexTextRequest, QueryRequest
 
 
 def test_rag_store_indexes_and_queries_with_evidence():
@@ -22,6 +25,9 @@ def test_rag_store_indexes_and_queries_with_evidence():
     assert response.evidences
     assert response.evidences[0].documentId == "doc-spring"
     assert "自动配置" in response.answer
+    assert response.evidences[0].retrievalSource == "rerank"
+    assert response.diagnostics["answerProvider"] == "local"
+    assert response.diagnostics["rerankProvider"] == "local"
     assert len(response.expandedQueries) >= 3
 
 
@@ -102,3 +108,89 @@ def test_dashscope_embedding_request_uses_1024_dimensions(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["json"]["model"] == "text-embedding-v4"
     assert captured["json"]["dimensions"] == 1024
+
+
+def test_local_rerank_keeps_evidence_id_and_scores():
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-rerank",
+            title="RAG 重排笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## 重排序\nRerank 会在 RAG-Fusion 后把更相关的证据排在前面。",
+        )
+    )
+    evidences = store.query(QueryRequest(question="RAG-Fusion 后如何重排序？", topK=3)).evidences
+    ranked = local_rerank("RAG-Fusion 后如何重排序？", evidences, 1)
+
+    assert len(ranked) == 1
+    assert ranked[0].evidenceId
+    assert ranked[0].retrievalSource == "rerank"
+
+
+def test_deterministic_answer_keeps_evidence_citation():
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-answer",
+            title="回答引用笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## 引用\n回答必须保留 evidenceId 引用。",
+        )
+    )
+    evidence = store.query(QueryRequest(question="回答为什么要保留引用？", topK=1)).evidences[0]
+    answer = deterministic_grounded_answer("回答为什么要保留引用？", [evidence])
+
+    assert f"[{evidence.evidenceId}]" in answer
+
+
+def test_video_metadata_filter_matches_promoted_block_metadata():
+    store = InMemoryRagStore()
+    block = DocumentBlock(
+        documentId="doc-video-filter",
+        blockId="doc-video-filter-subtitle-1",
+        fileType="srt",
+        blockType="text",
+        startTime="00:00:10",
+        endTime="00:00:20",
+        sectionTitle="视频字幕",
+        contentText="这里讲到了 RAG-Fusion 和 Multi-Query 检索。",
+        parseEngine="unit-subtitle",
+        sourceTitle="视频检索课",
+        sourcePath="https://example.com/rag-course.mp4",
+        metadata={
+            "mediaType": "video",
+            "evidenceChannel": "subtitle",
+            "videoUrl": "https://example.com/rag-course.mp4",
+        },
+    )
+    store.index_blocks(
+        document_id="doc-video-filter",
+        title="视频检索课",
+        document_type="srt",
+        source="unit-test",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="unit-subtitle",
+        blocks=[block],
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=len(block.contentText))),
+        status="READY",
+        source_path="https://example.com/rag-course.mp4",
+    )
+
+    response = store.query(
+        QueryRequest(
+            question="RAG-Fusion 怎么检索？",
+            topK=3,
+            metadataFilter={"mediaType": "video", "evidenceChannel": "subtitle"},
+        )
+    )
+
+    assert response.evidences
+    assert response.evidences[0].startTime == "00:00:10"
+    assert response.evidences[0].playbackUrl == "https://example.com/rag-course.mp4#t=10"

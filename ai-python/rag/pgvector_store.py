@@ -6,12 +6,13 @@ import os
 from collections import Counter
 from typing import Any
 
+from rag.bailian_llm import generate_grounded_answer
 from rag.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.reranking import rerank_evidences
 from rag.retrieval import (
     DEFAULT_EMBEDDING_DIMENSIONS,
-    build_answer,
     build_playback_url,
     embed_text,
     expand_queries,
@@ -214,16 +215,23 @@ class PgVectorRagStore:
             ranked_lists.append(self._vector_search(query_text, metadata_filter, limit=limit))
 
         fused = reciprocal_rank_fusion(ranked_lists)
-        selected = [(chunk_id, score) for chunk_id, score in fused[: request.topK] if chunk_id in chunk_by_id]
-        evidences = [
-            self._to_evidence(chunk_by_id[chunk_id], score, retrieval_source="fusion")
-            for chunk_id, score in selected
+        candidates = [
+            (chunk_id, score)
+            for chunk_id, score in fused[: max(request.topK * 3, request.topK)]
+            if chunk_id in chunk_by_id
         ]
-        answer = build_answer(request.question, evidences)
+        candidate_evidences = [
+            self._to_evidence(chunk_by_id[chunk_id], score, retrieval_source="fusion")
+            for chunk_id, score in candidates
+        ]
+        reranked = rerank_evidences(request.question, candidate_evidences, request.topK)
+        diagnostics.update(reranked.diagnostics())
+        generated = generate_grounded_answer(request.question, reranked.evidences)
+        diagnostics.update(generated.diagnostics())
         return QueryResponse(
-            answer=answer,
+            answer=generated.answer,
             expandedQueries=expanded_queries,
-            evidences=evidences,
+            evidences=reranked.evidences,
             diagnostics=diagnostics,
         )
 

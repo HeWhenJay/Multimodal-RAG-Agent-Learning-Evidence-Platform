@@ -99,7 +99,7 @@ class Evidence(BaseModel):
     sectionName: str
     documentType: str
     score: float
-    retrievalSource: Literal["bm25", "vector", "summary", "fusion"] = Field(
+    retrievalSource: Literal["bm25", "vector", "summary", "fusion", "rerank"] = Field(
         default="fusion",
         validation_alias=AliasChoices("retrievalSource", "retrieval_source"),
     )

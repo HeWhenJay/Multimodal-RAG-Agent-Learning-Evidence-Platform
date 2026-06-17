@@ -121,6 +121,7 @@ public class PythonRagClient {
                 .answer(text(root, "answer"))
                 .expandedQueries(readTextArray(root.get("expandedQueries")))
                 .evidences(evidences)
+                .diagnostics(readObjectMap(root.get("diagnostics")))
                 .build();
     }
 
@@ -304,6 +305,16 @@ public class PythonRagClient {
             result.add(item.asText());
         }
         return result;
+    }
+
+    /**
+     * 读取 Python 返回的诊断信息。
+     */
+    private Map<String, Object> readObjectMap(JsonNode node) {
+        if (node == null || !node.isObject()) {
+            return Map.of();
+        }
+        return objectMapper.convertValue(node, Map.class);
     }
 
     /**

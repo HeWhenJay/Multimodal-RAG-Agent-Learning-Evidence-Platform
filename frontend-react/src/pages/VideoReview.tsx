@@ -1,5 +1,5 @@
 import { CheckCircle2, Clock, PlayCircle, Video } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { fetchVideoSlices } from '../api/pageData';
 import type { VideoSlice } from '../api/types';
@@ -8,12 +8,15 @@ import type { VideoSlice } from '../api/types';
 export function VideoReview() {
   const [slices, setSlices] = useState<VideoSlice[]>([]);
   const [error, setError] = useState('');
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const [searchParams] = useSearchParams();
   const targetTitle = searchParams.get('title');
   const targetDocumentId = searchParams.get('documentId');
   const targetStartTime = searchParams.get('startTime');
   const targetEndTime = searchParams.get('endTime');
   const targetSourcePath = searchParams.get('sourcePath');
+  const targetVideoUrl = resolveVideoUrl(searchParams.get('videoUrl'), targetSourcePath);
+  const targetSeconds = targetStartTime ? timestampToSeconds(targetStartTime) : 0;
 
   useEffect(() => {
     fetchVideoSlices()
@@ -40,10 +43,23 @@ export function VideoReview() {
             </p>
             {targetSourcePath ? <span>来源：{targetSourcePath}</span> : null}
           </div>
-          <button className="ghost-action">
+          <button className="ghost-action" onClick={() => seekVideo(videoRef.current, targetSeconds)} disabled={!targetVideoUrl}>
             <PlayCircle size={16} />
             播放定位
           </button>
+        </section>
+      )}
+
+      {targetVideoUrl && (
+        <section className="panel video-player-panel">
+          <video
+            ref={videoRef}
+            className="video-player"
+            src={targetVideoUrl}
+            controls
+            preload="metadata"
+            onLoadedMetadata={(event) => seekVideo(event.currentTarget, targetSeconds)}
+          />
         </section>
       )}
 
@@ -73,4 +89,30 @@ export function VideoReview() {
       {error ? <p className="form-message danger">{error}</p> : null}
     </div>
   );
+}
+
+// 识别可直接播放的公开视频地址。
+function resolveVideoUrl(videoUrl: string | null, sourcePath: string | null) {
+  const candidate = videoUrl || sourcePath;
+  if (!candidate || !/^https?:\/\//i.test(candidate)) return null;
+  const lower = candidate.split('#', 1)[0].split('?', 1)[0].toLowerCase();
+  return /\.(mp4|mov|m4v|webm|mkv|avi)$/.test(lower) ? candidate : null;
+}
+
+// 将 HH:MM:SS 或 MM:SS 时间转为秒。
+function timestampToSeconds(value: string) {
+  const parts = value.replace(',', '.').split('.', 1)[0].split(':').map((part) => Number.parseInt(part, 10) || 0);
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length >= 3) {
+    const [hours, minutes, seconds] = parts.slice(-3);
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+  return 0;
+}
+
+// 将播放器定位到 evidence 命中的秒点。
+function seekVideo(video: HTMLVideoElement | null, seconds: number) {
+  if (!video || Number.isNaN(seconds)) return;
+  video.currentTime = Math.max(0, seconds);
+  video.play().catch(() => undefined);
 }

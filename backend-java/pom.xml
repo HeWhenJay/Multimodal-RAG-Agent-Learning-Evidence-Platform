@@ -22,6 +22,7 @@
         <mybatis.spring.version>3.0.4</mybatis.spring.version>
         <springdoc.version>2.6.0</springdoc.version>
         <lombok.version>1.18.34</lombok.version>
+        <aliyun.oss.version>3.18.4</aliyun.oss.version>
     </properties>
 
     <dependencies>
@@ -42,6 +43,11 @@
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>${springdoc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.aliyun.oss</groupId>
+            <artifactId>aliyun-sdk-oss</artifactId>
+            <version>${aliyun.oss.version}</version>
         </dependency>
         <dependency>
             <groupId>com.h2database</groupId>
@@ -75,4 +81,3 @@
         </plugins>
     </build>
 </project>
-
