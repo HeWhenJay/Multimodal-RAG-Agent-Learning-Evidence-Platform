@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class LogEvent {
@@ -28,8 +28,8 @@ public class LogEvent {
     private Long materialId;
     private String documentId;
     private String parser;
-    private LocalDateTime clientTime;
-    private LocalDateTime serverTime;
+    private OffsetDateTime clientTime;
+    private OffsetDateTime serverTime;
     private String contextJson;
-    private LocalDateTime createdAt;
+    private OffsetDateTime createdAt;
 }

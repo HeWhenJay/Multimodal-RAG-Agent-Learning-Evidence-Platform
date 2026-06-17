@@ -65,6 +65,9 @@ asr:
 video:
   ffmpeg-command: ${FFMPEG_COMMAND:}
   ffprobe-command: ${FFPROBE_COMMAND:}
+  ffmpeg-timeout-seconds: ${RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS:1800}
+  audio-segment-seconds: ${RAG_VIDEO_AUDIO_SEGMENT_SECONDS:300}
+  audio-overlap-seconds: ${RAG_VIDEO_AUDIO_OVERLAP_SECONDS:10}
   frame-sample-interval-seconds: ${RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS:5}
   frame-interval-seconds: ${RAG_VIDEO_FRAME_INTERVAL_SECONDS:30}
   max-frames: ${RAG_VIDEO_MAX_FRAMES:20}

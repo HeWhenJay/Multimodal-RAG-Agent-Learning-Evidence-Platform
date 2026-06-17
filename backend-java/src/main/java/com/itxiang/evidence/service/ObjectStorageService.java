@@ -2,12 +2,19 @@ package com.itxiang.evidence.service;
 
 import org.springframework.web.multipart.MultipartFile;
 
+import java.nio.file.Path;
+
 public interface ObjectStorageService {
 
     /**
      * 保存上传文件并返回可记录到资料表的来源路径。
      */
     StoredObject store(MultipartFile file, String filename, String userId, String documentType);
+
+    /**
+     * 保存已经合并到本地临时文件的上传资料。
+     */
+    StoredObject store(Path filePath, String filename, String userId, String documentType, String contentType);
 
     /**
      * 读取已保存的原始文件，用于重新解析和补跑索引。

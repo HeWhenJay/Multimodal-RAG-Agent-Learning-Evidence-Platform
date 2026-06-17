@@ -75,7 +75,7 @@ dashscope:
 
 ```mermaid
 flowchart LR
-    A["资料上传<br/>文档、图片、字幕、转写文本、原始视频"] --> B["文档 / 视频解析<br/>MinerU、ASR、PPT 翻页检测、OCR"]
+    A["资料上传<br/>文档、图片、字幕、转写文本、原始视频<br/>长视频自动分片上传"] --> B["文档 / 视频解析<br/>MinerU、重叠音频分段 ASR、PPT 翻页检测、OCR"]
     B --> C["结构化切块<br/>标题、章节、页面、字幕时间段、片段摘要"]
     C --> D["个人知识库 RAG<br/>Multi-Query + BM25 + 1024 维向量 + RAG-Fusion"]
     D --> E["JD 分析<br/>按当前用户知识库检索岗位技能证据"]
@@ -84,7 +84,9 @@ flowchart LR
 
 ### 视频 RAG 第一阶段
 
-当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储，Python 再基于本次上传文件字节执行 FFmpeg 抽音频、百炼 ASR 生成字幕、候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要，最终把字幕 evidence、画面 OCR evidence 与片段摘要 evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
+当前视频 RAG 已支持两类入口：一是 `.srt`、`.vtt` 和带时间戳的 `.txt` 字幕/转写文本；二是 `.mp4/.mov/.webm/.mkv/.avi` 等原始视频文件。原始视频会先由 Java 上传到配置的对象存储；大于 20MB 的视频由前端自动切成 20MB 分片，Java 合并后保存，再把 `sourcePath` 交给 Python 的视频源索引接口，避免再次把整段视频通过 multipart 转发。Python 会基于本地路径或公开视频 URL 执行 FFmpeg 抽音频、百炼 ASR 生成字幕、候选帧采样、PPT 翻页检测、关键帧 OCR 和视频片段摘要，最终把字幕 evidence、画面 OCR evidence 与片段摘要 evidence 统一写入 RAG。命中结果会保留 `startTime/endTime/playbackUrl`，前端知识库证据卡片展示命中时间范围，并提供“从这里播放”的跳转入口。
+
+为避免 2-3 小时长视频在分段处切断关键连续内容，本项目的本地/私有视频 ASR 默认按 5 分钟音频段处理，并在每段前后保留 10 秒重叠窗口。ASR 识别时使用带重叠的上下文，入库时保留与该段名义时间范围相交的字幕，再按全局时间轴合并和去重。这样可以减少边界处半句话、公式解释或代码步骤被切断的问题，同时避免重复 evidence。
 
 典型回答形态是：“某课程视频 `01:23:10-01:25:42` 命中字幕证据，同时可结合对应 PPT 翻页画面的 OCR 证据说明 RAG-Fusion 流程，点击证据卡片的播放入口跳到视频复习页定位。” 如果 FFmpeg、百炼 ASR、PPT 翻页检测、OCR 或片段摘要任一环节报错，Python 会把 `video.audio.extract`、`video.asr`、`video.frame.extract`、`video.slide_detect`、`video.frame_ocr[n]`、`video.segment_summary`、`video.fallback` 等位置写入 `parseQuality.messages`；Java 在 `PARTIAL` 时写入 `log_error.contextJson.errorLocation`，并保留可追踪的视频元数据 evidence。补配环境后可在资料列表触发“重建索引”或“高精度补跑”，重新生成字幕、画面 OCR 和片段摘要 evidence。
 
@@ -94,19 +96,28 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    V0["上传视频或课程资料包"] --> V1["保存视频文件和元数据<br/>课程名、来源、用户、可见范围"]
-    V1 --> V2["FFmpeg 音频轨提取"]
-    V2 --> V3["百炼语音识别 ASR<br/>输出带时间戳转写文本"]
+    V0["上传视频或课程资料包"] --> V0A{"是否大视频"}
+    V0A -->|"是"| V0B["前端 20MB 分片上传<br/>Java 暂存并按序合并"]
+    V0A -->|"否"| V1["保存视频文件和元数据<br/>课程名、来源、用户、可见范围"]
+    V0B --> V1
+    V1 --> V1A["Python 视频源索引<br/>传 sourcePath，不转发整段视频字节"]
+    V1A --> V2{"是否公开视频 URL"}
+    V2 -->|"是"| V3["百炼 filetrans 异步 ASR<br/>输出句级时间戳"]
+    V2 -->|"否"| V2A["FFmpeg 重叠音频分段<br/>默认 300s + 前后 10s 上下文"]
+    V2A --> V3A["分段同步 ASR<br/>时间戳平移到全局时间轴"]
+    V3A --> V3B["字幕合并去重<br/>保留相交字幕，重叠区做上下文"]
     V1 --> V4["候选帧采样<br/>默认每 5 秒抽一帧"]
     V4 --> V4A["PPT 翻页检测<br/>缩略图差异超过阈值保留为 ppt_flip"]
     V4A --> V5["百炼 Qwen-OCR / 本地 OCR<br/>识别板书、PPT、代码和图表文字"]
     V3 --> V6["字幕 / 转写文本解析<br/>生成 startTime、endTime"]
+    V3B --> V6
     V5 --> V7["画面文字块<br/>绑定 frameTime 和 sourcePath"]
     V6 --> V8["视频片段摘要<br/>合并字幕要点和画面 OCR"]
     V7 --> V8
     V8 --> V9["结构化切块<br/>保留时间戳、章节、来源"]
-    V2 -.报错.-> VERR["阶段告警<br/>parseQuality.messages 带 video.* 位置"]
+    V2A -.报错.-> VERR["阶段告警<br/>parseQuality.messages 带 video.* 位置"]
     V3 -.报错.-> VERR
+    V3A -.报错.-> VERR
     V4 -.报错.-> VERR
     V4A -.报错.-> VERR
     V5 -.报错.-> VERR
@@ -120,7 +131,8 @@ flowchart TD
 
 技术选型：
 
-- ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型；有公开视频 URL 时优先使用 `qwen3-asr-flash-filetrans` 异步文件转写获取句级时间戳，失败后降级 `qwen3-asr-flash` 同步转写；同步转写只返回纯文本时会按视频时长生成估算 SRT 时间段。
+- ASR：通过 `DASHSCOPE_API_KEY` 接入百炼语音识别模型；有公开视频 URL 时优先使用 `qwen3-asr-flash-filetrans` 异步文件转写获取句级时间戳，失败后降级为本地 FFmpeg 音频分段 + `qwen3-asr-flash` 同步转写；同步转写只返回纯文本时会按分段时长生成估算 SRT，再平移到原视频全局时间轴。
+- 连续性保护：本地/私有视频默认按 `RAG_VIDEO_AUDIO_SEGMENT_SECONDS=300` 分段，并用 `RAG_VIDEO_AUDIO_OVERLAP_SECONDS=10` 给每段前后保留上下文。入库前保留与名义分段相交的字幕并合并去重，减少关键句子被边界切断。
 - 关键帧和翻页：Python 先按候选帧间隔抽样，再用 Pillow 缩略图差异检测 PPT 翻页；首帧、翻页帧和固定间隔兜底帧会进入 OCR。
 - 画面 OCR：沿用 Python RAG 内的百炼 Qwen-OCR；未配置或失败时只对可降级场景使用本地 OCR，不在 Java 中实现识别逻辑。每个 OCR 失败都会带 `video.frame_ocr[n]` 位置。
 - 片段摘要：Python 将字幕 cue 与同时间段关键帧 OCR 合并为 `evidenceChannel=video_segment_summary` 的片段摘要块，再进入递归切块和索引。
@@ -141,14 +153,14 @@ flowchart TD
     FE -->|"登录、当前用户"| AUTH["Java AuthController<br/>/api/auth/*"]
     AUTH --> AUTHDB["app_user / auth_session / auth_login_record"]
 
-    FE -->|"上传文件、粘贴文本、重建索引"| RAGAPI["Java RagController<br/>/api/rag/materials/*"]
+    FE -->|"上传文件/视频分片、粘贴文本、重建索引"| RAGAPI["Java RagController<br/>/api/rag/materials/*"]
     RAGAPI --> RAGSVC["RagService<br/>校验用户、资料归属和状态机"]
     RAGSVC --> STORE["ObjectStorageService<br/>本地 uploads 或阿里 OSS"]
     RAGSVC --> LMDB["learning_material<br/>PENDING / PARSING / REINDEXING"]
-    RAGSVC --> PYIDX["Python 索引入口<br/>/internal/rag/documents/index-file 或 index-text"]
-    STORE -->|"原始文件字节、sourcePath"| PYIDX
+    RAGSVC --> PYIDX["Python 索引入口<br/>index-file / index-text / index-video-source"]
+    STORE -->|"普通文件字节或视频 sourcePath"| PYIDX
     PYIDX --> TYPE{"资料类型判断"}
-    TYPE -->|"原始视频"| VIDEOFLOW["视频处理链<br/>音频 ASR / 候选帧采样 / PPT 翻页检测 / OCR / 片段摘要"]
+    TYPE -->|"原始视频"| VIDEOFLOW["视频处理链<br/>视频源读取 / 重叠音频分段 ASR / 候选帧采样 / PPT 翻页检测 / OCR / 片段摘要"]
     TYPE -->|"文档、图片、字幕、文本"| PARSE["多格式解析路由<br/>MinerU / 原生解析 / OCR / 字幕解析"]
     PARSE --> BLOCK["DocumentBlock 统一模型<br/>页码、幻灯片、sheet、字幕时间、播放地址"]
     VIDEOFLOW --> BLOCK
@@ -200,16 +212,20 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A0["用户提交学习资料<br/>文件或文本"] --> A1["React 提交表单<br/>标题、类型、来源、可见范围"]
-    A1 --> A2["Java RAG 控制器<br/>校验空内容、文件大小、资料类型"]
+    A0["用户提交学习资料<br/>文件、文本或长视频"] --> A1{"是否大视频"}
+    A1 -->|"是"| A1A["React 分片上传<br/>默认每片 20MB"]
+    A1 -->|"否"| A1B["React 提交普通表单<br/>标题、类型、来源、可见范围"]
+    A1A --> A2["Java RAG 控制器<br/>校验空内容、分片参数、资料类型"]
+    A1B --> A2
     A2 --> A3["RAG 业务服务<br/>生成资料ID，状态写为 PENDING"]
     A3 --> A4["MyBatis 持久层<br/>保存资料记录"]
-    A3 --> A5["Python 服务调用客户端<br/>按接口契约转发资料"]
+    A3 --> A5["Python 服务调用客户端<br/>普通文件转发字节，视频传 sourcePath"]
     A5 --> A6{"输入是文件还是文本"}
     A6 -->|"文件"| A7["按格式选择解析器<br/>PDF / DOCX / PPTX / MD / XLSX / 图片 / TXT / 视频"]
     A7 --> AV0{"是否原始视频文件"}
-    AV0 -->|"是"| AV1["FFmpeg 抽音频<br/>百炼 ASR 或本地降级"]
-    AV1 --> AV2["候选帧采样<br/>PPT 翻页检测保留关键帧"]
+    AV0 -->|"是"| AV1["视频源处理<br/>公开视频 filetrans 或本地重叠音频分段"]
+    AV1 --> AV1A["字幕全局时间轴合并<br/>重叠上下文防切断，重复 cue 去重"]
+    AV1A --> AV2["候选帧采样<br/>PPT 翻页检测保留关键帧"]
     AV2 --> AV3["关键帧 OCR 入库<br/>evidenceChannel=frame_ocr"]
     AV3 --> AV4["视频片段摘要<br/>evidenceChannel=video_segment_summary"]
     AV4 --> A10
@@ -407,6 +423,11 @@ npm run dev
 | `RAG_EMBEDDING_PROVIDER` | 可选 | embedding 提供方；生产默认 `dashscope`，单测或离线演示才显式设置 `hash` | `dashscope` |
 | `RAG_EMBEDDING_BASE_URL` | 可选 | 百炼 OpenAI 兼容 embedding 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `RAG_EMBEDDING_TIMEOUT_SECONDS` | 可选 | 单次 embedding 请求超时 | `30` |
+| `SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE` | 可选 | Java 单个 multipart 文件上限；长视频仍推荐走分片上传 | `512MB` |
+| `SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE` | 可选 | Java 单个 multipart 请求上限 | `512MB` |
+| `SERVER_TOMCAT_MAX_SWALLOW_SIZE` | 可选 | Tomcat 处理超大请求体的吞吐上限 | `512MB` |
+| `EVIDENCE_AI_INDEX_TIMEOUT_SECONDS` | 可选 | Java 等待 Python 索引结果的超时时间，长视频建议保留较大值 | `1800` |
+| `EVIDENCE_UPLOAD_CHUNK_ROOT` | 可选 | Java 分片上传临时目录 | `uploads/chunks` |
 | `BAILIAN_OCR_MODEL` | 可选 | 百炼 OCR 模型名 | `qwen3.5-ocr` |
 | `BAILIAN_OCR_BASE_URL` | 可选 | 百炼 OpenAI 兼容接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `BAILIAN_OCR_ENABLED` | 可选 | 是否启用百炼 OCR；`auto` 表示存在 `DASHSCOPE_API_KEY` 时启用 | `auto` |
@@ -414,6 +435,9 @@ npm run dev
 | `BAILIAN_OCR_MAX_IMAGE_BYTES` | 可选 | 送入百炼 OCR 前允许的最大图片字节数 | `10485760` |
 | `LIBREOFFICE_COMMAND` / `SOFFICE_COMMAND` | 可选 | DOC/PPT 转 PDF 或结构化格式时指定 LibreOffice 命令 | `soffice` |
 | `OCR_LANG` | 可选 | 本地 `pytesseract` OCR 语言 | `chi_sim+eng` |
+| `RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS` | 可选 | FFmpeg 抽音频、分段和抽帧超时时间 | `1800` |
+| `RAG_VIDEO_AUDIO_SEGMENT_SECONDS` | 可选 | 本地/私有长视频音频分段长度 | `300` |
+| `RAG_VIDEO_AUDIO_OVERLAP_SECONDS` | 可选 | 音频分段前后重叠秒数，用于防止切断连续讲解 | `10` |
 | `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:7080` |
 
 ## MinerU 接入

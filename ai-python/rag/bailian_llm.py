@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from typing import Any
 
-from schemas.rag import Evidence
+from app.schemas.rag import Evidence
 
 
 DEFAULT_CHAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"

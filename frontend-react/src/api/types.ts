@@ -45,6 +45,16 @@ export interface LearningMaterial {
   updatedAt?: string;
 }
 
+export interface MaterialUploadChunk {
+  uploadId: string;
+  filename: string;
+  chunkIndex: number;
+  totalChunks: number;
+  receivedChunks: number;
+  completed: boolean;
+  material: LearningMaterial | null;
+}
+
 export interface RagEvidence {
   evidenceId: string;
   documentId: string;

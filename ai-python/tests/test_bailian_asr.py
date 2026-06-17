@@ -1,7 +1,14 @@
-from pathlib import Path
+﻿from pathlib import Path
 
-from rag.bailian_asr import BailianAsrClient, milliseconds_to_srt_timestamp, transcription_json_to_srt
-from rag.video_processing import estimate_srt_from_transcript, transcript_has_timestamps
+from video.asr.bailian_asr import BailianAsrClient, milliseconds_to_srt_timestamp, transcription_json_to_srt
+from video.chunking.video_processing import (
+    AudioSegment,
+    TranscriptCue,
+    cue_center_in_segment,
+    estimate_srt_from_transcript,
+    merge_transcript_cues,
+    transcript_has_timestamps,
+)
 
 
 def test_filetrans_result_converts_to_srt(monkeypatch, tmp_path: Path):
@@ -104,3 +111,31 @@ def test_estimate_srt_from_plain_transcript_creates_timestamp_ranges():
     assert transcript_has_timestamps(srt)
     assert "00:00:00,000 --> 00:00:10,000" in srt
     assert "00:00:10,000 --> 00:00:20,000" in srt
+
+
+def test_overlapped_audio_segment_only_indexes_nominal_window(tmp_path: Path):
+    segment = AudioSegment(
+        path=tmp_path / "audio.wav",
+        nominal_start=300,
+        nominal_end=600,
+        extract_start=290,
+        extract_end=610,
+    )
+
+    assert not cue_center_in_segment(TranscriptCue(1, 292, 296, "上一段上下文"), segment)
+    assert cue_center_in_segment(TranscriptCue(2, 598, 603, "边界处连续讲解"), segment)
+
+
+def test_merge_transcript_cues_deduplicates_overlap_text():
+    cues = [
+        TranscriptCue(1, 298, 303, "这里继续解释 RAG-Fusion。"),
+        TranscriptCue(2, 302, 307, "这里继续解释 RAG-Fusion。"),
+        TranscriptCue(3, 310, 315, "然后进入 BM25 和向量召回。"),
+    ]
+
+    merged = merge_transcript_cues(cues, overlap_seconds=10)
+
+    assert [cue.text for cue in merged] == [
+        "这里继续解释 RAG-Fusion。",
+        "然后进入 BM25 和向量召回。",
+    ]

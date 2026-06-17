@@ -34,6 +34,12 @@ button {
   cursor: pointer;
 }
 
+button:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.64;
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
@@ -243,6 +249,20 @@ button {
 
 .logout-action {
   flex: 0 0 auto;
+}
+
+.visually-hidden-file {
+  display: none;
+}
+
+.topbar-upload-status {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--primary);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .route-loading {
@@ -679,6 +699,17 @@ button {
   border-radius: 8px;
 }
 
+.upload-zone {
+  cursor: pointer;
+}
+
+.upload-zone.is-busy,
+.file-drop.is-busy {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.upload-zone input,
 .file-drop input {
   display: none;
 }
@@ -1137,7 +1168,8 @@ button {
   }
 
   .primary-action span,
-  .ghost-action span {
+  .ghost-action span,
+  .topbar-upload-status {
     display: none;
   }
 

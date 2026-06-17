@@ -1,9 +1,15 @@
 server:
   port: 7080
+  tomcat:
+    max-swallow-size: ${SERVER_TOMCAT_MAX_SWALLOW_SIZE:512MB}
 
 spring:
   application:
     name: learning-evidence-backend
+  servlet:
+    multipart:
+      max-file-size: ${SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE:512MB}
+      max-request-size: ${SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE:512MB}
   datasource:
     driver-class-name: org.postgresql.Driver
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://127.0.0.1:5433/postgres?currentSchema=learning_evidence,public}
@@ -25,7 +31,7 @@ evidence:
   ai:
     python-base-url: http://127.0.0.1:8090
     query-timeout-seconds: 30
-    index-timeout-seconds: 60
+    index-timeout-seconds: ${EVIDENCE_AI_INDEX_TIMEOUT_SECONDS:1800}
     overview-timeout-seconds: 5
   logs:
     enabled: true

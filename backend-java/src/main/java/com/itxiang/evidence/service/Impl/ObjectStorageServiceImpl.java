@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
@@ -50,6 +51,24 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
+     * 根据配置保存已经合并完成的本地临时文件。
+     */
+    @Override
+    public StoredObject store(Path filePath, String filename, String userId, String documentType, String contentType) {
+        if (filePath == null || !Files.exists(filePath) || !Files.isRegularFile(filePath)) {
+            throw new IllegalArgumentException("上传临时文件不存在");
+        }
+        String provider = properties.getProvider() == null ? "local" : properties.getProvider().trim().toLowerCase(Locale.ROOT);
+        if ("oss".equals(provider)) {
+            return storeToOss(filePath, filename, userId, documentType, contentType);
+        }
+        if (!"local".equals(provider)) {
+            throw new IllegalArgumentException("不支持的文件存储模式: " + properties.getProvider());
+        }
+        return storeToLocal(filePath, filename);
+    }
+
+    /**
      * 读取已保存原始文件，供资料重建索引或高精度补跑使用。
      */
     @Override
@@ -76,7 +95,25 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
             try (InputStream inputStream = file.getInputStream()) {
                 Files.copy(inputStream, target);
             }
-            return new StoredObject("local", target.toString(), target.toString(), null);
+            String absolutePath = target.toAbsolutePath().normalize().toString();
+            return new StoredObject("local", absolutePath, absolutePath, null);
+        } catch (IOException e) {
+            throw new IllegalStateException("保存上传文件失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 本地模式保存分片合并后的临时文件。
+     */
+    private StoredObject storeToLocal(Path filePath, String filename) {
+        String datePath = LocalDate.now().format(DATE_PATH_FORMATTER);
+        Path directory = Path.of(properties.getLocalRoot()).resolve(datePath);
+        Path target = directory.resolve(UUID.randomUUID() + "-" + sanitizeFilename(filename));
+        try {
+            Files.createDirectories(directory);
+            Files.copy(filePath, target, StandardCopyOption.REPLACE_EXISTING);
+            String absolutePath = target.toAbsolutePath().normalize().toString();
+            return new StoredObject("local", absolutePath, absolutePath, null);
         } catch (IOException e) {
             throw new IllegalStateException("保存上传文件失败: " + e.getMessage(), e);
         }
@@ -111,6 +148,42 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
         String publicUrl = buildPublicUrl(ossProperties, objectKey);
         String sourcePath = publicUrl == null ? "oss://" + ossProperties.getBucket() + "/" + objectKey : publicUrl;
         log.info("文件已上传到阿里 OSS: bucket={}, objectKey={}", ossProperties.getBucket(), objectKey);
+        return new StoredObject("oss", sourcePath, objectKey, publicUrl);
+    }
+
+    /**
+     * OSS 模式上传分片合并后的本地临时文件。
+     */
+    private StoredObject storeToOss(Path filePath, String filename, String userId, String documentType, String contentType) {
+        ObjectStorageProperties.Oss ossProperties = properties.getOss();
+        validateOssProperties(ossProperties);
+        String objectKey = buildObjectKey(ossProperties, filename, userId, documentType);
+        ObjectMetadata metadata = new ObjectMetadata();
+        try {
+            metadata.setContentLength(Files.size(filePath));
+        } catch (IOException e) {
+            throw new IllegalStateException("读取上传临时文件大小失败: " + e.getMessage(), e);
+        }
+        if (!isBlank(contentType)) {
+            metadata.setContentType(contentType);
+        }
+        OSS ossClient = new OSSClientBuilder().build(
+                ossProperties.getEndpoint(),
+                ossProperties.getAccessKeyId(),
+                ossProperties.getAccessKeySecret()
+        );
+        try (InputStream inputStream = Files.newInputStream(filePath)) {
+            ossClient.putObject(ossProperties.getBucket(), objectKey, inputStream, metadata);
+        } catch (OSSException | ClientException e) {
+            throw new IllegalStateException("上传文件到阿里 OSS 失败: " + e.getMessage(), e);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取上传临时文件失败: " + e.getMessage(), e);
+        } finally {
+            ossClient.shutdown();
+        }
+        String publicUrl = buildPublicUrl(ossProperties, objectKey);
+        String sourcePath = publicUrl == null ? "oss://" + ossProperties.getBucket() + "/" + objectKey : publicUrl;
+        log.info("分片合并文件已上传到阿里 OSS: bucket={}, objectKey={}", ossProperties.getBucket(), objectKey);
         return new StoredObject("oss", sourcePath, objectKey, publicUrl);
     }
 

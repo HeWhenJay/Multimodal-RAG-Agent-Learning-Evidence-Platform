@@ -1,5 +1,5 @@
-from rag.bailian_ocr import BailianOcrClient, OcrResult
-from rag.document_parsers import DocumentParserRouter
+﻿from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
+from rag.loaders.document_parsers import DocumentParserRouter
 
 
 class FakeResponse:

@@ -128,6 +128,31 @@ public class PythonRagClient {
     }
 
     /**
+     * 调用 Python 视频源索引接口，避免长视频再次通过 multipart 转发。
+     */
+    public IndexResult indexVideoSource(Long materialId,
+                                        String userId,
+                                        LearningMaterial material,
+                                        String filename,
+                                        String contentType,
+                                        Boolean highPrecision) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("documentId", "material-" + materialId);
+        payload.put("title", material.getTitle());
+        payload.put("documentType", material.getDocumentType());
+        payload.put("source", material.getSource());
+        payload.put("userId", userId);
+        payload.put("visibilityScope", "private");
+        payload.put("sourcePath", material.getOriginalFilePath());
+        payload.put("filename", filename == null ? material.getTitle() : filename);
+        payload.put("contentType", contentType);
+        payload.put("highPrecision", Boolean.TRUE.equals(highPrecision));
+
+        JsonNode root = postJson("/internal/rag/documents/index-video-source", payload);
+        return readIndexResult(root);
+    }
+
+    /**
      * 调用 Python RAG 查询接口。
      */
     public RagQueryVO query(RagQueryDTO dto) {

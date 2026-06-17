@@ -8,6 +8,7 @@ import com.itxiang.evidence.service.AuthService;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.RagService;
 import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryVO;
@@ -132,6 +133,45 @@ public class RagController {
                         "highPrecision", Boolean.TRUE.equals(highPrecision)
                 ),
                 () -> ragService.uploadMaterial(file, highPrecision, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 接收学习资料分片，全部分片到齐后合并并触发索引。
+     */
+    @PostMapping("/materials/upload/chunk")
+    @Operation(summary = "分片上传并索引学习资料")
+    public Result<MaterialUploadChunkVO> uploadMaterialChunk(@RequestParam("file") MultipartFile file,
+                                                             @RequestHeader(value = "Authorization", required = false) String authorization,
+                                                             @RequestParam(value = "uploadId", required = false) String uploadId,
+                                                             @RequestParam("filename") String filename,
+                                                             @RequestParam("chunkIndex") Integer chunkIndex,
+                                                             @RequestParam("totalChunks") Integer totalChunks,
+                                                             @RequestParam("totalSize") Long totalSize,
+                                                             @RequestParam(value = "highPrecision", defaultValue = "false") Boolean highPrecision) {
+        log.info("分片上传学习资料: uploadId={}, filename={}, chunkIndex={}, totalChunks={}, chunkSize={}",
+                uploadId, filename, chunkIndex, totalChunks, file.getSize());
+        return execute(
+                RagOperationContext.operation("material", "upload", "material_upload_chunk_request", "分片上传并索引学习资料"),
+                context(
+                        "uploadId", uploadId,
+                        "filename", filename,
+                        "chunkIndex", chunkIndex,
+                        "totalChunks", totalChunks,
+                        "chunkSize", file.getSize(),
+                        "totalSize", totalSize,
+                        "highPrecision", Boolean.TRUE.equals(highPrecision)
+                ),
+                () -> ragService.uploadMaterialChunk(
+                        file,
+                        uploadId,
+                        filename,
+                        chunkIndex,
+                        totalChunks,
+                        totalSize,
+                        highPrecision,
+                        currentUserId(authorization)
+                )
         );
     }
 

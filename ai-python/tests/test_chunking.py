@@ -1,4 +1,4 @@
-from rag.chunking import RecursiveChunker
+﻿from rag.chunkers.chunking import RecursiveChunker
 
 
 def test_recursive_chunker_keeps_metadata_and_overlap():

@@ -9,6 +9,7 @@ import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.RagService;
 import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryVO;
@@ -18,10 +19,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Stream;
 
 @Slf4j
 @Service
@@ -207,7 +217,7 @@ public class RagServiceImpl implements RagService {
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
         try {
-            PythonRagClient.IndexResult result = pythonRagClient.indexFile(
+            PythonRagClient.IndexResult result = indexStoredUpload(
                     material.getId(),
                     scopedUserId,
                     material,
@@ -240,6 +250,64 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 接收学习资料分片，全部到齐后合并文件并触发索引。
+     */
+    @Override
+    @Transactional
+    public MaterialUploadChunkVO uploadMaterialChunk(MultipartFile file,
+                                                    String uploadId,
+                                                    String filename,
+                                                    Integer chunkIndex,
+                                                    Integer totalChunks,
+                                                    Long totalSize,
+                                                    Boolean highPrecision,
+                                                    String userId) {
+        String scopedUserId = requireUserId(userId);
+        validateChunkRequest(file, filename, chunkIndex, totalChunks, totalSize);
+        String safeUploadId = blankToDefault(sanitizeUploadToken(uploadId), UUID.randomUUID().toString().replace("-", ""));
+        Path directory = chunkDirectory(scopedUserId, safeUploadId);
+        try {
+            Files.createDirectories(directory);
+            Path chunkPath = directory.resolve(String.format("chunk-%05d.part", chunkIndex));
+            try (InputStream inputStream = file.getInputStream()) {
+                Files.copy(inputStream, chunkPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+            int receivedChunks = countReceivedChunks(directory);
+            if (receivedChunks < totalChunks) {
+                return MaterialUploadChunkVO.builder()
+                        .uploadId(safeUploadId)
+                        .filename(filename)
+                        .chunkIndex(chunkIndex)
+                        .totalChunks(totalChunks)
+                        .receivedChunks(receivedChunks)
+                        .completed(false)
+                        .material(null)
+                        .build();
+            }
+            Path mergedPath = mergeChunks(directory, filename, totalChunks, totalSize);
+            LearningMaterialVO material = storeAndIndexMergedFile(
+                    mergedPath,
+                    filename,
+                    file.getContentType(),
+                    scopedUserId,
+                    highPrecision
+            );
+            cleanupChunkDirectory(directory);
+            return MaterialUploadChunkVO.builder()
+                    .uploadId(safeUploadId)
+                    .filename(filename)
+                    .chunkIndex(chunkIndex)
+                    .totalChunks(totalChunks)
+                    .receivedChunks(totalChunks)
+                    .completed(true)
+                    .material(material)
+                    .build();
+        } catch (IOException e) {
+            throw new IllegalStateException("保存上传分片失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * 重新读取原始文件并调用 Python RAG 重建索引，可用于低质量资料高精度补跑。
      */
     @Override
@@ -268,21 +336,33 @@ public class RagServiceImpl implements RagService {
         );
 
         try {
-            ObjectStorageService.LoadedObject loadedObject = objectStorageService.load(
-                    material.getStorageType(),
-                    material.getOriginalFilePath(),
-                    material.getObjectKey(),
-                    material.getOriginalFilename()
-            );
-            PythonRagClient.IndexResult result = pythonRagClient.indexFileBytes(
-                    material.getId(),
-                    scopedUserId,
-                    material,
-                    loadedObject.content(),
-                    loadedObject.filename(),
-                    loadedObject.contentType(),
-                    Boolean.TRUE.equals(highPrecision)
-            );
+            PythonRagClient.IndexResult result;
+            if (isVideoDocumentType(material.getDocumentType())) {
+                result = pythonRagClient.indexVideoSource(
+                        material.getId(),
+                        scopedUserId,
+                        material,
+                        material.getOriginalFilename(),
+                        null,
+                        Boolean.TRUE.equals(highPrecision)
+                );
+            } else {
+                ObjectStorageService.LoadedObject loadedObject = objectStorageService.load(
+                        material.getStorageType(),
+                        material.getOriginalFilePath(),
+                        material.getObjectKey(),
+                        material.getOriginalFilename()
+                );
+                result = pythonRagClient.indexFileBytes(
+                        material.getId(),
+                        scopedUserId,
+                        material,
+                        loadedObject.content(),
+                        loadedObject.filename(),
+                        loadedObject.contentType(),
+                        Boolean.TRUE.equals(highPrecision)
+                );
+            }
             recordIndexResultAnomalies(material, result);
             applyIndexResult(material, result);
             logService.recordRagEvent(
@@ -300,6 +380,93 @@ public class RagServiceImpl implements RagService {
                     "material_reindex_failed",
                     resolveRagErrorCode(e),
                     "学习资料重建索引失败",
+                    e,
+                    errorContext(material, e)
+            );
+            markFailed(material, e.getMessage());
+        }
+        return convertToVO(material);
+    }
+
+    /**
+     * 对已保存的上传资料选择合适的 Python 索引入口。
+     */
+    private PythonRagClient.IndexResult indexStoredUpload(Long materialId,
+                                                          String userId,
+                                                          LearningMaterial material,
+                                                          MultipartFile file,
+                                                          Boolean highPrecision) {
+        if (isVideoDocumentType(material.getDocumentType())) {
+            return pythonRagClient.indexVideoSource(
+                    materialId,
+                    userId,
+                    material,
+                    file.getOriginalFilename(),
+                    file.getContentType(),
+                    highPrecision
+            );
+        }
+        return pythonRagClient.indexFile(materialId, userId, material, file, highPrecision);
+    }
+
+    /**
+     * 保存分片合并文件、创建资料记录并调用 Python 索引。
+     */
+    private LearningMaterialVO storeAndIndexMergedFile(Path mergedPath,
+                                                       String filename,
+                                                       String contentType,
+                                                       String userId,
+                                                       Boolean highPrecision) {
+        String documentType = detectDocumentType(filename);
+        ObjectStorageService.StoredObject storedObject = objectStorageService.store(mergedPath, filename, userId, documentType, contentType);
+        LearningMaterial material = new LearningMaterial();
+        material.setTitle(filename);
+        material.setUserId(userId);
+        material.setDocumentType(documentType);
+        material.setSource("upload");
+        material.setStatus("PENDING");
+        material.setChunkCount(0);
+        material.setOriginalFilename(filename);
+        material.setOriginalFilePath(storedObject.sourcePath());
+        material.setStorageType(storedObject.storageType());
+        material.setObjectKey(storedObject.objectKey());
+        material.setPublicUrl(storedObject.publicUrl());
+        learningMaterialMapper.insert(material);
+        learningMaterialMapper.updateStatus(material.getId(), "PARSING");
+        material.setStatus("PARSING");
+        try {
+            PythonRagClient.IndexResult result;
+            if (isVideoDocumentType(documentType)) {
+                result = pythonRagClient.indexVideoSource(
+                        material.getId(),
+                        userId,
+                        material,
+                        filename,
+                        contentType,
+                        Boolean.TRUE.equals(highPrecision)
+                );
+            } else {
+                byte[] content = Files.readAllBytes(mergedPath);
+                result = pythonRagClient.indexFileBytes(
+                        material.getId(),
+                        userId,
+                        material,
+                        content,
+                        filename,
+                        contentType,
+                        Boolean.TRUE.equals(highPrecision)
+                );
+            }
+            recordIndexResultAnomalies(material, result);
+            applyIndexResult(material, result);
+        } catch (Exception e) {
+            log.warn("分片上传资料解析入库失败: materialId={}, reason={}", material.getId(), e.getMessage());
+            logService.recordRagError(
+                    "material",
+                    "index",
+                    "material_chunk_index_failed",
+                    resolveRagErrorCode(e),
+                    "分片上传资料索引失败",
                     e,
                     errorContext(material, e)
             );
@@ -443,6 +610,133 @@ public class RagServiceImpl implements RagService {
             return "avi";
         }
         return "text";
+    }
+
+    /**
+     * 校验上传分片基本参数，避免越界分片和空文件进入合并流程。
+     */
+    private void validateChunkRequest(MultipartFile file,
+                                      String filename,
+                                      Integer chunkIndex,
+                                      Integer totalChunks,
+                                      Long totalSize) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("上传分片不能为空");
+        }
+        if (filename == null || filename.isBlank()) {
+            throw new IllegalArgumentException("上传文件名不能为空");
+        }
+        if (chunkIndex == null || totalChunks == null || chunkIndex < 0 || totalChunks <= 0 || chunkIndex >= totalChunks) {
+            throw new IllegalArgumentException("分片参数不合法");
+        }
+        if (totalSize != null && totalSize <= 0) {
+            throw new IllegalArgumentException("文件总大小不合法");
+        }
+    }
+
+    /**
+     * 构造当前用户的分片暂存目录。
+     */
+    private Path chunkDirectory(String userId, String uploadId) {
+        return chunkRoot()
+                .resolve(sanitizeFilenameToken(userId))
+                .resolve(sanitizeUploadToken(uploadId))
+                .toAbsolutePath()
+                .normalize();
+    }
+
+    /**
+     * 获取分片暂存根目录，可通过环境变量覆盖。
+     */
+    private Path chunkRoot() {
+        return Path.of(System.getenv().getOrDefault("EVIDENCE_UPLOAD_CHUNK_ROOT", "uploads/chunks"))
+                .toAbsolutePath()
+                .normalize();
+    }
+
+    /**
+     * 统计当前已收到的分片数量。
+     */
+    private int countReceivedChunks(Path directory) throws IOException {
+        try (Stream<Path> files = Files.list(directory)) {
+            return (int) files
+                    .filter(path -> path.getFileName().toString().matches("chunk-\\d{5}\\.part"))
+                    .count();
+        }
+    }
+
+    /**
+     * 按分片序号顺序合并文件，并校验合并后的总大小。
+     */
+    private Path mergeChunks(Path directory, String filename, int totalChunks, Long totalSize) throws IOException {
+        Path mergedPath = directory.resolve("merged-" + sanitizeFilenameToken(filename));
+        try (OutputStream outputStream = Files.newOutputStream(mergedPath)) {
+            for (int index = 0; index < totalChunks; index++) {
+                Path chunkPath = directory.resolve(String.format("chunk-%05d.part", index));
+                if (!Files.exists(chunkPath)) {
+                    throw new IllegalStateException("上传分片缺失: " + index);
+                }
+                Files.copy(chunkPath, outputStream);
+            }
+        }
+        if (totalSize != null && Files.size(mergedPath) != totalSize) {
+            throw new IllegalStateException("分片合并后的文件大小与前端声明不一致");
+        }
+        return mergedPath;
+    }
+
+    /**
+     * 清理分片临时目录，先校验路径仍位于分片根目录内。
+     */
+    private void cleanupChunkDirectory(Path directory) {
+        Path root = chunkRoot();
+        Path target = directory.toAbsolutePath().normalize();
+        if (!target.startsWith(root)) {
+            log.warn("跳过分片目录清理，路径不在分片根目录内: {}", target);
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(target)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    log.debug("清理分片临时文件失败: path={}, reason={}", path, e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            log.debug("清理分片临时目录失败: path={}, reason={}", target, e.getMessage());
+        }
+    }
+
+    /**
+     * 判断资料类型是否属于原始视频。
+     */
+    private boolean isVideoDocumentType(String documentType) {
+        if (documentType == null) {
+            return false;
+        }
+        return List.of("mp4", "mov", "m4v", "webm", "mkv", "avi").contains(documentType.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 规整 uploadId，避免路径穿越。
+     */
+    private String sanitizeUploadToken(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        return value.replaceAll("[^A-Za-z0-9_-]", "");
+    }
+
+    /**
+     * 规整临时文件名片段。
+     */
+    private String sanitizeFilenameToken(String value) {
+        String fallback = value == null || value.isBlank() ? "material" : value;
+        return fallback
+                .replaceAll("[\\\\/:*?\"<>|]+", "_")
+                .replaceAll("\\s+", "_")
+                .toLowerCase(Locale.ROOT);
     }
 
     /**

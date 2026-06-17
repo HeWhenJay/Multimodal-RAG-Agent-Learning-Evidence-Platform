@@ -1,0 +1,17 @@
+package com.itxiang.evidence.vo;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class MaterialUploadChunkVO {
+
+    private String uploadId;
+    private String filename;
+    private Integer chunkIndex;
+    private Integer totalChunks;
+    private Integer receivedChunks;
+    private Boolean completed;
+    private LearningMaterialVO material;
+}

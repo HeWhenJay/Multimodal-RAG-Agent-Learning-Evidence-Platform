@@ -8,16 +8,18 @@ import {
   FileText,
   Flag,
   LibraryBig,
+  Loader2,
   PlayCircle,
   Search,
   Send,
   TriangleAlert,
   Video
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ChangeEvent, type DragEvent } from 'react';
 import { fetchDashboardData } from '../api/pageData';
 import { queryRag } from '../api/rag';
 import type { DashboardData, RagEvidence } from '../api/types';
+import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 
 // 工作台首页展示 RAG 概览、检索入口和证据对齐摘要。
 export function Dashboard() {
@@ -26,12 +28,37 @@ export function Dashboard() {
   const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
   const [error, setError] = useState('');
+  const { uploading, uploadMessage, uploadFile } = useMaterialUpload();
+
+  // 拉取工作台聚合数据。
+  const loadDashboard = useCallback(async () => {
+    try {
+      const data = await fetchDashboardData();
+      setDashboard(data);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
+    }
+  }, []);
 
   useEffect(() => {
-    fetchDashboardData().then(setDashboard).catch((loadError) => {
-      setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
-    });
-  }, []);
+    void loadDashboard();
+    window.addEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
+    return () => window.removeEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
+  }, [loadDashboard]);
+
+  // 处理工作台文件选择上传。
+  function handleUploadChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] || null;
+    event.target.value = '';
+    void uploadFile(file).catch(() => undefined);
+  }
+
+  // 处理拖拽到接入通道的文件上传。
+  function handleUploadDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0] || null;
+    void uploadFile(file).catch(() => undefined);
+  }
 
   // 执行一次 RAG 检索并刷新回答与证据列表。
   async function runQuery() {
@@ -125,13 +152,19 @@ export function Dashboard() {
               多模态数据接入通道
             </h3>
           </div>
-          <div className="upload-zone">
-            <CloudUpload size={28} />
-            <strong>拖拽文件或点击上传</strong>
+          <label
+            className={`upload-zone ${uploading ? 'is-busy' : ''}`}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={handleUploadDrop}
+          >
+            {uploading ? <Loader2 className="spin" size={28} /> : <CloudUpload size={28} />}
+            <strong>{uploading ? '正在上传并索引' : '拖拽文件或点击上传'}</strong>
             <div className="format-row">
               {['PDF', 'DOCX', 'PPTX', 'MP4', 'MD'].map((format) => <span key={format}>{format}</span>)}
             </div>
-          </div>
+            <input type="file" accept={MATERIAL_FILE_ACCEPT} disabled={uploading} onChange={handleUploadChange} />
+          </label>
+          {uploadMessage ? <p className="form-message">{uploadMessage}</p> : null}
           <h4>近期处理任务</h4>
           {(dashboard?.recentMaterials || []).map((item) => (
             <div className="task-row" key={item.id}>

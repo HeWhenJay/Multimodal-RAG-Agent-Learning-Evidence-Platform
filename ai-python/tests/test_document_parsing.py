@@ -1,7 +1,7 @@
-from rag.document_parsers import DocumentParserRouter
-from rag.retrieval import InMemoryRagStore
-from rag.video_processing import FrameImage, build_video_segment_summary_blocks, select_ppt_slide_frames
-from schemas.rag import DocumentBlock
+﻿from rag.loaders.document_parsers import DocumentParserRouter
+from rag.retrievers.retrieval import InMemoryRagStore
+from video.chunking.video_processing import FrameImage, build_video_segment_summary_blocks, select_ppt_slide_frames
+from app.schemas.rag import DocumentBlock
 
 
 def test_markdown_file_routes_to_document_blocks():

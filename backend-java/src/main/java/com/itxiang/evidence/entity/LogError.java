@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class LogError {
@@ -30,13 +30,13 @@ public class LogError {
     private Long materialId;
     private String documentId;
     private String parser;
-    private LocalDateTime clientTime;
-    private LocalDateTime serverTime;
+    private OffsetDateTime clientTime;
+    private OffsetDateTime serverTime;
     private String contextJson;
-    private LocalDateTime firstSeenAt;
-    private LocalDateTime lastSeenAt;
+    private OffsetDateTime firstSeenAt;
+    private OffsetDateTime lastSeenAt;
     private Integer occurrenceCount;
     private String status;
-    private LocalDateTime createdAt;
-    private LocalDateTime updatedAt;
+    private OffsetDateTime createdAt;
+    private OffsetDateTime updatedAt;
 }

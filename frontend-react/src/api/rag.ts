@@ -1,4 +1,4 @@
-import type { LearningMaterial, RagOverview, RagQueryResult, Result } from './types';
+import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagQueryResult, Result } from './types';
 import { getStoredAuthToken } from './auth';
 
 const jsonHeaders = {
@@ -76,6 +76,32 @@ export function uploadMaterial(file: File, highPrecision = false): Promise<Learn
   form.append('file', file);
   form.append('highPrecision', String(highPrecision));
   return request<LearningMaterial>('/api/rag/materials/upload', {
+    method: 'POST',
+    body: form
+  });
+}
+
+// 上传一个学习资料分片，全部分片到齐后后端会合并并触发索引。
+export function uploadMaterialChunk(payload: {
+  chunk: Blob;
+  filename: string;
+  uploadId?: string;
+  chunkIndex: number;
+  totalChunks: number;
+  totalSize: number;
+  highPrecision?: boolean;
+}): Promise<MaterialUploadChunk> {
+  const form = new FormData();
+  form.append('file', payload.chunk, payload.filename);
+  form.append('filename', payload.filename);
+  if (payload.uploadId) {
+    form.append('uploadId', payload.uploadId);
+  }
+  form.append('chunkIndex', String(payload.chunkIndex));
+  form.append('totalChunks', String(payload.totalChunks));
+  form.append('totalSize', String(payload.totalSize));
+  form.append('highPrecision', String(Boolean(payload.highPrecision)));
+  return request<MaterialUploadChunk>('/api/rag/materials/upload/chunk', {
     method: 'POST',
     body: form
   });

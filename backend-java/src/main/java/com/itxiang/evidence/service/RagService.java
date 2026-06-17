@@ -3,6 +3,7 @@ package com.itxiang.evidence.service;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryVO;
@@ -41,6 +42,18 @@ public interface RagService {
      * 上传并索引文件学习资料。
      */
     LearningMaterialVO uploadMaterial(MultipartFile file, Boolean highPrecision, String userId);
+
+    /**
+     * 接收文件分片，全部到齐后合并并索引学习资料。
+     */
+    MaterialUploadChunkVO uploadMaterialChunk(MultipartFile file,
+                                              String uploadId,
+                                              String filename,
+                                              Integer chunkIndex,
+                                              Integer totalChunks,
+                                              Long totalSize,
+                                              Boolean highPrecision,
+                                              String userId);
 
     /**
      * 重新读取原始文件并重建资料索引。

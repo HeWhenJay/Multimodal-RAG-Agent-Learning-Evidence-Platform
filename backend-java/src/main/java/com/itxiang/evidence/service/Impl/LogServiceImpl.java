@@ -26,6 +26,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -80,8 +82,8 @@ public class LogServiceImpl implements LogService {
         event.setMaterialId(dto.getMaterialId());
         event.setDocumentId(truncate(dto.getDocumentId(), 120));
         event.setParser(truncate(dto.getParser(), 80));
-        event.setClientTime(dto.getClientTime());
-        event.setServerTime(LocalDateTime.now());
+        event.setClientTime(toOffsetDateTime(dto.getClientTime()));
+        event.setServerTime(OffsetDateTime.now());
         event.setContextJson(toContextJson(dto.getContext(), logProperties.getMaxContextBytes()));
         logEventMapper.insert(event);
         return event.getId();
@@ -145,8 +147,8 @@ public class LogServiceImpl implements LogService {
         error.setMaterialId(dto.getMaterialId());
         error.setDocumentId(truncate(dto.getDocumentId(), 120));
         error.setParser(truncate(dto.getParser(), 80));
-        error.setClientTime(dto.getClientTime());
-        error.setServerTime(LocalDateTime.now());
+        error.setClientTime(toOffsetDateTime(dto.getClientTime()));
+        error.setServerTime(OffsetDateTime.now());
         error.setContextJson(toContextJson(dto.getContext(), logProperties.getMaxContextBytes()));
         error.setStatus("OPEN");
         logErrorMapper.insert(error);
@@ -456,7 +458,7 @@ public class LogServiceImpl implements LogService {
                 .documentId(event.getDocumentId())
                 .parser(event.getParser())
                 .contextJson(event.getContextJson())
-                .createdAt(event.getCreatedAt())
+                .createdAt(toLocalDateTime(event.getCreatedAt()))
                 .build();
     }
 
@@ -485,10 +487,24 @@ public class LogServiceImpl implements LogService {
                 .contextJson(error.getContextJson())
                 .occurrenceCount(error.getOccurrenceCount())
                 .status(error.getStatus())
-                .firstSeenAt(error.getFirstSeenAt())
-                .lastSeenAt(error.getLastSeenAt())
-                .createdAt(error.getCreatedAt())
+                .firstSeenAt(toLocalDateTime(error.getFirstSeenAt()))
+                .lastSeenAt(toLocalDateTime(error.getLastSeenAt()))
+                .createdAt(toLocalDateTime(error.getCreatedAt()))
                 .build();
+    }
+
+    /**
+     * 将请求中的本地时间转换为带时区时间，兼容 PostgreSQL TIMESTAMPTZ。
+     */
+    private OffsetDateTime toOffsetDateTime(LocalDateTime value) {
+        return value == null ? null : value.atZone(ZoneId.systemDefault()).toOffsetDateTime();
+    }
+
+    /**
+     * 将数据库带时区时间转换为前端沿用的本地时间。
+     */
+    private LocalDateTime toLocalDateTime(OffsetDateTime value) {
+        return value == null ? null : value.toLocalDateTime();
     }
 
     /**
