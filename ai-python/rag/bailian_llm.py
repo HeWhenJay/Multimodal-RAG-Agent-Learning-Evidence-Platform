@@ -63,26 +63,26 @@ class BailianChatClient:
             )
         if not self.should_call_dashscope:
             return GeneratedAnswer(
-                answer=deterministic_grounded_answer(question, evidences),
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
                 provider="local",
                 model="deterministic-grounded-answer",
             )
         if not self.api_key:
             return GeneratedAnswer(
-                answer=deterministic_grounded_answer(question, evidences),
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
                 provider="local",
                 model="deterministic-grounded-answer",
                 fallback_reason="DASHSCOPE_API_KEY 未配置",
             )
         try:
             return GeneratedAnswer(
-                answer=self._call_chat(question, evidences),
+                answer=append_evidence_reference_summary(self._call_chat(question, evidences), evidences),
                 provider="dashscope",
                 model=self.model,
             )
         except Exception as exc:
             return GeneratedAnswer(
-                answer=deterministic_grounded_answer(question, evidences),
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
                 provider="local",
                 model="deterministic-grounded-answer",
                 fallback_reason=f"百炼回答生成失败: {exc}",
@@ -185,6 +185,22 @@ def deterministic_grounded_answer(question: str, evidences: list[Evidence]) -> s
         f"{video_text}"
         f"优先参考：{evidence_text}。请基于这些证据整理正式回答，并保留方括号中的 evidenceId 引用。"
     )
+
+
+def append_evidence_reference_summary(answer: str, evidences: list[Evidence]) -> str:
+    """程序化追加证据引用摘要，确保来源、位置和分数不会完全依赖模型生成。"""
+    if not evidences:
+        return answer
+    if "证据引用：" in answer:
+        return answer
+    lines = ["", "证据引用："]
+    for item in evidences[:5]:
+        location = item.sectionName or item.sectionTitle or "全文"
+        if item.startTime:
+            location = f"{location}，时间={item.startTime}-{item.endTime}" if item.endTime else f"{location}，时间={item.startTime}"
+        source = item.sourcePath or item.source or "未知来源"
+        lines.append(f"- [{item.evidenceId}] {item.title}；位置：{location}；来源：{source}；分数：{item.score:.4f}")
+    return answer.rstrip() + "\n" + "\n".join(lines)
 
 
 def extract_message_content(data: dict[str, Any]) -> str:

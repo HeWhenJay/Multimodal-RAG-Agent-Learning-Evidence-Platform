@@ -1,6 +1,6 @@
 from rag.retrieval import cached_embedding, embed_text, embedding_provider_name
 from rag.retrieval import InMemoryRagStore
-from rag.bailian_llm import deterministic_grounded_answer
+from rag.bailian_llm import append_evidence_reference_summary, deterministic_grounded_answer
 from rag.pgvector_store import build_filter_clause, vector_literal
 from rag.reranking import local_rerank
 from rag.parse_quality import QualitySignals, evaluate_parse_quality
@@ -146,6 +146,29 @@ def test_deterministic_answer_keeps_evidence_citation():
     answer = deterministic_grounded_answer("回答为什么要保留引用？", [evidence])
 
     assert f"[{evidence.evidenceId}]" in answer
+
+
+def test_answer_reference_summary_keeps_source_location_and_score():
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-reference-summary",
+            title="引用摘要笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            sourcePath="uploads/rag/reference.md",
+            content="## 引用结构\n回答需要保留来源、章节和分数。",
+        )
+    )
+    evidence = store.query(QueryRequest(question="回答要保留哪些引用字段？", topK=1)).evidences[0]
+    answer = append_evidence_reference_summary("根据资料回答。", [evidence])
+
+    assert "证据引用：" in answer
+    assert evidence.evidenceId in answer
+    assert "引用摘要笔记" in answer
+    assert "uploads/rag/reference.md" in answer
+    assert "分数：" in answer
 
 
 def test_video_metadata_filter_matches_promoted_block_metadata():
