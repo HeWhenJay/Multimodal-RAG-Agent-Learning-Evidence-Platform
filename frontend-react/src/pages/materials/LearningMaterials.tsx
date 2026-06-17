@@ -18,7 +18,7 @@ export function LearningMaterials() {
   // 刷新最近学习资料列表。
   const refresh = useCallback(async () => {
     const data = await fetchMaterials();
-    setMaterials(data);
+    setMaterials((previous) => mergeMaterialProgress(previous, data));
   }, []);
 
   useEffect(() => {
@@ -195,6 +195,25 @@ export function LearningMaterials() {
 // 判断资料是否仍处于后台解析或重建中。
 function isProcessingStatus(status: string) {
   return ['PENDING', 'PARSING', 'REINDEXING'].includes(status);
+}
+
+// 刷新接口短暂缺少进度字段时保留旧进度，避免点击刷新后进度展示消失。
+function mergeMaterialProgress(previous: LearningMaterial[], next: LearningMaterial[]) {
+  const previousById = new Map(previous.map((item) => [item.id, item]));
+  return next.map((item) => {
+    if (item.latestProgress) {
+      return item;
+    }
+    const oldItem = previousById.get(item.id);
+    if (!oldItem?.latestProgress) {
+      return item;
+    }
+    return {
+      ...item,
+      latestProgress: oldItem.latestProgress,
+      progressEvents: oldItem.progressEvents,
+    };
+  });
 }
 
 // 将资料类型转换为中文展示文本。

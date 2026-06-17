@@ -178,6 +178,35 @@ public class LogServiceImpl implements LogService {
     }
 
     /**
+     * 记录用户可见的 RAG 进度事件，供资料页轮询展示。
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordRagProgress(String module,
+                                  String stage,
+                                  String action,
+                                  String message,
+                                  Map<String, Object> context,
+                                  Boolean success) {
+        try {
+            LogEventCreateDTO dto = new LogEventCreateDTO();
+            dto.setSource("java");
+            dto.setDomain("rag");
+            dto.setModule(module);
+            dto.setStage(stage);
+            dto.setEventType("rag_progress");
+            dto.setAction(action);
+            dto.setMessage(message);
+            dto.setSuccess(success == null || success);
+            dto.setContext(context == null ? new LinkedHashMap<>() : context);
+            enrichRagIds(dto, dto.getContext());
+            recordEvent(dto);
+        } catch (Exception e) {
+            log.warn("记录 RAG 进度失败: {}", e.getMessage());
+        }
+    }
+
+    /**
      * 记录 RAG 错误日志并标记异常，避免全局异常处理重复写入。
      */
     @Override

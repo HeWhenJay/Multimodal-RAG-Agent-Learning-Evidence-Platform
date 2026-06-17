@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.process_logger import logged_rag_method, process_event
 
 
 DEFAULT_RERANK_BASE_URL = "https://dashscope.aliyuncs.com"
@@ -56,7 +57,18 @@ class BailianRerankClient:
             return True
         return bool(self.api_key)
 
+    @logged_rag_method("query.rerank", "bailian_rerank", "执行百炼或本地重排")
     def rerank(self, question: str, evidences: list[Evidence], top_k: int) -> RerankResult:
+        process_event(
+            stage="query.rerank",
+            action="rerank_select_provider",
+            message="已选择 rerank 提供方",
+            context={
+                "provider": "dashscope" if self.should_call_dashscope else "local",
+                "candidateCount": len(evidences),
+                "topK": top_k,
+            },
+        )
         if not evidences:
             return RerankResult([], "local", "deterministic-reranker")
         if not self.should_call_dashscope:
@@ -78,6 +90,7 @@ class BailianRerankClient:
                 f"百炼 rerank 失败: {exc}",
             )
 
+    @logged_rag_method("query.rerank", "bailian_rerank_call", "调用百炼 rerank 接口")
     def _call_rerank(self, question: str, evidences: list[Evidence], top_k: int) -> list[Evidence]:
         try:
             import httpx
@@ -131,6 +144,7 @@ def render_document(item: Evidence) -> str:
     return f"{item.title} {location}\n{item.snippet}"
 
 
+@logged_rag_method("query.rerank", "local_rerank", "执行本地关键词重排")
 def local_rerank(question: str, evidences: list[Evidence], top_k: int) -> list[Evidence]:
     query_terms = set(tokenize(question))
     ranked = []

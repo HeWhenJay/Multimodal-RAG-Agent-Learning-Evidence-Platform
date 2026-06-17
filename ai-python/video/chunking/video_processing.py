@@ -11,6 +11,7 @@ from pathlib import Path
 from video.asr.bailian_asr import BailianAsrClient
 from video.ocr.bailian_ocr import BailianOcrClient
 from app.schemas.rag import DocumentBlock
+from rag.process_logger import logged_rag_method, process_event
 
 
 VIDEO_FILE_TYPES = {"mp4", "mov", "m4v", "webm", "mkv", "avi"}
@@ -50,6 +51,7 @@ class VideoProcessingResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@logged_rag_method("parse.video", "process_video_bytes", "处理上传视频字节")
 def process_video_bytes(
     *,
     content: bytes,
@@ -75,6 +77,7 @@ def process_video_bytes(
         )
 
 
+@logged_rag_method("parse.video", "process_video_source", "处理已保存视频来源")
 def process_video_source(
     *,
     source_path: str,
@@ -84,6 +87,12 @@ def process_video_source(
     ocr_client: BailianOcrClient,
 ) -> VideoProcessingResult:
     """按本地路径或公开视频 URL 处理长视频，避免 Java 转发完整视频字节。"""
+    process_event(
+        stage="parse.video",
+        action="process_video_source_route",
+        message="已进入视频来源路径处理",
+        context={"sourcePath": source_path, "filename": filename},
+    )
     if is_public_url(source_path):
         return process_video_input(
             video_input=source_path,
@@ -125,6 +134,7 @@ def process_video_source(
     )
 
 
+@logged_rag_method("parse.video", "process_video_input", "统一处理视频输入")
 def process_video_input(
     *,
     video_input: str,
@@ -175,6 +185,7 @@ def process_video_input(
     )
 
 
+@logged_rag_method("parse.video.asr", "transcribe_video_input", "执行视频 ASR 转写")
 def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | None) -> tuple[str, list[str]]:
     """对视频输入执行 ASR；公开视频优先 filetrans，本地视频走重叠音频分段。"""
     client = BailianAsrClient()
@@ -218,6 +229,7 @@ def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | N
     return "", warnings
 
 
+@logged_rag_method("parse.video.audio", "extract_audio_segments", "抽取视频音频分段")
 def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioSegment], list[str]]:
     """按固定窗口抽取音频段，边界保留重叠，避免切断关键连续表达。"""
     ffmpeg = ffmpeg_executable()
@@ -268,6 +280,7 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
     return segments, warnings
 
 
+@logged_rag_method("parse.video.frame", "extract_keyframes", "抽取视频关键帧")
 def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage], list[str]]:
     ffmpeg = ffmpeg_executable()
     if not ffmpeg:
@@ -306,6 +319,7 @@ def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage]
     )
 
 
+@logged_rag_method("parse.video.frame", "select_ppt_slide_frames", "识别 PPT 翻页关键帧")
 def select_ppt_slide_frames(
     candidates: list[FrameImage],
     *,
@@ -520,6 +534,7 @@ def estimate_srt_from_transcript(text: str, duration_seconds: float) -> str:
     return "\n".join(lines).strip()
 
 
+@logged_rag_method("parse.video.ocr", "ocr_video_frames", "执行视频关键帧 OCR")
 def ocr_video_frames(
     *,
     frames: list[FrameImage],
@@ -585,6 +600,7 @@ def ocr_video_frames(
     return blocks, warnings
 
 
+@logged_rag_method("parse.video.summary", "build_video_segment_summary_blocks", "生成视频片段摘要块")
 def build_video_segment_summary_blocks(
     *,
     document_id: str,
@@ -616,6 +632,7 @@ def build_video_segment_summary_blocks(
         return [], [stage_warning("video.segment_summary", f"生成视频片段摘要失败: {exc}")]
 
 
+@logged_rag_method("parse.video.summary", "build_transcript_segment_summaries", "生成字幕片段摘要")
 def build_transcript_segment_summaries(
     *,
     document_id: str,
@@ -678,6 +695,7 @@ def build_transcript_segment_summaries(
     return summary_blocks
 
 
+@logged_rag_method("parse.video.summary", "build_frame_segment_summaries", "生成画面 OCR 片段摘要")
 def build_frame_segment_summaries(
     *,
     document_id: str,

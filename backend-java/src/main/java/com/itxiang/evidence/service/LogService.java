@@ -32,6 +32,16 @@ public interface LogService {
     void recordRagEvent(String module, String stage, String action, String message, Map<String, Object> context);
 
     /**
+     * 写入 RAG 用户可见进度事件。
+     */
+    void recordRagProgress(String module,
+                           String stage,
+                           String action,
+                           String message,
+                           Map<String, Object> context,
+                           Boolean success);
+
+    /**
      * 写入 RAG 错误日志并标记异常已记录。
      */
     void recordRagError(String module,

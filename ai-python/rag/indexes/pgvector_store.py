@@ -10,6 +10,7 @@ from rag.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.process_logger import logged_rag_method, process_event
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.retrieval import (
     DEFAULT_EMBEDDING_DIMENSIONS,
@@ -65,6 +66,7 @@ class PgVectorRagStore:
         if ensure_schema:
             self.ensure_schema()
 
+    @logged_rag_method("index.text", "pgvector_index_text", "pgvector 模式索引文本资料")
     def index_text(self, request: IndexTextRequest) -> IndexResponse:
         block = DocumentBlock(
             documentId=request.documentId,
@@ -98,6 +100,7 @@ class PgVectorRagStore:
             source_path=request.sourcePath,
         )
 
+    @logged_rag_method("index.blocks", "pgvector_index_blocks", "pgvector 模式写入解析块索引")
     def index_blocks(
         self,
         *,
@@ -159,8 +162,20 @@ class PgVectorRagStore:
             )
             progress_reporter.emit("summary.index", "正在生成文档摘要和章节摘要索引", current_step=6, total_steps=8, percent=42)
         summaries = sanitize_for_postgres(self.summary_index.build(chunks))
+        process_event(
+            stage="index.blocks",
+            action="pgvector_index_blocks_chunked",
+            message=f"pgvector 准备写入 {len(chunks)} 个切块",
+            context={"chunkCount": len(chunks), "parser": parser, "status": status},
+        )
 
         Json = self._json_adapter()
+        process_event(
+            stage="index.database",
+            action="pgvector_index_transaction_start",
+            message="开始写入 rag_document 和 rag_chunk",
+            context={"chunkCount": len(chunks), "documentId": document_id},
+        )
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
@@ -248,6 +263,12 @@ class PgVectorRagStore:
                             vector_literal(embedding),
                         ),
                     )
+        process_event(
+            stage="index.database",
+            action="pgvector_index_transaction_completed",
+            message="rag_document 和 rag_chunk 写入完成",
+            context={"chunkCount": len(chunks), "documentId": document_id},
+        )
 
         final_status = status if chunks else "FAILED"
         if progress_reporter:
@@ -273,6 +294,7 @@ class PgVectorRagStore:
             progressEvents=progress_reporter.events if progress_reporter else [],
         )
 
+    @logged_rag_method("query.pipeline", "pgvector_query", "pgvector 模式执行 RAG 检索问答")
     def query(self, request: QueryRequest) -> QueryResponse:
         progress_reporter = RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
@@ -320,6 +342,7 @@ class PgVectorRagStore:
             progressEvents=progress_reporter.events,
         )
 
+    @logged_rag_method("overview", "pgvector_overview", "读取 pgvector RAG 概览")
     def overview(self) -> OverviewResponse:
         with self._connect() as conn:
             with conn.cursor() as cursor:
@@ -349,6 +372,7 @@ class PgVectorRagStore:
             lastIndexedTitle=last.get("title") if last else None,
         )
 
+    @logged_rag_method("evidence.list", "pgvector_list_evidences", "读取 pgvector 文档 evidence")
     def list_evidences(self, document_id: str, limit: int = 20) -> list[Evidence]:
         with self._connect() as conn:
             with conn.cursor() as cursor:
@@ -377,6 +401,7 @@ class PgVectorRagStore:
                 rows = cursor.fetchall()
         return [self._to_evidence(normalize_row(row), 1.0, retrieval_source="summary") for row in rows]
 
+    @logged_rag_method("index.schema", "pgvector_ensure_schema", "检查 pgvector RAG 表结构")
     def ensure_schema(self) -> None:
         with self._connect() as conn:
             with conn.cursor() as cursor:
@@ -489,6 +514,7 @@ class PgVectorRagStore:
             raise RuntimeError("使用 PostgreSQL/pgvector 需要安装 psycopg[binary] 依赖") from exc
         return Json
 
+    @logged_rag_method("query.filter", "pgvector_load_filtered_chunks", "按元数据过滤 pgvector 候选切块")
     def _load_filtered_chunks(self, metadata_filter: dict[str, Any]) -> list[dict[str, Any]]:
         where_sql, params = build_filter_clause(metadata_filter)
         with self._connect() as conn:
@@ -517,6 +543,7 @@ class PgVectorRagStore:
                 rows = cursor.fetchall()
         return [normalize_row(row) for row in rows]
 
+    @logged_rag_method("query.bm25", "pgvector_bm25_search", "执行 pgvector BM25 召回")
     def _bm25_search(self, query_text: str, rows: list[dict[str, Any]], limit: int) -> list[tuple[str, float]]:
         query_terms = tokenize(query_text)
         if not query_terms or not rows:
@@ -546,6 +573,7 @@ class PgVectorRagStore:
                 scores.append((str(row["chunk_id"]), score))
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
+    @logged_rag_method("query.vector", "pgvector_vector_search", "执行 pgvector 向量召回")
     def _vector_search(self, query_text: str, metadata_filter: dict[str, Any], limit: int) -> list[tuple[str, float]]:
         if not tokenize(query_text):
             return []

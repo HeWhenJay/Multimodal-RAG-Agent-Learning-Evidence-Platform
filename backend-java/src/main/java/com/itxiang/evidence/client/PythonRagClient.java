@@ -22,6 +22,7 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -114,15 +115,17 @@ public class PythonRagClient {
             body.add("high_precision", Boolean.TRUE.equals(highPrecision));
             body.add("file", new NamedByteArrayResource(content, filename == null ? material.getTitle() : filename));
 
-            String response = restClient.post()
+            byte[] response = restClient.post()
                     .uri(resolve("/internal/rag/documents/index-file"))
                     .contentType(MediaType.MULTIPART_FORM_DATA)
                     .body(body)
                     .retrieve()
-                    .body(String.class);
-            return readIndexResult(objectMapper.readTree(response));
+                    .body(byte[].class);
+            return readIndexResult(readJsonResponse("index-file", "/internal/rag/documents/index-file", response));
         } catch (RestClientResponseException e) {
             throw pythonException("index-file", "/internal/rag/documents/index-file", e);
+        } catch (PythonRagClientException e) {
+            throw e;
         } catch (Exception e) {
             throw pythonException("index-file", "/internal/rag/documents/index-file", e);
         }
@@ -207,11 +210,11 @@ public class PythonRagClient {
      */
     public List<RagEvidenceVO> listDocumentEvidences(String documentId, Integer limit) {
         try {
-            String response = restClient.get()
+            byte[] response = restClient.get()
                     .uri(resolve("/internal/rag/documents/" + documentId + "/evidences?limit=" + limit))
                     .retrieve()
-                    .body(String.class);
-            JsonNode root = objectMapper.readTree(response);
+                    .body(byte[].class);
+            JsonNode root = readJsonResponse("list-evidences", "/internal/rag/documents/{document_id}/evidences", response);
             List<RagEvidenceVO> evidences = new ArrayList<>();
             JsonNode evidenceNodes = root.get("evidences");
             if (evidenceNodes != null && evidenceNodes.isArray()) {
@@ -222,6 +225,8 @@ public class PythonRagClient {
             return evidences;
         } catch (RestClientResponseException e) {
             throw pythonException("list-evidences", "/internal/rag/documents/{document_id}/evidences", e);
+        } catch (PythonRagClientException e) {
+            throw e;
         } catch (Exception e) {
             throw pythonException("list-evidences", "/internal/rag/documents/{document_id}/evidences", e);
         }
@@ -232,11 +237,11 @@ public class PythonRagClient {
      */
     public PythonOverview fetchOverviewSafely() {
         try {
-            String response = restClient.get()
+            byte[] response = restClient.get()
                     .uri(resolve("/internal/rag/overview"))
                     .retrieve()
-                    .body(String.class);
-            JsonNode root = objectMapper.readTree(response);
+                    .body(byte[].class);
+            JsonNode root = readJsonResponse("overview", "/internal/rag/overview", response);
             return new PythonOverview(
                     root.path("documentCount").asInt(0),
                     root.path("chunkCount").asInt(0),
@@ -255,17 +260,38 @@ public class PythonRagClient {
     private JsonNode postJson(String path, Map<String, Object> payload) {
         try {
             String requestBody = objectMapper.writeValueAsString(payload);
-            String response = restClient.post()
+            byte[] response = restClient.post()
                     .uri(resolve(path))
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(requestBody)
                     .retrieve()
-                    .body(String.class);
-            return objectMapper.readTree(response);
+                    .body(byte[].class);
+            return readJsonResponse("post-json", path, response);
         } catch (RestClientResponseException e) {
             throw pythonException("post-json", path, e);
+        } catch (PythonRagClientException e) {
+            throw e;
         } catch (Exception e) {
             throw pythonException("post-json", path, e);
+        }
+    }
+
+    /**
+     * 按 UTF-8 读取 Python 响应，兼容 FastAPI 返回 application/octet-stream 的 JSON。
+     */
+    private JsonNode readJsonResponse(String operation, String endpoint, byte[] body) {
+        String response = body == null ? "" : new String(body, StandardCharsets.UTF_8);
+        try {
+            return objectMapper.readTree(response);
+        } catch (Exception e) {
+            throw new PythonRagClientException(
+                    operation,
+                    endpoint,
+                    null,
+                    truncate(response, 500),
+                    "Python RAG 响应不是合法 JSON: " + e.getMessage(),
+                    e
+            );
         }
     }
 
@@ -488,7 +514,7 @@ public class PythonRagClient {
                 operation,
                 endpoint,
                 e.getStatusCode().value(),
-                e.getResponseBodyAsString(),
+                e.getResponseBodyAsString(StandardCharsets.UTF_8),
                 "Python RAG 调用失败: " + e.getStatusCode(),
                 e
         );
@@ -506,6 +532,16 @@ public class PythonRagClient {
                 "Python RAG 调用失败: " + e.getMessage(),
                 e
         );
+    }
+
+    /**
+     * 截断过长响应摘要，避免日志上下文过大。
+     */
+    private String truncate(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, maxLength);
     }
 
     /**

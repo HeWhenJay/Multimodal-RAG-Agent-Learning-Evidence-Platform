@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.process_logger import logged_rag_method, process_event
 
 
 DEFAULT_CHAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -54,7 +55,17 @@ class BailianChatClient:
             return True
         return bool(self.api_key)
 
+    @logged_rag_method("query.answer", "bailian_answer", "执行百炼或本地回答生成")
     def generate(self, question: str, evidences: list[Evidence]) -> GeneratedAnswer:
+        process_event(
+            stage="query.answer",
+            action="answer_select_provider",
+            message="已选择回答生成提供方",
+            context={
+                "provider": "dashscope" if self.should_call_dashscope else "local",
+                "evidenceCount": len(evidences),
+            },
+        )
         if not evidences:
             return GeneratedAnswer(
                 answer="当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。",
@@ -88,6 +99,7 @@ class BailianChatClient:
                 fallback_reason=f"百炼回答生成失败: {exc}",
             )
 
+    @logged_rag_method("query.answer", "bailian_chat_call", "调用百炼回答生成接口")
     def _call_chat(self, question: str, evidences: list[Evidence]) -> str:
         try:
             import httpx

@@ -4,6 +4,7 @@ import re
 from dataclasses import replace
 
 from rag.models import Chunk
+from rag.process_logger import logged_rag_method, process_event
 from rag.text_sanitizer import clean_postgres_text, sanitize_for_postgres
 from app.schemas.rag import DocumentBlock
 
@@ -17,6 +18,7 @@ class RecursiveChunker:
         self.overlap = overlap
         self.separators = ["\n## ", "\n### ", "\n\n", "\n", "\u3002", "\uff1b", ";", ".", "\uff0c", ",", " "]
 
+    @logged_rag_method("chunk.recursive", "chunker_split_text", "按递归规则切分文本")
     def split(self, text: str, document_id: str, metadata: dict | None = None) -> list[Chunk]:
         metadata = sanitize_for_postgres(metadata or {})
         cleaned = self._normalize(text)
@@ -43,8 +45,15 @@ class RecursiveChunker:
                     metadata=chunk_metadata,
                 )
             )
+        process_event(
+            stage="chunk.recursive",
+            action="chunker_split_text_result",
+            message=f"文本递归切分完成，共 {len(chunks)} 块",
+            context={"chunkCount": len(chunks), "textLength": len(cleaned)},
+        )
         return chunks
 
+    @logged_rag_method("chunk.recursive", "chunker_split_blocks", "按 DocumentBlock 递归切块")
     def split_blocks(
         self,
         blocks: list[DocumentBlock],
@@ -104,6 +113,12 @@ class RecursiveChunker:
                     )
                 )
                 position += 1
+        process_event(
+            stage="chunk.recursive",
+            action="chunker_split_blocks_result",
+            message=f"DocumentBlock 递归切分完成，共 {len(chunks)} 块",
+            context={"blockCount": len(blocks), "chunkCount": len(chunks)},
+        )
         return chunks
 
     def _normalize(self, text: str) -> str:

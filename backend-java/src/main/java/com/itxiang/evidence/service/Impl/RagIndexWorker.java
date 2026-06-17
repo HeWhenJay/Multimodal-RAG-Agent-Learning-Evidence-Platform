@@ -99,6 +99,7 @@ public class RagIndexWorker {
             });
         } catch (Exception e) {
             log.warn("后台资料索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
+            recordFailureProgress(material, e);
             logService.recordRagError(
                     "material",
                     stage,
@@ -110,6 +111,33 @@ public class RagIndexWorker {
             );
             transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
         }
+    }
+
+    /**
+     * 失败时补写终态进度，避免前端刷新后仍显示旧的运行中阶段。
+     */
+    private void recordFailureProgress(LearningMaterial material, Exception e) {
+        String reason = e.getMessage() == null ? "Python RAG 解析失败" : e.getMessage();
+        Map<String, Object> context = materialContext(material);
+        context.putAll(pythonExceptionContext(e));
+        context.put("stageCode", "index.failed");
+        context.put("stageLabel", "索引失败");
+        context.put("message", "索引失败：" + truncate(reason, 180));
+        context.put("status", "FAILED");
+        context.put("currentStep", 8);
+        context.put("totalSteps", 8);
+        context.put("currentChunk", 0);
+        context.put("totalChunks", 0);
+        context.put("percent", 0);
+        context.put("detail", truncate(reason, 500));
+        logService.recordRagProgress(
+                "material",
+                "index.failed",
+                "rag_progress_index_failed",
+                "索引失败：" + truncate(reason, 180),
+                context,
+                false
+        );
     }
 
     /**

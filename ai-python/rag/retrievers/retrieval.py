@@ -13,6 +13,7 @@ from rag.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.process_logger import logged_rag_method, process_event
 from rag.progress import RagProgressReporter
 from rag.rerankers.reranking import rerank_evidences
 from rag.indexes.summary_index import SummaryIndex
@@ -51,6 +52,7 @@ class InMemoryRagStore:
         self.doc_freq: Counter[str] = Counter()
         self.embeddings: dict[str, list[float]] = {}
 
+    @logged_rag_method("index.text", "memory_index_text", "内存模式索引文本资料")
     def index_text(self, request: IndexTextRequest) -> IndexResponse:
         block = DocumentBlock(
             documentId=request.documentId,
@@ -84,6 +86,7 @@ class InMemoryRagStore:
             source_path=request.sourcePath,
         )
 
+    @logged_rag_method("index.blocks", "memory_index_blocks", "内存模式写入解析块索引")
     def index_blocks(
         self,
         *,
@@ -146,6 +149,12 @@ class InMemoryRagStore:
             )
             progress_reporter.emit("summary.index", "正在生成文档摘要和章节摘要索引", current_step=6, total_steps=8, percent=42)
         summaries = sanitize_for_postgres(self.summary_index.build(chunks))
+        process_event(
+            stage="index.blocks",
+            action="memory_index_blocks_chunked",
+            message=f"内存模式准备写入 {len(chunks)} 个切块",
+            context={"chunkCount": len(chunks), "parser": parser, "status": status},
+        )
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             if progress_reporter:
@@ -206,6 +215,7 @@ class InMemoryRagStore:
             progressEvents=progress_reporter.events if progress_reporter else [],
         )
 
+    @logged_rag_method("query.pipeline", "memory_query", "内存模式执行 RAG 检索问答")
     def query(self, request: QueryRequest) -> QueryResponse:
         progress_reporter = RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
@@ -246,6 +256,7 @@ class InMemoryRagStore:
             progressEvents=progress_reporter.events,
         )
 
+    @logged_rag_method("overview", "memory_overview", "读取内存模式 RAG 概览")
     def overview(self) -> OverviewResponse:
         last_title = None
         if self.documents:
@@ -258,6 +269,7 @@ class InMemoryRagStore:
             lastIndexedTitle=last_title,
         )
 
+    @logged_rag_method("evidence.list", "memory_list_evidences", "读取内存模式文档 evidence")
     def list_evidences(self, document_id: str, limit: int = 20) -> list[Evidence]:
         chunk_ids = [
             chunk.chunk_id
@@ -269,6 +281,7 @@ class InMemoryRagStore:
         ]
         return [self._to_evidence(chunk_id, 1.0, retrieval_source="summary") for chunk_id in chunk_ids[:limit]]
 
+    @logged_rag_method("index.cleanup", "memory_remove_document", "清理旧内存索引")
     def _remove_document(self, document_id: str) -> None:
         old_chunk_ids = [chunk_id for chunk_id, chunk in self.chunks.items() if chunk.document_id == document_id]
         for chunk_id in old_chunk_ids:
@@ -281,6 +294,7 @@ class InMemoryRagStore:
             self.embeddings.pop(chunk_id, None)
         self.documents.pop(document_id, None)
 
+    @logged_rag_method("query.filter", "memory_filter_chunks", "按元数据过滤内存候选切块")
     def _filter_chunks(self, metadata_filter: dict) -> list[Chunk]:
         if not metadata_filter:
             return list(self.chunks.values())
@@ -303,6 +317,7 @@ class InMemoryRagStore:
                 result.append(chunk)
         return result
 
+    @logged_rag_method("query.bm25", "memory_bm25_search", "执行内存 BM25 召回")
     def _bm25_search(self, query_text: str, chunks: list[Chunk], limit: int) -> list[tuple[str, float]]:
         query_terms = tokenize(query_text)
         if not query_terms:
@@ -327,6 +342,7 @@ class InMemoryRagStore:
                 scores.append((chunk.chunk_id, score))
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
+    @logged_rag_method("query.vector", "memory_vector_search", "执行内存向量召回")
     def _vector_search(self, query_text: str, chunks: list[Chunk], limit: int) -> list[tuple[str, float]]:
         query_vector = embed_text(query_text)
         scores = []

@@ -16,6 +16,7 @@ from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.models import ParsedBlockDocument
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
 from rag.indexes.summary_index import SummaryIndex
+from rag.process_logger import logged_rag_method, process_event
 from rag.progress import RagProgressReporter
 from rag.text_sanitizer import clean_postgres_text
 from video.chunking.video_processing import (
@@ -56,6 +57,7 @@ class DocumentParserRouter:
         self.ocr_client = ocr_client or BailianOcrClient.from_env()
         self.summary_index = SummaryIndex()
 
+    @logged_rag_method("parse.route", "parse_bytes", "解析上传文件字节")
     def parse_bytes(
         self,
         *,
@@ -72,6 +74,19 @@ class DocumentParserRouter:
         file_type = detect_file_type(filename, document_type, content_type)
         if file_type not in SUPPORTED_FILE_TYPES:
             file_type = "txt"
+        process_event(
+            stage="parse.route",
+            action="parse_bytes_route",
+            message="已完成上传文件解析路由判断",
+            context={
+                "filename": filename,
+                "documentType": document_type,
+                "contentType": content_type,
+                "fileType": file_type,
+                "size": len(content),
+                "highPrecision": high_precision,
+            },
+        )
         emit_parse_stage(progress_reporter, file_type)
 
         try:
@@ -189,9 +204,22 @@ class DocumentParserRouter:
             warnings = [f"native parser failed: {exc}"]
 
         result = self._finalize(document_id, blocks, parser, quality, warnings)
+        process_event(
+            stage="parse.completed",
+            action="parse_bytes_completed",
+            message="上传文件解析完成",
+            context={
+                "fileType": file_type,
+                "parser": result.parser,
+                "status": result.status,
+                "blockCount": len(result.blocks),
+                "warningCount": len(result.warnings),
+            },
+        )
         emit_parse_completed(progress_reporter, result)
         return result
 
+    @logged_rag_method("parse.text", "parse_text", "解析文本资料")
     def parse_text(
         self,
         *,
@@ -204,6 +232,12 @@ class DocumentParserRouter:
         progress_reporter: RagProgressReporter | None = None,
     ) -> ParsedBlockDocument:
         file_type = normalize_file_type(document_type)
+        process_event(
+            stage="parse.text",
+            action="parse_text_route",
+            message="已进入文本资料解析",
+            context={"documentType": document_type, "fileType": file_type, "contentLength": len(content), "parser": parser},
+        )
         emit_parse_stage(progress_reporter, file_type)
         if file_type in {"srt", "vtt"} or looks_like_transcript(content):
             blocks = parse_transcript_blocks(
@@ -238,9 +272,16 @@ class DocumentParserRouter:
         )
         quality = mark_text_native_quality(quality)
         result = self._finalize(document_id, blocks, parser or "manual-text", quality, [])
+        process_event(
+            stage="parse.completed",
+            action="parse_text_completed",
+            message="文本资料解析完成",
+            context={"parser": result.parser, "status": result.status, "blockCount": len(result.blocks)},
+        )
         emit_parse_completed(progress_reporter, result)
         return result
 
+    @logged_rag_method("parse.video", "parse_video_source_entry", "解析已保存视频来源")
     def parse_video_source(
         self,
         *,
@@ -261,6 +302,12 @@ class DocumentParserRouter:
         file_type = detect_file_type(source_filename, document_type, content_type)
         if file_type not in VIDEO_FILE_TYPES:
             file_type = normalize_file_type(document_type)
+        process_event(
+            stage="parse.video",
+            action="parse_video_source_route",
+            message="已进入视频源解析路线",
+            context={"filename": source_filename, "documentType": document_type, "fileType": file_type, "sourcePath": source_path},
+        )
         emit_parse_stage(progress_reporter, "video")
         try:
             blocks, quality, parser, warnings = self._parse_video_source(
@@ -276,9 +323,16 @@ class DocumentParserRouter:
             parser = "video-source-unavailable"
             warnings = [f"video.source: 视频来源解析失败: {exc}"]
         result = self._finalize(document_id, blocks, parser, quality, warnings)
+        process_event(
+            stage="parse.completed",
+            action="parse_video_source_completed",
+            message="视频源解析完成",
+            context={"parser": result.parser, "status": result.status, "blockCount": len(result.blocks), "warningCount": len(result.warnings)},
+        )
         emit_parse_completed(progress_reporter, result)
         return result
 
+    @logged_rag_method("parse.pdf", "parse_pdf", "解析 PDF 文件")
     def _parse_pdf(
         self,
         content: bytes,
@@ -324,6 +378,7 @@ class DocumentParserRouter:
         )
         return blocks, quality, "pdf-native", warnings
 
+    @logged_rag_method("parse.docx", "parse_docx", "解析 Word 文件")
     def _parse_docx(
         self,
         content: bytes,
@@ -365,6 +420,7 @@ class DocumentParserRouter:
                 warnings.extend(supplement_warnings)
         return blocks, quality, parser, warnings
 
+    @logged_rag_method("parse.pptx", "parse_pptx", "解析 PPT 文件")
     def _parse_pptx(
         self,
         content: bytes,
@@ -399,6 +455,7 @@ class DocumentParserRouter:
                 warnings.extend(supplement_warnings)
         return blocks, quality, parser, warnings
 
+    @logged_rag_method("parse.office", "parse_legacy_office", "解析旧版 Office 文件")
     def _parse_legacy_office(
         self,
         content: bytes,
@@ -468,6 +525,7 @@ class DocumentParserRouter:
             quality = merge_quality(quality, extra)
         return blocks, quality, "+".join(parsers) if parsers else "libreoffice-unavailable", warnings
 
+    @logged_rag_method("parse.office.supplement", "parse_office_pdf_supplement", "补跑 Office PDF 高精度解析")
     def _parse_office_pdf_supplement(
         self,
         content: bytes,
@@ -499,6 +557,7 @@ class DocumentParserRouter:
             warnings.extend(pdf_warnings)
             return blocks, quality, warnings
 
+    @logged_rag_method("parse.spreadsheet", "parse_spreadsheet", "解析表格文件")
     def _parse_spreadsheet(
         self,
         content: bytes,
@@ -521,6 +580,7 @@ class DocumentParserRouter:
                     f"pandas parser failed: {fallback_exc}",
                 ]
 
+    @logged_rag_method("parse.image.ocr", "parse_image", "解析图片并执行 OCR")
     def _parse_image(
         self,
         content: bytes,
@@ -575,11 +635,13 @@ class DocumentParserRouter:
             quality = quality.model_copy(update={"score": max(quality.score, confidence), "needsSupplement": False})
         return [block], quality, parser, warnings
 
+    @logged_rag_method("parse.image.ocr", "ocr_image_bytes", "调用图片 OCR")
     def _ocr_image_bytes(self, content: bytes, *, filename: str) -> OcrResult:
         if self.ocr_client.enabled:
             return self.ocr_client.recognize_image_bytes(image_bytes=content, filename=filename)
         return OcrResult(text="", parser="bailian-qwen-ocr-disabled")
 
+    @logged_rag_method("parse.video", "parse_video", "解析上传视频文件")
     def _parse_video(
         self,
         content: bytes,
@@ -636,6 +698,7 @@ class DocumentParserRouter:
             quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
         return blocks, quality, parser, warnings
 
+    @logged_rag_method("parse.video", "parse_video_source", "解析已保存视频源")
     def _parse_video_source(
         self,
         *,
@@ -691,6 +754,7 @@ class DocumentParserRouter:
             quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
         return blocks, quality, parser, warnings
 
+    @logged_rag_method("parse.finalize", "finalize_parse_result", "汇总解析结果和质量状态")
     def _finalize(
         self,
         document_id: str,
