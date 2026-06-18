@@ -32,6 +32,8 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
@@ -78,6 +80,31 @@ public class RagServiceImpl implements RagService {
     @Override
     public List<LearningMaterialVO> listRecentMaterials(String userId) {
         return learningMaterialMapper.findRecentByUserId(requireUserId(userId), 20).stream()
+                .map(this::convertToVO)
+                .toList();
+    }
+
+    /**
+     * 按日期范围和条数查询学习资料，用于工作台近期处理任务。
+     */
+    @Override
+    public List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer limit) {
+        String scopedUserId = requireUserId(userId);
+        int safeDays = recentDays == null ? 7 : Math.max(1, Math.min(recentDays, 7));
+        int safeLimit = limit == null ? 5 : Math.max(1, Math.min(limit, 50));
+        LocalDate today = LocalDate.now();
+        LocalDate earliestDate = today.minusDays(6);
+        LocalDate safeEndDate = endDate == null ? today : clampDate(endDate, earliestDate, today);
+        LocalDate safeStartDate = startDate == null ? safeEndDate.minusDays(safeDays - 1L) : startDate;
+        if (safeStartDate.isBefore(earliestDate)) {
+            safeStartDate = earliestDate;
+        }
+        if (safeStartDate.isAfter(safeEndDate)) {
+            safeStartDate = safeEndDate;
+        }
+        LocalDateTime startTime = safeStartDate.atStartOfDay();
+        LocalDateTime endTime = safeEndDate.plusDays(1).atStartOfDay();
+        return learningMaterialMapper.findRecentByUserIdBetween(scopedUserId, startTime, endTime, safeLimit).stream()
                 .map(this::convertToVO)
                 .toList();
     }
@@ -747,6 +774,19 @@ public class RagServiceImpl implements RagService {
      */
     private String blankToDefault(String value, String defaultValue) {
         return value == null || value.isBlank() ? defaultValue : value;
+    }
+
+    /**
+     * 将日期限制在允许查询的日期范围内。
+     */
+    private LocalDate clampDate(LocalDate value, LocalDate minDate, LocalDate maxDate) {
+        if (value.isBefore(minDate)) {
+            return minDate;
+        }
+        if (value.isAfter(maxDate)) {
+            return maxDate;
+        }
+        return value;
     }
 
     /**

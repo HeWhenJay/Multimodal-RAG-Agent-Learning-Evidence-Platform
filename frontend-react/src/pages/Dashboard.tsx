@@ -1,4 +1,5 @@
 import {
+  CalendarDays,
   Anchor,
   BarChart3,
   Bot,
@@ -15,11 +16,19 @@ import {
   TriangleAlert,
   Video
 } from 'lucide-react';
-import { useCallback, useEffect, useState, type ChangeEvent, type DragEvent } from 'react';
+import { DayPicker, type DateRange } from '@daypicker/react';
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type DragEvent } from 'react';
 import { fetchDashboardData } from '../api/pageData';
 import { queryRag } from '../api/rag';
 import type { DashboardData, LearningMaterial, RagEvidence } from '../api/types';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
+
+const RECENT_LIMIT_MIN = 1;
+const RECENT_LIMIT_MAX = 50;
+const CALENDAR_FORMATTERS = {
+  formatCaption: formatCalendarCaption,
+  formatWeekdayName: formatCalendarWeekdayName
+};
 
 // 工作台首页展示 RAG 概览、检索入口和证据对齐摘要。
 export function Dashboard() {
@@ -28,17 +37,26 @@ export function Dashboard() {
   const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
   const [error, setError] = useState('');
+  const [recentRange, setRecentRange] = useState<DateRange>(() => defaultRecentRange());
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [recentLimit, setRecentLimit] = useState(5);
   const { uploading, uploadMessage, uploadFile } = useMaterialUpload();
+  const rangeBounds = useMemo(() => recentRangeBounds(), []);
 
   // 拉取工作台聚合数据。
   const loadDashboard = useCallback(async () => {
     try {
-      const data = await fetchDashboardData();
+      const normalizedRange = completeRecentRange(recentRange, rangeBounds);
+      const data = await fetchDashboardData({
+        startDate: formatDateParam(normalizedRange.from),
+        endDate: formatDateParam(normalizedRange.to),
+        recentLimit
+      });
       setDashboard(data);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
     }
-  }, []);
+  }, [rangeBounds, recentLimit, recentRange]);
 
   useEffect(() => {
     void loadDashboard();
@@ -175,15 +193,76 @@ export function Dashboard() {
             <input type="file" accept={MATERIAL_FILE_ACCEPT} disabled={uploading} onChange={handleUploadChange} />
           </label>
           {uploadMessage ? <p className="form-message">{uploadMessage}</p> : null}
-          <h4>近期处理任务</h4>
+          <div className="task-toolbar">
+            <h4>近期处理任务</h4>
+            <div className="task-filters" aria-label="近期处理任务筛选">
+              <div className="task-date-range">
+                <div className="task-date-field">
+                  <span>从</span>
+                  <button type="button" className="task-date-button" onClick={() => setDatePickerOpen((open) => !open)}>
+                    <CalendarDays size={16} />
+                    {formatDateLabel(recentRange.from, '开始时间')}
+                  </button>
+                </div>
+                <div className="task-date-field">
+                  <span>到</span>
+                  <button type="button" className="task-date-button" onClick={() => setDatePickerOpen((open) => !open)}>
+                    <CalendarDays size={16} />
+                    {formatDateLabel(recentRange.to, '结束时间')}
+                  </button>
+                </div>
+                {datePickerOpen ? (
+                  <div className="task-calendar-popover" role="dialog" aria-label="选择近期处理任务日期范围">
+                    <DayPicker
+                      mode="range"
+                      weekStartsOn={0}
+                      selected={recentRange}
+                      onSelect={(range) => setRecentRange(clampRecentRange(range, rangeBounds))}
+                      disabled={[{ before: rangeBounds.minDate }, { after: rangeBounds.maxDate }]}
+                      defaultMonth={recentRange.to || rangeBounds.maxDate}
+                      captionLayout="label"
+                      formatters={CALENDAR_FORMATTERS}
+                    />
+                    <div className="task-calendar-footer">
+                      <span>仅查询最近 7 天内任务</span>
+                      <button type="button" onClick={() => {
+                        setRecentRange(defaultRecentRange());
+                        setDatePickerOpen(false);
+                      }}>
+                        重置
+                      </button>
+                      <button type="button" className="primary" onClick={() => setDatePickerOpen(false)}>
+                        确定
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+              <label>
+                <span>条数</span>
+                <input
+                  aria-label="近期处理任务条数"
+                  type="number"
+                  min={RECENT_LIMIT_MIN}
+                  max={RECENT_LIMIT_MAX}
+                  value={recentLimit}
+                  onChange={(event) => setRecentLimit(clampNumber(event.target.value, RECENT_LIMIT_MIN, RECENT_LIMIT_MAX))}
+                />
+              </label>
+            </div>
+          </div>
           {(dashboard?.recentMaterials || []).map((item) => (
             <div className="task-row" key={item.id}>
               <FileText size={20} />
               <span>
                 <strong>{item.title}</strong>
                 {item.latestProgress ? <small>{formatTaskProgress(item)}</small> : null}
+                <small>{formatDocumentMeta(item)}</small>
               </span>
-              <strong className={item.status === 'READY' ? '' : 'processing'}>{formatMaterialStatus(item.status)}</strong>
+              <div className="task-status">
+                <strong className={item.status === 'READY' ? '' : 'processing'}>{formatMaterialStatus(item.status)}</strong>
+                <small>{item.chunkCount} 个切块</small>
+              </div>
             </div>
           ))}
           {(dashboard?.recentMaterials || []).length === 0 ? <div className="empty-state">暂无资料处理任务</div> : null}
@@ -282,8 +361,111 @@ function formatMaterialStatus(status: string) {
   if (status === 'PARTIAL') return '部分完成';
   if (status === 'PARSING') return '解析中';
   if (status === 'PENDING') return '等待解析';
+  if (status === 'REINDEXING') return '重建索引';
   if (status === 'FAILED') return '解析失败';
   return status;
+}
+
+// 展示资料类型、解析器和更新时间等任务元数据。
+function formatDocumentMeta(item: LearningMaterial) {
+  const parser = item.parser || '等待解析';
+  const updatedAt = item.updatedAt ? `更新 ${formatDateTime(item.updatedAt)}` : '';
+  return [item.documentType.toUpperCase(), parser, updatedAt].filter(Boolean).join(' · ');
+}
+
+// 格式化简短时间，方便任务列表扫描。
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+// 默认查询最近 7 天内的任务。
+function defaultRecentRange(): DateRange {
+  const { minDate, maxDate } = recentRangeBounds();
+  return { from: minDate, to: maxDate };
+}
+
+// 近期任务筛选只允许落在最近 7 天内。
+function recentRangeBounds() {
+  const maxDate = startOfLocalDay(new Date());
+  const minDate = addDays(maxDate, -6);
+  return { minDate, maxDate };
+}
+
+// 保留用户正在选择中的半完成日期范围，并限制在最近 7 天。
+function clampRecentRange(range: DateRange | undefined, bounds: { minDate: Date; maxDate: Date }): DateRange {
+  if (!range?.from) {
+    return { from: bounds.minDate, to: bounds.maxDate };
+  }
+  const from = clampDate(range.from, bounds.minDate, bounds.maxDate);
+  const to = range.to ? clampDate(range.to, bounds.minDate, bounds.maxDate) : undefined;
+  if (to && from > to) {
+    return { from: to, to: from };
+  }
+  return { from, to };
+}
+
+// 发起查询时把半完成日期范围补成完整范围。
+function completeRecentRange(range: DateRange, bounds: { minDate: Date; maxDate: Date }) {
+  const clamped = clampRecentRange(range, bounds);
+  const from = clamped.from || bounds.minDate;
+  const to = clamped.to || from;
+  return from <= to ? { from, to } : { from: to, to: from };
+}
+
+// 日期查询参数使用本地 YYYY-MM-DD，避免 UTC 转换导致日期偏移。
+function formatDateParam(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// 日期输入框展示文案。
+function formatDateLabel(date: Date | undefined, placeholder: string) {
+  return date ? formatDateParam(date) : placeholder;
+}
+
+function formatCalendarCaption(date: Date) {
+  return `${date.getFullYear()} 年 ${date.getMonth() + 1} 月`;
+}
+
+function formatCalendarWeekdayName(date: Date) {
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()];
+}
+
+function startOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function clampDate(date: Date, minDate: Date, maxDate: Date) {
+  const localDate = startOfLocalDay(date);
+  if (localDate < minDate) return minDate;
+  if (localDate > maxDate) return maxDate;
+  return localDate;
+}
+
+// 将用户输入的近期任务条数约束在后端允许范围内。
+function clampNumber(value: string, min: number, max: number) {
+  const numberValue = Number(value);
+  if (Number.isNaN(numberValue)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, Math.trunc(numberValue)));
 }
 
 // 判断资料是否仍处于后台解析或重建中。

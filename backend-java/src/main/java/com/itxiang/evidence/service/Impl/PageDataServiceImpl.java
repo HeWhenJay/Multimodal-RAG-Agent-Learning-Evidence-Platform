@@ -29,6 +29,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
@@ -37,7 +38,6 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class PageDataServiceImpl implements PageDataService {
 
-    private static final int DASHBOARD_RECENT_LIMIT = 3;
     private static final int PAGE_LIST_LIMIT = 50;
 
     private final RagService ragService;
@@ -53,8 +53,9 @@ public class PageDataServiceImpl implements PageDataService {
      * 聚合工作台统计、最近资料、视频切片、JD 分析和简历证据数据。
      */
     @Override
-    public DashboardVO dashboard(String userId) {
+    public DashboardVO dashboard(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer recentLimit) {
         LocalDateTime sevenDaysAgo = LocalDateTime.now().minusDays(7);
+        int safeRecentLimit = recentLimit == null ? 5 : Math.max(1, Math.min(recentLimit, 50));
         RagOverviewVO ragOverview = ragService.overview(userId);
         LogOverviewVO logOverview = logService.overview(30);
         return DashboardVO.builder()
@@ -65,10 +66,10 @@ public class PageDataServiceImpl implements PageDataService {
                 .evidenceCount(defaultInt(ragOverview.getChunkCount()))
                 .openErrorCount(defaultLong(logOverview.getOpenErrorCount()))
                 .errorCount30Days(defaultLong(logOverview.getErrorCount()))
-                .recentMaterials(ragService.listRecentMaterials(userId).stream().limit(DASHBOARD_RECENT_LIMIT).toList())
-                .recentVideoSlices(videoSliceMapper.findRecent(DASHBOARD_RECENT_LIMIT).stream().map(this::toVideoSliceVO).toList())
+                .recentMaterials(ragService.listRecentMaterials(userId, startDate, endDate, recentDays, safeRecentLimit))
+                .recentVideoSlices(videoSliceMapper.findRecent(3).stream().map(this::toVideoSliceVO).toList())
                 .latestJdAnalysis(latestJdAnalysis(userId))
-                .resumeAlignments(resumeEvidenceAlignmentMapper.findRecentByUserId(userId, DASHBOARD_RECENT_LIMIT).stream()
+                .resumeAlignments(resumeEvidenceAlignmentMapper.findRecentByUserId(userId, 3).stream()
                         .map(this::toResumeEvidenceAlignmentVO)
                         .toList())
                 .build();

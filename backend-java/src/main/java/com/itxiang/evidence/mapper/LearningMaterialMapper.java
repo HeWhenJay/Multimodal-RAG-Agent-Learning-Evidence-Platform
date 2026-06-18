@@ -40,6 +40,14 @@ public interface LearningMaterialMapper {
     List<LearningMaterial> findRecentByUserId(@Param("userId") String userId, @Param("limit") Integer limit);
 
     /**
+     * 查询指定时间范围内的最近学习资料列表。
+     */
+    List<LearningMaterial> findRecentByUserIdBetween(@Param("userId") String userId,
+                                                     @Param("startTime") LocalDateTime startTime,
+                                                     @Param("endTime") LocalDateTime endTime,
+                                                     @Param("limit") Integer limit);
+
+    /**
      * 统计学习资料总数。
      */
     Long countAllByUserId(@Param("userId") String userId);

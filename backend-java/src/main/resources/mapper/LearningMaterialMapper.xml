@@ -98,6 +98,32 @@
         LIMIT #{limit}
     </select>
 
+    <select id="findRecentByUserIdBetween" resultMap="LearningMaterialResultMap">
+        SELECT
+            id,
+            title,
+            user_id,
+            document_type,
+            source,
+            status,
+            parser,
+            document_summary,
+            chunk_count,
+            original_filename,
+            original_file_path,
+            storage_type,
+            object_key,
+            public_url,
+            created_at,
+            updated_at
+        FROM learning_material
+        WHERE user_id = #{userId}
+          AND updated_at &gt;= #{startTime}
+          AND updated_at &lt; #{endTime}
+        ORDER BY updated_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
     <select id="findByIdAndUserId" resultMap="LearningMaterialResultMap">
         SELECT
             id,

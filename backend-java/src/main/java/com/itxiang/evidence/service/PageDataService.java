@@ -7,6 +7,7 @@ import com.itxiang.evidence.vo.ResumeEvidenceAlignmentVO;
 import com.itxiang.evidence.vo.SystemSettingVO;
 import com.itxiang.evidence.vo.VideoSliceVO;
 
+import java.time.LocalDate;
 import java.util.List;
 
 public interface PageDataService {
@@ -14,7 +15,7 @@ public interface PageDataService {
     /**
      * 获取工作台页面所需的数据库聚合数据。
      */
-    DashboardVO dashboard(String userId);
+    DashboardVO dashboard(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer recentLimit);
 
     /**
      * 获取最近一次 JD 分析数据。

@@ -30,9 +30,20 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return envelope.data;
 }
 
-// 获取工作台聚合数据。
-export function fetchDashboardData(): Promise<DashboardData> {
-  return request<DashboardData>('/api/page-data/dashboard');
+// 获取工作台聚合数据，可控制近期任务的日期范围和条数。
+export function fetchDashboardData(options: { startDate?: string; endDate?: string; recentLimit?: number } = {}): Promise<DashboardData> {
+  const params = new URLSearchParams();
+  if (options.startDate) {
+    params.set('startDate', options.startDate);
+  }
+  if (options.endDate) {
+    params.set('endDate', options.endDate);
+  }
+  if (options.recentLimit) {
+    params.set('recentLimit', String(options.recentLimit));
+  }
+  const query = params.toString();
+  return request<DashboardData>(`/api/page-data/dashboard${query ? `?${query}` : ''}`);
 }
 
 // 获取最近一次 JD 分析数据。

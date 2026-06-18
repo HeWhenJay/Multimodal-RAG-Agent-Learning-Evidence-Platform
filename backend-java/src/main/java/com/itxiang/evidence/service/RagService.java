@@ -9,6 +9,7 @@ import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.time.LocalDate;
 import java.util.List;
 
 public interface RagService {
@@ -22,6 +23,11 @@ public interface RagService {
      * 查询最近学习资料。
      */
     List<LearningMaterialVO> listRecentMaterials(String userId);
+
+    /**
+     * 按最近天数和数量查询学习资料。
+     */
+    List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer limit);
 
     /**
      * 查询单个学习资料解析状态。

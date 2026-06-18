@@ -14,13 +14,16 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
 import java.util.List;
 
 @Slf4j
@@ -38,9 +41,16 @@ public class PageDataController {
      */
     @GetMapping("/dashboard")
     @Operation(summary = "获取工作台页面数据")
-    public Result<DashboardVO> dashboard(@RequestHeader(value = "Authorization", required = false) String authorization) {
-        log.info("获取工作台页面数据");
-        return Result.success(pageDataService.dashboard(currentUserId(authorization)));
+    public Result<DashboardVO> dashboard(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                         @RequestParam(value = "startDate", required = false)
+                                         @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate startDate,
+                                         @RequestParam(value = "endDate", required = false)
+                                         @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate endDate,
+                                         @RequestParam(value = "recentDays", required = false) Integer recentDays,
+                                         @RequestParam(value = "recentLimit", defaultValue = "5") Integer recentLimit) {
+        log.info("获取工作台页面数据: startDate={}, endDate={}, recentDays={}, recentLimit={}",
+                startDate, endDate, recentDays, recentLimit);
+        return Result.success(pageDataService.dashboard(currentUserId(authorization), startDate, endDate, recentDays, recentLimit));
     }
 
     /**

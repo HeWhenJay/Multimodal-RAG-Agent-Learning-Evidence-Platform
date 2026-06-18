@@ -256,13 +256,12 @@ input:disabled {
 }
 
 .topbar-upload-status {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 380px;
+  white-space: normal;
   color: var(--primary);
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
 }
 
 .route-loading {
@@ -733,7 +732,7 @@ input:disabled {
   border-top: 1px solid var(--line);
 }
 
-.task-row strong {
+.task-row > strong {
   margin-left: auto;
   color: var(--success);
   font-size: 12px;
@@ -750,18 +749,282 @@ input:disabled {
 .task-row > span strong {
   margin-left: 0;
   color: var(--text);
-  font-size: 14px;
+  font-size: 15px;
+  line-height: 1.35;
 }
 
 .task-row > span small {
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.35;
+  font-size: 13px;
+  line-height: 1.4;
   overflow-wrap: anywhere;
 }
 
-.task-row strong.processing {
+.task-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.task-toolbar h4 {
+  margin: 0;
+}
+
+.task-filters {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.task-filters label,
+.task-date-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.task-date-range {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.task-date-field {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.task-date-button {
+  min-width: 136px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  color: #334155;
+  background: #f8fafc;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.task-date-button:hover {
+  border-color: #a8c7fa;
+  background: #fff;
+}
+
+.task-date-button svg {
+  color: #64748b;
+}
+
+.task-calendar-popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(336px, calc(100vw - 32px));
+  padding: 14px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  box-shadow: 0 18px 45px rgba(15, 23, 42, 0.16);
+}
+
+.task-calendar-popover .rdp-root {
+  --rdp-accent-color: var(--primary);
+  --rdp-day_button-height: 34px;
+  --rdp-day_button-width: 34px;
+  margin: 0;
+  color: #111827;
+  font-size: 14px;
+}
+
+.task-calendar-popover .rdp-months {
+  max-width: 100%;
+}
+
+.task-calendar-popover .rdp-month_caption {
+  position: relative;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.task-calendar-popover .rdp-nav {
+  position: absolute;
+  inset: 14px 14px auto 14px;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+}
+
+.task-calendar-popover .rdp-button_previous,
+.task-calendar-popover .rdp-button_next {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #0f172a;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.task-calendar-popover .rdp-button_previous:hover,
+.task-calendar-popover .rdp-button_next:hover {
+  background: #f1f5f9;
+}
+
+.task-calendar-popover .rdp-month_grid {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+}
+
+.task-calendar-popover .rdp-weekday {
+  height: 30px;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.task-calendar-popover .rdp-day {
+  width: 42px;
+  height: 36px;
+  text-align: center;
+}
+
+.task-calendar-popover .rdp-day_button {
+  width: 34px;
+  height: 34px;
+  color: #0f172a;
+  background: transparent;
+  border: 0;
+  border-radius: 9px;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.task-calendar-popover .rdp-day_button:hover {
+  background: #eef6ff;
+}
+
+.task-calendar-popover .rdp-selected .rdp-day_button,
+.task-calendar-popover .rdp-range_start .rdp-day_button,
+.task-calendar-popover .rdp-range_end .rdp-day_button {
+  color: #fff;
+  background: var(--primary);
+}
+
+.task-calendar-popover .rdp-range_middle .rdp-day_button {
+  color: #0369a1;
+  background: #e0f2fe;
+}
+
+.task-calendar-popover .rdp-today .rdp-day_button {
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.task-calendar-popover .rdp-disabled .rdp-day_button {
+  color: #cbd5e1;
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.task-calendar-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.task-calendar-footer span {
+  margin-right: auto;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.task-calendar-footer button {
+  height: 30px;
+  padding: 0 12px;
+  color: #334155;
+  background: #f8fafc;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.task-calendar-footer button.primary {
+  color: #fff;
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+.task-filters select,
+.task-filters input {
+  height: 32px;
+  padding: 0 10px;
+  color: #334155;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+}
+
+.task-filters select {
+  padding-right: 28px;
+}
+
+.task-filters input {
+  width: 78px;
+}
+
+.task-status {
+  min-width: 78px;
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.task-status strong {
+  color: var(--success);
+  font-size: 13px;
+}
+
+.task-status strong.processing {
   color: var(--warning);
+}
+
+.task-status small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .field-label {
@@ -965,6 +1228,8 @@ input:disabled {
 .form-message {
   margin: 12px 0 0;
   color: var(--primary);
+  font-size: 15px;
+  line-height: 1.45;
   font-weight: 700;
 }
 
@@ -1300,9 +1565,13 @@ input:disabled {
   }
 
   .primary-action span,
-  .ghost-action span,
-  .topbar-upload-status {
+  .ghost-action span {
     display: none;
+  }
+
+  .topbar-upload-status {
+    flex: 1 1 100%;
+    max-width: none;
   }
 
   .page-surface {
