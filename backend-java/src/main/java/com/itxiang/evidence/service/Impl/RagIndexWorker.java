@@ -61,6 +61,8 @@ public class RagIndexWorker {
         try {
             PythonRagClient.IndexResult result;
             if (isVideoDocumentType(material.getDocumentType())) {
+                log.info("RAG后台索引阶段: materialId={}, documentId=material-{}, stage=index.video_source, message=调用 Python 视频源索引入口",
+                        material.getId(), material.getId());
                 result = pythonRagClient.indexVideoSource(
                         material.getId(),
                         userId,
@@ -70,12 +72,16 @@ public class RagIndexWorker {
                         Boolean.TRUE.equals(highPrecision)
                 );
             } else {
+                log.info("RAG后台索引阶段: materialId={}, documentId=material-{}, stage=storage.load, message=读取已保存原始文件",
+                        material.getId(), material.getId());
                 ObjectStorageService.LoadedObject loadedObject = objectStorageService.load(
                         material.getStorageType(),
                         material.getOriginalFilePath(),
                         material.getObjectKey(),
                         material.getOriginalFilename()
                 );
+                log.info("RAG后台索引阶段: materialId={}, documentId=material-{}, stage=index.file, filename={}, size={}, message=调用 Python 文件索引入口",
+                        material.getId(), material.getId(), loadedObject.filename(), loadedObject.content().length);
                 result = pythonRagClient.indexFileBytes(
                         material.getId(),
                         userId,
@@ -88,6 +94,7 @@ public class RagIndexWorker {
             }
             transactionTemplate.executeWithoutResult(status -> {
                 recordIndexResultAnomalies(material, result);
+                recordReturnedProgressEvents(material, result);
                 applyIndexResult(material, result);
                 logService.recordRagEvent(
                         "material",
@@ -97,6 +104,8 @@ public class RagIndexWorker {
                         indexResultContext(material, result)
                 );
             });
+            log.info("RAG后台索引完成: materialId={}, documentId=material-{}, status={}, parser={}, chunkCount={}",
+                    material.getId(), material.getId(), result.status(), result.parser(), result.chunkCount());
         } catch (Exception e) {
             log.warn("后台资料索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
             recordFailureProgress(material, e);
@@ -110,6 +119,41 @@ public class RagIndexWorker {
                     errorContext(material, e)
             );
             transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
+        }
+    }
+
+    /**
+     * 将 Python 响应中携带的进度事件补写到 Java 日志表，防止实时回调丢失。
+     */
+    private void recordReturnedProgressEvents(LearningMaterial material, PythonRagClient.IndexResult result) {
+        if (result == null || result.progressEvents() == null || result.progressEvents().isEmpty()) {
+            return;
+        }
+        for (PythonRagClient.ProgressResult progress : result.progressEvents()) {
+            if (progress == null || progress.stageCode() == null || progress.stageCode().isBlank()) {
+                continue;
+            }
+            Map<String, Object> context = materialContext(material);
+            context.put("stageCode", progress.stageCode());
+            context.put("stageLabel", progress.stageLabel());
+            context.put("message", progress.message());
+            context.put("status", progress.status());
+            context.put("currentStep", progress.currentStep());
+            context.put("totalSteps", progress.totalSteps());
+            context.put("currentChunk", progress.currentChunk());
+            context.put("totalChunks", progress.totalChunks());
+            context.put("chunkId", progress.chunkId());
+            context.put("blockId", progress.blockId());
+            context.put("percent", progress.percent());
+            context.put("detail", progress.detail());
+            logService.recordRagProgress(
+                    "material",
+                    progress.stageCode(),
+                    "rag_progress_returned_" + sanitizeAction(progress.stageCode()),
+                    progress.message(),
+                    context,
+                    !"FAILED".equals(progress.status())
+            );
         }
     }
 
@@ -347,5 +391,12 @@ public class RagIndexWorker {
             return value;
         }
         return value.substring(0, maxLength);
+    }
+
+    /**
+     * 将阶段码转换为日志 action 中可用的安全片段。
+     */
+    private String sanitizeAction(String value) {
+        return value == null ? "unknown" : value.replaceAll("[^A-Za-z0-9_]+", "_");
     }
 }

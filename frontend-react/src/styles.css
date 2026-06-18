@@ -739,6 +739,27 @@ input:disabled {
   font-size: 12px;
 }
 
+.task-row > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text);
+}
+
+.task-row > span strong {
+  margin-left: 0;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.task-row > span small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .task-row strong.processing {
   color: var(--warning);
 }
@@ -1016,6 +1037,73 @@ input:disabled {
   border-radius: inherit;
   background: linear-gradient(90deg, #2563eb, #0f766e);
   transition: width 180ms ease;
+}
+
+.material-progress-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.material-progress-metrics span {
+  padding: 3px 7px;
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.material-progress-timeline {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.material-progress-timeline li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.material-progress-timeline li > span {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: var(--warning);
+  box-shadow: 0 0 0 3px #fef3c7;
+}
+
+.material-progress-timeline li > span.completed {
+  background: var(--success);
+  box-shadow: 0 0 0 3px #dcfce7;
+}
+
+.material-progress-timeline li > span.failed {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px #fee2e2;
+}
+
+.material-progress-timeline strong {
+  display: block;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.material-progress-timeline small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .empty-state {

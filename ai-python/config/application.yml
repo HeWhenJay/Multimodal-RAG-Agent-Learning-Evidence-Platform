@@ -30,6 +30,13 @@ rag:
     base-url: ${RAG_LLM_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
     timeout-seconds: ${RAG_LLM_TIMEOUT_SECONDS:45}
     temperature: ${RAG_LLM_TEMPERATURE:0.2}
+  progress:
+    console-enabled: ${RAG_CONSOLE_PROGRESS_ENABLED:true}
+  process-log:
+    console-enabled: ${RAG_CONSOLE_PROCESS_ENABLED:true}
+  callbacks:
+    event-url: ${RAG_EVENT_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/events}
+    error-url: ${RAG_ERROR_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/errors}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}

@@ -18,7 +18,7 @@ import {
 import { useCallback, useEffect, useState, type ChangeEvent, type DragEvent } from 'react';
 import { fetchDashboardData } from '../api/pageData';
 import { queryRag } from '../api/rag';
-import type { DashboardData, RagEvidence } from '../api/types';
+import type { DashboardData, LearningMaterial, RagEvidence } from '../api/types';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 
 // 工作台首页展示 RAG 概览、检索入口和证据对齐摘要。
@@ -45,6 +45,16 @@ export function Dashboard() {
     window.addEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
     return () => window.removeEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!dashboard?.recentMaterials?.some((item) => isProcessingStatus(item.status))) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void loadDashboard();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [dashboard?.recentMaterials, loadDashboard]);
 
   // 处理工作台文件选择上传。
   function handleUploadChange(event: ChangeEvent<HTMLInputElement>) {
@@ -169,7 +179,10 @@ export function Dashboard() {
           {(dashboard?.recentMaterials || []).map((item) => (
             <div className="task-row" key={item.id}>
               <FileText size={20} />
-              <span>{item.title}</span>
+              <span>
+                <strong>{item.title}</strong>
+                {item.latestProgress ? <small>{formatTaskProgress(item)}</small> : null}
+              </span>
               <strong className={item.status === 'READY' ? '' : 'processing'}>{formatMaterialStatus(item.status)}</strong>
             </div>
           ))}
@@ -271,6 +284,23 @@ function formatMaterialStatus(status: string) {
   if (status === 'PENDING') return '等待解析';
   if (status === 'FAILED') return '解析失败';
   return status;
+}
+
+// 判断资料是否仍处于后台解析或重建中。
+function isProcessingStatus(status: string) {
+  return ['PENDING', 'PARSING', 'REINDEXING'].includes(status);
+}
+
+// 工作台任务行展示当前 RAG 阶段和切块计数。
+function formatTaskProgress(item: LearningMaterial) {
+  const progress = item.latestProgress;
+  if (!progress) return '';
+  const parts = [
+    progress.message || progress.stageLabel || progress.stageCode,
+    progress.currentChunk && progress.totalChunks ? `切块 ${progress.currentChunk}/${progress.totalChunks}` : '',
+    typeof progress.percent === 'number' ? `${Math.round(progress.percent)}%` : ''
+  ].filter(Boolean);
+  return parts.join(' · ');
 }
 
 // 根据适配状态展示对应的中文状态标记。

@@ -1,7 +1,7 @@
 import { FileUp, Loader2, Plus, RefreshCw, RotateCcw, Wrench } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { fetchMaterials, indexText, reindexMaterial } from '../../api/rag';
-import type { LearningMaterial } from '../../api/types';
+import type { LearningMaterial, RagProgress } from '../../api/types';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../../hooks/useMaterialUpload';
 
 // 学习资料页负责文本索引、文件上传和资料状态展示。
@@ -165,7 +165,30 @@ export function LearningMaterials() {
                     >
                       <span style={{ width: `${progressPercent(item)}%` }} />
                     </div>
+                    <div className="material-progress-metrics">
+                      {item.latestProgress.stageLabel ? <span>{item.latestProgress.stageLabel}</span> : null}
+                      {item.latestProgress.currentStep && item.latestProgress.totalSteps ? (
+                        <span>流程 {item.latestProgress.currentStep}/{item.latestProgress.totalSteps}</span>
+                      ) : null}
+                      {item.latestProgress.currentChunk && item.latestProgress.totalChunks ? (
+                        <span>切块 {item.latestProgress.currentChunk}/{item.latestProgress.totalChunks}</span>
+                      ) : null}
+                      {item.latestProgress.chunkId ? <span>{item.latestProgress.chunkId}</span> : null}
+                    </div>
                     {item.latestProgress.detail && <p>{item.latestProgress.detail}</p>}
+                    {progressTimeline(item).length > 0 && (
+                      <ol className="material-progress-timeline" aria-label="RAG 最近处理流程">
+                        {progressTimeline(item).map((progress, index) => (
+                          <li key={`${progress.stageCode}-${progress.chunkId || index}-${progress.createdAt || index}`}>
+                            <span className={progress.status === 'FAILED' ? 'failed' : progress.status === 'COMPLETED' ? 'completed' : ''} />
+                            <div>
+                              <strong>{timelineTitle(progress)}</strong>
+                              <small>{timelineMeta(progress)}</small>
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
                   </div>
                 )}
               </div>
@@ -257,6 +280,29 @@ function formatProgressTitle(item: LearningMaterial) {
     ? `第 ${progress.currentChunk}/${progress.totalChunks} 块`
     : '';
   return `${message}${chunkLabel && !message.includes(chunkLabel) ? ` · ${chunkLabel}` : ''}`;
+}
+
+// 最近流程按时间正序展示，避免用户只能看到单个“解析中”状态。
+function progressTimeline(item: LearningMaterial) {
+  return (item.progressEvents || [])
+    .slice(0, 6)
+    .reverse();
+}
+
+// 生成单条流程节点标题。
+function timelineTitle(progress: RagProgress) {
+  return progress.message || progress.stageLabel || progress.stageCode;
+}
+
+// 生成单条流程节点附加信息。
+function timelineMeta(progress: RagProgress) {
+  const parts = [
+    progress.stageCode,
+    progress.currentStep && progress.totalSteps ? `流程 ${progress.currentStep}/${progress.totalSteps}` : '',
+    progress.currentChunk && progress.totalChunks ? `切块 ${progress.currentChunk}/${progress.totalChunks}` : '',
+    typeof progress.percent === 'number' ? `${Math.round(progress.percent)}%` : ''
+  ].filter(Boolean);
+  return parts.join(' · ');
 }
 
 // 读取后端进度百分比，缺省时按状态兜底。

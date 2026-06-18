@@ -11,6 +11,7 @@ from functools import wraps
 from time import perf_counter
 from typing import Any
 
+from rag.log_callback import post_log_error, post_log_event
 from rag.progress import parse_material_id, truncate
 
 
@@ -130,10 +131,79 @@ class RagProcessLogger:
             logger.warning(log_message, self.document_id, stage, action, message)
         else:
             logger.info(log_message, self.document_id, stage, action, message)
+        self._console(stage, action, message, normalized_level, success, duration_ms, safe_context)
 
+        if self._post_event_callback(stage, action, message, safe_context, level, success, duration_ms, parser):
+            return
         if not self.persist:
             return
         self._persist(stage, action, message, safe_context, level, success, duration_ms, parser)
+
+    def _console(
+        self,
+        stage: str,
+        action: str,
+        message: str,
+        level: str,
+        success: bool,
+        duration_ms: int | None,
+        context: dict[str, Any],
+    ) -> None:
+        """把方法级处理日志同步打印到 Python 控制台。"""
+        if os.getenv("RAG_CONSOLE_PROCESS_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+            return
+        parts = [
+            f"traceId={self.trace_id}",
+            f"documentId={self.document_id}",
+            f"stage={stage}",
+            f"action={action}",
+            f"level={level}",
+            f"success={str(success).lower()}",
+        ]
+        if duration_ms is not None:
+            parts.append(f"durationMs={duration_ms}")
+        if "chunkIndex" in context and "totalChunks" in context:
+            parts.append(f"chunk={context.get('chunkIndex')}/{context.get('totalChunks')}")
+        if "chunkId" in context:
+            parts.append(f"chunkId={context.get('chunkId')}")
+        if "blockCount" in context:
+            parts.append(f"blockCount={context.get('blockCount')}")
+        if "chunkCount" in context:
+            parts.append(f"chunkCount={context.get('chunkCount')}")
+        parts.append(f"message={message}")
+        print("RAG处理 | " + " | ".join(parts), flush=True)
+
+    def _post_event_callback(
+        self,
+        stage: str,
+        action: str,
+        message: str,
+        context: dict[str, Any],
+        level: str,
+        success: bool,
+        duration_ms: int | None,
+        parser: str | None,
+    ) -> bool:
+        """优先把方法级处理日志回调给 Java 控制面板。"""
+        payload = {
+            "traceId": self.trace_id,
+            "userId": truncate(self.user_id, 120),
+            "source": "python",
+            "domain": "rag",
+            "level": truncate(level.upper(), 20),
+            "module": truncate(self.module, 80),
+            "stage": truncate(stage, 80),
+            "eventType": "rag_process",
+            "action": truncate(action, 120),
+            "message": truncate(message, 500),
+            "success": success,
+            "durationMs": duration_ms,
+            "materialId": self.material_id,
+            "documentId": truncate(self.document_id, 120),
+            "parser": truncate(parser, 80),
+            "context": context,
+        }
+        return post_log_event(payload)
 
     def _persist(
         self,
@@ -236,6 +306,18 @@ class RagProcessLogger:
                 truncate(str(throwable), 500) or "",
             ]),
         ).hex
+        if self._post_error_callback(
+            stage=stage,
+            action=action,
+            error_code=error_code,
+            message=message,
+            throwable=throwable,
+            context=safe_context,
+            stack_trace=stack_trace,
+            fingerprint=fingerprint,
+            parser=parser,
+        ):
+            return
         try:
             with psycopg.connect(self.database_url) as conn:
                 with conn.cursor() as cursor:
@@ -288,6 +370,41 @@ class RagProcessLogger:
                     )
         except Exception:
             return
+
+    def _post_error_callback(
+        self,
+        *,
+        stage: str,
+        action: str,
+        error_code: str,
+        message: str,
+        throwable: Exception,
+        context: dict[str, Any],
+        stack_trace: str | None,
+        fingerprint: str,
+        parser: str | None,
+    ) -> bool:
+        """优先把 Python 错误回调给 Java 错误面板。"""
+        payload = {
+            "traceId": self.trace_id,
+            "userId": truncate(self.user_id, 120),
+            "source": "python",
+            "domain": "rag",
+            "severity": "ERROR",
+            "module": truncate(self.module, 80),
+            "stage": truncate(stage, 80),
+            "action": truncate(action, 120),
+            "errorType": truncate(throwable.__class__.__name__, 120),
+            "errorCode": truncate(error_code, 120),
+            "message": truncate(message, 1000),
+            "stackTrace": stack_trace,
+            "fingerprint": fingerprint,
+            "materialId": self.material_id,
+            "documentId": truncate(self.document_id, 120),
+            "parser": truncate(parser, 80),
+            "context": context,
+        }
+        return post_log_error(payload)
 
 
 @contextmanager

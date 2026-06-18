@@ -20,6 +20,7 @@
 | `POST` | `/api/logs/events` | 接收普通业务事件日志 |
 | `POST` | `/api/logs/events/batch` | 批量接收普通业务事件日志 |
 | `POST` | `/api/logs/errors` | 接收报错日志 |
+| `POST` | `/api/logs/internal/events` | 接收 Python 等内部服务业务事件、RAG 进度和处理过程日志 |
 | `POST` | `/api/logs/internal/errors` | 接收 Python 等内部服务错误日志 |
 | `GET` | `/api/logs/events/recent` | 查看最近普通日志 |
 | `GET` | `/api/logs/errors/recent` | 查看最近错误日志 |
@@ -105,6 +106,59 @@
 服务端会按 `source/domain/module/errorType/errorCode/message/topStackFrame` 生成 `fingerprint`。同一 fingerprint 再次上报时不新增记录，只更新 `last_seen_at` 和 `occurrence_count`。
 
 ## 内部错误上报
+
+## 内部事件上报
+
+`POST /api/logs/internal/events`
+
+用途：Python RAG 服务在解析、切块、摘要、embedding、向量入库、检索、重排和回答生成过程中实时上报 `rag_progress` 与 `rag_process`，让 Java 控制面板和前端轮询不必等待 Python 索引请求结束。
+
+Header：
+
+```text
+X-Internal-Log-Token: ${EVIDENCE_INTERNAL_LOG_TOKEN}
+```
+
+请求示例：
+
+```json
+{
+  "source": "python",
+  "domain": "rag",
+  "level": "INFO",
+  "module": "material",
+  "stage": "embedding.chunk",
+  "eventType": "rag_progress",
+  "action": "rag_progress_embedding_chunk",
+  "message": "第 12/80 块：生成 embedding",
+  "success": true,
+  "materialId": 1,
+  "documentId": "material-1",
+  "context": {
+    "stageCode": "embedding.chunk",
+    "stageLabel": "生成 embedding",
+    "status": "RUNNING",
+    "currentStep": 7,
+    "totalSteps": 8,
+    "currentChunk": 12,
+    "totalChunks": 80,
+    "percent": 51
+  }
+}
+```
+
+`eventType=rag_progress` 用于资料页和工作台展示；`eventType=rag_process` 用于日志控制面板查看方法级处理轨迹。
+
+Python 运行配置：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_EVENT_CALLBACK_URL` | `http://127.0.0.1:7080/api/logs/internal/events` | Python 实时上报进度和处理日志的 Java 地址 |
+| `RAG_ERROR_CALLBACK_URL` | `http://127.0.0.1:7080/api/logs/internal/errors` | Python 实时上报错误日志的 Java 地址 |
+| `RAG_CONSOLE_PROGRESS_ENABLED` | `true` | 是否在 Python 控制台打印 `RAG进度` |
+| `RAG_CONSOLE_PROCESS_ENABLED` | `true` | 是否在 Python 控制台打印 `RAG处理` |
+
+如果 Java 回调不可用，Python 会降级尝试直接写 `RAG_DATABASE_URL/DATABASE_URL` 指向的 `log_event/log_error` 表；如果两者都不可用，至少仍会在 Python 控制台打印每个阶段。
 
 `POST /api/logs/internal/errors`
 

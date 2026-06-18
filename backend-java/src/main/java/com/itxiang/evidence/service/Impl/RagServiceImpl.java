@@ -33,6 +33,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -462,8 +463,11 @@ public class RagServiceImpl implements RagService {
             return List.of();
         }
         try {
-            return logEventMapper.findRecentProgressByMaterialId(materialId, 8).stream()
+            LinkedHashSet<String> seen = new LinkedHashSet<>();
+            return logEventMapper.findRecentProgressByMaterialId(materialId, 20).stream()
                     .map(this::toProgressVO)
+                    .filter(progress -> seen.add(progressKey(progress)))
+                    .limit(8)
                     .toList();
         } catch (Exception e) {
             log.debug("读取资料进度事件失败: materialId={}, reason={}", materialId, e.getMessage());
@@ -491,6 +495,19 @@ public class RagServiceImpl implements RagService {
                 .detail(text(context, "detail"))
                 .createdAt(event.getCreatedAt() == null ? null : event.getCreatedAt().toLocalDateTime())
                 .build();
+    }
+
+    /**
+     * 生成进度去重键，避免 Python 实时回调和 Java 返回补偿重复展示。
+     */
+    private String progressKey(RagProgressVO progress) {
+        return String.join("|",
+                defaultText(progress.getStageCode(), ""),
+                defaultText(progress.getMessage(), ""),
+                defaultText(progress.getChunkId(), ""),
+                String.valueOf(progress.getCurrentChunk()),
+                String.valueOf(progress.getTotalChunks())
+        );
     }
 
     /**

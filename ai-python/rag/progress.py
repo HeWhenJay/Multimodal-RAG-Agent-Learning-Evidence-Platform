@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -8,7 +9,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.schemas.rag import ProgressEvent
+from rag.log_callback import post_log_event
 
+
+logger = logging.getLogger(__name__)
 
 STAGE_LABELS = {
     "index.request": "接收索引请求",
@@ -92,9 +96,61 @@ class RagProgressReporter:
             createdAt=datetime.now(timezone.utc).isoformat(),
         )
         self.events.append(event)
+        self._console(event)
+        if self._post_callback(event, parser=parser):
+            return event
         if self.persist:
             self._persist(event, parser=parser)
         return event
+
+    def _console(self, event: ProgressEvent) -> None:
+        """每个用户可见进度都输出到 Python 控制台，便于大文件解析时定位当前阶段。"""
+        if not console_progress_enabled():
+            return
+        parts = [
+            f"documentId={self.document_id}",
+            f"stage={event.stageCode}",
+            f"status={event.status}",
+        ]
+        if event.percent is not None:
+            parts.append(f"percent={event.percent}%")
+        if event.currentStep is not None and event.totalSteps is not None:
+            parts.append(f"step={event.currentStep}/{event.totalSteps}")
+        if event.currentChunk is not None and event.totalChunks is not None:
+            parts.append(f"chunk={event.currentChunk}/{event.totalChunks}")
+        if event.chunkId:
+            parts.append(f"chunkId={event.chunkId}")
+        parts.append(f"message={event.message}")
+        if event.detail:
+            parts.append(f"detail={event.detail}")
+        text = "RAG进度 | " + " | ".join(parts)
+        logger.info(text)
+        print(text, flush=True)
+
+    def _post_callback(self, event: ProgressEvent, *, parser: str | None) -> bool:
+        """优先回调 Java 日志接口，让前端无需等待 Python 请求结束即可轮询进度。"""
+        context = event.model_dump(mode="json")
+        context["documentId"] = self.document_id
+        context["materialId"] = self.material_id
+        action = "rag_progress_" + re.sub(r"[^a-zA-Z0-9_]+", "_", event.stageCode).strip("_")
+        payload = {
+            "traceId": "py_" + uuid.uuid4().hex,
+            "userId": truncate(self.user_id, 120),
+            "source": "python",
+            "domain": "rag",
+            "level": "INFO",
+            "module": "material",
+            "stage": truncate(event.stageCode, 80),
+            "eventType": "rag_progress",
+            "action": truncate(action, 120),
+            "message": truncate(event.message, 500),
+            "success": event.status != "FAILED",
+            "materialId": self.material_id,
+            "documentId": truncate(self.document_id, 120),
+            "parser": truncate(parser, 80),
+            "context": context,
+        }
+        return post_log_event(payload)
 
     def _persist(self, event: ProgressEvent, *, parser: str | None) -> None:
         try:
@@ -167,3 +223,9 @@ def truncate(value: str | None, max_length: int) -> str | None:
     if value is None or len(value) <= max_length:
         return value
     return value[:max_length]
+
+
+def console_progress_enabled() -> bool:
+    """读取控制台进度输出开关，默认开启。"""
+    value = os.getenv("RAG_CONSOLE_PROGRESS_ENABLED", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}

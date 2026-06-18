@@ -52,6 +52,22 @@ public class LogController {
     }
 
     /**
+     * 接收 Python 等内部服务上报的业务事件和 RAG 进度日志。
+     */
+    @PostMapping("/internal/events")
+    @Operation(summary = "记录内部服务业务事件日志")
+    public Result<Long> recordInternalEvent(@RequestHeader(value = "X-Internal-Log-Token", required = false) String token,
+                                            @Valid @RequestBody LogEventCreateDTO dto) {
+        if (!internalTokenValid(token)) {
+            return Result.error("内部日志令牌无效");
+        }
+        if (dto.getSource() == null || dto.getSource().isBlank() || "java".equals(dto.getSource())) {
+            dto.setSource("python");
+        }
+        return Result.success(logService.recordEvent(dto));
+    }
+
+    /**
      * 接收单条错误日志。
      */
     @PostMapping("/errors")
