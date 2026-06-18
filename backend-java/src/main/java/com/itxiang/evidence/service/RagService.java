@@ -27,7 +27,7 @@ public interface RagService {
     /**
      * 按最近天数和数量查询学习资料。
      */
-    List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer limit);
+    List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer limit);
 
     /**
      * 查询单个学习资料解析状态。

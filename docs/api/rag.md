@@ -682,7 +682,8 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 前端保持后台管理风格，只补充必要字段：
 
 - 上传支持格式文案扩展，包含 `.srt/.vtt` 字幕和带时间戳的 `.txt` 转写文本。
-- 工作台 `/api/page-data/dashboard` 支持 `startDate`、`endDate`、`recentDays` 和 `recentLimit` 查询参数；新前端使用 `startDate/endDate` 做“从/到”日期范围筛选，范围限制在最近 7 天内，`recentDays` 仅作为旧调用兜底，`recentLimit` 默认 5 条、最多 50 条。
+- 工作台 `/api/page-data/dashboard` 支持 `startDate`、`endDate`、`recentDays` 和 `recentLimit` 查询参数；新前端使用 `startDate/endDate` 做“从/到”日期范围筛选，用户点击“确定”后才触发后端查询，范围限制在最近 7 天内，`recentDays` 仅作为旧调用兜底，`recentLimit` 默认 5 条、最多 50 条。
+- `DashboardVO` 会返回 `recentTaskStartDate`、`recentTaskEndDate` 和 `recentTaskLimit`，用于前端展示后端实际生效的任务查询范围；后端通过 `learning_material.updated_at >= startDate 00:00:00` 且 `< endDate + 1 day 00:00:00` 查询，已用单测校验 mapper 收到真实起止时间。
 - 上传后的顶部栏、工作台上传区和资料页上传区不再只显示“已上传，正在后台解析”，而是轮询单个资料状态并显示类似“第 133/173 块：生成 embedding · 切块 133/173 · 77%”的主进度。
 - 资料列表显示 `PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING`。
 - 点击刷新时，如果接口短暂没有返回 `latestProgress`，前端保留该资料已有进度，避免大文件解析过程中进度块闪烁或消失；后端返回新的 `latestProgress` 时立即覆盖旧进度。

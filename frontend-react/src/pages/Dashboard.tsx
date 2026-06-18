@@ -37,7 +37,8 @@ export function Dashboard() {
   const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
   const [error, setError] = useState('');
-  const [recentRange, setRecentRange] = useState<DateRange>(() => defaultRecentRange());
+  const [appliedRecentRange, setAppliedRecentRange] = useState<DateRange>(() => defaultRecentRange());
+  const [draftRecentRange, setDraftRecentRange] = useState<DateRange>(() => defaultRecentRange());
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [recentLimit, setRecentLimit] = useState(5);
   const { uploading, uploadMessage, uploadFile } = useMaterialUpload();
@@ -46,7 +47,7 @@ export function Dashboard() {
   // 拉取工作台聚合数据。
   const loadDashboard = useCallback(async () => {
     try {
-      const normalizedRange = completeRecentRange(recentRange, rangeBounds);
+      const normalizedRange = completeRecentRange(appliedRecentRange, rangeBounds);
       const data = await fetchDashboardData({
         startDate: formatDateParam(normalizedRange.from),
         endDate: formatDateParam(normalizedRange.to),
@@ -56,7 +57,7 @@ export function Dashboard() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
     }
-  }, [rangeBounds, recentLimit, recentRange]);
+  }, [appliedRecentRange, rangeBounds, recentLimit]);
 
   useEffect(() => {
     void loadDashboard();
@@ -86,6 +87,26 @@ export function Dashboard() {
     event.preventDefault();
     const file = event.dataTransfer.files?.[0] || null;
     void uploadFile(file).catch(() => undefined);
+  }
+
+  // 打开日期范围选择器时先复制当前已生效范围，避免半选状态直接触发查询。
+  function openDatePicker() {
+    setDraftRecentRange(appliedRecentRange);
+    setDatePickerOpen(true);
+  }
+
+  // 用户点击确定后才应用日期范围并触发后端查询。
+  function applyRecentRange() {
+    setAppliedRecentRange(completeRecentRange(draftRecentRange, rangeBounds));
+    setDatePickerOpen(false);
+  }
+
+  // 重置为最近 7 天并立即触发后端查询。
+  function resetRecentRange() {
+    const defaultRange = defaultRecentRange();
+    setDraftRecentRange(defaultRange);
+    setAppliedRecentRange(defaultRange);
+    setDatePickerOpen(false);
   }
 
   // 执行一次 RAG 检索并刷新回答与证据列表。
@@ -194,21 +215,24 @@ export function Dashboard() {
           </label>
           {uploadMessage ? <p className="form-message">{uploadMessage}</p> : null}
           <div className="task-toolbar">
-            <h4>近期处理任务</h4>
+            <div className="task-heading">
+              <h4>近期处理任务</h4>
+              <small>{formatRecentTaskScope(dashboard)}</small>
+            </div>
             <div className="task-filters" aria-label="近期处理任务筛选">
               <div className="task-date-range">
                 <div className="task-date-field">
                   <span>从</span>
-                  <button type="button" className="task-date-button" onClick={() => setDatePickerOpen((open) => !open)}>
+                  <button type="button" className="task-date-button" onClick={datePickerOpen ? () => setDatePickerOpen(false) : openDatePicker}>
                     <CalendarDays size={16} />
-                    {formatDateLabel(recentRange.from, '开始时间')}
+                    {formatDateLabel((datePickerOpen ? draftRecentRange : appliedRecentRange).from, '开始时间')}
                   </button>
                 </div>
                 <div className="task-date-field">
                   <span>到</span>
-                  <button type="button" className="task-date-button" onClick={() => setDatePickerOpen((open) => !open)}>
+                  <button type="button" className="task-date-button" onClick={datePickerOpen ? () => setDatePickerOpen(false) : openDatePicker}>
                     <CalendarDays size={16} />
-                    {formatDateLabel(recentRange.to, '结束时间')}
+                    {formatDateLabel((datePickerOpen ? draftRecentRange : appliedRecentRange).to, '结束时间')}
                   </button>
                 </div>
                 {datePickerOpen ? (
@@ -216,22 +240,19 @@ export function Dashboard() {
                     <DayPicker
                       mode="range"
                       weekStartsOn={0}
-                      selected={recentRange}
-                      onSelect={(range) => setRecentRange(clampRecentRange(range, rangeBounds))}
+                      selected={draftRecentRange}
+                      onSelect={(range) => setDraftRecentRange(clampRecentRange(range, rangeBounds))}
                       disabled={[{ before: rangeBounds.minDate }, { after: rangeBounds.maxDate }]}
-                      defaultMonth={recentRange.to || rangeBounds.maxDate}
+                      defaultMonth={draftRecentRange.to || rangeBounds.maxDate}
                       captionLayout="label"
                       formatters={CALENDAR_FORMATTERS}
                     />
                     <div className="task-calendar-footer">
                       <span>仅查询最近 7 天内任务</span>
-                      <button type="button" onClick={() => {
-                        setRecentRange(defaultRecentRange());
-                        setDatePickerOpen(false);
-                      }}>
+                      <button type="button" onClick={resetRecentRange}>
                         重置
                       </button>
-                      <button type="button" className="primary" onClick={() => setDatePickerOpen(false)}>
+                      <button type="button" className="primary" onClick={applyRecentRange}>
                         确定
                       </button>
                     </div>
@@ -371,6 +392,14 @@ function formatDocumentMeta(item: LearningMaterial) {
   const parser = item.parser || '等待解析';
   const updatedAt = item.updatedAt ? `更新 ${formatDateTime(item.updatedAt)}` : '';
   return [item.documentType.toUpperCase(), parser, updatedAt].filter(Boolean).join(' · ');
+}
+
+// 展示后端实际生效的近期任务查询条件。
+function formatRecentTaskScope(dashboard: DashboardData | null) {
+  if (!dashboard?.recentTaskStartDate || !dashboard.recentTaskEndDate) {
+    return '等待查询范围';
+  }
+  return `已按 ${dashboard.recentTaskStartDate} 至 ${dashboard.recentTaskEndDate} 查询 · ${dashboard.recentTaskLimit || 5} 条`;
 }
 
 // 格式化简短时间，方便任务列表扫描。

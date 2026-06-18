@@ -175,6 +175,9 @@ export interface DashboardData {
   evidenceCount: number;
   openErrorCount: number;
   errorCount30Days: number;
+  recentTaskStartDate?: string | null;
+  recentTaskEndDate?: string | null;
+  recentTaskLimit?: number | null;
   recentMaterials: LearningMaterial[];
   recentVideoSlices: VideoSlice[];
   latestJdAnalysis: JdAnalysis | null;

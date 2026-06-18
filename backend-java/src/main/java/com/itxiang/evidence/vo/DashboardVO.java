@@ -16,6 +16,9 @@ public class DashboardVO {
     private Integer evidenceCount;
     private Long openErrorCount;
     private Long errorCount30Days;
+    private String recentTaskStartDate;
+    private String recentTaskEndDate;
+    private Integer recentTaskLimit;
     private List<LearningMaterialVO> recentMaterials;
     private List<VideoSliceVO> recentVideoSlices;
     private JdAnalysisVO latestJdAnalysis;

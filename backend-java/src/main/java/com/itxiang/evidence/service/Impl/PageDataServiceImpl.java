@@ -55,7 +55,7 @@ public class PageDataServiceImpl implements PageDataService {
     @Override
     public DashboardVO dashboard(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer recentLimit) {
         LocalDateTime sevenDaysAgo = LocalDateTime.now().minusDays(7);
-        int safeRecentLimit = recentLimit == null ? 5 : Math.max(1, Math.min(recentLimit, 50));
+        RecentTaskQuery recentTaskQuery = normalizeRecentTaskQuery(startDate, endDate, recentDays, recentLimit);
         RagOverviewVO ragOverview = ragService.overview(userId);
         LogOverviewVO logOverview = logService.overview(30);
         return DashboardVO.builder()
@@ -66,7 +66,10 @@ public class PageDataServiceImpl implements PageDataService {
                 .evidenceCount(defaultInt(ragOverview.getChunkCount()))
                 .openErrorCount(defaultLong(logOverview.getOpenErrorCount()))
                 .errorCount30Days(defaultLong(logOverview.getErrorCount()))
-                .recentMaterials(ragService.listRecentMaterials(userId, startDate, endDate, recentDays, safeRecentLimit))
+                .recentTaskStartDate(recentTaskQuery.startDate().toString())
+                .recentTaskEndDate(recentTaskQuery.endDate().toString())
+                .recentTaskLimit(recentTaskQuery.limit())
+                .recentMaterials(ragService.listRecentMaterials(userId, recentTaskQuery.startDate(), recentTaskQuery.endDate(), recentTaskQuery.limit()))
                 .recentVideoSlices(videoSliceMapper.findRecent(3).stream().map(this::toVideoSliceVO).toList())
                 .latestJdAnalysis(latestJdAnalysis(userId))
                 .resumeAlignments(resumeEvidenceAlignmentMapper.findRecentByUserId(userId, 3).stream()
@@ -249,6 +252,35 @@ public class PageDataServiceImpl implements PageDataService {
     }
 
     /**
+     * 归一化工作台近期任务筛选条件，保证查询始终落在最近 7 天内。
+     */
+    private RecentTaskQuery normalizeRecentTaskQuery(LocalDate startDate, LocalDate endDate, Integer recentDays, Integer recentLimit) {
+        int safeDays = recentDays == null ? 7 : Math.max(1, Math.min(recentDays, 7));
+        int safeLimit = recentLimit == null ? 5 : Math.max(1, Math.min(recentLimit, 50));
+        LocalDate today = LocalDate.now();
+        LocalDate earliestDate = today.minusDays(6);
+        LocalDate safeEndDate = endDate == null ? today : clampDate(endDate, earliestDate, today);
+        LocalDate safeStartDate = startDate == null ? safeEndDate.minusDays(safeDays - 1L) : clampDate(startDate, earliestDate, today);
+        if (safeStartDate.isAfter(safeEndDate)) {
+            safeStartDate = safeEndDate;
+        }
+        return new RecentTaskQuery(safeStartDate, safeEndDate, safeLimit);
+    }
+
+    /**
+     * 将日期限制在允许范围内。
+     */
+    private LocalDate clampDate(LocalDate value, LocalDate minDate, LocalDate maxDate) {
+        if (value.isBefore(minDate)) {
+            return minDate;
+        }
+        if (value.isAfter(maxDate)) {
+            return maxDate;
+        }
+        return value;
+    }
+
+    /**
      * 为 Long 空值提供 0 默认值。
      */
     private Long defaultLong(Long value) {
@@ -260,5 +292,8 @@ public class PageDataServiceImpl implements PageDataService {
      */
     private Integer defaultInt(Integer value) {
         return value == null ? 0 : value;
+    }
+
+    private record RecentTaskQuery(LocalDate startDate, LocalDate endDate, Integer limit) {
     }
 }

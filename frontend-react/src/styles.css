@@ -772,6 +772,20 @@ input:disabled {
   margin: 0;
 }
 
+.task-heading {
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-heading small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
 .task-filters {
   display: flex;
   flex-wrap: wrap;

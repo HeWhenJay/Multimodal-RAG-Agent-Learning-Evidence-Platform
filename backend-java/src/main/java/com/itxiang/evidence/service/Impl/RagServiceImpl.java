@@ -88,17 +88,13 @@ public class RagServiceImpl implements RagService {
      * 按日期范围和条数查询学习资料，用于工作台近期处理任务。
      */
     @Override
-    public List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer recentDays, Integer limit) {
+    public List<LearningMaterialVO> listRecentMaterials(String userId, LocalDate startDate, LocalDate endDate, Integer limit) {
         String scopedUserId = requireUserId(userId);
-        int safeDays = recentDays == null ? 7 : Math.max(1, Math.min(recentDays, 7));
         int safeLimit = limit == null ? 5 : Math.max(1, Math.min(limit, 50));
         LocalDate today = LocalDate.now();
         LocalDate earliestDate = today.minusDays(6);
         LocalDate safeEndDate = endDate == null ? today : clampDate(endDate, earliestDate, today);
-        LocalDate safeStartDate = startDate == null ? safeEndDate.minusDays(safeDays - 1L) : startDate;
-        if (safeStartDate.isBefore(earliestDate)) {
-            safeStartDate = earliestDate;
-        }
+        LocalDate safeStartDate = startDate == null ? earliestDate : clampDate(startDate, earliestDate, today);
         if (safeStartDate.isAfter(safeEndDate)) {
             safeStartDate = safeEndDate;
         }

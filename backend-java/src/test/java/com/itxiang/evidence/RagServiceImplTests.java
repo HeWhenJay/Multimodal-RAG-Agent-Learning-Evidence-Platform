@@ -17,6 +17,8 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 
@@ -94,6 +96,24 @@ class RagServiceImplTests {
                 anyString(),
                 isNull(),
                 argThat(context -> containsErrorLocation(context, "video.frame_ocr[1]"))
+        );
+    }
+
+    @Test
+    void listRecentMaterialsUsesSelectedDateRange() {
+        LocalDate startDate = LocalDate.now().minusDays(2);
+        LocalDate endDate = LocalDate.now().minusDays(1);
+        when(learningMaterialMapper.findRecentByUserIdBetween(eq("7"), any(LocalDateTime.class), any(LocalDateTime.class), eq(10)))
+                .thenReturn(List.of());
+
+        List<LearningMaterialVO> result = ragService.listRecentMaterials("7", startDate, endDate, 10);
+
+        assertThat(result).isEmpty();
+        verify(learningMaterialMapper).findRecentByUserIdBetween(
+                eq("7"),
+                eq(startDate.atStartOfDay()),
+                eq(endDate.plusDays(1).atStartOfDay()),
+                eq(10)
         );
     }
 
