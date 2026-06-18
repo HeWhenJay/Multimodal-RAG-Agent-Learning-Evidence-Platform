@@ -162,6 +162,10 @@ class RagProcessLogger:
         ]
         if duration_ms is not None:
             parts.append(f"durationMs={duration_ms}")
+        for key in ("filename", "fileType", "documentType", "contentType", "parser", "status", "phase"):
+            value = context.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={value}")
         if "chunkIndex" in context and "totalChunks" in context:
             parts.append(f"chunk={context.get('chunkIndex')}/{context.get('totalChunks')}")
         if "chunkId" in context:
@@ -170,6 +174,8 @@ class RagProcessLogger:
             parts.append(f"blockCount={context.get('blockCount')}")
         if "chunkCount" in context:
             parts.append(f"chunkCount={context.get('chunkCount')}")
+        if "highPrecision" in context:
+            parts.append(f"highPrecision={context.get('highPrecision')}")
         parts.append(f"message={message}")
         print("RAG处理 | " + " | ".join(parts), flush=True)
 

@@ -160,6 +160,20 @@ Python 运行配置：
 
 如果 Java 回调不可用，Python 会降级尝试直接写 `RAG_DATABASE_URL/DATABASE_URL` 指向的 `log_event/log_error` 表；如果两者都不可用，至少仍会在 Python 控制台打印每个阶段。
 
+后端控制台输出约定：
+
+```text
+RAG处理 | traceId=py_xxx | documentId=material-1 | stage=parse.route | action=parse_bytes_route | level=INFO | success=true | filename=课程资料.pptx | fileType=pptx | documentType=pptx | contentType=application/vnd.openxmlformats-officedocument.presentationml.presentation | message=已完成上传文件解析路由判断
+RAG处理 | traceId=py_xxx | documentId=material-1 | stage=parse.completed | action=parse_bytes_completed | level=INFO | success=true | parser=python-pptx | status=READY | blockCount=12 | message=上传文件解析完成
+RAG处理 | traceId=py_xxx | documentId=material-1 | stage=index.database | action=pgvector_index_transaction_completed | level=INFO | success=true | chunkCount=18 | message=rag_document 和 rag_chunk 事务写入完成
+```
+
+说明：
+
+- `RAG处理` 是 Python 后端控制台和 `rag_process` 事件的统一格式，不要求前端新增日志页。
+- 任意上传格式都应打印 `filename/fileType/documentType/contentType`，解析完成后打印 `parser/status/blockCount`，入库完成后打印 `chunkCount`。
+- `RAG进度` 继续用于用户可见的阶段进度和资料页轮询，重点展示百分比、流程步骤和当前切块。
+
 `POST /api/logs/internal/errors`
 
 用途：Python RAG 服务主动上报解析、OCR、索引或检索内部错误。
@@ -208,7 +222,7 @@ X-Internal-Log-Token: ${EVIDENCE_INTERNAL_LOG_TOKEN}
 | 位置 | 普通日志 | 错误日志 |
 | --- | --- | --- |
 | 文本索引 | `material_index_text_start/result` | `material_index_text_failed` |
-| 文件上传 | `material_upload_saved` | `material_file_save_failed` |
+| 文件上传 | `material_upload_stored` | `material_file_save_failed` |
 | 文件索引 | `material_index_file_result` | `material_index_file_failed` |
 | RAG 查询 | `rag_query_start/success/no_evidence` | `rag_query_failed` |
 | evidence 查询 | 无 | `material_evidence_query_failed` |

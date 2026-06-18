@@ -160,6 +160,33 @@ class PgVectorRagStore:
                 total_chunks=len(chunks),
                 percent=38,
             )
+        if not chunks:
+            message = f"递归切块结果为空，已拒绝写入 rag_document：{document_id}"
+            process_event(
+                stage="index.database",
+                action="pgvector_index_rejected_empty_chunks",
+                message=message,
+                level="ERROR",
+                success=False,
+                context={"documentId": document_id, "chunkCount": 0, "parser": parser, "status": status},
+            )
+            self._delete_orphan_document_index(document_id)
+            if progress_reporter:
+                progress_reporter.emit(
+                    "index.failed",
+                    "索引失败：递归切块结果为空，未写入 RAG 文档记录",
+                    status="FAILED",
+                    current_step=8,
+                    total_steps=8,
+                    current_chunk=0,
+                    total_chunks=0,
+                    percent=0,
+                    detail=message,
+                    parser=parser,
+                )
+            raise RuntimeError(message)
+
+        if progress_reporter:
             progress_reporter.emit("summary.index", "正在生成文档摘要和章节摘要索引", current_step=6, total_steps=8, percent=42)
         summaries = sanitize_for_postgres(self.summary_index.build(chunks))
         process_event(
@@ -169,148 +196,166 @@ class PgVectorRagStore:
             context={"chunkCount": len(chunks), "parser": parser, "status": status},
         )
 
+        total_chunks = len(chunks)
+        prepared_chunks: list[tuple[Chunk, dict[str, int], str]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            process_event(
+                stage="embedding.chunk",
+                action="pgvector_embedding_chunk",
+                message=f"第 {index}/{total_chunks} 块：生成 embedding",
+                context={
+                    "chunkIndex": index,
+                    "totalChunks": total_chunks,
+                    "chunkId": chunk.chunk_id,
+                    "documentId": document_id,
+                },
+            )
+            if progress_reporter:
+                progress_reporter.emit(
+                    "embedding.chunk",
+                    f"第 {index}/{total_chunks} 块：生成 embedding",
+                    current_step=7,
+                    total_steps=8,
+                    current_chunk=index,
+                    total_chunks=total_chunks,
+                    chunk_id=chunk.chunk_id,
+                    percent=chunk_percent(index, total_chunks, 45, 86),
+                )
+            token_counts = Counter(tokenize(chunk.text))
+            embedding = embed_text(chunk.text, dimensions=self.dimensions)
+            prepared_chunks.append((chunk, dict(token_counts), vector_literal(embedding)))
+
         Json = self._json_adapter()
         process_event(
             stage="index.database",
             action="pgvector_index_transaction_start",
-            message="开始写入 rag_document 和 rag_chunk",
-            context={"chunkCount": len(chunks), "documentId": document_id},
+            message="开始事务写入 rag_document 和 rag_chunk",
+            context={"chunkCount": total_chunks, "documentId": document_id},
         )
         with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
-                cursor.execute(
-                    """
-                    INSERT INTO rag_document (
-                        document_id,
-                        title,
-                        document_type,
-                        source,
-                        user_id,
-                        visibility_scope,
-                        language,
-                        parser,
-                        document_summary,
-                        section_summaries,
-                        chunk_count
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        document_id,
-                        title,
-                        document_type,
-                        source,
-                        user_id,
-                        visibility_scope,
-                        language,
-                        parser,
-                        summaries["documentSummary"],
-                        Json(summaries["sectionSummaries"]),
-                        len(chunks),
-                    ),
-                )
-                total_chunks = len(chunks)
-                for index, chunk in enumerate(chunks, start=1):
-                    process_event(
-                        stage="embedding.chunk",
-                        action="pgvector_embedding_chunk",
-                        message=f"第 {index}/{total_chunks} 块：生成 embedding",
-                        context={
-                            "chunkIndex": index,
-                            "totalChunks": total_chunks,
-                            "chunkId": chunk.chunk_id,
-                            "documentId": document_id,
-                        },
-                    )
-                    if progress_reporter:
-                        progress_reporter.emit(
-                            "embedding.chunk",
-                            f"第 {index}/{total_chunks} 块：生成 embedding",
-                            current_step=7,
-                            total_steps=8,
-                            current_chunk=index,
-                            total_chunks=total_chunks,
-                            chunk_id=chunk.chunk_id,
-                            percent=chunk_percent(index, total_chunks, 45, 86),
-                        )
-                    token_counts = Counter(tokenize(chunk.text))
-                    embedding = embed_text(chunk.text, dimensions=self.dimensions)
-                    process_event(
-                        stage="vector.upsert.chunk",
-                        action="pgvector_upsert_chunk",
-                        message=f"第 {index}/{total_chunks} 块：写入向量数据库",
-                        context={
-                            "chunkIndex": index,
-                            "totalChunks": total_chunks,
-                            "chunkId": chunk.chunk_id,
-                            "tokenCount": sum(token_counts.values()),
-                            "documentId": document_id,
-                        },
-                    )
-                    if progress_reporter:
-                        progress_reporter.emit(
-                            "vector.upsert.chunk",
-                            f"第 {index}/{total_chunks} 块：写入向量数据库",
-                            current_step=8,
-                            total_steps=8,
-                            current_chunk=index,
-                            total_chunks=total_chunks,
-                            chunk_id=chunk.chunk_id,
-                            percent=chunk_percent(index, total_chunks, 48, 92),
-                        )
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
                     cursor.execute(
                         """
-                        INSERT INTO rag_chunk (
-                            chunk_id,
+                        INSERT INTO rag_document (
                             document_id,
-                            chunk_position,
-                            section_name,
-                            text,
-                            metadata,
-                            term_counts,
-                            token_count,
-                            embedding
+                            title,
+                            document_type,
+                            source,
+                            user_id,
+                            visibility_scope,
+                            language,
+                            parser,
+                            document_summary,
+                            section_summaries,
+                            chunk_count
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            chunk.chunk_id,
                             document_id,
-                            int(chunk.metadata.get("chunkPosition") or 0),
-                            str(chunk.metadata.get("sectionName") or "全文"),
-                            chunk.text,
-                            Json(chunk.metadata),
-                            Json(dict(token_counts)),
-                            sum(token_counts.values()),
-                            vector_literal(embedding),
+                            title,
+                            document_type,
+                            source,
+                            user_id,
+                            visibility_scope,
+                            language,
+                            parser,
+                            summaries["documentSummary"],
+                            Json(summaries["sectionSummaries"]),
+                            total_chunks,
                         ),
                     )
+                    for index, (chunk, token_counts, embedding_literal) in enumerate(prepared_chunks, start=1):
+                        process_event(
+                            stage="vector.upsert.chunk",
+                            action="pgvector_upsert_chunk",
+                            message=f"第 {index}/{total_chunks} 块：写入向量数据库",
+                            context={
+                                "chunkIndex": index,
+                                "totalChunks": total_chunks,
+                                "chunkId": chunk.chunk_id,
+                                "tokenCount": sum(token_counts.values()),
+                                "documentId": document_id,
+                            },
+                        )
+                        if progress_reporter:
+                            progress_reporter.emit(
+                                "vector.upsert.chunk",
+                                f"第 {index}/{total_chunks} 块：写入向量数据库",
+                                current_step=8,
+                                total_steps=8,
+                                current_chunk=index,
+                                total_chunks=total_chunks,
+                                chunk_id=chunk.chunk_id,
+                                percent=chunk_percent(index, total_chunks, 48, 92),
+                            )
+                        cursor.execute(
+                            """
+                            INSERT INTO rag_chunk (
+                                chunk_id,
+                                document_id,
+                                chunk_position,
+                                section_name,
+                                text,
+                                metadata,
+                                term_counts,
+                                token_count,
+                                embedding
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                            """,
+                            (
+                                chunk.chunk_id,
+                                document_id,
+                                int(chunk.metadata.get("chunkPosition") or 0),
+                                str(chunk.metadata.get("sectionName") or "全文"),
+                                chunk.text,
+                                Json(chunk.metadata),
+                                Json(token_counts),
+                                sum(token_counts.values()),
+                                embedding_literal,
+                            ),
+                        )
+                    persisted_count = self._count_document_chunks_in_transaction(cursor, document_id)
+                    if persisted_count != total_chunks:
+                        raise RuntimeError(
+                            "rag_document/rag_chunk 事务内计数不一致："
+                            f"documentId={document_id}, expected={total_chunks}, actual={persisted_count}"
+                        )
+        committed_count = self._count_document_chunks(document_id)
+        if committed_count != total_chunks:
+            self._delete_document_index(document_id)
+            raise RuntimeError(
+                "rag_document/rag_chunk 提交后计数不一致，已清理本次索引："
+                f"documentId={document_id}, expected={total_chunks}, actual={committed_count}"
+            )
         process_event(
             stage="index.database",
             action="pgvector_index_transaction_completed",
-            message="rag_document 和 rag_chunk 写入完成",
-            context={"chunkCount": len(chunks), "documentId": document_id},
+            message="rag_document 和 rag_chunk 事务写入完成",
+            context={"chunkCount": total_chunks, "documentId": document_id},
         )
 
-        final_status = status if chunks else "FAILED"
+        final_status = status
         if progress_reporter:
             progress_reporter.emit(
-                "index.completed" if chunks else "index.failed",
-                f"索引完成：状态 {final_status}，共 {len(chunks)} 个切块",
-                status="COMPLETED" if chunks else "FAILED",
+                "index.completed",
+                f"索引完成：状态 {final_status}，共 {total_chunks} 个切块",
+                status="COMPLETED",
                 current_step=8,
                 total_steps=8,
-                current_chunk=len(chunks),
-                total_chunks=len(chunks),
-                percent=100 if chunks else 0,
+                current_chunk=total_chunks,
+                total_chunks=total_chunks,
+                percent=100,
                 parser=parser,
             )
         return IndexResponse(
             documentId=document_id,
             title=title,
             status=final_status,
-            chunkCount=len(chunks),
+            chunkCount=total_chunks,
             parser=parser,
             documentSummary=summaries["documentSummary"],
             parseQuality=parse_quality,
@@ -516,6 +561,34 @@ class PgVectorRagStore:
                         ON rag_chunk USING hnsw (embedding vector_cosine_ops)
                     """
                 )
+
+    @logged_rag_method("index.cleanup", "pgvector_delete_document_index", "清理 pgvector 文档索引")
+    def _delete_document_index(self, document_id: str) -> None:
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    self._delete_document_index_with_cursor(cursor, document_id)
+
+    @logged_rag_method("index.cleanup", "pgvector_delete_orphan_document_index", "清理 pgvector 孤儿文档索引")
+    def _delete_orphan_document_index(self, document_id: str) -> None:
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    self._delete_document_index_with_cursor(cursor, document_id)
+
+    def _delete_document_index_with_cursor(self, cursor, document_id: str) -> None:
+        cursor.execute("DELETE FROM rag_chunk WHERE document_id = %s", (document_id,))
+        cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
+
+    def _count_document_chunks(self, document_id: str) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                return self._count_document_chunks_in_transaction(cursor, document_id)
+
+    def _count_document_chunks_in_transaction(self, cursor, document_id: str) -> int:
+        cursor.execute("SELECT COUNT(1) AS chunk_count FROM rag_chunk WHERE document_id = %s", (document_id,))
+        row = cursor.fetchone() or {}
+        return int(row.get("chunk_count") or 0)
 
     def _connect(self):
         try:
