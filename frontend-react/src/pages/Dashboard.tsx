@@ -22,6 +22,7 @@ import { fetchDashboardData } from '../api/pageData';
 import { queryRag } from '../api/rag';
 import type { DashboardData, LearningMaterial, RagEvidence } from '../api/types';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
+import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
 
 const RECENT_LIMIT_MIN = 1;
 const RECENT_LIMIT_MAX = 50;
@@ -41,7 +42,16 @@ export function Dashboard() {
   const [draftRecentRange, setDraftRecentRange] = useState<DateRange>(() => defaultRecentRange());
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [recentLimit, setRecentLimit] = useState(5);
-  const { uploading, uploadMessage, uploadFile } = useMaterialUpload();
+  const { uploading, uploadMessage, uploadFile } = useMaterialUpload({
+    onUploaded: (material) => {
+      setDashboard((previous) => previous
+        ? {
+            ...previous,
+            recentMaterials: upsertMaterialWithProgress(previous.recentMaterials || [], material).slice(0, recentLimit)
+          }
+        : previous);
+    }
+  });
   const rangeBounds = useMemo(() => recentRangeBounds(), []);
 
   // 拉取工作台聚合数据。
@@ -53,7 +63,10 @@ export function Dashboard() {
         endDate: formatDateParam(normalizedRange.to),
         recentLimit
       });
-      setDashboard(data);
+      setDashboard((previous) => ({
+        ...data,
+        recentMaterials: mergeMaterialProgress(previous?.recentMaterials || [], data.recentMaterials || [])
+      }));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '工作台数据加载失败');
     }

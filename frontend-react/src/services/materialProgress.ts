@@ -1,0 +1,29 @@
+import type { LearningMaterial } from '../api/types';
+
+// 合并资料刷新结果，避免接口短暂缺少进度字段时覆盖已展示的 RAG 进度。
+export function mergeMaterialProgress(previous: LearningMaterial[], next: LearningMaterial[]) {
+  const previousById = new Map(previous.map((item) => [item.id, item]));
+  return next.map((item) => mergeSingleMaterialProgress(previousById.get(item.id), item));
+}
+
+// 将上传接口返回的资料并入当前列表，让后续刷新有可保留的进度基线。
+export function upsertMaterialWithProgress(previous: LearningMaterial[], material: LearningMaterial) {
+  const merged = mergeSingleMaterialProgress(previous.find((item) => item.id === material.id), material);
+  const existingIndex = previous.findIndex((item) => item.id === material.id);
+  if (existingIndex < 0) {
+    return [merged, ...previous];
+  }
+  return previous.map((item, index) => index === existingIndex ? merged : item);
+}
+
+// 优先使用最新进度；当最新响应缺失进度时保留旧进度展示。
+function mergeSingleMaterialProgress(previous: LearningMaterial | undefined, next: LearningMaterial) {
+  if (!previous) {
+    return next;
+  }
+  return {
+    ...next,
+    latestProgress: next.latestProgress || previous.latestProgress,
+    progressEvents: next.progressEvents?.length ? next.progressEvents : previous.progressEvents
+  };
+}
