@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from math import ceil
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from video.asr.bailian_asr import BailianAsrClient
 from video.ocr.bailian_ocr import BailianOcrClient
@@ -187,7 +188,7 @@ def process_video_input(
         )
         warnings.extend(asr_warnings)
 
-        frames, frame_warnings = extract_keyframes(video_input, tmp_dir)
+        frames, frame_warnings = extract_keyframes(video_input, tmp_dir, progress_reporter=progress_reporter)
         warnings.extend(frame_warnings)
         frame_blocks, ocr_warnings = ocr_video_frames(
             frames=frames,
@@ -241,9 +242,23 @@ def transcribe_video_input(
     *,
     progress_reporter: RagProgressReporter | None = None,
 ) -> tuple[str, str | None, list[str]]:
-    """对视频输入执行 ASR；公开视频优先 filetrans，本地视频走重叠音频分段。"""
+    """对视频输入执行转写；优先字幕，缺字幕时再按来源选择 filetrans 或分段 ASR。"""
     client = BailianAsrClient()
     warnings: list[str] = []
+
+    subtitle_text, subtitle_source, subtitle_warnings = load_sidecar_subtitle(video_input, source_path)
+    warnings.extend(subtitle_warnings)
+    if subtitle_text:
+        return subtitle_text, "sidecar-subtitle-transcript", warnings
+
+    embedded_checked = False
+    if should_probe_embedded_subtitle_before_asr(video_input, source_path):
+        embedded_checked = True
+        embedded_text, embedded_warnings = extract_embedded_subtitle(video_input, tmp_dir)
+        warnings.extend(embedded_warnings)
+        if embedded_text:
+            return embedded_text, "embedded-subtitle-transcript", warnings
+
     if is_public_url(source_path):
         if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
             emit_model_progress(
@@ -252,7 +267,10 @@ def transcribe_video_input(
                 percent=16,
                 detail=f"目前在使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
             )
-        transcript_text, filetrans_warnings = client.transcribe_source_url(str(source_path))
+        transcript_text, filetrans_warnings = client.transcribe_source_url(
+            str(source_path),
+            progress_callback=lambda event: emit_filetrans_progress(progress_reporter, client, event),
+        )
         warnings.extend(stage_warning("video.asr", warning) for warning in filetrans_warnings)
         if transcript_text:
             if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
@@ -261,18 +279,14 @@ def transcribe_video_input(
                     f"已使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
                     percent=18,
                     detail=f"已使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
-                )
+            )
             return transcript_text, "bailian-asr-transcript", warnings
 
-    subtitle_text, subtitle_source, subtitle_warnings = load_sidecar_subtitle(video_input, source_path)
-    warnings.extend(subtitle_warnings)
-    if subtitle_text:
-        return subtitle_text, "sidecar-subtitle-transcript", warnings
-
-    embedded_text, embedded_warnings = extract_embedded_subtitle(video_input, tmp_dir)
-    warnings.extend(embedded_warnings)
-    if embedded_text:
-        return embedded_text, "embedded-subtitle-transcript", warnings
+    if not embedded_checked:
+        embedded_text, embedded_warnings = extract_embedded_subtitle(video_input, tmp_dir)
+        warnings.extend(embedded_warnings)
+        if embedded_text:
+            return embedded_text, "embedded-subtitle-transcript", warnings
 
     segments, segment_warnings = extract_audio_segments(video_input, tmp_dir)
     warnings.extend(segment_warnings)
@@ -390,6 +404,22 @@ def subtitle_stems(stem: str) -> list[str]:
     return list(dict.fromkeys(stems))
 
 
+def should_probe_embedded_subtitle_before_asr(video_input: str, source_path: str | None) -> bool:
+    """判断是否应在 ASR 前抽取内嵌字幕，避免普通公开视频先被远程 FFmpeg 探测拖慢。"""
+    if not is_public_url(video_input):
+        return True
+    candidates = [video_input, source_path or ""]
+    subtitle_markers = (".subtitled", ".subtitle", "_subtitled", "_subtitle", "withsubtitles")
+    for value in candidates:
+        if not value:
+            continue
+        parsed_path = unquote(urlparse(value).path if is_public_url(value) else value).lower()
+        stem = Path(parsed_path).stem
+        if any(marker in stem for marker in subtitle_markers):
+            return True
+    return False
+
+
 @logged_rag_method("parse.video.subtitle", "extract_embedded_subtitle", "抽取视频内嵌字幕")
 def extract_embedded_subtitle(video_input: str, tmp_dir: Path) -> tuple[str, list[str]]:
     """尝试用 FFmpeg 抽取第一个内嵌字幕轨，适配 *.subtitled.mp4。"""
@@ -407,7 +437,15 @@ def extract_embedded_subtitle(video_input: str, tmp_dir: Path) -> tuple[str, lis
         str(subtitle_path),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ffmpeg_timeout_seconds(),
+        )
     except Exception as exc:
         return "", [stage_warning("video.subtitle.embedded", f"FFmpeg 未提取到内嵌字幕: {exc}")]
     if not subtitle_path.exists() or subtitle_path.stat().st_size == 0:
@@ -465,7 +503,15 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
             str(audio_path),
         ]
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=ffmpeg_timeout_seconds(),
+            )
         except Exception as exc:
             warnings.append(stage_warning("video.audio.extract", f"FFmpeg 提取音频分段 {index} 失败: {exc}"))
         if audio_path.exists() and audio_path.stat().st_size > 0:
@@ -480,17 +526,36 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
 
 
 @logged_rag_method("parse.video.frame", "extract_keyframes", "抽取视频关键帧")
-def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage], list[str]]:
-    """按 V6 策略抽取全时长候选帧，再执行两阶段 OCR 预算选择。"""
+def extract_keyframes(
+    video_input: str,
+    tmp_dir: Path,
+    *,
+    progress_reporter: RagProgressReporter | None = None,
+) -> tuple[list[FrameImage], list[str]]:
+    """按 V6 策略抽取全时长候选帧，再执行两阶段 OCR 帧选择。"""
     ffmpeg = ffmpeg_executable()
     if not ffmpeg:
         return [], [stage_warning("video.frame.extract", "未找到 FFmpeg，跳过视频关键帧抽取")]
     sample_interval = max(1, int(os.getenv("RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS", "5")))
     keep_interval = max(sample_interval, int(os.getenv("RAG_VIDEO_FRAME_INTERVAL_SECONDS", "30")))
-    max_frames = max(1, int(os.getenv("RAG_VIDEO_MAX_FRAMES", "20")))
-    max_candidates = max(max_frames, int(os.getenv("RAG_VIDEO_FRAME_MAX_CANDIDATES", "720")))
+    max_frames = video_ocr_frame_limit()
+    max_candidates = int(os.getenv("RAG_VIDEO_FRAME_MAX_CANDIDATES", "720"))
+    if max_frames is not None:
+        max_candidates = max(max_frames, max_candidates)
     scan_mode = video_frame_scan_mode()
+    max_frames_label = format_ocr_frame_limit(max_frames)
     warnings: list[str] = []
+    emit_video_progress(
+        progress_reporter,
+        "parse.video.frame.extract",
+        f"正在按 {sample_interval}s 间隔扫描视频候选帧，{max_frames_label}",
+        percent=18,
+        detail=(
+            f"scanMode={scan_mode}; sampleIntervalSeconds={sample_interval}; "
+            f"maxCandidates={max_candidates}; maxOcrFrames={max_frames_label}; "
+            f"keepIntervalSeconds={keep_interval}; minIntervalSeconds={video_frame_min_interval_seconds()}"
+        ),
+    )
 
     candidates: list[FrameImage]
     if scan_mode == "prefix":
@@ -533,11 +598,30 @@ def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage]
 
     if not candidates:
         return [], warnings or [stage_warning("video.frame.extract", "FFmpeg 未生成关键帧图片")]
-    selected, selection_warnings = select_ppt_slide_frames(
-        candidates,
-        keep_interval_seconds=keep_interval,
-        max_frames=max_frames,
+    emit_video_progress(
+        progress_reporter,
+        "parse.video.frame.candidates",
+        f"已抽取 {len(candidates)} 个全视频候选帧，准备执行 PPT 翻页检测和视觉去重",
+        percent=18,
+        detail=(
+            f"candidateCount={len(candidates)}; maxOcrFrames={max_frames_label}; "
+            f"scanMode={scan_mode}; visualDedupEnabled={visual_dedup_enabled()}; "
+            f"keepIntervalSeconds={keep_interval}; minIntervalSeconds={video_frame_min_interval_seconds()}"
+        ),
     )
+    if progress_reporter is None:
+        selected, selection_warnings = select_ppt_slide_frames(
+            candidates,
+            keep_interval_seconds=keep_interval,
+            max_frames=max_frames,
+        )
+    else:
+        selected, selection_warnings = select_ppt_slide_frames(
+            candidates,
+            keep_interval_seconds=keep_interval,
+            max_frames=max_frames,
+            progress_reporter=progress_reporter,
+        )
     warnings.extend(selection_warnings)
     return selected, warnings
 
@@ -566,7 +650,15 @@ def extract_prefix_frame_candidates(
         str(frame_pattern),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ffmpeg_timeout_seconds(),
+        )
     except Exception as exc:
         return [], [stage_warning("video.frame.extract", f"FFmpeg 抽取关键帧失败: {exc}")]
     return frame_candidates_from_directory(frame_dir, sample_interval), []
@@ -605,7 +697,15 @@ def extract_full_frame_candidates(
         str(frame_pattern),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ffmpeg_timeout_seconds(),
+        )
     except Exception as exc:
         reset_directory(frame_dir)
         return [], [stage_warning("video.frame.extract", f"FFmpeg 全时长抽取关键帧失败: {exc}")]
@@ -647,13 +747,27 @@ def select_ppt_slide_frames(
     candidates: list[FrameImage],
     *,
     keep_interval_seconds: int,
-    max_frames: int,
+    max_frames: int | None,
+    progress_reporter: RagProgressReporter | None = None,
 ) -> tuple[list[FrameImage], list[str]]:
     """先扫描全部候选帧生成事件，再按全时长时间桶选择 OCR 帧。"""
     if not candidates:
         return [], []
     sorted_candidates = sorted(candidates, key=lambda item: item.time_seconds)
-    if visual_dedup_enabled():
+    dedup_enabled = visual_dedup_enabled()
+    max_frames_label = format_ocr_frame_limit(max_frames)
+    emit_video_progress(
+        progress_reporter,
+        "parse.video.slide_detect",
+        f"正在检测 PPT 翻页和视觉重复：候选帧 {len(sorted_candidates)} 个，{max_frames_label}",
+        percent=19,
+        detail=(
+            f"candidateCount={len(sorted_candidates)}; maxOcrFrames={max_frames_label}; "
+            f"visualDedupEnabled={dedup_enabled}; keepIntervalSeconds={keep_interval_seconds}; "
+            f"minIntervalSeconds={video_frame_min_interval_seconds()}"
+        ),
+    )
+    if dedup_enabled:
         events, warnings = build_visual_candidate_events(
             sorted_candidates,
             keep_interval_seconds=keep_interval_seconds,
@@ -665,6 +779,39 @@ def select_ppt_slide_frames(
             keep_interval_seconds=keep_interval_seconds,
         )
     selected = select_stage_b_ocr_frames(events, max_frames=max_frames)
+    stats = frame_selection_stats(events, selected)
+    selected_label = f"{stats['selectedCount']}/{max_frames} 帧" if max_frames is not None else f"{stats['selectedCount']} 帧（未设上限）"
+    emit_video_progress(
+        progress_reporter,
+        "parse.video.slide_detect",
+        (
+            "PPT 翻页检测完成："
+            f"候选帧 {stats['candidateCount']} 个，"
+            f"翻页命中 {stats['pptFlipCount']} 个，"
+            f"视觉重复跳过 {stats['repeatVisualCount']} 个，"
+            f"最终进入 OCR {selected_label}"
+        ),
+        percent=19,
+        detail=(
+            f"triggerCounts={stats['triggerCounts']}; selectedTriggerCounts={stats['selectedTriggerCounts']}; "
+            f"visualGroupCount={stats['visualGroupCount']}; maxOcrFrames={max_frames_label}; "
+            f"keepIntervalSeconds={keep_interval_seconds}; minIntervalSeconds={video_frame_min_interval_seconds()}; "
+            f"ocrCandidateCount={stats['ocrCandidateCount']}; selectedCount={stats['selectedCount']}; "
+            f"repeatVisualCount={stats['repeatVisualCount']}; pptFlipCount={stats['pptFlipCount']}"
+        ),
+    )
+    process_event(
+        stage="parse.video.slide_detect",
+        action="select_ppt_slide_frames_completed",
+        message="PPT 翻页检测和 OCR 帧预算选择完成",
+        context={
+            **stats,
+            "maxOcrFrames": max_frames,
+            "maxOcrFramesConfigured": max_frames is not None,
+            "keepIntervalSeconds": keep_interval_seconds,
+            "minIntervalSeconds": video_frame_min_interval_seconds(),
+        },
+    )
     return selected, warnings
 
 
@@ -717,7 +864,7 @@ def build_visual_candidate_events(
     candidates: list[FrameImage],
     *,
     keep_interval_seconds: int,
-    max_frames: int,
+    max_frames: int | None,
 ) -> tuple[list[FrameCandidateEvent], list[str]]:
     """生成 V6 视觉四态事件，并把高置信重复中的少量样本提升为验证 OCR。"""
     warnings: list[str] = []
@@ -835,16 +982,22 @@ def build_visual_candidate_events(
 def promote_visual_verification_events(
     events: list[FrameCandidateEvent],
     *,
-    max_frames: int,
+    max_frames: int | None,
 ) -> tuple[list[FrameCandidateEvent], list[str]]:
     """从高置信重复事件中抽少量验证 OCR，降低小字或数字变化漏检风险。"""
     ratio = max(0.0, float(os.getenv("RAG_VIDEO_FRAME_VISUAL_VERIFICATION_RATIO", "0.25")))
-    budget = max(1, int(max_frames * ratio)) if ratio > 0 else 0
+    primary_ocr_count = sum(
+        1
+        for event in events
+        if event.ocr_candidate and event.frame.trigger in {"initial_slide", "ppt_flip", "interval", "new_visual", "ambiguous_visual"}
+    )
+    verification_base = max_frames if max_frames is not None else primary_ocr_count
+    budget = max(1, int(verification_base * ratio)) if ratio > 0 and verification_base > 0 else 0
     per_group_limit = max(0, int(os.getenv("RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP", "2")))
     verify_interval = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_VERIFY_INTERVAL_SECONDS", "900")))
     stay_seconds = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_STAY_VERIFY_SECONDS", "600")))
     revisit_seconds = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_REVISIT_VERIFY_SECONDS", "1800")))
-    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], max_frames)
+    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], max(1, verification_base))
     primary_buckets = {
         event.frame.time_seconds // bucket_seconds
         for event in events
@@ -913,19 +1066,20 @@ def promote_visual_verification_events(
     return promoted, warnings
 
 
-def select_stage_b_ocr_frames(events: list[FrameCandidateEvent], *, max_frames: int) -> list[FrameImage]:
-    """按全视频时间桶和最终预算选择 OCR 帧，避免前缀偏置。"""
+def select_stage_b_ocr_frames(events: list[FrameCandidateEvent], *, max_frames: int | None) -> list[FrameImage]:
+    """按全视频时间桶和可选最终预算选择 OCR 帧，避免前缀偏置。"""
     ocr_events = [event for event in events if event.ocr_candidate]
     if not ocr_events:
         return []
     initial_events = [event for event in ocr_events if event.frame.trigger == "initial_slide"]
     selected: list[FrameCandidateEvent] = initial_events[:1]
     selected_ids = {id(event) for event in selected}
-    remaining_budget = max(0, max_frames - len(selected))
+    effective_budget = max_frames if max_frames is not None else len(ocr_events)
+    remaining_budget = max(0, effective_budget - len(selected))
     if remaining_budget <= 0:
         return attach_visual_only_ranges([event.frame for event in selected], events)
 
-    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], max_frames)
+    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], effective_budget)
     buckets: dict[int, list[FrameCandidateEvent]] = defaultdict(list)
     for event in ocr_events:
         if id(event) in selected_ids:
@@ -936,7 +1090,7 @@ def select_stage_b_ocr_frames(events: list[FrameCandidateEvent], *, max_frames: 
         bucket_events.sort(key=lambda event, center=bucket_center: stage_b_event_sort_key(event, center))
 
     group_counts = selected_visual_group_counts(selected)
-    min_interval = max(0, int(os.getenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "30")))
+    min_interval = video_frame_min_interval_seconds()
     while remaining_budget > 0 and buckets:
         made_progress = False
         for bucket in stage_b_bucket_order(sorted(buckets.keys()), remaining_budget):
@@ -960,6 +1114,31 @@ def select_stage_b_ocr_frames(events: list[FrameCandidateEvent], *, max_frames: 
 
     selected_frames = [event.frame for event in sorted(selected, key=lambda item: item.frame.time_seconds)]
     return attach_visual_only_ranges(selected_frames, events)
+
+
+def frame_selection_stats(events: list[FrameCandidateEvent], selected: list[FrameImage]) -> dict[str, Any]:
+    """汇总 PPT 翻页检测和 OCR 预算选择统计，用于前端进度和控制面板。"""
+    trigger_counts: dict[str, int] = defaultdict(int)
+    selected_trigger_counts: dict[str, int] = defaultdict(int)
+    visual_groups = {event.frame.visual_group_id for event in events if event.frame.visual_group_id}
+    for event in events:
+        trigger_counts[event.frame.trigger] += 1
+    for frame in selected:
+        selected_trigger_counts[frame.trigger] += 1
+    return {
+        "candidateCount": len(events),
+        "ocrCandidateCount": sum(1 for event in events if event.ocr_candidate),
+        "selectedCount": len(selected),
+        "pptFlipCount": trigger_counts.get("ppt_flip", 0),
+        "intervalCount": trigger_counts.get("interval", 0),
+        "newVisualCount": trigger_counts.get("new_visual", 0),
+        "ambiguousVisualCount": trigger_counts.get("ambiguous_visual", 0),
+        "repeatVisualCount": trigger_counts.get("repeat_visual_confident", 0),
+        "visualVerificationCount": trigger_counts.get("visual_verification", 0),
+        "visualGroupCount": len(visual_groups),
+        "triggerCounts": dict(trigger_counts),
+        "selectedTriggerCounts": dict(selected_trigger_counts),
+    }
 
 
 def stage_b_bucket_order(bucket_keys: list[int], remaining_budget: int) -> list[int]:
@@ -1177,6 +1356,30 @@ def video_frame_scan_mode() -> str:
     return value if value in {"auto", "prefix", "full"} else "auto"
 
 
+def video_frame_min_interval_seconds() -> int:
+    """读取最终 OCR 帧之间的最小间隔。"""
+    return max(0, int(os.getenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "30")))
+
+
+def video_ocr_frame_limit() -> int | None:
+    """读取显式 OCR 帧上限；未配置或小于 1 时不截断最终 OCR 帧。"""
+    value = os.getenv("RAG_VIDEO_MAX_FRAMES")
+    if value is None or value.strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def format_ocr_frame_limit(max_frames: int | None) -> str:
+    """生成面向日志和前端进度的 OCR 帧上限说明。"""
+    if max_frames is None:
+        return "未设置最终 OCR 帧上限"
+    return f"最终 OCR 预算最多 {max_frames} 帧"
+
+
 def image_difference_score(left_path: Path, right_path: Path) -> float:
     """计算两张候选帧缩略图的平均像素差异，用于检测 PPT 翻页。"""
     try:
@@ -1214,7 +1417,15 @@ def probe_media_duration_strict(video_input: str | Path) -> float | None:
             str(video_input),
         ]
         try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
             duration = float(result.stdout.strip())
             return max(1.0, duration) if duration > 0 else None
         except Exception:
@@ -1223,7 +1434,14 @@ def probe_media_duration_strict(video_input: str | Path) -> float | None:
     if not ffmpeg:
         return None
     try:
-        result = subprocess.run([ffmpeg, "-i", str(video_input)], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            [ffmpeg, "-i", str(video_input)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
         output = f"{result.stderr}\n{result.stdout}"
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
         if match:
@@ -1389,6 +1607,7 @@ def ocr_video_frames(
                     f"第 {index}/{len(frames)} 帧：目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
                     percent=20,
                     detail=f"目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+                    stage_code="parse.video.ocr",
                 )
             ocr_result = ocr_client.recognize_image_bytes(
                 image_bytes=image_bytes,
@@ -1409,6 +1628,7 @@ def ocr_video_frames(
                 f"第 {index}/{len(frames)} 帧：已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
                 percent=22,
                 detail=f"已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+                stage_code="parse.video.ocr",
             )
         if ocr_result and ocr_result.warnings:
             warnings.extend(stage_warning(f"video.frame_ocr[{index}]", warning) for warning in ocr_result.warnings)
@@ -1898,17 +2118,85 @@ def emit_model_progress(
     *,
     percent: int,
     detail: str,
+    stage_code: str = "parse.video",
 ) -> None:
     """把用户关心的模型调用事件同步到资料进度。"""
     if progress_reporter is None:
         return
     progress_reporter.emit(
-        "parse.video",
+        stage_code,
         message,
         current_step=3,
         total_steps=8,
         percent=percent,
         detail=detail,
+    )
+
+
+def emit_video_progress(
+    progress_reporter: RagProgressReporter | None,
+    stage_code: str,
+    message: str,
+    *,
+    percent: int,
+    detail: str,
+) -> None:
+    """把视频解析子阶段同步到前端可见进度。"""
+    if progress_reporter is None:
+        return
+    progress_reporter.emit(
+        stage_code,
+        message,
+        current_step=3,
+        total_steps=8,
+        percent=percent,
+        detail=detail,
+    )
+
+
+def emit_filetrans_progress(
+    progress_reporter: RagProgressReporter | None,
+    client: BailianAsrClient,
+    event: dict[str, Any],
+) -> None:
+    """把百炼 filetrans 异步提交、轮询和重试状态同步到前端。"""
+    if progress_reporter is None:
+        return
+    phase = event.get("phase")
+    attempt = event.get("attempt")
+    max_attempts = event.get("maxAttempts")
+    poll_index = event.get("pollIndex")
+    max_polls = event.get("maxPolls")
+    task_status = event.get("taskStatus") or "UNKNOWN"
+    if phase == "submit":
+        message = f"第 {attempt}/{max_attempts} 次提交 {client.filetrans_model} 异步 ASR 任务"
+    elif phase == "submitted":
+        message = f"已提交 {client.filetrans_model} 异步 ASR 任务，等待百炼处理"
+    elif phase == "poll":
+        message = f"正在等待 {client.filetrans_model} 异步 ASR：轮询 {poll_index}/{max_polls}，状态 {task_status}"
+    elif phase == "download":
+        message = f"{client.filetrans_model} 异步 ASR 已完成，正在下载转写结果"
+    elif phase == "retry":
+        message = f"{client.filetrans_model} 异步 ASR 第 {attempt}/{max_attempts} 次失败，准备重试第 {event.get('nextAttempt')} 次"
+    elif phase == "failed":
+        message = f"{client.filetrans_model} 异步 ASR 已失败，准备降级到字幕或同步 ASR"
+    else:
+        message = f"{client.filetrans_model} 异步 ASR 状态更新"
+    detail_parts = [
+        f"phase={phase}",
+        f"attempt={attempt}/{max_attempts}",
+        f"poll={poll_index}/{max_polls}" if poll_index and max_polls else "",
+        f"taskStatus={task_status}" if phase == "poll" else "",
+        f"taskId={event.get('taskId')}" if event.get("taskId") else "",
+        f"error={event.get('errorMessage')}" if event.get("errorMessage") else "",
+    ]
+    progress_reporter.emit(
+        "parse.video.asr",
+        message,
+        current_step=3,
+        total_steps=8,
+        percent=17 if phase in {"poll", "submitted"} else 16,
+        detail="; ".join(part for part in detail_parts if part),
     )
 
 

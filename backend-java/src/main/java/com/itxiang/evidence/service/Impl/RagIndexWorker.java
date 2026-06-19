@@ -108,7 +108,12 @@ public class RagIndexWorker {
                     material.getId(), material.getId(), result.status(), result.parser(), result.chunkCount());
         } catch (Exception e) {
             log.warn("后台资料索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
-            recordFailureProgress(material, e);
+            boolean timeout = isPythonTimeout(e);
+            if (timeout) {
+                recordTimeoutProgress(material, e);
+            } else {
+                recordFailureProgress(material, e);
+            }
             logService.recordRagError(
                     "material",
                     stage,
@@ -118,7 +123,9 @@ public class RagIndexWorker {
                     e,
                     errorContext(material, e)
             );
-            transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
+            if (!timeout) {
+                transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
+            }
         }
     }
 
@@ -181,6 +188,31 @@ public class RagIndexWorker {
                 "索引失败：" + truncate(reason, 180),
                 context,
                 false
+        );
+    }
+
+    /**
+     * Python 长任务等待超时时保留运行状态，后续由 Python 终态回调同步资料结果。
+     */
+    private void recordTimeoutProgress(LearningMaterial material, Exception e) {
+        String reason = e.getMessage() == null ? "Python RAG 等待超时" : e.getMessage();
+        Map<String, Object> context = materialContext(material);
+        context.putAll(pythonExceptionContext(e));
+        context.put("stageCode", "index.waiting");
+        context.put("stageLabel", "等待索引结果");
+        context.put("message", "Java 等待 Python 索引结果超时，继续接收后台进度回调");
+        context.put("status", "RUNNING");
+        context.put("currentStep", 7);
+        context.put("totalSteps", 8);
+        context.put("percent", 95);
+        context.put("detail", truncate(reason, 500));
+        logService.recordRagProgress(
+                "material",
+                "index.waiting",
+                "rag_progress_index_waiting_timeout",
+                "Java 等待 Python 索引结果超时，继续接收后台进度回调",
+                context,
+                true
         );
     }
 
@@ -381,6 +413,17 @@ public class RagIndexWorker {
             return "RAG_PYTHON_BAD_RESPONSE";
         }
         return "RAG_STATUS_SYNC_FAILED";
+    }
+
+    /**
+     * 判断异常是否属于 Java 等待 Python 长任务结果超时。
+     */
+    private boolean isPythonTimeout(Throwable e) {
+        if (e instanceof PythonRagClient.PythonRagClientException pythonException && pythonException.getStatusCode() != null) {
+            return false;
+        }
+        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        return message.contains("timed out") || message.contains("timeout");
     }
 
     /**

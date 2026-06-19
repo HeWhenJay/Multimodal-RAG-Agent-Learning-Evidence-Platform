@@ -1,4 +1,4 @@
-import type { LearningMaterial } from '../api/types';
+import type { LearningMaterial, RagProgress } from '../api/types';
 
 // 合并资料刷新结果，避免接口短暂缺少进度字段时覆盖已展示的 RAG 进度。
 export function mergeMaterialProgress(previous: LearningMaterial[], next: LearningMaterial[]) {
@@ -24,6 +24,42 @@ function mergeSingleMaterialProgress(previous: LearningMaterial | undefined, nex
   return {
     ...next,
     latestProgress: next.latestProgress || previous.latestProgress,
-    progressEvents: next.progressEvents?.length ? next.progressEvents : previous.progressEvents
+    progressEvents: mergeProgressEvents(previous.progressEvents, next.progressEvents)
   };
+}
+
+// 合并刷新前后的进度，保留视频关键阶段，避免逐帧 OCR 事件挤掉翻页检测结果。
+function mergeProgressEvents(previous?: RagProgress[], next?: RagProgress[]) {
+  if (!next?.length) {
+    return previous;
+  }
+  const merged = [...next];
+  for (const progress of previous || []) {
+    if (!isStickyVideoProgress(progress)) {
+      continue;
+    }
+    if (!merged.some((item) => progressKey(item) === progressKey(progress))) {
+      merged.push(progress);
+    }
+  }
+  return merged;
+}
+
+function isStickyVideoProgress(progress: RagProgress) {
+  return [
+    'parse.video.frame.extract',
+    'parse.video.frame.candidates',
+    'parse.video.slide_detect',
+    'parse.video.ocr'
+  ].includes(progress.stageCode);
+}
+
+function progressKey(progress: RagProgress) {
+  return [
+    progress.stageCode || '',
+    progress.message || '',
+    progress.chunkId || '',
+    progress.currentChunk || '',
+    progress.totalChunks || ''
+  ].join('|');
 }

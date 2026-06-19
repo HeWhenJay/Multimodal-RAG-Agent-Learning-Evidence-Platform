@@ -66,7 +66,9 @@ def frame_block(
 def test_full_scan_uses_dynamic_interval_and_reaches_video_tail(tmp_path, monkeypatch):
     captured = {}
 
-    def fake_run(command, check, capture_output, text, timeout):
+    def fake_run(command, check, capture_output, text, encoding, errors, timeout):
+        assert encoding == "utf-8"
+        assert errors == "replace"
         captured["command"] = command
         pattern = Path(command[-1])
         pattern.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +120,43 @@ def test_stage_b_selection_covers_tail_when_events_exceed_budget(tmp_path, monke
     assert len(selected) == 5
     assert selected[0].time_seconds == 0
     assert selected[-1].time_seconds >= 25 * 60
+
+
+def test_stage_b_default_has_no_twenty_frame_limit(tmp_path, monkeypatch):
+    monkeypatch.delenv("RAG_VIDEO_MAX_FRAMES", raising=False)
+    monkeypatch.setenv("RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED", "false")
+    monkeypatch.setenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "0")
+    frames = [FrameImage(time_seconds=index * 60, path=make_frame(tmp_path / f"frame-no-limit-{index:04d}.jpg", str(index))) for index in range(30)]
+
+    selected, warnings = select_ppt_slide_frames(frames, keep_interval_seconds=60, max_frames=None)
+
+    assert warnings == []
+    assert len(selected) == 30
+    assert selected[-1].time_seconds == 29 * 60
+
+
+def test_slide_detection_reports_frontend_progress(tmp_path, monkeypatch):
+    from rag.progress import RagProgressReporter
+
+    monkeypatch.setenv("RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED", "false")
+    monkeypatch.setenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "0")
+    reporter = RagProgressReporter(document_id="doc-video-progress", persist=False)
+    frames = [
+        FrameImage(time_seconds=0, path=make_frame(tmp_path / "progress-1.jpg", "第一页")),
+        FrameImage(time_seconds=60, path=make_frame(tmp_path / "progress-2.jpg", "第二页", fill="black")),
+    ]
+
+    selected, warnings = select_ppt_slide_frames(
+        frames,
+        keep_interval_seconds=30,
+        max_frames=2,
+        progress_reporter=reporter,
+    )
+
+    assert warnings == []
+    assert selected
+    assert any(event.stageCode == "parse.video.slide_detect" for event in reporter.events)
+    assert "翻页命中" in reporter.events[-1].message
 
 
 def test_visual_only_ranges_do_not_participate_in_frames_between():

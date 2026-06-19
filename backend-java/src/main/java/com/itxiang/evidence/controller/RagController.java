@@ -11,6 +11,7 @@ import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -209,6 +210,39 @@ public class RagController {
                         "topK", dto.getTopK() == null ? 5 : dto.getTopK()
                 ),
                 () -> ragService.query(dto, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 创建 RAG 检索问答任务，前端随后轮询读取阶段详情。
+     */
+    @PostMapping("/query/tasks")
+    @Operation(summary = "创建 RAG 检索问答任务")
+    public Result<RagQueryTaskVO> startQueryTask(@Valid @RequestBody RagQueryDTO dto,
+                                                 @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("创建 RAG 检索问答任务: question={}, topK={}", dto.getQuestion(), dto.getTopK());
+        return execute(
+                RagOperationContext.operation("rag_query", "retrieve", "rag_query_task_request", "创建 RAG 检索问答任务"),
+                context(
+                        "questionLength", dto.getQuestion() == null ? 0 : dto.getQuestion().length(),
+                        "topK", dto.getTopK() == null ? 5 : dto.getTopK()
+                ),
+                () -> ragService.startQueryTask(dto, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 轮询 RAG 检索问答任务状态。
+     */
+    @GetMapping("/query/tasks/{taskId}")
+    @Operation(summary = "查询 RAG 检索问答任务状态")
+    public Result<RagQueryTaskVO> getQueryTask(@PathVariable String taskId,
+                                               @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("查询 RAG 检索问答任务状态: taskId={}", taskId);
+        return execute(
+                RagOperationContext.operation("rag_query", "retrieve", "rag_query_task_poll", "查询 RAG 检索问答任务状态"),
+                context("taskId", taskId),
+                () -> ragService.getQueryTask(taskId, currentUserId(authorization))
         );
     }
 

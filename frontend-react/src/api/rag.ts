@@ -1,4 +1,4 @@
-import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagQueryResult, Result } from './types';
+import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagProgress, RagQueryResult, RagQueryTask, Result } from './types';
 import { getStoredAuthToken } from './auth';
 
 const jsonHeaders = {
@@ -67,6 +67,68 @@ export function queryRag(payload: {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify(payload)
+  });
+}
+
+// 创建 RAG 检索问答任务，前端通过轮询读取实时进度。
+export function startRagQueryTask(payload: {
+  question: string;
+  topK?: number;
+  metadataFilter?: Record<string, unknown>;
+}): Promise<RagQueryTask> {
+  return request<RagQueryTask>('/api/rag/query/tasks', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 读取 RAG 检索问答任务当前状态。
+export function fetchRagQueryTask(taskId: string): Promise<RagQueryTask> {
+  return request<RagQueryTask>(`/api/rag/query/tasks/${taskId}`);
+}
+
+// 创建并轮询 RAG 检索任务，持续把阶段事件回调给页面。
+export async function runRagQueryTask(
+  payload: {
+    question: string;
+    topK?: number;
+    metadataFilter?: Record<string, unknown>;
+  },
+  onProgress: (events: RagProgress[], task: RagQueryTask) => void,
+  options: { pollIntervalMs?: number; signal?: AbortSignal } = {}
+): Promise<RagQueryResult> {
+  const pollIntervalMs = options.pollIntervalMs ?? 350;
+  let task = await startRagQueryTask(payload);
+  onProgress(task.progressEvents || [], task);
+
+  while (task.status === 'RUNNING') {
+    await wait(pollIntervalMs, options.signal);
+    if (options.signal?.aborted) {
+      throw new Error('RAG 检索已取消');
+    }
+    task = await fetchRagQueryTask(task.taskId);
+    onProgress(task.progressEvents || [], task);
+  }
+
+  if (task.status === 'COMPLETED' && task.result) {
+    return task.result;
+  }
+  throw new Error(task.errorMessage || task.message || 'RAG 检索失败');
+}
+
+// 支持 AbortController 取消正在等待的轮询间隔。
+function wait(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('RAG 检索已取消'));
+      return;
+    }
+    const timer = window.setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      window.clearTimeout(timer);
+      reject(new Error('RAG 检索已取消'));
+    }, { once: true });
   });
 }
 

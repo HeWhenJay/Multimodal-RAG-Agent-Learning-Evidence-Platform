@@ -83,6 +83,70 @@ def test_filetrans_result_converts_to_srt(monkeypatch, tmp_path: Path):
     assert captured["json"]["input"]["file_url"] == "https://example.com/course.mp4"
 
 
+def test_filetrans_reports_poll_progress(monkeypatch):
+    events = []
+
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.poll_count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def post(self, url, headers, json):
+            return FakeResponse({"output": {"task_id": "task-progress"}})
+
+        def get(self, url, headers=None):
+            if url.endswith("/tasks/task-progress"):
+                self.poll_count += 1
+                status = "RUNNING" if self.poll_count == 1 else "SUCCEEDED"
+                return FakeResponse(
+                    {
+                        "output": {
+                            "task_status": status,
+                            "result": {"transcription_url": "https://example.com/asr-result.json"},
+                        }
+                    }
+                )
+            return FakeResponse(
+                {
+                    "transcripts": [
+                        {"sentences": [{"begin_time": 0, "end_time": 1000, "text": "进度测试"}]}
+                    ]
+                }
+            )
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    client = BailianAsrClient(
+        api_key="test-key",
+        provider="dashscope_filetrans",
+        max_polls=3,
+        poll_interval_seconds=0,
+    )
+
+    transcript, warnings = client.transcribe_source_url("https://example.com/course.mp4", progress_callback=events.append)
+
+    assert warnings == []
+    assert "进度测试" in transcript
+    assert any(event.get("phase") == "submitted" for event in events)
+    assert any(event.get("phase") == "poll" and event.get("taskStatus") == "RUNNING" for event in events)
+    assert any(event.get("phase") == "download" for event in events)
+
+
 def test_transcription_json_to_srt_requires_timestamped_sentences():
     srt = transcription_json_to_srt(
         {

@@ -81,7 +81,7 @@ video:
   frame-sample-interval-seconds: ${RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS:5}
   frame-interval-seconds: ${RAG_VIDEO_FRAME_INTERVAL_SECONDS:30}
   frame-min-interval-seconds: ${RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS:30}
-  max-frames: ${RAG_VIDEO_MAX_FRAMES:20}
+  max-frames: ${RAG_VIDEO_MAX_FRAMES:}
   frame-target-candidates: ${RAG_VIDEO_FRAME_TARGET_CANDIDATES:360}
   frame-max-candidates: ${RAG_VIDEO_FRAME_MAX_CANDIDATES:720}
   ppt-flip-diff-threshold: ${RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD:0.08}

@@ -151,6 +151,17 @@ class QueryResponse(BaseModel):
     progressEvents: list[ProgressEvent] = Field(default_factory=list)
 
 
+class QueryTaskResponse(BaseModel):
+    taskId: str
+    status: Literal["RUNNING", "COMPLETED", "FAILED", "EXPIRED"]
+    message: str
+    progressEvents: list[ProgressEvent] = Field(default_factory=list)
+    result: QueryResponse | None = None
+    errorMessage: str | None = None
+    createdAt: str | None = None
+    updatedAt: str | None = None
+
+
 class OverviewResponse(BaseModel):
     documentCount: int
     chunkCount: int

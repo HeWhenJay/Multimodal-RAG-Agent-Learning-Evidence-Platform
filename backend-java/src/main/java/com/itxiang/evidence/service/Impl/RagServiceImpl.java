@@ -17,6 +17,7 @@ import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagProgressVO;
+import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,13 +29,11 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -54,6 +53,7 @@ public class RagServiceImpl implements RagService {
     private final LogService logService;
     private final ObjectStorageService objectStorageService;
     private final RagIndexWorker ragIndexWorker;
+    private final RagUploadWorker ragUploadWorker;
     private final ObjectMapper objectMapper;
 
     /**
@@ -289,27 +289,36 @@ public class RagServiceImpl implements RagService {
                         .chunkIndex(chunkIndex)
                         .totalChunks(totalChunks)
                         .receivedChunks(receivedChunks)
+                        .status("UPLOADING")
+                        .message("已接收视频分片：" + receivedChunks + "/" + totalChunks)
                         .completed(false)
                         .material(null)
                         .build();
             }
-            Path mergedPath = mergeChunks(directory, filename, totalChunks, totalSize);
-            LearningMaterialVO material = storeAndIndexMergedFile(
-                    mergedPath,
+            LearningMaterial material = createPendingUploadMaterial(filename, scopedUserId);
+            recordChunkProcessingProgress(material, safeUploadId, totalChunks);
+            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+                    material.getId(),
+                    scopedUserId,
+                    directory,
+                    chunkRoot(),
+                    safeUploadId,
                     filename,
                     file.getContentType(),
-                    scopedUserId,
-                    highPrecision
-            );
-            cleanupChunkDirectory(directory);
+                    totalChunks,
+                    totalSize,
+                    Boolean.TRUE.equals(highPrecision)
+            ));
             return MaterialUploadChunkVO.builder()
                     .uploadId(safeUploadId)
                     .filename(filename)
                     .chunkIndex(chunkIndex)
                     .totalChunks(totalChunks)
                     .receivedChunks(totalChunks)
+                    .status("PROCESSING")
+                    .message("视频分片已收齐，正在后台合并并上传对象存储")
                     .completed(true)
-                    .material(material)
+                    .material(convertToVO(material))
                     .build();
         } catch (IOException e) {
             throw new IllegalStateException("保存上传分片失败: " + e.getMessage(), e);
@@ -374,15 +383,10 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 保存分片合并文件、创建资料记录并调用 Python 索引。
+     * 创建分片视频的待处理资料记录，后续由后台线程补写对象存储路径。
      */
-    private LearningMaterialVO storeAndIndexMergedFile(Path mergedPath,
-                                                       String filename,
-                                                       String contentType,
-                                                       String userId,
-                                                       Boolean highPrecision) {
+    private LearningMaterial createPendingUploadMaterial(String filename, String userId) {
         String documentType = detectDocumentType(filename);
-        ObjectStorageService.StoredObject storedObject = objectStorageService.store(mergedPath, filename, userId, documentType, contentType);
         LearningMaterial material = new LearningMaterial();
         material.setTitle(filename);
         material.setUserId(userId);
@@ -391,19 +395,34 @@ public class RagServiceImpl implements RagService {
         material.setStatus("PENDING");
         material.setChunkCount(0);
         material.setOriginalFilename(filename);
-        material.setOriginalFilePath(storedObject.sourcePath());
-        material.setStorageType(storedObject.storageType());
-        material.setObjectKey(storedObject.objectKey());
-        material.setPublicUrl(storedObject.publicUrl());
+        material.setStorageType("pending");
         learningMaterialMapper.insert(material);
-        learningMaterialMapper.updateStatus(material.getId(), "PARSING");
-        material.setStatus("PARSING");
-        scheduleAfterCommit(() -> ragIndexWorker.indexStoredMaterial(
-                material.getId(),
-                userId,
-                Boolean.TRUE.equals(highPrecision)
-        ));
-        return convertToVO(material);
+        return material;
+    }
+
+    /**
+     * 记录分片收齐后的后台收尾进度，让前端立即看到“合并上传中”。
+     */
+    private void recordChunkProcessingProgress(LearningMaterial material, String uploadId, Integer totalChunks) {
+        Map<String, Object> context = materialContext(material);
+        context.put("uploadId", uploadId);
+        context.put("stageCode", "upload.processing");
+        context.put("stageLabel", "后台合并上传");
+        context.put("message", "视频分片已收齐，正在后台合并并上传对象存储");
+        context.put("status", "RUNNING");
+        context.put("currentStep", 1);
+        context.put("totalSteps", 8);
+        context.put("currentChunk", totalChunks);
+        context.put("totalChunks", totalChunks);
+        context.put("percent", 8);
+        logService.recordRagProgress(
+                "material",
+                "upload.processing",
+                "material_upload_chunk_processing",
+                "视频分片已收齐，正在后台合并并上传对象存储",
+                context,
+                true
+        );
     }
 
     /**
@@ -452,6 +471,61 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 创建 Python RAG 查询任务，前端通过任务 ID 轮询实时进度。
+     */
+    @Override
+    public RagQueryTaskVO startQueryTask(RagQueryDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        RagQueryDTO scopedDto = scopedQuery(dto, scopedUserId);
+        logService.recordRagEvent(
+                "rag_query",
+                "retrieve",
+                "rag_query_task_start",
+                "开始 RAG 查询任务",
+                queryContext(scopedDto, null, null)
+        );
+        try {
+            RagQueryTaskVO task = pythonRagClient.startQueryTask(scopedDto);
+            Map<String, Object> context = queryContext(scopedDto, null, null);
+            context.put("taskId", task.getTaskId());
+            context.put("taskStatus", task.getStatus());
+            logService.recordRagEvent(
+                    "rag_query",
+                    "retrieve",
+                    "rag_query_task_created",
+                    "RAG 查询任务已创建",
+                    context
+            );
+            return task;
+        } catch (Exception e) {
+            Map<String, Object> context = queryContext(scopedDto, null, null);
+            context.putAll(pythonExceptionContext(e));
+            logService.recordRagError(
+                    "rag_query",
+                    "retrieve",
+                    "rag_query_task_failed",
+                    resolveRagErrorCode(e),
+                    "RAG 查询任务创建失败",
+                    e,
+                    context
+            );
+            throw e;
+        }
+    }
+
+    /**
+     * 读取 Python RAG 查询任务状态。
+     */
+    @Override
+    public RagQueryTaskVO getQueryTask(String taskId, String userId) {
+        requireUserId(userId);
+        if (taskId == null || taskId.isBlank()) {
+            throw new IllegalArgumentException("查询任务 ID 不能为空");
+        }
+        return pythonRagClient.getQueryTask(taskId.trim());
+    }
+
+    /**
      * 将资料实体转换为前端展示对象。
      */
     private LearningMaterialVO convertToVO(LearningMaterial material) {
@@ -487,10 +561,18 @@ public class RagServiceImpl implements RagService {
         }
         try {
             LinkedHashSet<String> seen = new LinkedHashSet<>();
-            return logEventMapper.findRecentProgressByMaterialId(materialId, 20).stream()
+            List<RagProgressVO> recentProgress = logEventMapper.findRecentProgressByMaterialId(materialId, 40).stream()
                     .map(this::toProgressVO)
+                    .toList();
+            List<RagProgressVO> videoProgress = logEventMapper.findVideoProgressByMaterialId(materialId, 80).stream()
+                    .map(this::toProgressVO)
+                    .toList();
+            List<RagProgressVO> merged = new java.util.ArrayList<>();
+            merged.addAll(recentProgress);
+            merged.addAll(videoProgress);
+            return merged.stream()
                     .filter(progress -> seen.add(progressKey(progress)))
-                    .limit(8)
+                    .limit(30)
                     .toList();
         } catch (Exception e) {
             log.debug("读取资料进度事件失败: materialId={}, reason={}", materialId, e.getMessage());
@@ -688,49 +770,6 @@ public class RagServiceImpl implements RagService {
             return (int) files
                     .filter(path -> path.getFileName().toString().matches("chunk-\\d{5}\\.part"))
                     .count();
-        }
-    }
-
-    /**
-     * 按分片序号顺序合并文件，并校验合并后的总大小。
-     */
-    private Path mergeChunks(Path directory, String filename, int totalChunks, Long totalSize) throws IOException {
-        Path mergedPath = directory.resolve("merged-" + sanitizeFilenameToken(filename));
-        try (OutputStream outputStream = Files.newOutputStream(mergedPath)) {
-            for (int index = 0; index < totalChunks; index++) {
-                Path chunkPath = directory.resolve(String.format("chunk-%05d.part", index));
-                if (!Files.exists(chunkPath)) {
-                    throw new IllegalStateException("上传分片缺失: " + index);
-                }
-                Files.copy(chunkPath, outputStream);
-            }
-        }
-        if (totalSize != null && Files.size(mergedPath) != totalSize) {
-            throw new IllegalStateException("分片合并后的文件大小与前端声明不一致");
-        }
-        return mergedPath;
-    }
-
-    /**
-     * 清理分片临时目录，先校验路径仍位于分片根目录内。
-     */
-    private void cleanupChunkDirectory(Path directory) {
-        Path root = chunkRoot();
-        Path target = directory.toAbsolutePath().normalize();
-        if (!target.startsWith(root)) {
-            log.warn("跳过分片目录清理，路径不在分片根目录内: {}", target);
-            return;
-        }
-        try (Stream<Path> paths = Files.walk(target)) {
-            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
-                try {
-                    Files.deleteIfExists(path);
-                } catch (IOException e) {
-                    log.debug("清理分片临时文件失败: path={}, reason={}", path, e.getMessage());
-                }
-            });
-        } catch (IOException e) {
-            log.debug("清理分片临时目录失败: path={}, reason={}", target, e.getMessage());
         }
     }
 

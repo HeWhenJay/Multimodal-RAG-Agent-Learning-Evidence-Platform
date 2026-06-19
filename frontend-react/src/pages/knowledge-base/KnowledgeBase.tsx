@@ -1,7 +1,10 @@
 import { Database, FileText, PlayCircle, Search, Send } from 'lucide-react';
-import { useState } from 'react';
-import { queryRag } from '../../api/rag';
-import type { RagQueryResult } from '../../api/types';
+import { useEffect, useRef, useState } from 'react';
+import { runRagQueryTask } from '../../api/rag';
+import type { RagProgress, RagQueryResult } from '../../api/types';
+import { MarkdownText } from '../../components/MarkdownText';
+import { RagQueryProgress } from '../../components/RagQueryProgress';
+import { markRagQueryProgressFailed } from '../../services/ragQueryProgress';
 
 // 知识库页负责提交 RAG 问题并展示回答和证据。
 export function KnowledgeBase() {
@@ -11,6 +14,11 @@ export function KnowledgeBase() {
   const [documentType, setDocumentType] = useState('');
   const [mediaType, setMediaType] = useState('');
   const [evidenceChannel, setEvidenceChannel] = useState('');
+  const [querying, setQuerying] = useState(false);
+  const [queryProgressEvents, setQueryProgressEvents] = useState<RagProgress[]>([]);
+  const queryAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => queryAbortRef.current?.abort(), []);
 
   // 提交问题并刷新 RAG 检索结果。
   async function submit() {
@@ -19,14 +27,43 @@ export function KnowledgeBase() {
       setError('请输入检索问题');
       return;
     }
+    let controller: AbortController | null = null;
     try {
       const metadataFilter: Record<string, string> = {};
       if (documentType) metadataFilter.documentType = documentType;
       if (mediaType) metadataFilter.mediaType = mediaType;
       if (evidenceChannel) metadataFilter.evidenceChannel = evidenceChannel;
-      setResult(await queryRag({ question, topK: 6, metadataFilter }));
+      setResult(null);
+      setQuerying(true);
+      setQueryProgressEvents([]);
+      queryAbortRef.current?.abort();
+      controller = new AbortController();
+      queryAbortRef.current = controller;
+      const response = await runRagQueryTask(
+        { question, topK: 6, metadataFilter },
+        (events) => {
+          if (queryAbortRef.current === controller) {
+            setQueryProgressEvents(events);
+          }
+        },
+        { signal: controller.signal }
+      );
+      if (queryAbortRef.current !== controller) {
+        return;
+      }
+      setResult(response);
+      setQueryProgressEvents(response.progressEvents || []);
     } catch (err) {
+      if (err instanceof Error && err.message === 'RAG 检索已取消') {
+        return;
+      }
       setError(err instanceof Error ? err.message : '检索失败');
+      setQueryProgressEvents((events) => markRagQueryProgressFailed(events));
+    } finally {
+      if (queryAbortRef.current === controller) {
+        queryAbortRef.current = null;
+        setQuerying(false);
+      }
     }
   }
 
@@ -75,6 +112,10 @@ export function KnowledgeBase() {
         {error && <p className="form-message danger">{error}</p>}
       </section>
 
+      {(querying || queryProgressEvents.length > 0) && (
+        <RagQueryProgress events={queryProgressEvents} running={querying} />
+      )}
+
       {result && (
         <section className="two-column evidence-layout">
           <article className="panel">
@@ -82,7 +123,7 @@ export function KnowledgeBase() {
               <h3>回答</h3>
               <span className="status-pill">{result.evidences.length} 条证据</span>
             </div>
-            <p className="answer-copy">{result.answer}</p>
+            <MarkdownText className="answer-copy" content={result.answer} />
             <div className="query-tags">
               {result.expandedQueries.map((query) => <span key={query}>{query}</span>)}
             </div>

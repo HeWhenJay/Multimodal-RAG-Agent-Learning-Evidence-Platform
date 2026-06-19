@@ -25,9 +25,26 @@ public interface LearningMaterialMapper {
                            @Param("chunkCount") Integer chunkCount);
 
     /**
+     * 按 Python 进度回调同步学习资料索引状态。
+     */
+    void updateProgressStatus(@Param("id") Long id,
+                              @Param("status") String status,
+                              @Param("parser") String parser,
+                              @Param("chunkCount") Integer chunkCount);
+
+    /**
      * 更新学习资料解析状态。
      */
     void updateStatus(@Param("id") Long id, @Param("status") String status);
+
+    /**
+     * 回写原始文件对象存储位置。
+     */
+    void updateStorageInfo(@Param("id") Long id,
+                           @Param("originalFilePath") String originalFilePath,
+                           @Param("storageType") String storageType,
+                           @Param("objectKey") String objectKey,
+                           @Param("publicUrl") String publicUrl);
 
     /**
      * 按 ID 查询学习资料。

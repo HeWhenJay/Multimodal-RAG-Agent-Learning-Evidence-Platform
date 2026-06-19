@@ -156,6 +156,107 @@ def test_video_source_with_sidecar_txt_indexes_subtitle_evidence(tmp_path, monke
     assert not any(message.startswith("video.fallback:") for message in parsed.parse_quality.messages)
 
 
+def test_video_source_prefers_sidecar_before_public_filetrans(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "dashscope_filetrans")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    source_video = tmp_path / "course.subtitled.mp4"
+    source_video.write_bytes(b"fake-video")
+    transcript = tmp_path / "course.srt"
+    transcript.write_text(
+        "1\n"
+        "00:00:01,000 --> 00:00:03,000\n"
+        "已有字幕应优先入库，不再等待公开视频 ASR。\n",
+        encoding="utf-8",
+    )
+
+    from video.asr.bailian_asr import BailianAsrClient
+
+    def fail_filetrans(self, source_url, progress_callback=None):
+        raise AssertionError("已有字幕时不应触发百炼 filetrans")
+
+    monkeypatch.setattr(BailianAsrClient, "transcribe_source_url", fail_filetrans)
+    parser = DocumentParserRouter()
+
+    parsed = parser.parse_video_source(
+        document_id="doc-video-sidecar-first",
+        title="已有字幕视频",
+        document_type="mp4",
+        source="upload",
+        user_id="unit-user",
+        visibility_scope="private",
+        source_path=str(source_video),
+        filename=source_video.name,
+    )
+
+    subtitle_blocks = [block for block in parsed.blocks if block.metadata.get("evidenceChannel") == "subtitle"]
+    assert parsed.status == "READY"
+    assert subtitle_blocks
+    assert all(block.parseEngine == "sidecar-subtitle-transcript" for block in subtitle_blocks)
+    assert not any("等待百炼 ASR 异步任务超时" in message for message in parsed.parse_quality.messages)
+
+
+def test_public_video_prefers_embedded_subtitle_before_filetrans(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "dashscope_filetrans")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    from video.asr.bailian_asr import BailianAsrClient
+    from video.chunking import video_processing
+
+    monkeypatch.setattr(video_processing, "load_sidecar_subtitle", lambda video_input, source_path: ("", None, []))
+    monkeypatch.setattr(
+        video_processing,
+        "extract_embedded_subtitle",
+        lambda video_input, tmp_dir: (
+            "1\n00:00:01,000 --> 00:00:03,000\n内嵌字幕已可用。\n",
+            [],
+        ),
+    )
+
+    def fail_filetrans(self, source_url, progress_callback=None):
+        raise AssertionError("内嵌字幕成功时不应触发百炼 filetrans")
+
+    monkeypatch.setattr(BailianAsrClient, "transcribe_source_url", fail_filetrans)
+
+    text, parser, warnings = video_processing.transcribe_video_input(
+        "https://example.com/course.subtitled.mp4",
+        tmp_path,
+        "https://example.com/course.subtitled.mp4",
+    )
+
+    assert "内嵌字幕已可用" in text
+    assert parser == "embedded-subtitle-transcript"
+    assert warnings == []
+
+
+def test_public_video_without_subtitle_marker_keeps_filetrans_first(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "dashscope_filetrans")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    from video.asr.bailian_asr import BailianAsrClient
+    from video.chunking import video_processing
+
+    monkeypatch.setattr(video_processing, "load_sidecar_subtitle", lambda video_input, source_path: ("", None, []))
+
+    def fail_embedded(video_input, tmp_dir):
+        raise AssertionError("普通公开视频不应在 filetrans 前探测内嵌字幕")
+
+    def fake_filetrans(self, source_url, progress_callback=None):
+        return "1\n00:00:01,000 --> 00:00:03,000\nfiletrans 字幕。\n", []
+
+    monkeypatch.setattr(video_processing, "extract_embedded_subtitle", fail_embedded)
+    monkeypatch.setattr(BailianAsrClient, "transcribe_source_url", fake_filetrans)
+
+    text, parser, warnings = video_processing.transcribe_video_input(
+        "https://example.com/course.mp4",
+        tmp_path,
+        "https://example.com/course.mp4",
+    )
+
+    assert "filetrans 字幕" in text
+    assert parser == "bailian-asr-transcript"
+    assert warnings == []
+
+
 def test_video_ocr_retry_progress_reports_attempt_message():
     from rag.progress import RagProgressReporter
     from video.chunking.video_processing import emit_ocr_retry_progress

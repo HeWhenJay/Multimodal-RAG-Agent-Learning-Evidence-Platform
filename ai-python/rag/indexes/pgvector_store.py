@@ -20,6 +20,10 @@ from rag.retrievers.retrieval import (
     embed_text,
     embedding_model_name,
     expand_queries,
+    format_evidence_titles,
+    format_metadata_filter,
+    format_query_variants,
+    format_ranked_hits,
     reciprocal_rank_fusion,
     tokenize,
 )
@@ -134,6 +138,8 @@ class PgVectorRagStore:
             progress_reporter.emit("sanitize.blocks", "正在清洗解析块正文和元数据", current_step=4, total_steps=8, percent=28)
         parse_quality = sanitize_parse_quality(parse_quality)
         blocks = sanitize_document_blocks(blocks)
+        metadata_parse_quality = parse_quality.model_copy(update={"messages": []}).model_dump()
+        metadata_parse_quality["messageCount"] = len(parse_quality.messages)
         metadata = sanitize_for_postgres({
             "documentId": document_id,
             "title": title,
@@ -146,7 +152,7 @@ class PgVectorRagStore:
             "language": language,
             "parser": parser,
             "parseStatus": status,
-            "parseQuality": parse_quality.model_dump(),
+            "parseQuality": metadata_parse_quality,
         })
         if progress_reporter:
             progress_reporter.emit("chunk.recursive", "正在按标题、段落、句子和长度预算执行递归切块", current_step=5, total_steps=8, percent=32)
@@ -353,6 +359,7 @@ class PgVectorRagStore:
                 total_chunks=total_chunks,
                 percent=100,
                 parser=parser,
+                extra_context={"parseStatus": final_status, "chunkCount": total_chunks, "parser": parser},
             )
         return IndexResponse(
             documentId=document_id,
@@ -366,13 +373,32 @@ class PgVectorRagStore:
         )
 
     @logged_rag_method("query.pipeline", "pgvector_query", "pgvector 模式执行 RAG 检索问答")
-    def query(self, request: QueryRequest) -> QueryResponse:
-        progress_reporter = RagProgressReporter(document_id="query", persist=False)
+    def query(self, request: QueryRequest, progress_reporter: RagProgressReporter | None = None) -> QueryResponse:
+        """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
+        progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
         metadata_filter = request.metadataFilter or {}
         expanded_queries = expand_queries(request.question)
+        progress_reporter.emit(
+            "query.expand",
+            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体",
+            status="COMPLETED",
+            current_step=1,
+            total_steps=7,
+            percent=14,
+            detail=format_query_variants(expanded_queries),
+        )
         progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
         filtered_chunks = self._load_filtered_chunks(metadata_filter)
+        progress_reporter.emit(
+            "query.filter",
+            f"元数据过滤完成：保留 {len(filtered_chunks)} 个候选切块",
+            status="COMPLETED",
+            current_step=2,
+            total_steps=7,
+            percent=24,
+            detail=format_metadata_filter(metadata_filter),
+        )
         chunk_by_id = {row["chunk_id"]: row for row in filtered_chunks}
         ranked_lists: list[list[tuple[str, float]]] = []
         diagnostics: dict[str, int | list[str]] = {
@@ -384,9 +410,39 @@ class PgVectorRagStore:
         for query_text in expanded_queries:
             limit = candidate_budget
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
-            ranked_lists.append(self._bm25_search(query_text, filtered_chunks, limit=limit))
+            bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=limit)
+            ranked_lists.append(bm25_hits)
+            progress_reporter.emit(
+                "query.bm25",
+                f"BM25 召回完成：{query_text}，命中 {len(bm25_hits)} 条",
+                status="COMPLETED",
+                current_step=3,
+                total_steps=7,
+                percent=36,
+                detail=format_ranked_hits(
+                    bm25_hits,
+                    lambda chunk_id: self._to_evidence(chunk_by_id[chunk_id], 0.0, retrieval_source="bm25")
+                    if chunk_id in chunk_by_id
+                    else None,
+                ),
+            )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=7, percent=45)
-            ranked_lists.append(self._vector_search(query_text, metadata_filter, limit=limit))
+            vector_hits = self._vector_search(query_text, metadata_filter, limit=limit)
+            ranked_lists.append(vector_hits)
+            progress_reporter.emit(
+                "query.vector",
+                f"向量召回完成：{query_text}，命中 {len(vector_hits)} 条",
+                status="COMPLETED",
+                current_step=4,
+                total_steps=7,
+                percent=52,
+                detail=format_ranked_hits(
+                    vector_hits,
+                    lambda chunk_id: self._to_evidence(chunk_by_id[chunk_id], 0.0, retrieval_source="vector")
+                    if chunk_id in chunk_by_id
+                    else None,
+                ),
+            )
 
         progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=7, percent=62)
         fused = reciprocal_rank_fusion(ranked_lists)
@@ -400,6 +456,15 @@ class PgVectorRagStore:
             self._to_evidence(chunk_by_id[chunk_id], score, retrieval_source="fusion")
             for chunk_id, score in candidates
         ]
+        progress_reporter.emit(
+            "query.fusion",
+            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，得到 {len(candidates)} 个候选",
+            status="COMPLETED",
+            current_step=5,
+            total_steps=7,
+            percent=70,
+            detail=format_evidence_titles(candidate_evidences),
+        )
         rerank_model = os.getenv("RAG_RERANK_MODEL") or "qwen3-rerank"
         progress_reporter.emit(
             "query.rerank",
@@ -413,6 +478,15 @@ class PgVectorRagStore:
         diagnostics.update(reranked.diagnostics())
         diversified = dedupe_evidences_for_context(request.question, reranked.evidences, request.topK)
         diagnostics.update(diversified.diagnostics())
+        progress_reporter.emit(
+            "query.rerank",
+            f"重排完成：输入 {len(candidate_evidences)} 条，保留 {len(diversified.evidences)} 条最终 evidence",
+            status="COMPLETED",
+            current_step=6,
+            total_steps=7,
+            percent=84,
+            detail=format_evidence_titles(diversified.evidences),
+        )
         answer_model = os.getenv("RAG_LLM_MODEL") or "qwen-plus"
         progress_reporter.emit(
             "query.answer",
@@ -424,7 +498,15 @@ class PgVectorRagStore:
         )
         generated = generate_grounded_answer(request.question, diversified.evidences)
         diagnostics.update(generated.diagnostics())
-        progress_reporter.emit("query.answer", "RAG 检索问答完成", status="COMPLETED", current_step=7, total_steps=7, percent=100)
+        progress_reporter.emit(
+            "query.answer",
+            "RAG 检索问答完成",
+            status="COMPLETED",
+            current_step=7,
+            total_steps=7,
+            percent=100,
+            detail=f"回答模型：{generated.diagnostics().get('answerModel') or answer_model}；引用 evidence 数：{len(diversified.evidences)}",
+        )
         return QueryResponse(
             answer=generated.answer,
             expandedQueries=expanded_queries,

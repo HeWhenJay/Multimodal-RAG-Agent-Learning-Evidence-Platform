@@ -10,13 +10,17 @@ import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.Impl.RagIndexWorker;
 import com.itxiang.evidence.service.Impl.RagServiceImpl;
+import com.itxiang.evidence.service.Impl.RagUploadWorker;
 import com.itxiang.evidence.vo.LearningMaterialVO;
+import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.mock.web.MockMultipartFile;
 
+import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -29,6 +33,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -52,6 +57,9 @@ class RagServiceImplTests {
 
     @Mock
     private RagIndexWorker ragIndexWorker;
+
+    @Mock
+    private RagUploadWorker ragUploadWorker;
 
     @Mock
     private ObjectMapper objectMapper;
@@ -115,6 +123,83 @@ class RagServiceImplTests {
                 eq(endDate.plusDays(1).atStartOfDay()),
                 eq(10)
         );
+    }
+
+    @Test
+    void uploadMaterialChunkReturnsProcessingWhenAllChunksReceived() {
+        MockMultipartFile chunk = new MockMultipartFile(
+                "file",
+                "course.mp4",
+                "video/mp4",
+                "hello".getBytes()
+        );
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(88L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        when(logEventMapper.findRecentProgressByMaterialId(eq(88L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(88L), eq(80))).thenReturn(List.of());
+
+        MaterialUploadChunkVO result = ragService.uploadMaterialChunk(
+                chunk,
+                "upload123",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+
+        assertThat(result.getCompleted()).isTrue();
+        assertThat(result.getStatus()).isEqualTo("PROCESSING");
+        assertThat(result.getMaterial()).isNotNull();
+        assertThat(result.getMaterial().getId()).isEqualTo(88L);
+        verify(ragUploadWorker).completeChunkedUpload(
+                eq(88L),
+                eq("7"),
+                any(Path.class),
+                any(Path.class),
+                eq("upload123"),
+                eq("course.mp4"),
+                eq("video/mp4"),
+                eq(1),
+                eq(5L),
+                eq(false)
+        );
+        verify(objectStorageService, never()).store(any(Path.class), anyString(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void uploadMaterialChunkLoadsVideoProgressEventsForFrontend() {
+        MockMultipartFile chunk = new MockMultipartFile(
+                "file",
+                "course.mp4",
+                "video/mp4",
+                "hello".getBytes()
+        );
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(89L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        when(logEventMapper.findRecentProgressByMaterialId(eq(89L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(89L), eq(80))).thenReturn(List.of());
+
+        ragService.uploadMaterialChunk(
+                chunk,
+                "upload-video-progress",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+
+        verify(logEventMapper).findRecentProgressByMaterialId(eq(89L), eq(40));
+        verify(logEventMapper).findVideoProgressByMaterialId(eq(89L), eq(80));
     }
 
     /**

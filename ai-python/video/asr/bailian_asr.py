@@ -4,7 +4,7 @@ import base64
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rag.model_logging import log_model_call
 
@@ -35,6 +35,7 @@ class BailianAsrClient:
         max_audio_bytes: int | None = None,
         max_polls: int | None = None,
         poll_interval_seconds: float | None = None,
+        filetrans_max_attempts: int | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = (base_url or os.getenv("RAG_ASR_BASE_URL") or DEFAULT_ASR_BASE_URL).rstrip("/")
@@ -52,6 +53,7 @@ class BailianAsrClient:
         self.poll_interval_seconds = poll_interval_seconds if poll_interval_seconds is not None else float(
             os.getenv("RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS", "2")
         )
+        self.filetrans_max_attempts = filetrans_max_attempts or int(os.getenv("RAG_ASR_FILETRANS_MAX_ATTEMPTS", "2"))
 
     @property
     def should_call_dashscope(self) -> bool:
@@ -61,7 +63,12 @@ class BailianAsrClient:
             return True
         return bool(self.api_key)
 
-    def transcribe_audio_file(self, audio_path: Path, source_url: str | None = None) -> tuple[str, list[str]]:
+    def transcribe_audio_file(
+        self,
+        audio_path: Path,
+        source_url: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[str, list[str]]:
         if not self.should_call_dashscope:
             return "", ["百炼 ASR 未启用，跳过音频转写"]
         if not self.api_key:
@@ -70,7 +77,7 @@ class BailianAsrClient:
         warnings: list[str] = []
         if self.should_call_filetrans(source_url):
             try:
-                return self._call_filetrans(str(source_url)), []
+                return self._call_filetrans(str(source_url), progress_callback=progress_callback), []
             except Exception as exc:
                 warnings.append(f"百炼 ASR 异步时间戳转写失败，降级同步识别: {exc}")
 
@@ -87,7 +94,11 @@ class BailianAsrClient:
             warnings.append(f"百炼 ASR 调用失败: {exc}")
             return "", warnings
 
-    def transcribe_source_url(self, source_url: str) -> tuple[str, list[str]]:
+    def transcribe_source_url(
+        self,
+        source_url: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[str, list[str]]:
         """对公开视频 URL 直接发起百炼异步文件转写。"""
         if not self.should_call_dashscope:
             return "", ["百炼 ASR 未启用，跳过音频转写"]
@@ -96,7 +107,7 @@ class BailianAsrClient:
         if not self.should_call_filetrans(source_url):
             return "", ["当前配置未启用公开视频 URL 异步转写"]
         try:
-            return self._call_filetrans(source_url), []
+            return self._call_filetrans(source_url, progress_callback=progress_callback), []
         except Exception as exc:
             return "", [f"百炼 ASR 异步时间戳转写失败: {exc}"]
 
@@ -111,7 +122,11 @@ class BailianAsrClient:
             return bool(source_url and source_url.startswith(("http://", "https://")))
         return bool(source_url and source_url.startswith(("http://", "https://")))
 
-    def _call_filetrans(self, file_url: str) -> str:
+    def _call_filetrans(
+        self,
+        file_url: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         try:
             import httpx
         except ImportError as exc:
@@ -140,26 +155,74 @@ class BailianAsrClient:
             recoverable=True,
             fallback_message=f"使用 {self.filetrans_model} 模型完成视频异步 ASR 转写事件失败，已降级到同步 ASR、字幕或视频元数据继续处理",
         ):
+            errors: list[str] = []
+            max_attempts = max(1, self.filetrans_max_attempts)
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
-                if response.status_code >= 400:
-                    raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
-                task_id = ((response.json().get("output") or {}).get("task_id"))
-                if not task_id:
-                    raise RuntimeError("百炼 ASR 异步任务未返回 task_id")
-                transcription_url = self._wait_filetrans_result(client, task_id, headers)
-                result_response = client.get(transcription_url)
-                if result_response.status_code >= 400:
-                    raise RuntimeError(f"下载 ASR 转写结果失败: HTTP {result_response.status_code}")
-                return transcription_json_to_srt(result_response.json())
+                for attempt in range(1, max_attempts + 1):
+                    notify_progress(progress_callback, phase="submit", attempt=attempt, maxAttempts=max_attempts)
+                    try:
+                        response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
+                        if response.status_code >= 400:
+                            raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
+                        task_id = ((response.json().get("output") or {}).get("task_id"))
+                        if not task_id:
+                            raise RuntimeError("百炼 ASR 异步任务未返回 task_id")
+                        notify_progress(progress_callback, phase="submitted", attempt=attempt, maxAttempts=max_attempts, taskId=task_id)
+                        transcription_url = self._wait_filetrans_result(
+                            client,
+                            task_id,
+                            headers,
+                            progress_callback=progress_callback,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                        )
+                        notify_progress(progress_callback, phase="download", attempt=attempt, maxAttempts=max_attempts, taskId=task_id)
+                        result_response = client.get(transcription_url)
+                        if result_response.status_code >= 400:
+                            raise RuntimeError(f"下载 ASR 转写结果失败: HTTP {result_response.status_code}")
+                        return transcription_json_to_srt(result_response.json())
+                    except Exception as exc:
+                        errors.append(str(exc))
+                        notify_progress(
+                            progress_callback,
+                            phase="retry" if attempt < max_attempts else "failed",
+                            attempt=attempt,
+                            maxAttempts=max_attempts,
+                            errorMessage=str(exc),
+                            nextAttempt=attempt + 1 if attempt < max_attempts else None,
+                        )
+                        if attempt >= max_attempts:
+                            break
+                        time.sleep(max(0.0, self.poll_interval_seconds))
+                raise RuntimeError("；".join(errors) if errors else "百炼 ASR 异步任务失败")
 
-    def _wait_filetrans_result(self, client: Any, task_id: str, headers: dict[str, str]) -> str:
-        for _ in range(max(1, self.max_polls)):
+    def _wait_filetrans_result(
+        self,
+        client: Any,
+        task_id: str,
+        headers: dict[str, str],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        attempt: int = 1,
+        max_attempts: int = 1,
+    ) -> str:
+        max_polls = max(1, self.max_polls)
+        for poll_index in range(1, max_polls + 1):
             response = client.get(f"{self.task_base_url}/tasks/{task_id}", headers=headers)
             if response.status_code >= 400:
                 raise RuntimeError(f"查询 ASR 任务失败: HTTP {response.status_code} {response.text[:500]}")
             output = response.json().get("output") or {}
             status = output.get("task_status")
+            notify_progress(
+                progress_callback,
+                phase="poll",
+                attempt=attempt,
+                maxAttempts=max_attempts,
+                pollIndex=poll_index,
+                maxPolls=max_polls,
+                taskStatus=status,
+                taskId=task_id,
+            )
             if status == "SUCCEEDED":
                 transcription_url = extract_transcription_url(output)
                 if not transcription_url:
@@ -287,3 +350,13 @@ def milliseconds_to_srt_timestamp(value: int) -> str:
     seconds = (safe_value % 60_000) // 1000
     milliseconds = safe_value % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def notify_progress(callback: Callable[[dict[str, Any]], None] | None, **event: Any) -> None:
+    """向调用方报告 ASR 异步任务状态，回调失败不影响主流程。"""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        return

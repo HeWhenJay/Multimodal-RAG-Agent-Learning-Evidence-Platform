@@ -695,7 +695,7 @@ class DocumentParserRouter:
                 file_type=file_type,
                 source_title=source_title,
                 source_path=source_path,
-                parse_engine="bailian-asr-transcript",
+                parse_engine=artifacts.transcript_parser,
             )
             blocks.extend(transcript_blocks)
         frame_blocks, dedup_stats = dedupe_video_frame_blocks(
@@ -763,7 +763,7 @@ class DocumentParserRouter:
                 file_type=file_type,
                 source_title=source_title,
                 source_path=source_path,
-                parse_engine="bailian-asr-transcript",
+                parse_engine=artifacts.transcript_parser,
             )
             blocks.extend(transcript_blocks)
         frame_blocks, dedup_stats = dedupe_video_frame_blocks(
@@ -2223,7 +2223,15 @@ def convert_with_libreoffice(input_path: Path, target_ext: str, output_dir: Path
             str(input_path),
         ]
     try:
-        subprocess.run(args, check=True, timeout=120, capture_output=True, text=True)
+        subprocess.run(
+            args,
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     except Exception:
         return None
 

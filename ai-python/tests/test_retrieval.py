@@ -1,5 +1,6 @@
 ﻿from rag.retrievers.retrieval import cached_embedding, embed_text, embedding_provider_name
 from rag.retrievers.retrieval import InMemoryRagStore
+from rag.progress import RagProgressReporter
 from rag.bailian_llm import append_evidence_reference_summary, deterministic_grounded_answer
 from rag.indexes.pgvector_store import build_filter_clause, vector_literal
 from rag.rerankers.reranking import local_rerank
@@ -43,6 +44,34 @@ def test_rag_store_indexes_and_queries_with_evidence():
     assert response.diagnostics["answerProvider"] == "local"
     assert response.diagnostics["rerankProvider"] == "local"
     assert len(response.expandedQueries) >= 3
+
+
+def test_query_progress_reporter_streams_multi_query_details():
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-query-progress",
+            title="查询进度笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## 鸡蛋做法\n鸡蛋可以水煮、煎蛋、炒蛋，也可以做蒸蛋。",
+        )
+    )
+    streamed_events = []
+    reporter = RagProgressReporter(document_id="query", persist=False, on_emit=streamed_events.append)
+
+    response = store.query(
+        QueryRequest(question="鸡蛋怎么做", topK=2, metadataFilter={"userId": "unit-user"}),
+        progress_reporter=reporter,
+    )
+
+    expand_events = [event for event in streamed_events if event.stageCode == "query.expand"]
+    bm25_events = [event for event in streamed_events if event.stageCode == "query.bm25" and event.status == "COMPLETED"]
+    assert response.progressEvents == streamed_events
+    assert expand_events[-1].detail is not None
+    assert "鸡蛋怎么做 学习资料 笔记" in expand_events[-1].detail
+    assert len(bm25_events) == len(response.expandedQueries)
 
 
 def test_pgvector_filter_clause_supports_columns_and_metadata():
@@ -352,3 +381,5 @@ def test_index_blocks_removes_postgres_nul_before_storage():
     assert nul not in chunk.text
     assert_no_postgres_nul(document)
     assert_no_postgres_nul(chunk.metadata)
+    assert chunk.metadata["parseQuality"]["messages"] == []
+    assert chunk.metadata["parseQuality"]["messageCount"] == 1

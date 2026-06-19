@@ -8,6 +8,7 @@ import com.itxiang.evidence.dto.LogErrorCreateDTO;
 import com.itxiang.evidence.dto.LogEventCreateDTO;
 import com.itxiang.evidence.entity.LogError;
 import com.itxiang.evidence.entity.LogEvent;
+import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogErrorMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.service.LogService;
@@ -49,6 +50,7 @@ public class LogServiceImpl implements LogService {
 
     private final LogEventMapper logEventMapper;
     private final LogErrorMapper logErrorMapper;
+    private final LearningMaterialMapper learningMaterialMapper;
     private final ObjectMapper objectMapper;
     private final LogProperties logProperties;
 
@@ -60,6 +62,9 @@ public class LogServiceImpl implements LogService {
     public Long recordEvent(LogEventCreateDTO dto) {
         if (Boolean.FALSE.equals(logProperties.getEnabled())) {
             return null;
+        }
+        if (dto.getContext() != null) {
+            enrichRagIds(dto, dto.getContext());
         }
         LogEvent event = new LogEvent();
         event.setTraceId(defaultText(dto.getTraceId(), newTraceId()));
@@ -86,6 +91,7 @@ public class LogServiceImpl implements LogService {
         event.setServerTime(OffsetDateTime.now());
         event.setContextJson(toContextJson(dto.getContext(), logProperties.getMaxContextBytes()));
         logEventMapper.insert(event);
+        syncMaterialStatusFromRagProgress(event, dto.getContext());
         return event.getId();
     }
 
@@ -317,6 +323,87 @@ public class LogServiceImpl implements LogService {
         if (parser != null) {
             dto.setParser(String.valueOf(parser));
         }
+    }
+
+    /**
+     * 根据 Python RAG 进度回调同步资料主状态，避免长任务 HTTP 等待超时后状态停留在失败。
+     */
+    private void syncMaterialStatusFromRagProgress(LogEvent event, Map<String, Object> context) {
+        if (!isRagProgressEvent(event) || event.getMaterialId() == null) {
+            return;
+        }
+        String stage = defaultText(event.getStage(), text(context, "stageCode"));
+        String progressStatus = normalizeStatus(text(context, "status"));
+        if ("index.completed".equals(stage)) {
+            String parseStatus = normalizeStatus(text(context, "parseStatus"));
+            String finalStatus = isFinalSuccessStatus(parseStatus) ? parseStatus : "READY";
+            learningMaterialMapper.updateProgressStatus(
+                    event.getMaterialId(),
+                    finalStatus,
+                    defaultText(event.getParser(), text(context, "parser")),
+                    completedChunkCount(context)
+            );
+            return;
+        }
+        if ("index.failed".equals(stage) || "FAILED".equals(progressStatus)) {
+            learningMaterialMapper.updateProgressStatus(
+                    event.getMaterialId(),
+                    "FAILED",
+                    defaultText(event.getParser(), text(context, "parser")),
+                    integer(context, "chunkCount")
+            );
+            return;
+        }
+        if ("RUNNING".equals(progressStatus) || hasUnfinishedProgress(context)) {
+            learningMaterialMapper.updateProgressStatus(
+                    event.getMaterialId(),
+                    "PARSING",
+                    defaultText(event.getParser(), text(context, "parser")),
+                    null
+            );
+        }
+    }
+
+    /**
+     * 判断是否为用户可见的 RAG 进度事件。
+     */
+    private boolean isRagProgressEvent(LogEvent event) {
+        return "rag".equals(event.getDomain()) && "rag_progress".equals(event.getEventType());
+    }
+
+    /**
+     * 判断进度上下文是否明确显示仍未完成。
+     */
+    private boolean hasUnfinishedProgress(Map<String, Object> context) {
+        Integer currentChunk = integer(context, "currentChunk");
+        Integer totalChunks = integer(context, "totalChunks");
+        if (currentChunk != null && totalChunks != null && currentChunk < totalChunks) {
+            return true;
+        }
+        Integer percent = integer(context, "percent");
+        return percent != null && percent > 0 && percent < 100;
+    }
+
+    /**
+     * 判断 Python 索引成功终态是否可直接回写资料。
+     */
+    private boolean isFinalSuccessStatus(String status) {
+        return "READY".equals(status) || "PARTIAL".equals(status);
+    }
+
+    /**
+     * 读取索引完成后的切块数，兼容旧版 Python 终态回调只带 totalChunks 的情况。
+     */
+    private Integer completedChunkCount(Map<String, Object> context) {
+        Integer chunkCount = integer(context, "chunkCount");
+        if (chunkCount != null) {
+            return chunkCount;
+        }
+        Integer totalChunks = integer(context, "totalChunks");
+        if (totalChunks != null) {
+            return totalChunks;
+        }
+        return integer(context, "currentChunk");
     }
 
     /**
@@ -569,6 +656,41 @@ public class LogServiceImpl implements LogService {
      */
     private Long defaultLong(Long value) {
         return value == null ? 0L : value;
+    }
+
+    /**
+     * 从日志上下文中读取文本字段。
+     */
+    private String text(Map<String, Object> context, String key) {
+        if (context == null || !context.containsKey(key) || context.get(key) == null) {
+            return null;
+        }
+        return String.valueOf(context.get(key));
+    }
+
+    /**
+     * 从日志上下文中读取整数字段。
+     */
+    private Integer integer(Map<String, Object> context, String key) {
+        if (context == null || !context.containsKey(key) || context.get(key) == null) {
+            return null;
+        }
+        Object value = context.get(key);
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 统一状态大小写，兼容 Python 和 Java 侧不同来源。
+     */
+    private String normalizeStatus(String status) {
+        return status == null ? "" : status.trim().toUpperCase(Locale.ROOT);
     }
 
     /**

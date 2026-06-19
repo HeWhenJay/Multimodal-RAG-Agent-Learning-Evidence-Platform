@@ -67,9 +67,28 @@
         WHERE id = #{id}
     </update>
 
+    <update id="updateProgressStatus">
+        UPDATE learning_material
+        SET status = #{status},
+            parser = COALESCE(#{parser}, parser),
+            chunk_count = COALESCE(#{chunkCount}, chunk_count),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
     <update id="updateStatus">
         UPDATE learning_material
         SET status = #{status},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateStorageInfo">
+        UPDATE learning_material
+        SET original_file_path = #{originalFilePath},
+            storage_type = #{storageType},
+            object_key = #{objectKey},
+            public_url = #{publicUrl},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
     </update>

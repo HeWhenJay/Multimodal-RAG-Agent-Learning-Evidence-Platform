@@ -134,7 +134,7 @@ function formatMaterialStatus(status: string) {
   return status;
 }
 
-// 按固定大小切分视频文件，最后一个分片完成时返回资料索引结果。
+// 按固定大小切分视频文件，分片收齐后以后端返回的资料记录进入轮询。
 async function uploadVideoInChunks(
   file: File,
   highPrecision: boolean,
@@ -157,9 +157,12 @@ async function uploadVideoInChunks(
       highPrecision
     });
     uploadId = result.uploadId;
+    if (result.message) {
+      setUploadMessage(result.message);
+    }
     if (result.completed && result.material) {
       return result.material;
     }
   }
-  throw new Error('视频分片上传未返回资料索引结果');
+  throw new Error('视频分片已上传，但后端未返回可轮询的资料记录');
 }

@@ -45,7 +45,15 @@ class MineruDocumentLoader:
                 args = shlex.split(command) + [str(input_path), str(output_dir)]
 
             try:
-                subprocess.run(args, check=True, timeout=120, capture_output=True, text=True)
+                subprocess.run(
+                    args,
+                    check=True,
+                    timeout=120,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
             except Exception:
                 return ParsedDocument(text="", parser="mineru-failed", metadata={"filename": filename})
 
@@ -96,4 +104,3 @@ class MineruDocumentLoader:
         finally:
             if "tmp_path" in locals():
                 Path(tmp_path).unlink(missing_ok=True)
-

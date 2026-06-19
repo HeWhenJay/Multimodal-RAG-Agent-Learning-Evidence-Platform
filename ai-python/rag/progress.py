@@ -6,7 +6,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from app.schemas.rag import ProgressEvent
 from rag.log_callback import post_log_event
@@ -23,6 +23,11 @@ STAGE_LABELS = {
     "parse.spreadsheet": "解析表格",
     "parse.image.ocr": "图片 OCR",
     "parse.video": "处理视频",
+    "parse.video.asr": "视频 ASR",
+    "parse.video.frame.extract": "抽取视频候选帧",
+    "parse.video.frame.candidates": "视频候选帧",
+    "parse.video.slide_detect": "PPT 翻页检测",
+    "parse.video.ocr": "关键帧 OCR",
     "parse.text": "解析文本",
     "parse.completed": "解析完成",
     "sanitize.blocks": "清洗文本",
@@ -53,6 +58,7 @@ class RagProgressReporter:
         user_id: str = "anonymous",
         database_url: str | None = None,
         persist: bool = True,
+        on_emit: Callable[[ProgressEvent], None] | None = None,
     ) -> None:
         self.document_id = document_id
         self.user_id = user_id or "anonymous"
@@ -61,6 +67,7 @@ class RagProgressReporter:
         self.persist = persist and bool(self.database_url)
         self.material_id = parse_material_id(document_id)
         self.events: list[ProgressEvent] = []
+        self.on_emit = on_emit
 
     def emit(
         self,
@@ -77,6 +84,7 @@ class RagProgressReporter:
         percent: int | None = None,
         detail: str | None = None,
         parser: str | None = None,
+        extra_context: dict[str, Any] | None = None,
     ) -> ProgressEvent:
         """追加一次进度事件，并尽量写入 Java 侧 log_event 表供前端轮询。"""
         safe_percent = normalize_percent(percent, current_step, total_steps)
@@ -96,11 +104,16 @@ class RagProgressReporter:
             createdAt=datetime.now(timezone.utc).isoformat(),
         )
         self.events.append(event)
+        if self.on_emit:
+            try:
+                self.on_emit(event)
+            except Exception as exc:
+                logger.debug("RAG 进度回调失败，已忽略: %s", exc)
         self._console(event)
-        if self._post_callback(event, parser=parser):
+        if self._post_callback(event, parser=parser, extra_context=extra_context):
             return event
         if self.persist:
-            self._persist(event, parser=parser)
+            self._persist(event, parser=parser, extra_context=extra_context)
         return event
 
     def _console(self, event: ProgressEvent) -> None:
@@ -127,11 +140,13 @@ class RagProgressReporter:
         logger.info(text)
         print(text, flush=True)
 
-    def _post_callback(self, event: ProgressEvent, *, parser: str | None) -> bool:
+    def _post_callback(self, event: ProgressEvent, *, parser: str | None, extra_context: dict[str, Any] | None) -> bool:
         """优先回调 Java 日志接口，让前端无需等待 Python 请求结束即可轮询进度。"""
         context = event.model_dump(mode="json")
         context["documentId"] = self.document_id
         context["materialId"] = self.material_id
+        if extra_context:
+            context.update(extra_context)
         action = "rag_progress_" + re.sub(r"[^a-zA-Z0-9_]+", "_", event.stageCode).strip("_")
         payload = {
             "traceId": "py_" + uuid.uuid4().hex,
@@ -152,7 +167,7 @@ class RagProgressReporter:
         }
         return post_log_event(payload)
 
-    def _persist(self, event: ProgressEvent, *, parser: str | None) -> None:
+    def _persist(self, event: ProgressEvent, *, parser: str | None, extra_context: dict[str, Any] | None) -> None:
         try:
             import psycopg
             from psycopg import sql
@@ -162,6 +177,8 @@ class RagProgressReporter:
         context = event.model_dump(mode="json")
         context["documentId"] = self.document_id
         context["materialId"] = self.material_id
+        if extra_context:
+            context.update(extra_context)
         action = "rag_progress_" + re.sub(r"[^a-zA-Z0-9_]+", "_", event.stageCode).strip("_")
         try:
             with psycopg.connect(self.database_url) as conn:

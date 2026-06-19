@@ -9,6 +9,7 @@ import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.vo.RagProgressVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
+import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ByteArrayResource;
@@ -23,6 +24,8 @@ import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -166,6 +169,46 @@ public class PythonRagClient {
         payload.put("metadataFilter", dto.getMetadataFilter());
 
         JsonNode root = postJson("/internal/rag/query", payload);
+        return readQueryResult(root);
+    }
+
+    /**
+     * 创建 Python RAG 查询任务，用于前端轮询实时阶段详情。
+     */
+    public RagQueryTaskVO startQueryTask(RagQueryDTO dto) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("question", dto.getQuestion());
+        payload.put("topK", dto.getTopK() == null ? 5 : dto.getTopK());
+        payload.put("metadataFilter", dto.getMetadataFilter());
+
+        JsonNode root = postJson("/internal/rag/query/tasks", payload);
+        return readQueryTask(root);
+    }
+
+    /**
+     * 读取 Python RAG 查询任务状态和已产生的进度事件。
+     */
+    public RagQueryTaskVO getQueryTask(String taskId) {
+        try {
+            byte[] response = restClient.get()
+                    .uri(resolve("/internal/rag/query/tasks/" + taskId))
+                    .retrieve()
+                    .body(byte[].class);
+            JsonNode root = readJsonResponse("get-query-task", "/internal/rag/query/tasks/{task_id}", response);
+            return readQueryTask(root);
+        } catch (RestClientResponseException e) {
+            throw pythonException("get-query-task", "/internal/rag/query/tasks/{task_id}", e);
+        } catch (PythonRagClientException e) {
+            throw e;
+        } catch (Exception e) {
+            throw pythonException("get-query-task", "/internal/rag/query/tasks/{task_id}", e);
+        }
+    }
+
+    /**
+     * 读取 Python 查询响应结构。
+     */
+    private RagQueryVO readQueryResult(JsonNode root) {
         List<RagEvidenceVO> evidences = new ArrayList<>();
         JsonNode evidenceNodes = root.get("evidences");
         if (evidenceNodes != null && evidenceNodes.isArray()) {
@@ -179,6 +222,23 @@ public class PythonRagClient {
                 .evidences(evidences)
                 .diagnostics(readObjectMap(root.get("diagnostics")))
                 .progressEvents(readProgressVOs(root.get("progressEvents")))
+                .build();
+    }
+
+    /**
+     * 读取 Python 查询任务响应结构。
+     */
+    private RagQueryTaskVO readQueryTask(JsonNode root) {
+        JsonNode result = root == null ? null : root.get("result");
+        return RagQueryTaskVO.builder()
+                .taskId(text(root, "taskId"))
+                .status(text(root, "status"))
+                .message(text(root, "message"))
+                .progressEvents(readProgressVOs(root == null ? null : root.get("progressEvents")))
+                .result(result == null || result.isNull() ? null : readQueryResult(result))
+                .errorMessage(text(root, "errorMessage"))
+                .createdAt(readDateTime(root, "createdAt"))
+                .updatedAt(readDateTime(root, "updatedAt"))
                 .build();
     }
 
@@ -430,6 +490,25 @@ public class PythonRagClient {
     private Integer nullableInt(JsonNode node, String fieldName) {
         JsonNode value = node == null ? null : node.get(fieldName);
         return value == null || value.isNull() ? null : value.asInt();
+    }
+
+    /**
+     * 读取 Python 返回的 ISO 时间，统一转为本地时间对象。
+     */
+    private LocalDateTime readDateTime(JsonNode node, String fieldName) {
+        String value = text(node, fieldName);
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return OffsetDateTime.parse(value).toLocalDateTime();
+        } catch (Exception e) {
+            try {
+                return LocalDateTime.parse(value);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
     }
 
     /**

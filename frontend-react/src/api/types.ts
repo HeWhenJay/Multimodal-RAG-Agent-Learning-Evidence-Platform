@@ -69,6 +69,8 @@ export interface MaterialUploadChunk {
   chunkIndex: number;
   totalChunks: number;
   receivedChunks: number;
+  status?: 'UPLOADING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | string;
+  message?: string | null;
   completed: boolean;
   material: LearningMaterial | null;
 }
@@ -105,6 +107,17 @@ export interface RagQueryResult {
   evidences: RagEvidence[];
   diagnostics?: Record<string, unknown>;
   progressEvents?: RagProgress[];
+}
+
+export interface RagQueryTask {
+  taskId: string;
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'EXPIRED' | string;
+  message: string;
+  progressEvents?: RagProgress[];
+  result?: RagQueryResult | null;
+  errorMessage?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
 }
 
 export interface VideoSlice {

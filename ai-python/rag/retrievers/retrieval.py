@@ -120,6 +120,8 @@ class InMemoryRagStore:
             progress_reporter.emit("sanitize.blocks", "正在清洗解析块正文和元数据", current_step=4, total_steps=8, percent=28)
         parse_quality = sanitize_parse_quality(parse_quality)
         blocks = sanitize_document_blocks(blocks)
+        metadata_parse_quality = parse_quality.model_copy(update={"messages": []}).model_dump()
+        metadata_parse_quality["messageCount"] = len(parse_quality.messages)
         metadata = sanitize_for_postgres({
             "documentId": document_id,
             "title": title,
@@ -132,7 +134,7 @@ class InMemoryRagStore:
             "language": language,
             "parser": parser,
             "parseStatus": status,
-            "parseQuality": parse_quality.model_dump(),
+            "parseQuality": metadata_parse_quality,
         })
         self._remove_document(document_id)
         if progress_reporter:
@@ -229,6 +231,7 @@ class InMemoryRagStore:
                 total_chunks=len(chunks),
                 percent=100 if chunks else 0,
                 parser=parser,
+                extra_context={"parseStatus": final_status, "chunkCount": len(chunks), "parser": parser},
             )
         return IndexResponse(
             documentId=document_id,
@@ -242,12 +245,32 @@ class InMemoryRagStore:
         )
 
     @logged_rag_method("query.pipeline", "memory_query", "内存模式执行 RAG 检索问答")
-    def query(self, request: QueryRequest) -> QueryResponse:
-        progress_reporter = RagProgressReporter(document_id="query", persist=False)
+    def query(self, request: QueryRequest, progress_reporter: RagProgressReporter | None = None) -> QueryResponse:
+        """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
+        progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
         expanded_queries = expand_queries(request.question)
+        progress_reporter.emit(
+            "query.expand",
+            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体",
+            status="COMPLETED",
+            current_step=1,
+            total_steps=7,
+            percent=14,
+            detail=format_query_variants(expanded_queries),
+        )
+        metadata_filter = request.metadataFilter or {}
         progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
         filtered_chunks = self._filter_chunks(request.metadataFilter or {})
+        progress_reporter.emit(
+            "query.filter",
+            f"元数据过滤完成：保留 {len(filtered_chunks)} 个候选切块",
+            status="COMPLETED",
+            current_step=2,
+            total_steps=7,
+            percent=24,
+            detail=format_metadata_filter(metadata_filter),
+        )
         ranked_lists: list[list[tuple[str, float]]] = []
         diagnostics: dict[str, int | list[str]] = {
             "expandedQueries": expanded_queries,
@@ -257,9 +280,29 @@ class InMemoryRagStore:
         candidate_budget = max(request.topK * 4, 20)
         for query_text in expanded_queries:
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
-            ranked_lists.append(self._bm25_search(query_text, filtered_chunks, limit=candidate_budget))
+            bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=candidate_budget)
+            ranked_lists.append(bm25_hits)
+            progress_reporter.emit(
+                "query.bm25",
+                f"BM25 召回完成：{query_text}，命中 {len(bm25_hits)} 条",
+                status="COMPLETED",
+                current_step=3,
+                total_steps=7,
+                percent=36,
+                detail=format_ranked_hits(bm25_hits, lambda chunk_id: self._to_evidence(chunk_id, 0.0, retrieval_source="bm25")),
+            )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=7, percent=45)
-            ranked_lists.append(self._vector_search(query_text, filtered_chunks, limit=candidate_budget))
+            vector_hits = self._vector_search(query_text, filtered_chunks, limit=candidate_budget)
+            ranked_lists.append(vector_hits)
+            progress_reporter.emit(
+                "query.vector",
+                f"向量召回完成：{query_text}，命中 {len(vector_hits)} 条",
+                status="COMPLETED",
+                current_step=4,
+                total_steps=7,
+                percent=52,
+                detail=format_ranked_hits(vector_hits, lambda chunk_id: self._to_evidence(chunk_id, 0.0, retrieval_source="vector")),
+            )
 
         progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=7, percent=62)
         fused = reciprocal_rank_fusion(ranked_lists)
@@ -269,6 +312,15 @@ class InMemoryRagStore:
             self._to_evidence(chunk_id, score, retrieval_source="fusion")
             for chunk_id, score in candidates
         ]
+        progress_reporter.emit(
+            "query.fusion",
+            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，得到 {len(candidates)} 个候选",
+            status="COMPLETED",
+            current_step=5,
+            total_steps=7,
+            percent=70,
+            detail=format_evidence_titles(candidate_evidences),
+        )
         rerank_model = os.getenv("RAG_RERANK_MODEL") or "qwen3-rerank"
         progress_reporter.emit(
             "query.rerank",
@@ -282,6 +334,15 @@ class InMemoryRagStore:
         diagnostics.update(reranked.diagnostics())
         diversified = dedupe_evidences_for_context(request.question, reranked.evidences, request.topK)
         diagnostics.update(diversified.diagnostics())
+        progress_reporter.emit(
+            "query.rerank",
+            f"重排完成：输入 {len(candidate_evidences)} 条，保留 {len(diversified.evidences)} 条最终 evidence",
+            status="COMPLETED",
+            current_step=6,
+            total_steps=7,
+            percent=84,
+            detail=format_evidence_titles(diversified.evidences),
+        )
         answer_model = os.getenv("RAG_LLM_MODEL") or "qwen-plus"
         progress_reporter.emit(
             "query.answer",
@@ -293,7 +354,15 @@ class InMemoryRagStore:
         )
         generated = generate_grounded_answer(request.question, diversified.evidences)
         diagnostics.update(generated.diagnostics())
-        progress_reporter.emit("query.answer", "RAG 检索问答完成", status="COMPLETED", current_step=7, total_steps=7, percent=100)
+        progress_reporter.emit(
+            "query.answer",
+            "RAG 检索问答完成",
+            status="COMPLETED",
+            current_step=7,
+            total_steps=7,
+            percent=100,
+            detail=f"回答模型：{generated.diagnostics().get('answerModel') or answer_model}；引用 evidence 数：{len(diversified.evidences)}",
+        )
         return QueryResponse(
             answer=generated.answer,
             expandedQueries=expanded_queries,
@@ -628,6 +697,55 @@ def expand_queries(question: str) -> list[str]:
     if any(term in base.lower() for term in ["简历", "resume", "项目"]):
         variants.append(f"{base} 简历证据 项目经历")
     return list(dict.fromkeys(variants))
+
+
+def format_query_variants(queries: list[str]) -> str:
+    """格式化 Multi-Query 改写结果，供前端展示每个查询变体。"""
+    return "；".join(f"{index}. {query}" for index, query in enumerate(queries, start=1))
+
+
+def format_metadata_filter(metadata_filter: dict[str, Any]) -> str:
+    """格式化查询元数据过滤条件，避免前端只看到过滤阶段名称。"""
+    visible_items = [
+        f"{key}={value}"
+        for key, value in metadata_filter.items()
+        if value is not None and value != "" and value != []
+    ]
+    return "过滤条件：" + ("；".join(visible_items) if visible_items else "无")
+
+
+def format_ranked_hits(
+    hits: list[tuple[str, float]],
+    evidence_loader,
+    *,
+    limit: int = 3,
+) -> str:
+    """格式化召回命中的 Top evidence 标题和分数。"""
+    if not hits:
+        return "未命中候选 evidence"
+    lines: list[str] = []
+    for index, (chunk_id, score) in enumerate(hits[:limit], start=1):
+        try:
+            evidence = evidence_loader(chunk_id)
+            lines.append(f"{index}. {evidence.title} / {evidence.sectionName} / 分数 {score:.4f}")
+        except Exception:
+            lines.append(f"{index}. {chunk_id} / 分数 {score:.4f}")
+    if len(hits) > limit:
+        lines.append(f"另有 {len(hits) - limit} 条候选")
+    return "；".join(lines)
+
+
+def format_evidence_titles(evidences: list[Evidence], *, limit: int = 5) -> str:
+    """格式化候选 evidence，用于融合、重排和回答阶段详情。"""
+    if not evidences:
+        return "无候选 evidence"
+    lines = [
+        f"{index}. {item.title} / {item.sectionName} / 分数 {item.score:.4f}"
+        for index, item in enumerate(evidences[:limit], start=1)
+    ]
+    if len(evidences) > limit:
+        lines.append(f"另有 {len(evidences) - limit} 条候选")
+    return "；".join(lines)
 
 
 def reciprocal_rank_fusion(ranked_lists: list[list[tuple[str, float]]], k: int = 60) -> list[tuple[str, float]]:

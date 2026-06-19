@@ -17,16 +17,25 @@ from app.schemas.rag import (
     OverviewResponse,
     QueryRequest,
     QueryResponse,
+    QueryTaskResponse,
     ResumeAlignmentResult,
 )
 
 import re
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 
 router = APIRouter(prefix="/internal/rag", tags=["RAG"])
 loader = MineruDocumentLoader()
 parser_router = DocumentParserRouter(loader)
 store = create_rag_store()
+query_task_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rag-query-task")
+query_tasks: dict[str, dict] = {}
+query_tasks_lock = Lock()
+QUERY_TASK_TTL = timedelta(minutes=30)
 
 
 @router.post("/documents/index-text", response_model=IndexResponse)
@@ -271,6 +280,144 @@ def query(request: QueryRequest) -> QueryResponse:
             if not response.evidences:
                 response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
             return response
+
+
+@router.post("/query/tasks", response_model=QueryTaskResponse)
+def start_query_task(request: QueryRequest) -> QueryTaskResponse:
+    """创建 RAG 查询后台任务，让 Java 和前端可以轮询真实阶段事件。"""
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="question is empty")
+    cleanup_expired_query_tasks()
+    task_id = uuid.uuid4().hex
+    now = now_iso()
+    task = {
+        "taskId": task_id,
+        "status": "RUNNING",
+        "message": "正在执行 RAG 检索问答",
+        "progressEvents": [],
+        "result": None,
+        "errorMessage": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    with query_tasks_lock:
+        query_tasks[task_id] = task
+    query_task_executor.submit(run_query_task, task_id, request)
+    return task_response(task)
+
+
+@router.get("/query/tasks/{task_id}", response_model=QueryTaskResponse)
+def get_query_task(task_id: str) -> QueryTaskResponse:
+    """读取 RAG 查询任务当前状态和已产生的阶段事件。"""
+    cleanup_expired_query_tasks()
+    with query_tasks_lock:
+        task = query_tasks.get(task_id)
+        if task is None:
+            return QueryTaskResponse(
+                taskId=task_id,
+                status="EXPIRED",
+                message="RAG 查询任务不存在或已过期",
+                progressEvents=[],
+                result=None,
+                errorMessage="RAG 查询任务不存在或已过期",
+                createdAt=None,
+                updatedAt=None,
+            )
+        return task_response(task)
+
+
+def run_query_task(task_id: str, request: QueryRequest) -> None:
+    """在后台执行 RAG 检索，并把每个 reporter 事件写入任务快照。"""
+    user_id = str((request.metadataFilter or {}).get("userId") or "anonymous")
+    process_logger = RagProcessLogger(document_id="query", user_id=user_id, module="query")
+
+    def on_emit(event) -> None:
+        with query_tasks_lock:
+            task = query_tasks.get(task_id)
+            if task is None:
+                return
+            task["progressEvents"] = [*task["progressEvents"], event]
+            task["message"] = event.message
+            task["updatedAt"] = now_iso()
+
+    try:
+        with use_process_logger(process_logger):
+            with process_logger.step(
+                "api.query.task",
+                "query_task_pipeline",
+                "处理 RAG 检索问答任务",
+                context={"taskId": task_id, "topK": request.topK, "metadataFilter": request.metadataFilter},
+            ):
+                process_event(
+                    stage="api.query.task",
+                    action="query_task_received",
+                    message="Python 已接收 RAG 检索问答任务",
+                    context={"taskId": task_id, "topK": request.topK, "metadataFilter": request.metadataFilter},
+                )
+                progress = RagProgressReporter(document_id="query", user_id=user_id, persist=False, on_emit=on_emit)
+                response = store.query(request, progress_reporter=progress)
+                if not response.evidences:
+                    response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
+                with query_tasks_lock:
+                    task = query_tasks.get(task_id)
+                    if task is None:
+                        return
+                    task["status"] = "COMPLETED"
+                    task["message"] = "RAG 检索问答完成"
+                    task["progressEvents"] = response.progressEvents
+                    task["result"] = response
+                    task["updatedAt"] = now_iso()
+    except Exception as exc:
+        with query_tasks_lock:
+            task = query_tasks.get(task_id)
+            if task is None:
+                return
+            task["status"] = "FAILED"
+            task["message"] = "RAG 检索问答失败"
+            task["errorMessage"] = str(exc)
+            task["updatedAt"] = now_iso()
+
+
+def task_response(task: dict) -> QueryTaskResponse:
+    """把内部任务字典转换为接口响应模型，避免外部持有可变引用。"""
+    return QueryTaskResponse(
+        taskId=task["taskId"],
+        status=task["status"],
+        message=task["message"],
+        progressEvents=list(task["progressEvents"]),
+        result=task["result"],
+        errorMessage=task["errorMessage"],
+        createdAt=task["createdAt"],
+        updatedAt=task["updatedAt"],
+    )
+
+
+def cleanup_expired_query_tasks() -> None:
+    """清理过期查询任务，避免临时进度快照长期占用内存。"""
+    cutoff = datetime.now(timezone.utc) - QUERY_TASK_TTL
+    with query_tasks_lock:
+        expired_ids = [
+            task_id
+            for task_id, task in query_tasks.items()
+            if parse_iso_datetime(task.get("updatedAt")) < cutoff
+        ]
+        for task_id in expired_ids:
+            query_tasks.pop(task_id, None)
+
+
+def now_iso() -> str:
+    """生成接口使用的 UTC ISO 时间。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso_datetime(value: str | None) -> datetime:
+    """解析任务更新时间，异常值按最早时间处理以便清理。"""
+    if not value:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
 @router.post("/jd-analysis", response_model=JdAnalyzeResponse)

@@ -1,5 +1,5 @@
-import { FileUp, Loader2, Plus, RefreshCw, RotateCcw, Wrench } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { FileSearch, FileUp, Filter, Images, Loader2, Plus, RefreshCw, RotateCcw, ScanLine, Wrench } from 'lucide-react';
+import { useCallback, useEffect, useState, type DragEvent } from 'react';
 import { fetchMaterials, indexText, reindexMaterial } from '../../api/rag';
 import type { LearningMaterial, RagProgress } from '../../api/types';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../../hooks/useMaterialUpload';
@@ -11,6 +11,7 @@ export function LearningMaterials() {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [highPrecision, setHighPrecision] = useState(false);
+  const [draggingFile, setDraggingFile] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const { uploading, uploadMessage, uploadFile } = useMaterialUpload({
@@ -66,7 +67,30 @@ export function LearningMaterials() {
   // 提交文件资料并按当前解析精度选项入库。
   function submitFile(file: File | null) {
     setMessage('');
+    setDraggingFile(false);
     void uploadFile(file).catch(() => undefined);
+  }
+
+  // 允许从系统文件管理器拖入资料文件。
+  function handleFileDragOver(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    if (!actionBusy) {
+      setDraggingFile(true);
+    }
+  }
+
+  // 离开上传区域时恢复普通展示状态。
+  function handleFileDragLeave(event: DragEvent<HTMLLabelElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setDraggingFile(false);
+    }
+  }
+
+  // 拖放文件后复用统一上传流程，保持高精度选项和进度提示一致。
+  function handleFileDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0] || null;
+    submitFile(file);
   }
 
   // 重新读取原始文件，支持普通重建和高精度补跑。
@@ -117,10 +141,15 @@ export function LearningMaterials() {
           <div className="panel-title">
             <h3><FileUp size={20} />多格式文件解析</h3>
           </div>
-          <label className={`file-drop ${uploading ? 'is-busy' : ''}`}>
+          <label
+            className={`file-drop ${uploading ? 'is-busy' : ''} ${draggingFile ? 'is-dragging' : ''}`}
+            onDragOver={handleFileDragOver}
+            onDragLeave={handleFileDragLeave}
+            onDrop={handleFileDrop}
+          >
             {uploading ? <Loader2 className="spin" size={30} /> : <FileUp size={30} />}
-            <strong>PDF / DOC / PPT / XLSX / TXT / SRT / VTT / 图片 / 视频</strong>
-            <span>文件先进入配置的对象存储，视频会继续抽取字幕和关键帧 evidence</span>
+            <strong>{draggingFile ? '松开鼠标开始上传' : 'PDF / DOC / PPT / XLSX / TXT / SRT / VTT / 图片 / 视频'}</strong>
+            <span>拖入文件或点击选择，视频会继续抽取字幕和关键帧 evidence</span>
             <input
               type="file"
               accept={MATERIAL_FILE_ACCEPT}
@@ -180,6 +209,7 @@ export function LearningMaterials() {
                       {item.latestProgress.chunkId ? <span>{item.latestProgress.chunkId}</span> : null}
                     </div>
                     {item.latestProgress.detail && <p>{item.latestProgress.detail}</p>}
+                    <VideoProgressPanel item={item} />
                     {progressTimeline(item).length > 0 && (
                       <ol className="material-progress-timeline" aria-label="RAG 最近处理流程">
                         {progressTimeline(item).map((progress, index) => (
@@ -256,6 +286,67 @@ function formatStatus(status: string) {
   return status;
 }
 
+// 展示视频解析子阶段，让用户能看到抽帧、翻页检测、视觉去重和筛选过程。
+function VideoProgressPanel({ item }: { item: LearningMaterial }) {
+  const summary = videoProgressSummary(item);
+  if (!summary) return null;
+  const steps = [
+    {
+      key: 'extract',
+      icon: <Images size={14} />,
+      label: '抽取候选帧',
+      value: summary.candidateCount !== null ? `${summary.candidateCount} 帧` : summary.extractEvent?.stageLabel || '等待',
+      meta: compactParts([summary.scanMode, summary.sampleInterval, summary.maxCandidates]).join(' · '),
+      done: Boolean(summary.candidateEvent || summary.slideDoneEvent || summary.ocrEvent)
+    },
+    {
+      key: 'slide',
+      icon: <ScanLine size={14} />,
+      label: 'PPT 翻页检测',
+      value: summary.pptFlipCount !== null ? `${summary.pptFlipCount} 次` : stageState(summary.slideDoneEvent || summary.slideStartEvent),
+      meta: compactParts([summary.keepInterval, summary.minInterval]).join(' · '),
+      done: Boolean(summary.slideDoneEvent)
+    },
+    {
+      key: 'dedup',
+      icon: <FileSearch size={14} />,
+      label: '视觉去重',
+      value: summary.visualDedupEnabled === 'false' ? '未启用' : summary.repeatVisualCount !== null ? `跳过 ${summary.repeatVisualCount} 帧` : stageState(summary.slideDoneEvent || summary.slideStartEvent),
+      meta: summary.visualGroupCount ? `${summary.visualGroupCount} 个视觉组` : '',
+      done: Boolean(summary.slideDoneEvent)
+    },
+    {
+      key: 'select',
+      icon: <Filter size={14} />,
+      label: '最小间隔筛选',
+      value: summary.selectedCount !== null ? `进入 OCR ${summary.selectedCount} 帧` : stageState(summary.slideDoneEvent),
+      meta: compactParts([summary.maxOcrFrames, summary.ocrCandidateCount ? `候选 ${summary.ocrCandidateCount} 帧` : '']).join(' · '),
+      done: Boolean(summary.slideDoneEvent)
+    }
+  ];
+
+  return (
+    <div className="video-progress-panel" aria-label="视频解析过程">
+      <div className="video-progress-panel-head">
+        <strong>视频解析过程</strong>
+        <span>{summary.currentStage}</span>
+      </div>
+      <div className="video-progress-grid">
+        {steps.map((step) => (
+          <div className={`video-progress-step ${step.done ? 'done' : ''}`} key={step.key}>
+            <span>{step.icon}</span>
+            <div>
+              <small>{step.label}</small>
+              <strong>{step.value}</strong>
+              {step.meta ? <em>{step.meta}</em> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // 生成资料行中的当前进度标题。
 function formatProgressTitle(item: LearningMaterial) {
   const progress = item.latestProgress;
@@ -299,4 +390,109 @@ function progressPercent(item: LearningMaterial) {
   if (item.status === 'READY' || item.status === 'PARTIAL') return 100;
   if (item.status === 'FAILED') return 0;
   return 12;
+}
+
+// 汇总视频子阶段进度，优先使用后端保留的关键事件。
+function videoProgressSummary(item: LearningMaterial) {
+  const events = item.progressEvents || [];
+  const videoEvents = events.filter((event) => event.stageCode?.startsWith('parse.video'));
+  if (!videoEvents.length && !isVideoDocument(item.documentType)) {
+    return null;
+  }
+  const extractEvent = latestStage(events, 'parse.video.frame.extract');
+  const candidateEvent = latestStage(events, 'parse.video.frame.candidates');
+  const slideEvents = events.filter((event) => event.stageCode === 'parse.video.slide_detect');
+  const slideDoneEvent = slideEvents.find((event) => event.message?.includes('检测完成'));
+  const slideStartEvent = slideDoneEvent ? slideEvents.find((event) => event !== slideDoneEvent) : slideEvents[0];
+  const slideCurrentEvent = slideDoneEvent || slideStartEvent;
+  const ocrEvent = latestStage(events, 'parse.video.ocr');
+  const mergedDetail = [
+    extractEvent?.detail,
+    candidateEvent?.detail,
+    slideStartEvent?.detail,
+    slideDoneEvent?.detail
+  ].filter(Boolean).join('; ');
+  const slideMessage = slideCurrentEvent?.message || '';
+  const candidateCount = firstNumber(detailValue(mergedDetail, 'candidateCount'), matchNumber(slideMessage, /候选帧\s*(\d+)\s*个/));
+  const selectedCount = firstNumber(detailValue(mergedDetail, 'selectedCount'), matchNumber(slideMessage, /最终进入 OCR\s*(\d+)/));
+  const pptFlipCount = firstNumber(detailValue(mergedDetail, 'pptFlipCount'), matchNumber(slideMessage, /翻页命中\s*(\d+)\s*个/));
+  const repeatVisualCount = firstNumber(detailValue(mergedDetail, 'repeatVisualCount'), matchNumber(slideMessage, /视觉重复跳过\s*(\d+)\s*个/));
+
+  return {
+    extractEvent,
+    candidateEvent,
+    slideStartEvent,
+    slideDoneEvent,
+    ocrEvent,
+    currentStage: ocrEvent?.message || slideCurrentEvent?.message || candidateEvent?.message || extractEvent?.message || '等待视频解析进度',
+    scanMode: labelValue('扫描', detailText(mergedDetail, 'scanMode')),
+    sampleInterval: secondsLabel('采样间隔', detailNumber(mergedDetail, 'sampleIntervalSeconds')),
+    keepInterval: secondsLabel('兜底间隔', detailNumber(mergedDetail, 'keepIntervalSeconds')),
+    minInterval: secondsLabel('最小间隔', detailNumber(mergedDetail, 'minIntervalSeconds')),
+    maxCandidates: labelValue('候选上限', detailText(mergedDetail, 'maxCandidates')),
+    maxOcrFrames: labelValue('OCR 上限', detailText(mergedDetail, 'maxOcrFrames')),
+    visualDedupEnabled: detailText(mergedDetail, 'visualDedupEnabled'),
+    candidateCount,
+    selectedCount,
+    pptFlipCount,
+    repeatVisualCount,
+    ocrCandidateCount: detailValue(mergedDetail, 'ocrCandidateCount'),
+    visualGroupCount: detailValue(mergedDetail, 'visualGroupCount')
+  };
+}
+
+function isVideoDocument(type: string) {
+  return ['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'].includes(type.toLowerCase());
+}
+
+function latestStage(events: RagProgress[], stageCode: string) {
+  return events.find((event) => event.stageCode === stageCode);
+}
+
+function stageState(progress?: RagProgress) {
+  if (!progress) return '等待';
+  if (progress.status === 'FAILED') return '失败';
+  if (progress.status === 'COMPLETED') return '完成';
+  return '进行中';
+}
+
+function detailText(detail: string, key: string) {
+  const match = detail.match(new RegExp(`${escapeRegExp(key)}=([^;]+)`));
+  return match?.[1]?.trim() || '';
+}
+
+function detailNumber(detail: string, key: string) {
+  const value = detailText(detail, key);
+  const match = value.match(/\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+function detailValue(detail: string, key: string) {
+  const value = detailNumber(detail, key);
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function matchNumber(text: string, pattern: RegExp) {
+  const match = text.match(pattern);
+  return match ? Number(match[1]) : null;
+}
+
+function firstNumber(...values: Array<number | null>) {
+  return values.find((value) => typeof value === 'number' && Number.isFinite(value)) ?? null;
+}
+
+function labelValue(label: string, value?: string | null) {
+  return value ? `${label} ${value}` : '';
+}
+
+function secondsLabel(label: string, value: number | null) {
+  return typeof value === 'number' ? `${label} ${value}s` : '';
+}
+
+function compactParts(parts: Array<string | null | undefined>) {
+  return parts.filter((part): part is string => Boolean(part));
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

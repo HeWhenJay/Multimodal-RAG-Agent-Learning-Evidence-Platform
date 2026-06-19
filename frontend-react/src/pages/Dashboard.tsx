@@ -17,15 +17,20 @@ import {
   Video
 } from 'lucide-react';
 import { DayPicker, type DateRange } from '@daypicker/react';
-import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { fetchDashboardData } from '../api/pageData';
-import { queryRag } from '../api/rag';
-import type { DashboardData, LearningMaterial, RagEvidence } from '../api/types';
+import { runRagQueryTask } from '../api/rag';
+import type { DashboardData, LearningMaterial, RagEvidence, RagProgress } from '../api/types';
+import { MarkdownText } from '../components/MarkdownText';
+import { RagQueryProgress } from '../components/RagQueryProgress';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
+import { markRagQueryProgressFailed } from '../services/ragQueryProgress';
 
 const RECENT_LIMIT_MIN = 1;
 const RECENT_LIMIT_MAX = 50;
+const PROCESSING_MATERIAL_STATUSES = new Set(['PENDING', 'PARSING', 'REINDEXING', 'UPLOADING', 'PROCESSING', 'RUNNING']);
+const TERMINAL_PROGRESS_STATUSES = new Set(['COMPLETED', 'FAILED']);
 const CALENDAR_FORMATTERS = {
   formatCaption: formatCalendarCaption,
   formatWeekdayName: formatCalendarWeekdayName
@@ -37,12 +42,17 @@ export function Dashboard() {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
+  const [querying, setQuerying] = useState(false);
+  const [queryProgressEvents, setQueryProgressEvents] = useState<RagProgress[]>([]);
+  const queryAbortRef = useRef<AbortController | null>(null);
   const [error, setError] = useState('');
   const [appliedRecentRange, setAppliedRecentRange] = useState<DateRange>(() => defaultRecentRange());
   const [draftRecentRange, setDraftRecentRange] = useState<DateRange>(() => defaultRecentRange());
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [recentLimit, setRecentLimit] = useState(5);
+  const [highPrecisionUpload, setHighPrecisionUpload] = useState(false);
   const { uploading, uploadMessage, uploadFile } = useMaterialUpload({
+    highPrecision: highPrecisionUpload,
     onUploaded: (material) => {
       setDashboard((previous) => previous
         ? {
@@ -53,6 +63,12 @@ export function Dashboard() {
     }
   });
   const rangeBounds = useMemo(() => recentRangeBounds(), []);
+  const backgroundProgressMessage = useMemo(
+    () => formatChannelProcessingMessage(dashboard?.recentMaterials || []),
+    [dashboard?.recentMaterials]
+  );
+  const channelMessage = uploadMessage || backgroundProgressMessage;
+  const channelBusy = uploading || Boolean(backgroundProgressMessage);
 
   // 拉取工作台聚合数据。
   const loadDashboard = useCallback(async () => {
@@ -75,11 +91,14 @@ export function Dashboard() {
   useEffect(() => {
     void loadDashboard();
     window.addEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
-    return () => window.removeEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
+    return () => {
+      queryAbortRef.current?.abort();
+      window.removeEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
+    };
   }, [loadDashboard]);
 
   useEffect(() => {
-    if (!dashboard?.recentMaterials?.some((item) => isProcessingStatus(item.status))) {
+    if (!dashboard?.recentMaterials?.some(isProcessingMaterial)) {
       return undefined;
     }
     const timer = window.setInterval(() => {
@@ -128,10 +147,43 @@ export function Dashboard() {
       setError('请输入检索问题');
       return;
     }
-    setError('');
-    const result = await queryRag({ question, topK: 3 });
-    setAnswer(result.answer);
-    setEvidences(result.evidences);
+    let controller: AbortController | null = null;
+    try {
+      setError('');
+      setAnswer('');
+      setEvidences([]);
+      setQuerying(true);
+      setQueryProgressEvents([]);
+      queryAbortRef.current?.abort();
+      controller = new AbortController();
+      queryAbortRef.current = controller;
+      const result = await runRagQueryTask(
+        { question, topK: 3 },
+        (events) => {
+          if (queryAbortRef.current === controller) {
+            setQueryProgressEvents(events);
+          }
+        },
+        { signal: controller.signal }
+      );
+      if (queryAbortRef.current !== controller) {
+        return;
+      }
+      setAnswer(result.answer);
+      setEvidences(result.evidences);
+      setQueryProgressEvents(result.progressEvents || []);
+    } catch (queryError) {
+      if (queryError instanceof Error && queryError.message === 'RAG 检索已取消') {
+        return;
+      }
+      setError(queryError instanceof Error ? queryError.message : '检索失败');
+      setQueryProgressEvents((events) => markRagQueryProgressFailed(events));
+    } finally {
+      if (queryAbortRef.current === controller) {
+        queryAbortRef.current = null;
+        setQuerying(false);
+      }
+    }
   }
 
   const stats = [
@@ -183,16 +235,19 @@ export function Dashboard() {
           </div>
           <div className="rag-input-row">
             <textarea value={question} onChange={(event) => setQuestion(event.target.value)} />
-            <button className="send-button" onClick={runQuery} aria-label="发送问题">
-              <Send size={18} />
+            <button className="send-button" onClick={runQuery} disabled={querying} aria-label="发送问题">
+              {querying ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
             </button>
           </div>
+          {(querying || queryProgressEvents.length > 0) ? (
+            <RagQueryProgress events={queryProgressEvents} running={querying} />
+          ) : null}
           <div className="answer-box">
             <div className="answer-label">
               <Bot size={17} />
               RAG 回复
             </div>
-            <p>{answer || '提交问题后展示基于数据库证据检索生成的回答。'}</p>
+            <MarkdownText content={answer || '提交问题后展示基于数据库证据检索生成的回答。'} />
             <div className="citation-row">
               {evidences.length > 0 ? (
                 evidences.slice(0, 3).map((item) => (
@@ -213,20 +268,29 @@ export function Dashboard() {
               <CloudUpload size={20} />
               多模态数据接入通道
             </h3>
+            <button
+              type="button"
+              className={`chip-button ${highPrecisionUpload ? 'is-active' : ''}`}
+              disabled={uploading}
+              aria-pressed={highPrecisionUpload}
+              onClick={() => setHighPrecisionUpload((enabled) => !enabled)}
+            >
+              高精度处理
+            </button>
           </div>
           <label
-            className={`upload-zone ${uploading ? 'is-busy' : ''}`}
+            className={`upload-zone ${channelBusy ? 'is-busy' : ''}`}
             onDragOver={(event) => event.preventDefault()}
             onDrop={handleUploadDrop}
           >
-            {uploading ? <Loader2 className="spin" size={28} /> : <CloudUpload size={28} />}
-            <strong>{uploading ? '正在上传并索引' : '拖拽文件或点击上传'}</strong>
+            {channelBusy ? <Loader2 className="spin" size={28} /> : <CloudUpload size={28} />}
+            <strong>{channelBusy ? '正在处理多模态资料' : '拖拽文件或点击上传'}</strong>
             <div className="format-row">
               {['PDF', 'DOCX', 'PPTX', 'MP4', 'MD'].map((format) => <span key={format}>{format}</span>)}
             </div>
             <input type="file" accept={MATERIAL_FILE_ACCEPT} disabled={uploading} onChange={handleUploadChange} />
           </label>
-          {uploadMessage ? <p className="form-message">{uploadMessage}</p> : null}
+          {channelMessage ? <p className="form-message">{channelMessage}</p> : null}
           <div className="task-toolbar">
             <div className="task-heading">
               <h4>近期处理任务</h4>
@@ -294,7 +358,7 @@ export function Dashboard() {
                 <small>{formatDocumentMeta(item)}</small>
               </span>
               <div className="task-status">
-                <strong className={item.status === 'READY' ? '' : 'processing'}>{formatMaterialStatus(item.status)}</strong>
+                <strong className={displayMaterialStatus(item) === 'READY' ? '' : 'processing'}>{formatMaterialStatus(displayMaterialStatus(item))}</strong>
                 <small>{item.chunkCount} 个切块</small>
               </div>
             </div>
@@ -396,8 +460,16 @@ function formatMaterialStatus(status: string) {
   if (status === 'PARSING') return '解析中';
   if (status === 'PENDING') return '等待解析';
   if (status === 'REINDEXING') return '重建索引';
+  if (status === 'UPLOADING') return '上传中';
+  if (status === 'PROCESSING') return '处理中';
+  if (status === 'RUNNING') return '运行中';
   if (status === 'FAILED') return '解析失败';
   return status;
+}
+
+// 当前进度仍在运行时，以进度事件覆盖滞后的资料主状态。
+function displayMaterialStatus(item: LearningMaterial) {
+  return isProcessingMaterial(item) ? 'PARSING' : item.status;
 }
 
 // 展示资料类型、解析器和更新时间等任务元数据。
@@ -510,9 +582,47 @@ function clampNumber(value: string, min: number, max: number) {
   return Math.max(min, Math.min(max, Math.trunc(numberValue)));
 }
 
-// 判断资料是否仍处于后台解析或重建中。
-function isProcessingStatus(status: string) {
-  return ['PENDING', 'PARSING', 'REINDEXING'].includes(status);
+// 判断资料是否仍处于后台处理，优先结合最新进度事件而非只看资料主状态。
+function isProcessingMaterial(item: LearningMaterial) {
+  if (PROCESSING_MATERIAL_STATUSES.has(normalizeStatus(item.status))) {
+    return true;
+  }
+  const progress = item.latestProgress;
+  if (!progress) {
+    return false;
+  }
+  if (progress.currentChunk && progress.totalChunks && progress.currentChunk < progress.totalChunks) {
+    return true;
+  }
+  if (typeof progress.percent === 'number' && progress.percent > 0 && progress.percent < 100) {
+    return true;
+  }
+  if (normalizeStatus(progress.status) === 'RUNNING') {
+    return true;
+  }
+  if (progress.status && TERMINAL_PROGRESS_STATUSES.has(normalizeStatus(progress.status))) {
+    return false;
+  }
+  return false;
+}
+
+// 统一后端状态大小写，兼容不同接口返回的状态枚举。
+function normalizeStatus(status: string | null | undefined) {
+  return (status || '').trim().toUpperCase();
+}
+
+// 从近期任务恢复接入通道的后台处理提示，支持页面刷新后的进度展示。
+function formatChannelProcessingMessage(items: LearningMaterial[]) {
+  const processingItems = items.filter(isProcessingMaterial);
+  const current = processingItems[0];
+  if (!current) {
+    return '';
+  }
+
+  const progressText = formatTaskProgress(current);
+  const statusText = progressText || formatMaterialStatus(current.status);
+  const extraCount = processingItems.length > 1 ? `，另有 ${processingItems.length - 1} 个任务处理中` : '';
+  return `正在处理《${current.title}》：${statusText}${extraCount}`;
 }
 
 // 工作台任务行展示当前 RAG 阶段和切块计数。

@@ -12,6 +12,8 @@ public class MaterialUploadChunkVO {
     private Integer chunkIndex;
     private Integer totalChunks;
     private Integer receivedChunks;
+    private String status;
+    private String message;
     private Boolean completed;
     private LearningMaterialVO material;
 }
