@@ -1,6 +1,8 @@
 ﻿from rag.retrievers.retrieval import cached_embedding, embed_text, embedding_provider_name
 from rag.retrievers.retrieval import InMemoryRagStore
 from rag.progress import RagProgressReporter
+from rag.retrievers.evidence_diversity import dedupe_evidences_for_context
+from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
 from rag.bailian_llm import append_evidence_reference_summary, deterministic_grounded_answer
 from rag.indexes.pgvector_store import build_filter_clause, vector_literal
 from rag.rerankers.reranking import local_rerank
@@ -339,7 +341,7 @@ def test_query_diversity_filters_duplicate_video_frame_ocr(monkeypatch):
     ]
     assert group_ids.count("doc-video-diversity-frame-group-1") <= 1
     assert response.diagnostics["candidateBudget"] == 20
-    assert response.diagnostics["dedupRemovedCount"] >= 1
+    assert response.diagnostics["parentAggregation"]["expandedParentCount"] >= 1
     assert response.diagnostics["diversityPolicy"] == "video_duplicate_group_and_time_window"
 
 
@@ -383,3 +385,153 @@ def test_index_blocks_removes_postgres_nul_before_storage():
     assert_no_postgres_nul(chunk.metadata)
     assert chunk.metadata["parseQuality"]["messages"] == []
     assert chunk.metadata["parseQuality"]["messageCount"] == 1
+
+
+def test_summary_child_can_be_recalled_and_aggregated_to_parent():
+    """summary child 应进入召回，并在进入 rerank 前聚合为父段 evidence。"""
+    store = InMemoryRagStore()
+    block = DocumentBlock(
+        documentId="doc-summary-child",
+        blockId="doc-summary-child-raw",
+        fileType="md",
+        blockType="text",
+        sectionTitle="索引增强",
+        contentText="这段只描述父子索引会保留小块召回和大块上下文。",
+        parseEngine="unit-markdown",
+        sourceTitle="索引增强笔记",
+    )
+    store.index_blocks(
+        document_id="doc-summary-child",
+        title="索引增强笔记",
+        document_type="markdown",
+        source="unit-test",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="unit-markdown",
+        blocks=[block],
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=100)),
+        status="READY",
+    )
+
+    summary_chunks = [chunk for chunk in store.chunks.values() if chunk.metadata.get("childKind") == "summary"]
+    assert summary_chunks
+    response = store.query(QueryRequest(question="父段摘要", topK=3))
+
+    assert response.evidences
+    assert response.evidences[0].retrievalSource in {"fusion", "rerank"}
+    assert response.evidences[0].metadata["retrievalLayer"] == "parent_aggregated"
+    assert response.diagnostics["parentAggregation"]["enabled"] is True
+    assert response.diagnostics["matchedChildIds"]
+    assert response.diagnostics["expandedParentIds"]
+    assert response.diagnostics["prerequisiteAddedIds"] == []
+
+
+def test_retrieval_source_stays_enum_and_layer_lives_in_metadata():
+    """父段聚合不能把 retrievalSource 改成非法枚举。"""
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-layer",
+            title="检索层级笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## 检索层级\n父段聚合后的层级信息应写入 metadata.retrievalLayer。",
+        )
+    )
+
+    evidence = store.query(QueryRequest(question="父段聚合层级信息在哪里？", topK=1)).evidences[0]
+
+    assert evidence.retrievalSource == "rerank"
+    assert evidence.metadata["retrievalLayer"] == "parent_aggregated"
+
+
+def test_parent_aggregation_helper_is_shared_contract():
+    """helper 单测覆盖 memory/pgvector 共用的父段聚合契约。"""
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-parent-helper",
+            title="父段 helper 笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## helper\nmemory 和 pgvector 需要共用父段聚合 helper。",
+        )
+    )
+    child = next(chunk for chunk in store.chunks.values() if chunk.metadata.get("childKind") == "raw")
+    evidence = store._to_evidence(child.chunk_id, 0.5, retrieval_source="fusion")
+
+    result = aggregate_parent_evidences(
+        [evidence],
+        chunks=[
+            ParentAggregationChunk(
+                chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                text=chunk.text,
+                metadata=chunk.metadata,
+            )
+            for chunk in store.chunks.values()
+        ],
+        limit=5,
+    )
+
+    assert result.evidences[0].evidenceId == child.metadata["parentSegmentId"]
+    assert result.evidences[0].metadata["matchedChildIds"]
+    assert result.diagnostics()["parentAggregation"]["prerequisiteExpansionEnabled"] is False
+
+
+def test_video_ocr_occurrence_not_folded_by_diversity(monkeypatch):
+    """相同 OCR 内容在不同 occurrence 下不应被 diversity 折叠。"""
+    monkeypatch.setenv("RAG_QUERY_DIVERSITY_DEDUP_ENABLED", "true")
+    monkeypatch.setenv("RAG_PARENT_VIDEO_WINDOW_SECONDS", "60")
+    monkeypatch.setenv("RAG_QUERY_VIDEO_TIME_WINDOW_SECONDS", "60")
+    store = InMemoryRagStore()
+    block = DocumentBlock(
+        documentId="doc-occurrence-diversity",
+        blockId="doc-occurrence-diversity-frame",
+        fileType="mp4",
+        blockType="image",
+        startTime="00:00:10",
+        endTime="00:01:30",
+        sectionTitle="视频画面聚合 00:00:10 - 00:01:30",
+        contentText="视频画面聚合 00:00:10 - 00:01:30\nRAG-Fusion 使用 RRF 融合 BM25 和向量检索结果。",
+        parseEngine="video-frame-ocr",
+        sourceTitle="RAG 课程视频",
+        metadata={
+            "mediaType": "video",
+            "evidenceChannel": "frame_ocr",
+            "duplicateGroupId": "same-frame-ocr-group",
+            "normalizedTextHash": "same-normalized-hash",
+            "sourceFrameTimes": ["00:00:10", "00:01:30"],
+            "timeRanges": [
+                {"startTime": "00:00:10", "endTime": "00:00:10"},
+                {"startTime": "00:01:30", "endTime": "00:01:30"},
+            ],
+        },
+    )
+    store.index_blocks(
+        document_id="doc-occurrence-diversity",
+        title="RAG 课程视频",
+        document_type="mp4",
+        source="unit-test",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="unit-video",
+        blocks=[block],
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=120)),
+        status="READY",
+    )
+    occurrence_evidences = [
+        store._to_evidence(chunk.chunk_id, 1.0, retrieval_source="fusion")
+        for chunk in store.chunks.values()
+        if chunk.metadata.get("childKind") == "ocr_occurrence"
+    ]
+
+    result = dedupe_evidences_for_context("RAG-Fusion 如何融合？", occurrence_evidences, top_k=2)
+
+    assert len(occurrence_evidences) == 2
+    assert len(result.evidences) == 2
+    assert result.removed_count == 0

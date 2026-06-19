@@ -18,6 +18,7 @@ from rag.process_logger import logged_rag_method, process_event
 from rag.progress import RagProgressReporter
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
+from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
 from rag.indexes.summary_index import SummaryIndex
 from rag.text_sanitizer import (
     clean_postgres_text,
@@ -153,11 +154,19 @@ class InMemoryRagStore:
             )
             progress_reporter.emit("summary.index", "正在生成文档摘要和章节摘要索引", current_step=6, total_steps=8, percent=42)
         summaries = sanitize_for_postgres(self.summary_index.build(chunks))
+        summary_chunks = sanitize_chunks(
+            self.summary_index.build_parent_summary_chunks(
+                chunks,
+                document_id=document_id,
+                start_position=len(chunks),
+            )
+        )
+        chunks = [*chunks, *summary_chunks]
         process_event(
             stage="index.blocks",
             action="memory_index_blocks_chunked",
             message=f"内存模式准备写入 {len(chunks)} 个切块",
-            context={"chunkCount": len(chunks), "parser": parser, "status": status},
+            context={"chunkCount": len(chunks), "summaryChildCount": len(summary_chunks), "parser": parser, "status": status},
         )
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
@@ -312,9 +321,24 @@ class InMemoryRagStore:
             self._to_evidence(chunk_id, score, retrieval_source="fusion")
             for chunk_id, score in candidates
         ]
+        parent_aggregated = aggregate_parent_evidences(
+            candidate_evidences,
+            chunks=[
+                ParentAggregationChunk(
+                    chunk_id=chunk.chunk_id,
+                    document_id=chunk.document_id,
+                    text=chunk.text,
+                    metadata=chunk.metadata,
+                )
+                for chunk in filtered_chunks
+            ],
+            limit=candidate_budget,
+        )
+        candidate_evidences = parent_aggregated.evidences
+        diagnostics.update(parent_aggregated.diagnostics())
         progress_reporter.emit(
             "query.fusion",
-            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，得到 {len(candidates)} 个候选",
+            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
             status="COMPLETED",
             current_step=5,
             total_steps=7,

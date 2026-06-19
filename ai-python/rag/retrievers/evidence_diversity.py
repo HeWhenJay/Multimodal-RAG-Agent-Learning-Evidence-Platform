@@ -30,6 +30,22 @@ EVIDENCE_METADATA_KEYS = {
     "visualSourceFrameTimes",
     "visualHash",
     "visualHashDistance",
+    "parentSegmentId",
+    "parentStartTime",
+    "parentEndTime",
+    "parentKind",
+    "childKind",
+    "occurrenceId",
+    "occurrenceTime",
+    "retrievalLayer",
+    "concepts",
+    "segmentRole",
+    "prerequisiteSegmentIds",
+    "relatedSegmentIds",
+    "matchedChildIds",
+    "matchedChildKinds",
+    "linkedVisualGroupIds",
+    "linkedDuplicateGroupIds",
 }
 
 
@@ -158,7 +174,13 @@ def register_time_window(
 def stable_group_key(evidence: Evidence) -> str | None:
     metadata = evidence.metadata or {}
     channel = evidence_channel(evidence)
+    occurrence_id = metadata.get("occurrenceId")
+    if channel == "frame_ocr" and occurrence_id:
+        return f"{evidence.documentId}:{channel}:occurrence:{occurrence_id}"
     group_id = metadata.get("duplicateGroupId")
+    parent_id = metadata.get("parentSegmentId")
+    if channel == "frame_ocr" and parent_id and group_id:
+        return f"{evidence.documentId}:{channel}:parent:{parent_id}:group:{group_id}"
     if group_id:
         return f"{evidence.documentId}:{channel}:{group_id}"
     frame_group_ids = metadata.get("frameDuplicateGroupIds")

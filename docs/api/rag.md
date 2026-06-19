@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回和前端 Markdown 回答渲染。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、前端 Markdown 回答渲染，以及 Stage 1 父子索引、summary child、OCR occurrence 和父段聚合诊断。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
 
 边界约定：
 
@@ -437,11 +437,20 @@ Java 调用 Python：
   "rerankedCandidateCount": 12,
   "dedupRemovedCount": 3,
   "dedupGroupCount": 2,
-  "diversityPolicy": "video_duplicate_group_and_time_window"
+  "diversityPolicy": "video_duplicate_group_and_time_window",
+  "parentAggregation": {
+    "enabled": true,
+    "matchedChildCount": 18,
+    "expandedParentCount": 5,
+    "prerequisiteExpansionEnabled": false
+  },
+  "matchedChildIds": ["material-2-11", "material-2-summary-0001"],
+  "expandedParentIds": ["material-2-parent-text-0001"],
+  "prerequisiteAddedIds": []
 }
 ```
 
-其中 `candidateBudget` 表示 RRF/RAG-Fusion 后进入 rerank 的候选证据预算；`dedupRemovedCount`、`dedupGroupCount` 和 `diversityPolicy` 用于说明查询阶段是否移除了视频近重复 evidence。
+其中 `candidateBudget` 表示 RRF/RAG-Fusion 后进入 rerank 的候选证据预算；`parentAggregation`、`matchedChildIds`、`expandedParentIds` 用于说明子块命中后是否展开到父段上下文；`prerequisiteAddedIds` 现阶段固定为空，Stage 2 前置知识扩展默认关闭；`dedupRemovedCount`、`dedupGroupCount` 和 `diversityPolicy` 用于说明查询阶段是否移除了视频近重复 evidence。
 
 `RagQueryVO` 响应示例：
 
@@ -469,7 +478,16 @@ Java 调用 Python：
     "answerProvider": "dashscope",
     "answerModel": "qwen-plus",
     "filteredChunkCount": 42,
-    "candidateBudget": 20
+    "candidateBudget": 20,
+    "parentAggregation": {
+      "enabled": true,
+      "matchedChildCount": 2,
+      "expandedParentCount": 1,
+      "prerequisiteExpansionEnabled": false
+    },
+    "matchedChildIds": ["material-2-11", "material-2-summary-0001"],
+    "expandedParentIds": ["material-2-parent-text-0001"],
+    "prerequisiteAddedIds": []
   },
   "progressEvents": [
     {
@@ -710,6 +728,31 @@ Python `IndexResponse`：
 
 字幕或转写文本解析出的 `DocumentBlock` 会写入 `startTime/endTime`，时间格式保持原字幕文本中的 `HH:MM:SS` 或 `MM:SS` 表达。`blockType` 取值：`heading/text/table/image/chart/formula/code/list`。
 
+## 父子索引与 summary child
+
+Stage 1 索引统一使用父子结构，但不新增 Agent 编排、长任务调度或工具调用。Python 在递归切块阶段为文本和视频 chunk 补齐父段字段，并把摘要作为一等可召回子块写入 BM25 与 embedding：
+
+- 文本父段优先按 Markdown heading、解析器 sectionTitle、页面/幻灯片章节构建；没有标题时退化为段落窗口。父段 metadata 包含 `parentSegmentId`、`parentKind=text_section/text_window`、`parentStartTime=null`、`parentEndTime=null`。
+- 视频父段按字幕/ASR 时间窗口、视频片段摘要和 OCR 出现时间构建。父段 metadata 包含 `parentSegmentId`、`parentKind=video_segment`、`parentStartTime`、`parentEndTime`。
+- 原文、字幕 ASR、表格、代码、图片 OCR 等切块统一标记 `childKind=raw` 或更具体的 `ocr_occurrence`、`video_segment_summary`。
+- `SummaryIndex.build()` 仍生成 `rag_document.document_summary` 和 `section_summaries`，同时 Python 会基于父段生成 `childKind=summary` 的 summary child。summary child 必须与 raw child 一样写入 BM25、term_counts 和 embedding，不能只停留在资料摘要字段。
+- 视频 `evidenceChannel=video_segment_summary` 的解析块视为可检索 summary child，`childKind=video_segment_summary`，不再作为只展示的轻量摘要。
+- 新增 metadata keys 保留：`parentSegmentId`、`parentStartTime`、`parentEndTime`、`parentKind`、`childKind`、`occurrenceId`、`occurrenceTime`、`retrievalLayer`、`concepts`、`segmentRole`、`prerequisiteSegmentIds`、`relatedSegmentIds`、`matchedChildIds`、`matchedChildKinds`、`linkedVisualGroupIds`、`linkedDuplicateGroupIds`。
+- `segmentRole` 当前仅做 metadata 标注，合法值为 `intro|definition|basic|explanation|example|application|derivation|advanced|review|chitchat|unknown`；Stage 2 prerequisite/base-advanced 扩展默认关闭，`prerequisiteAddedIds` 为空。
+
+视频 OCR occurrence 建模：
+
+- 入库前视频 OCR 仍可按文本近重复得到代表 `DocumentBlock`，并保留 `timeRanges/sourceFrameTimes`。
+- 切块阶段会把每个 OCR-confirmed `sourceFrameTimes` 或 `timeRanges` 展开为独立 occurrence child。每个 child 拥有稳定 `occurrenceId`、`occurrenceTime` 和 occurrence 所在时间段的 `parentSegmentId`。
+- 同一视觉/OCR 内容在第 10 分钟和第 90 分钟出现时，会生成两个 occurrence child，分别挂到对应视频父段；查询 diversity 优先按 `occurrenceId` 分组，其次按 `parentSegmentId + duplicateGroupId`，最后才沿用旧 duplicate/hash 逻辑。
+
+父段聚合：
+
+- memory retriever 与 pgvector retriever 共用 Python `parent_aggregation` helper。RRF/RAG-Fusion 得到的是子块候选，进入 rerank 前先聚合为父段 evidence。
+- 聚合 evidence 的 `retrievalSource` 仍使用现有合法枚举 `fusion`，不新增 `parent` 枚举；命中的原始层级写入 `metadata.retrievalLayer=parent_aggregated`，并带上 `matchedChildIds`、`matchedChildKinds`。
+- 如果命中子块没有父段字段，helper 会按原 evidence 透传，并写入 `metadata.retrievalLayer=child`。
+- 诊断信息必须包含 `parentAggregation`、`matchedChildIds`、`expandedParentIds`，可选 `prerequisiteAddedIds`；Stage 1 默认不启用 prerequisite 扩展。
+
 ## Evidence 结构
 
 检索和资料 evidence 查询统一返回：
@@ -738,7 +781,9 @@ Python `IndexResponse`：
 }
 ```
 
-视频字幕或 ASR 转写文本命中时，`startTime/endTime` 用于展示视频证据所在时间段，例如 `01:23:10-01:25:42`，`playbackUrl` 用于跳到视频复习页或真实视频 URL 的秒点。兼容字段：Java/前端仍可读取 `title`、`source`、`sectionName`、`documentType`，其值分别映射自 `documentTitle`、`sourcePath/source`、`sectionTitle` 和资料类型。
+视频字幕、ASR 转写文本或关键帧 OCR 命中时，`startTime/endTime` 用于展示视频证据所在时间段，例如 `01:23:10-01:25:42`，`playbackUrl` 用于跳到视频复习页或真实视频 URL 的秒点。兼容字段：Java/前端仍可读取 `title`、`source`、`sectionName`、`documentType`，其值分别映射自 `documentTitle`、`sourcePath/source`、`sectionTitle` 和资料类型。
+
+Python `Evidence.metadata` 会保留上述父子索引、OCR occurrence、聚合诊断和视频去重字段。当前 Java `PythonRagClient` / `RagEvidenceVO` 只透传固定 evidence 字段，未把完整 `metadata` 暴露给前端；因此本阶段 metadata 可见性保证在 Python 内部、Python query/list 响应和 `diagnostics`，Java/前端页面只依赖既有字段展示。后续如需前端展示 `retrievalLayer` 或 `matchedChildIds`，必须先扩展 `RagEvidenceVO` 和 TypeScript 类型。
 
 ## 原始视频 RAG 策略
 
@@ -929,7 +974,8 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 -> DocumentBlock
 -> 内容清洗（删除 PostgreSQL 不支持的 NUL/0x00 字符，覆盖正文、章节名、来源路径和 metadata）
 -> 递归切块
--> 文档/章节/表格/图片摘要
+-> 父段 metadata 构建与 OCR occurrence 展开
+-> 文档/章节摘要 + parent summary child
 -> BM25 索引
 -> Embedding 向量索引
 -> 事务写入 rag_document + rag_chunk
@@ -940,7 +986,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 
 - 文本块按标题、章节、页面、幻灯片、段落、句子递归切分。
 - 表格、图片、代码块、公式和图表默认作为原子块保存，避免随意切碎。
-- chunk metadata 保留 `blockId/blockType/pageIndex/slideIndex/sheetName/cellRange/startTime/endTime/sectionTitle/sourcePath/assetPath/parseEngine`。
+- chunk metadata 保留 `blockId/blockType/pageIndex/slideIndex/sheetName/cellRange/startTime/endTime/sectionTitle/sourcePath/assetPath/parseEngine`，并保留父子索引字段 `parentSegmentId/parentStartTime/parentEndTime/parentKind/childKind/occurrenceId/occurrenceTime/retrievalLayer/concepts/segmentRole/prerequisiteSegmentIds/relatedSegmentIds/matchedChildIds/matchedChildKinds/linkedVisualGroupIds/linkedDuplicateGroupIds`。
 
 ## 前端影响
 
