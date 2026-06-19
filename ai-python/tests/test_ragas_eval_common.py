@@ -1,15 +1,28 @@
+import json
+import sys
+import types
 from pathlib import Path
 
+import pytest
+
+from evaluation import run_ragas_small_eval
 from evaluation.ragas_eval_common import (
+    RagasEvalSettings,
+    EvaluationRunResult,
     build_ragas_input_row,
+    build_ragas_model_adapter,
     calculate_document_hit,
     ensure_ragas_eval_config,
     evaluate_boundary_case,
     has_valid_evidence_reference,
     load_json,
     load_jsonl,
+    load_ragas_eval_settings,
     normalize_path,
+    ragas_result_to_rows,
+    require_ragas_core_dependencies,
     snake_case_query_to_project_request,
+    write_ragas_scores_csv,
 )
 
 
@@ -138,3 +151,394 @@ def test_ragas_mode_requires_separate_eval_key(monkeypatch):
         assert "RAGAS_EVAL_API_KEY 未配置" in str(exc)
     else:
         raise AssertionError("缺少 RAGAS_EVAL_API_KEY 时必须报错")
+
+
+def _set_valid_ragas_env(monkeypatch, *, provider: str = "openai-compatible") -> None:
+    """设置一组合法的 Ragas 真实评分环境变量。"""
+    monkeypatch.setenv("RAGAS_EVAL_PROVIDER", provider)
+    monkeypatch.setenv("RAGAS_EVAL_API_KEY", "eval-key")
+    monkeypatch.setenv("RAGAS_EVAL_LLM_MODEL", "eval-llm")
+    monkeypatch.setenv("RAGAS_EVAL_EMBEDDING_MODEL", "eval-embedding")
+    monkeypatch.setenv("RAGAS_EVAL_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("RAGAS_EVAL_TEMPERATURE", "0.2")
+    if provider == "openai-compatible":
+        monkeypatch.setenv("RAGAS_EVAL_BASE_URL", "https://example.test/v1")
+    else:
+        monkeypatch.delenv("RAGAS_EVAL_BASE_URL", raising=False)
+
+
+def test_ragas_eval_config_requires_base_url_for_compatible(monkeypatch):
+    """确认 openai-compatible 模式必须配置 base_url。"""
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.delenv("RAGAS_EVAL_BASE_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_BASE_URL 未配置"):
+        load_ragas_eval_settings()
+
+
+def test_ragas_eval_config_allows_official_openai_without_base_url(monkeypatch):
+    """确认 openai 模式可不配置 base_url，并会映射给 Ragas openai provider。"""
+    _set_valid_ragas_env(monkeypatch, provider="openai")
+
+    settings = load_ragas_eval_settings()
+
+    assert settings.provider == "openai"
+    assert settings.ragas_provider == "openai"
+    assert settings.base_url is None
+
+
+def test_ragas_eval_config_rejects_invalid_provider(monkeypatch):
+    """确认 provider 只允许 openai-compatible 或 openai。"""
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.setenv("RAGAS_EVAL_PROVIDER", "dashscope")
+
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_PROVIDER 只允许"):
+        load_ragas_eval_settings()
+
+
+def test_ragas_eval_config_requires_models_and_valid_numbers(monkeypatch):
+    """确认模型、timeout 和 temperature 配置都会被严格校验。"""
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.delenv("RAGAS_EVAL_LLM_MODEL", raising=False)
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_LLM_MODEL 未配置"):
+        load_ragas_eval_settings()
+
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.delenv("RAGAS_EVAL_EMBEDDING_MODEL", raising=False)
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_EMBEDDING_MODEL 未配置"):
+        load_ragas_eval_settings()
+
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.setenv("RAGAS_EVAL_TIMEOUT_SECONDS", "abc")
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_TIMEOUT_SECONDS 必须是数字"):
+        load_ragas_eval_settings()
+
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.setenv("RAGAS_EVAL_TIMEOUT_SECONDS", "0")
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_TIMEOUT_SECONDS 必须大于 0"):
+        load_ragas_eval_settings()
+
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.setenv("RAGAS_EVAL_TEMPERATURE", "2.1")
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_TEMPERATURE 必须在 0 到 2 之间"):
+        load_ragas_eval_settings()
+
+
+def test_ragas_eval_config_rejects_invalid_base_url(monkeypatch):
+    """确认显式 base_url 必须带 http 或 https 协议。"""
+    _set_valid_ragas_env(monkeypatch, provider="openai")
+    monkeypatch.setenv("RAGAS_EVAL_BASE_URL", "example.test/v1")
+
+    with pytest.raises(RuntimeError, match="RAGAS_EVAL_BASE_URL 必须以"):
+        load_ragas_eval_settings()
+
+
+def test_require_ragas_dependencies_reports_core_group(monkeypatch):
+    """确认缺核心依赖时中文提示会区分 ragas/openai/datasets。"""
+    original_import_module = __import__("importlib").import_module
+
+    def fake_import_module(name, package=None):
+        if name in {"ragas", "openai", "datasets"}:
+            raise ImportError(name)
+        return original_import_module(name, package)
+
+    monkeypatch.setattr("evaluation.ragas_eval_common.importlib.import_module", fake_import_module)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        require_ragas_core_dependencies()
+
+    message = str(exc_info.value)
+    assert "ragas、openai、datasets" in message
+    assert "python -m pip install -r ai-python/requirements.txt" in message
+
+
+class _FakeMetric:
+    """测试用假指标，记录构造参数并暴露 name。"""
+
+    def __init__(self, llm=None, embeddings=None, name=None):
+        self.llm = llm
+        self.embeddings = embeddings
+        self.name = name or self.__class__.__name__
+
+
+class ContextPrecisionWithReference(_FakeMetric):
+    pass
+
+
+class ContextRecall(_FakeMetric):
+    pass
+
+
+class Faithfulness(_FakeMetric):
+    pass
+
+
+class AnswerRelevancy(_FakeMetric):
+    pass
+
+
+class LLMContextPrecisionWithReference(_FakeMetric):
+    pass
+
+
+class LLMContextRecall(_FakeMetric):
+    pass
+
+
+class ResponseRelevancy(_FakeMetric):
+    pass
+
+
+def _settings() -> RagasEvalSettings:
+    """构造测试用 Ragas 配置。"""
+    return RagasEvalSettings(
+        provider="openai-compatible",
+        ragas_provider="openai",
+        base_url="https://example.test/v1",
+        api_key="eval-key",
+        llm_model="eval-llm",
+        embedding_model="eval-embedding",
+        timeout_seconds=30,
+        temperature=0.1,
+    )
+
+
+def _install_modern_ragas_modules(monkeypatch, *, llm_supports_client: bool = True) -> dict[str, object]:
+    """安装测试用现代 Ragas 模块。"""
+    calls: dict[str, object] = {}
+
+    class AsyncOpenAI:
+        def __init__(self, **kwargs):
+            calls["client_kwargs"] = kwargs
+
+    class OpenAIEmbeddings:
+        def __init__(self, **kwargs):
+            calls["embedding_kwargs"] = kwargs
+
+    if llm_supports_client:
+        def llm_factory(model, provider="openai", client=None, **kwargs):
+            calls["llm_factory"] = {"model": model, "provider": provider, "client": client, **kwargs}
+            return "modern-llm"
+    else:
+        def llm_factory(model, provider="openai", **kwargs):
+            calls["llm_factory"] = {"model": model, "provider": provider, **kwargs}
+            return "legacy-signature-llm"
+
+    openai_module = types.ModuleType("openai")
+    openai_module.AsyncOpenAI = AsyncOpenAI
+    embeddings_module = types.ModuleType("ragas.embeddings")
+    embeddings_module.OpenAIEmbeddings = OpenAIEmbeddings
+    llms_module = types.ModuleType("ragas.llms")
+    llms_module.llm_factory = llm_factory
+    collections_module = types.ModuleType("ragas.metrics.collections")
+    collections_module.ContextPrecisionWithReference = ContextPrecisionWithReference
+    collections_module.ContextRecall = ContextRecall
+    collections_module.Faithfulness = Faithfulness
+    collections_module.AnswerRelevancy = AnswerRelevancy
+    for name, module in {
+        "openai": openai_module,
+        "ragas.embeddings": embeddings_module,
+        "ragas.llms": llms_module,
+        "ragas.metrics.collections": collections_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return calls
+
+
+def _install_legacy_ragas_modules(monkeypatch) -> dict[str, object]:
+    """安装测试用 legacy Ragas 与 langchain-openai 模块。"""
+    calls: dict[str, object] = {}
+
+    class ChatOpenAI:
+        def __init__(self, **kwargs):
+            calls["chat_kwargs"] = kwargs
+
+    class OpenAIEmbeddings:
+        def __init__(self, **kwargs):
+            calls["embedding_kwargs"] = kwargs
+
+    class LangchainLLMWrapper:
+        def __init__(self, llm, run_config=None):
+            self.llm = llm
+            self.run_config = run_config
+
+    class LangchainEmbeddingsWrapper:
+        def __init__(self, embeddings, run_config=None):
+            self.embeddings = embeddings
+            self.run_config = run_config
+
+    langchain_openai = types.ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = ChatOpenAI
+    langchain_openai.OpenAIEmbeddings = OpenAIEmbeddings
+    llms_module = sys.modules.get("ragas.llms") or types.ModuleType("ragas.llms")
+    llms_module.LangchainLLMWrapper = LangchainLLMWrapper
+    embeddings_module = sys.modules.get("ragas.embeddings") or types.ModuleType("ragas.embeddings")
+    embeddings_module.LangchainEmbeddingsWrapper = LangchainEmbeddingsWrapper
+    metrics_module = types.ModuleType("ragas.metrics")
+    metrics_module.LLMContextPrecisionWithReference = LLMContextPrecisionWithReference
+    metrics_module.LLMContextRecall = LLMContextRecall
+    metrics_module.Faithfulness = Faithfulness
+    metrics_module.ResponseRelevancy = ResponseRelevancy
+    for name, module in {
+        "langchain_openai": langchain_openai,
+        "ragas.llms": llms_module,
+        "ragas.embeddings": embeddings_module,
+        "ragas.metrics": metrics_module,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return calls
+
+
+def test_build_modern_adapter_uses_collections_answer_relevancy(monkeypatch):
+    """确认现代主路径使用 OpenAI client、collections 指标和 AnswerRelevancy。"""
+    calls = _install_modern_ragas_modules(monkeypatch)
+
+    adapter = build_ragas_model_adapter(_settings())
+
+    assert adapter.adapter_name == "modern"
+    assert adapter.metric_names == [
+        "ContextPrecisionWithReference",
+        "ContextRecall",
+        "Faithfulness",
+        "AnswerRelevancy",
+    ]
+    assert calls["client_kwargs"]["base_url"] == "https://example.test/v1"
+    assert calls["llm_factory"]["provider"] == "openai"
+    assert calls["llm_factory"]["temperature"] == 0.1
+
+
+def test_build_legacy_adapter_only_after_modern_signature_fails(monkeypatch):
+    """确认现代 llm_factory 不支持 client 时才回退 legacy wrapper 指标。"""
+    _install_modern_ragas_modules(monkeypatch, llm_supports_client=False)
+    calls = _install_legacy_ragas_modules(monkeypatch)
+
+    adapter = build_ragas_model_adapter(_settings())
+
+    assert adapter.adapter_name == "legacy"
+    assert adapter.metric_names == [
+        "LLMContextPrecisionWithReference",
+        "LLMContextRecall",
+        "Faithfulness",
+        "ResponseRelevancy",
+    ]
+    assert calls["chat_kwargs"]["base_url"] == "https://example.test/v1"
+    assert calls["chat_kwargs"]["temperature"] == 0.1
+    assert any("llm_factory 不支持 client" in error for error in adapter.construction_errors)
+
+
+def test_legacy_missing_dependency_has_clear_hint(monkeypatch):
+    """确认 legacy fallback 缺 langchain-openai 时提示 fallback 依赖。"""
+    _install_modern_ragas_modules(monkeypatch, llm_supports_client=False)
+    monkeypatch.delitem(sys.modules, "langchain_openai", raising=False)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        build_ragas_model_adapter(_settings())
+
+    assert "fallback 需要 langchain-openai" in str(exc_info.value)
+
+
+class _ResultWithPandas:
+    """测试用 to_pandas 结果对象。"""
+
+    def to_pandas(self):
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {"case_id": "old", "user_input": "问题1", "faithfulness": 1.0},
+                {"case_id": "old", "user_input": "问题2", "faithfulness": 0.5},
+            ]
+        )
+
+
+class _ResultWithScores:
+    """测试用 scores 结果对象。"""
+
+    scores = [{"faithfulness": 0.8}, {"faithfulness": 0.6}]
+
+
+def _ragas_rows() -> list[dict[str, object]]:
+    """构造测试用 Ragas 输入行。"""
+    return [{"case_id": "R01"}, {"case_id": "R02"}]
+
+
+def test_ragas_result_to_rows_supports_to_pandas_scores_dict_and_list():
+    """确认不同 Ragas 结果形态都能转换为行列表。"""
+    assert ragas_result_to_rows(_ResultWithPandas())[0]["faithfulness"] == 1.0
+    assert ragas_result_to_rows(_ResultWithScores())[1]["faithfulness"] == 0.6
+    assert ragas_result_to_rows({"faithfulness": [0.7, 0.9]}) == [{"faithfulness": 0.7}, {"faithfulness": 0.9}]
+    assert ragas_result_to_rows([{"faithfulness": 0.7}]) == [{"faithfulness": 0.7}]
+
+
+def test_write_ragas_scores_csv_overwrites_case_id_and_summarizes_numeric_only(tmp_path):
+    """确认写 CSV 前会覆盖已有 case_id，且汇总跳过文本列。"""
+    output_csv = tmp_path / "ragas_scores.csv"
+
+    summary = write_ragas_scores_csv(output_csv, _ResultWithPandas(), _ragas_rows())
+
+    content = output_csv.read_text(encoding="utf-8-sig")
+    assert "R01" in content
+    assert "old" not in content
+    assert summary == {"faithfulness": 0.75}
+
+
+def test_write_ragas_scores_csv_rejects_row_count_mismatch(tmp_path):
+    """确认 Ragas 输出行数和输入样本数不一致时会中文报错。"""
+    output_csv = tmp_path / "ragas_scores.csv"
+
+    with pytest.raises(RuntimeError, match="Ragas 结果行数与输入样本数不一致"):
+        write_ragas_scores_csv(output_csv, [{"faithfulness": 1.0}], _ragas_rows())
+
+
+def test_ragas_cli_missing_config_writes_offline_outputs(monkeypatch, tmp_path):
+    """确认 --mode ragas 缺配置时仍先写离线输出和 failureReason。"""
+    output_dir = tmp_path / "ragas-missing-config"
+    monkeypatch.setattr(
+        run_ragas_small_eval,
+        "parse_args",
+        lambda: types.SimpleNamespace(
+            mode="ragas",
+            cases=Path("unused-cases.jsonl"),
+            documents=Path("unused-documents.json"),
+            output_dir=output_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        run_ragas_small_eval,
+        "run_project_eval",
+        lambda **kwargs: EvaluationRunResult(
+            rows=[
+                {
+                    "case_id": "R01",
+                    "case_type": "ragas",
+                    "passed": True,
+                    "top3_hit": True,
+                    "evidence_reference_ok": True,
+                    "evidence_count": 1,
+                    "missing_points": [],
+                }
+            ],
+            ragas_rows=[
+                {
+                    "case_id": "R01",
+                    "user_input": "问题",
+                    "response": "回答",
+                    "retrieved_contexts": ["证据"],
+                    "reference": "参考",
+                }
+            ],
+            summary={"offline_passed": True, "main_case_count": 1},
+        ),
+    )
+    monkeypatch.delenv("RAGAS_EVAL_API_KEY", raising=False)
+
+    exit_code = run_ragas_small_eval.main()
+
+    assert exit_code == 1
+    assert (output_dir / "ragas_input.jsonl").exists()
+    assert (output_dir / "offline_scores.csv").exists()
+    assert not (output_dir / "ragas_scores.csv").exists()
+    run_config = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
+    assert "RAGAS_EVAL_API_KEY 未配置" in run_config["ragas"]["failureReason"]
+    assert "summary" in run_config
+    assert "ragas_failure_reason" in run_config["summary"]

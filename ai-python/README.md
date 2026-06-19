@@ -94,6 +94,17 @@ python run.py
 
 未配置 `RAG_DATABASE_URL` 时会退回内存后端，主要用于本地单元测试。正式运行使用 PostgreSQL/pgvector，建库和建表语句见 `docs/database/postgresql-pgvector.md` 与 `infra/sql/init.sql`。
 
+## RAG 评估
+
+小样本 Ragas 评估入口位于 `ai-python/tests/evaluation/run_ragas_small_eval.py`。离线基线不需要外部模型：
+
+```powershell
+$env:PYTHONPATH='ai-python'
+python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
+```
+
+真实 Ragas 评分需要先按 `docs/testing/ragas-small-evaluation-plan.md` 配置 `RAGAS_EVAL_*` 环境变量。评估 Key 不会写入 `run_config.json` 或日志输出。
+
 ## 接口
 
 - `GET /health`

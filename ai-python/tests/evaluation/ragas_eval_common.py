@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import asyncio
 import importlib
+import inspect
 import json
 import math
 import os
@@ -27,6 +29,42 @@ class EvaluationRunResult:
     rows: list[dict[str, Any]]
     ragas_rows: list[dict[str, Any]]
     summary: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RagasEvalSettings:
+    """保存真实 Ragas 评分所需的环境配置，不包含明文 Key 输出。"""
+
+    provider: str
+    ragas_provider: str
+    base_url: str | None
+    api_key: str
+    llm_model: str
+    embedding_model: str
+    timeout_seconds: float
+    temperature: float
+
+
+@dataclass(frozen=True)
+class RagasModelAdapter:
+    """保存 Ragas 评估模型、embedding 与指标适配器。"""
+
+    adapter_name: str
+    llm: Any
+    embeddings: Any
+    metrics: list[Any]
+    metric_names: list[str]
+    construction_errors: list[str]
+
+
+@dataclass(frozen=True)
+class RagasMetricsRunResult:
+    """保存一次真实 Ragas 评分运行结果。"""
+
+    summary: dict[str, Any]
+    ragas_version: str
+    model_adapter: str
+    metric_names: list[str]
 
 
 def ensure_ai_python_path() -> None:
@@ -383,8 +421,19 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(normalized)
 
 
-def write_run_config(path: Path, *, mode: str, summary: dict[str, Any], ragas_version: str | None = None) -> None:
-    """写出本次评估运行配置。"""
+def write_run_config(
+    path: Path,
+    *,
+    mode: str,
+    summary: dict[str, Any],
+    output_paths: dict[str, str],
+    ragas_version: str | None = None,
+    ragas_settings: RagasEvalSettings | None = None,
+    ragas_model_adapter: str | None = None,
+    metric_names: list[str] | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """写出本次评估运行配置，不记录评估模型 API Key。"""
     config = {
         "mode": mode,
         "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -397,19 +446,33 @@ def write_run_config(path: Path, *, mode: str, summary: dict[str, Any], ragas_ve
         },
         "ragas": {
             "version": ragas_version,
-            "RAGAS_EVAL_PROVIDER": os.getenv("RAGAS_EVAL_PROVIDER"),
-            "RAGAS_EVAL_BASE_URL": os.getenv("RAGAS_EVAL_BASE_URL"),
-            "RAGAS_EVAL_LLM_MODEL": os.getenv("RAGAS_EVAL_LLM_MODEL"),
-            "RAGAS_EVAL_EMBEDDING_MODEL": os.getenv("RAGAS_EVAL_EMBEDDING_MODEL"),
-            "RAGAS_EVAL_TIMEOUT_SECONDS": os.getenv("RAGAS_EVAL_TIMEOUT_SECONDS"),
-            "RAGAS_EVAL_TEMPERATURE": os.getenv("RAGAS_EVAL_TEMPERATURE", "0"),
+            "provider": ragas_settings.provider if ragas_settings else os.getenv("RAGAS_EVAL_PROVIDER"),
+            "ragasProvider": ragas_settings.ragas_provider if ragas_settings else None,
+            "baseUrl": ragas_settings.base_url if ragas_settings else os.getenv("RAGAS_EVAL_BASE_URL"),
+            "llmModel": ragas_settings.llm_model if ragas_settings else os.getenv("RAGAS_EVAL_LLM_MODEL"),
+            "embeddingModel": ragas_settings.embedding_model if ragas_settings else os.getenv("RAGAS_EVAL_EMBEDDING_MODEL"),
+            "timeoutSeconds": ragas_settings.timeout_seconds if ragas_settings else os.getenv("RAGAS_EVAL_TIMEOUT_SECONDS"),
+            "temperature": ragas_settings.temperature if ragas_settings else os.getenv("RAGAS_EVAL_TEMPERATURE", "0"),
+            "ragasModelAdapter": ragas_model_adapter,
+            "metricNames": metric_names or [],
+            "failureReason": failure_reason,
         },
         "summary": summary,
+        "outputs": output_paths,
     }
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_manual_review(path: Path, rows: list[dict[str, Any]], summary: dict[str, Any], ragas_version: str | None = None) -> None:
+def write_manual_review(
+    path: Path,
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    *,
+    ragas_version: str | None = None,
+    ragas_failure_reason: str | None = None,
+    ragas_metric_names: list[str] | None = None,
+    rerun_command: str | None = None,
+) -> None:
     """写出人工复核 Markdown 报告。"""
     lines = [
         "# Ragas 小样本人工复核记录",
@@ -430,11 +493,43 @@ def write_manual_review(path: Path, rows: list[dict[str, Any]], summary: dict[st
         f"- 主样本空 evidence：{summary.get('empty_evidence_main_count')}",
         f"- 关键点平均覆盖率：{summary.get('average_answer_point_coverage')}",
         "",
-        "## 样本明细",
+        "## 真实 Ragas 分数汇总",
         "",
-        "| 用例 | 类型 | 通过 | top3 | 引用 | evidence | 缺失关键点 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
+    ragas_scores = summary.get("ragas_scores") or {}
+    if ragas_scores:
+        for key, value in ragas_scores.items():
+            lines.append(f"- `{key}`：{value}")
+    elif ragas_failure_reason:
+        lines.append("- 本次真实 Ragas 评分未完成，未生成 `ragas_scores.csv`。")
+    else:
+        lines.append("- 未运行真实 Ragas 评分。")
+    if ragas_metric_names:
+        lines.extend(["", f"- 指标：{', '.join(f'`{name}`' for name in ragas_metric_names)}"])
+    lines.extend(
+        [
+            "",
+            "## 真实 Ragas 失败原因",
+            "",
+            ragas_failure_reason or "- 无",
+            "",
+            "## 复跑命令",
+            "",
+        ]
+    )
+    if rerun_command:
+        lines.extend(["```powershell", rerun_command, "```"])
+    else:
+        lines.append("- 如需真实评分，请配置 `RAGAS_EVAL_*` 环境变量后运行 `python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas`。")
+    lines.extend(
+        [
+            "",
+            "## 样本明细",
+            "",
+            "| 用例 | 类型 | 通过 | top3 | 引用 | evidence | 缺失关键点 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
     for row in rows:
         missing = "、".join(row.get("missing_points") or [])
         lines.append(
@@ -468,89 +563,248 @@ def get_ragas_version() -> str:
     return str(getattr(ragas, "__version__", "unknown"))
 
 
-def ensure_ragas_eval_config() -> None:
-    """校验真实 Ragas 评分所需的评估模型环境变量。"""
-    if not os.getenv("RAGAS_EVAL_API_KEY"):
-        raise RuntimeError("RAGAS_EVAL_API_KEY 未配置，请先配置评估模型 Key，或改用 --mode offline。")
-    if not os.getenv("RAGAS_EVAL_LLM_MODEL"):
-        raise RuntimeError("RAGAS_EVAL_LLM_MODEL 未配置，请指定 Ragas 评估 LLM 模型。")
-    if not os.getenv("RAGAS_EVAL_EMBEDDING_MODEL"):
-        raise RuntimeError("RAGAS_EVAL_EMBEDDING_MODEL 未配置，请指定 Ragas 评估 embedding 模型。")
+def _require_env(name: str, description: str) -> str:
+    """读取必填环境变量并输出中文错误。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise RuntimeError(f"{name} 未配置，请指定 Ragas 真实评分所需的{description}。")
+    return value.strip()
 
 
-def build_ragas_eval_models() -> tuple[Any, Any]:
-    """按 RAGAS_EVAL_* 环境变量创建 Ragas 评估模型。"""
+def _parse_positive_float(name: str, default: str) -> float:
+    """读取必须大于 0 的数字环境变量。"""
+    raw_value = (os.getenv(name) or default).strip()
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是数字，当前值为：{raw_value}") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} 必须大于 0，当前值为：{raw_value}")
+    return value
+
+
+def _parse_temperature(name: str, default: str) -> float:
+    """读取 0 到 2 范围内的 temperature 配置。"""
+    raw_value = (os.getenv(name) or default).strip()
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是数字，当前值为：{raw_value}") from exc
+    if value < 0 or value > 2:
+        raise RuntimeError(f"{name} 必须在 0 到 2 之间，当前值为：{raw_value}")
+    return value
+
+
+def _validate_base_url(value: str | None, *, required: bool) -> str | None:
+    """校验 OpenAI 或 OpenAI-compatible base_url。"""
+    normalized = (value or "").strip()
+    if required and not normalized:
+        raise RuntimeError("RAGAS_EVAL_BASE_URL 未配置，openai-compatible 模式必须指定兼容 OpenAI 的服务地址。")
+    if normalized and not normalized.startswith(("http://", "https://")):
+        raise RuntimeError("RAGAS_EVAL_BASE_URL 必须以 http:// 或 https:// 开头。")
+    return normalized or None
+
+
+def load_ragas_eval_settings() -> RagasEvalSettings:
+    """校验并读取真实 Ragas 评分所需的评估模型环境变量。"""
+    provider = (os.getenv("RAGAS_EVAL_PROVIDER") or "openai-compatible").strip()
+    if provider not in {"openai-compatible", "openai"}:
+        raise RuntimeError("RAGAS_EVAL_PROVIDER 只允许 openai-compatible 或 openai。")
+    api_key = _require_env("RAGAS_EVAL_API_KEY", "API Key")
+    llm_model = _require_env("RAGAS_EVAL_LLM_MODEL", "LLM 模型名称")
+    embedding_model = _require_env("RAGAS_EVAL_EMBEDDING_MODEL", "embedding 模型名称")
+    base_url = _validate_base_url(os.getenv("RAGAS_EVAL_BASE_URL"), required=provider == "openai-compatible")
+    return RagasEvalSettings(
+        provider=provider,
+        ragas_provider="openai",
+        base_url=base_url,
+        api_key=api_key,
+        llm_model=llm_model,
+        embedding_model=embedding_model,
+        timeout_seconds=_parse_positive_float("RAGAS_EVAL_TIMEOUT_SECONDS", "60"),
+        temperature=_parse_temperature("RAGAS_EVAL_TEMPERATURE", "0"),
+    )
+
+
+def ensure_ragas_eval_config() -> RagasEvalSettings:
+    """兼容旧测试入口，返回已校验的 Ragas 评分配置。"""
+    return load_ragas_eval_settings()
+
+
+def require_ragas_core_dependencies() -> None:
+    """校验现代主路径依赖，给出可直接执行的安装提示。"""
+    missing: list[str] = []
+    for module_name in ("ragas", "openai", "datasets"):
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(module_name)
+    if missing:
+        modules = "、".join(missing)
+        raise RuntimeError(
+            f"运行 Ragas 真实评分缺少依赖：{modules}。请先执行：python -m pip install -r ai-python/requirements.txt"
+        )
+
+
+def _build_run_config(timeout_seconds: float) -> Any | None:
+    """按可用 Ragas 版本创建 RunConfig。"""
+    try:
+        from ragas.run_config import RunConfig
+
+        return RunConfig(timeout=timeout_seconds)
+    except Exception:
+        return None
+
+
+def _metric_name(metric: Any) -> str:
+    """提取指标名称，优先使用 Ragas metric.name。"""
+    return str(getattr(metric, "name", None) or metric.__class__.__name__)
+
+
+def _import_wrapper(module_name: str, class_name: str) -> Any:
+    """从 Ragas 顶层或 base 子模块导入 legacy wrapper。"""
+    module = importlib.import_module(module_name)
+    wrapper = getattr(module, class_name, None)
+    if wrapper is not None:
+        return wrapper
+    base_module = importlib.import_module(f"{module_name}.base")
+    return getattr(base_module, class_name)
+
+
+def _instantiate_metric(metric_class: Any, *, llm: Any, embeddings: Any) -> Any:
+    """按不同 Ragas 指标签名创建指标实例。"""
+    try:
+        return metric_class(llm=llm, embeddings=embeddings)
+    except TypeError:
+        try:
+            return metric_class(llm=llm)
+        except TypeError:
+            metric = metric_class()
+            if getattr(metric, "llm", None) is None:
+                setattr(metric, "llm", llm)
+            if getattr(metric, "embeddings", None) is None:
+                setattr(metric, "embeddings", embeddings)
+            return metric
+
+
+def build_modern_ragas_adapter(settings: RagasEvalSettings) -> RagasModelAdapter:
+    """构造 Ragas 0.4 现代 OpenAI client 与 collections 指标路径。"""
     try:
         from openai import AsyncOpenAI
         from ragas.embeddings import OpenAIEmbeddings
         from ragas.llms import llm_factory
     except ImportError as exc:
-        raise RuntimeError("运行 Ragas 真实评分需要安装 openai 与 ragas 依赖。") from exc
+        raise RuntimeError(
+            "运行 Ragas 现代评分路径缺少 ragas/openai 依赖，请执行：python -m pip install -r ai-python/requirements.txt"
+        ) from exc
 
-    api_key = os.getenv("RAGAS_EVAL_API_KEY")
-    base_url = os.getenv("RAGAS_EVAL_BASE_URL") or None
-    timeout = float(os.getenv("RAGAS_EVAL_TIMEOUT_SECONDS", "60"))
-    llm_model = os.getenv("RAGAS_EVAL_LLM_MODEL")
-    embedding_model = os.getenv("RAGAS_EVAL_EMBEDDING_MODEL")
-    client_kwargs = {"api_key": api_key, "timeout": timeout}
-    if base_url:
-        client_kwargs["base_url"] = base_url
+    signature = inspect.signature(llm_factory)
+    if "client" not in signature.parameters:
+        raise RuntimeError("当前 Ragas 的 llm_factory 不支持 client 参数，无法使用现代评分路径。")
+
+    client_kwargs: dict[str, Any] = {
+        "api_key": settings.api_key,
+        "timeout": settings.timeout_seconds,
+    }
+    if settings.base_url:
+        client_kwargs["base_url"] = settings.base_url
     client = AsyncOpenAI(**client_kwargs)
-    llm = llm_factory(llm_model, client=client)
-    embeddings = OpenAIEmbeddings(client=client, model=embedding_model)
-    return llm, embeddings
-
-
-def build_ragas_metrics(llm: Any, embeddings: Any) -> list[Any]:
-    """集中创建 Ragas 指标，兼容 ragas>=0.4,<0.5 的常见导入路径。"""
-    try:
-        collections = importlib.import_module("ragas.metrics.collections")
-        return [
-            collections.ContextPrecision(llm=llm),
-            collections.ContextRecall(llm=llm),
-            collections.Faithfulness(llm=llm),
-            collections.ResponseRelevancy(llm=llm, embeddings=embeddings),
-        ]
-    except Exception:
-        pass
-
-    metrics_module = importlib.import_module("ragas.metrics")
-    result = []
-    context_precision_class = getattr(metrics_module, "LLMContextPrecisionWithReference", None) or getattr(
-        metrics_module, "LLMContextPrecisionWithoutReference", None
+    llm = llm_factory(
+        settings.llm_model,
+        provider=settings.ragas_provider,
+        client=client,
+        temperature=settings.temperature,
     )
-    context_recall_class = getattr(metrics_module, "LLMContextRecall", None) or getattr(metrics_module, "ContextRecall", None)
-    faithfulness_class = getattr(metrics_module, "Faithfulness", None)
-    response_relevancy_class = getattr(metrics_module, "ResponseRelevancy", None) or getattr(metrics_module, "AnswerRelevancy", None)
-    metric_classes = [context_precision_class, context_recall_class, faithfulness_class, response_relevancy_class]
-    for metric_class in metric_classes:
-        if metric_class is None:
-            continue
-        try:
-            metric = metric_class(llm=llm, embeddings=embeddings)
-        except TypeError:
-            try:
-                metric = metric_class(llm=llm)
-            except TypeError:
-                metric = metric_class()
-        result.append(metric)
-    if len(result) < 4:
-        raise RuntimeError("当前 Ragas 版本无法找到 Context Precision、Context Recall、Faithfulness、Response Relevancy 指标。")
-    return result
+    embeddings = OpenAIEmbeddings(client=client, model=settings.embedding_model)
+    collections = importlib.import_module("ragas.metrics.collections")
+    context_precision_class = getattr(collections, "ContextPrecisionWithReference", None) or getattr(
+        collections, "ContextPrecision", None
+    )
+    metric_classes = [
+        context_precision_class,
+        getattr(collections, "ContextRecall", None),
+        getattr(collections, "Faithfulness", None),
+        getattr(collections, "AnswerRelevancy", None),
+    ]
+    if any(metric_class is None for metric_class in metric_classes):
+        raise RuntimeError("当前 Ragas collections 指标不完整，无法构造现代评分路径。")
+    metrics = [
+        metric_classes[0](llm=llm),
+        metric_classes[1](llm=llm),
+        metric_classes[2](llm=llm),
+        metric_classes[3](llm=llm, embeddings=embeddings),
+    ]
+    return RagasModelAdapter(
+        adapter_name="modern",
+        llm=llm,
+        embeddings=embeddings,
+        metrics=metrics,
+        metric_names=[_metric_name(metric) for metric in metrics],
+        construction_errors=[],
+    )
 
 
-def run_ragas_metrics(ragas_rows: list[dict[str, Any]], output_csv: Path) -> dict[str, Any]:
-    """运行真实 Ragas LLM 指标，并把结果写出为 CSV。"""
-    ensure_ragas_eval_config()
+def build_legacy_ragas_adapter(settings: RagasEvalSettings, previous_errors: list[str] | None = None) -> RagasModelAdapter:
+    """构造 LangChain wrapper 与 legacy 指标路径。"""
     try:
-        from datasets import Dataset
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
     except ImportError as exc:
-        raise RuntimeError("运行 Ragas 真实评分需要安装 datasets 依赖，通常会随 ragas 安装。") from exc
+        raise RuntimeError(
+            "Ragas 现代路径不可用，fallback 需要 langchain-openai。请执行：python -m pip install -r ai-python/requirements.txt"
+        ) from exc
 
-    ragas = importlib.import_module("ragas")
-    llm, embeddings = build_ragas_eval_models()
-    metrics = build_ragas_metrics(llm, embeddings)
-    dataset_rows = [
+    run_config = _build_run_config(settings.timeout_seconds)
+    client_kwargs: dict[str, Any] = {
+        "api_key": settings.api_key,
+        "timeout": settings.timeout_seconds,
+    }
+    if settings.base_url:
+        client_kwargs["base_url"] = settings.base_url
+    chat = ChatOpenAI(model=settings.llm_model, temperature=settings.temperature, **client_kwargs)
+    embedding = OpenAIEmbeddings(model=settings.embedding_model, **client_kwargs)
+    llm_wrapper_class = _import_wrapper("ragas.llms", "LangchainLLMWrapper")
+    embedding_wrapper_class = _import_wrapper("ragas.embeddings", "LangchainEmbeddingsWrapper")
+    llm = llm_wrapper_class(chat, run_config=run_config)
+    embeddings = embedding_wrapper_class(embedding, run_config=run_config)
+    metrics_module = importlib.import_module("ragas.metrics")
+    metric_classes = [
+        getattr(metrics_module, "LLMContextPrecisionWithReference", None)
+        or getattr(metrics_module, "LLMContextPrecisionWithoutReference", None),
+        getattr(metrics_module, "LLMContextRecall", None) or getattr(metrics_module, "ContextRecall", None),
+        getattr(metrics_module, "Faithfulness", None),
+        getattr(metrics_module, "ResponseRelevancy", None) or getattr(metrics_module, "AnswerRelevancy", None),
+    ]
+    if any(metric_class is None for metric_class in metric_classes):
+        raise RuntimeError("当前 Ragas legacy 指标不完整，无法构造真实评分指标。")
+    metrics = [_instantiate_metric(metric_class, llm=llm, embeddings=embeddings) for metric_class in metric_classes]
+    return RagasModelAdapter(
+        adapter_name="legacy",
+        llm=llm,
+        embeddings=embeddings,
+        metrics=metrics,
+        metric_names=[_metric_name(metric) for metric in metrics],
+        construction_errors=previous_errors or [],
+    )
+
+
+def build_ragas_model_adapter(settings: RagasEvalSettings) -> RagasModelAdapter:
+    """优先构造现代适配器，失败后回退 legacy wrapper。"""
+    errors: list[str] = []
+    try:
+        return build_modern_ragas_adapter(settings)
+    except Exception as exc:
+        errors.append(f"modern: {exc}")
+    try:
+        return build_legacy_ragas_adapter(settings, previous_errors=errors)
+    except Exception as exc:
+        errors.append(f"legacy: {exc}")
+        detail = "；".join(errors)
+        raise RuntimeError(f"无法构造 Ragas 真实评分模型适配器：{detail}") from exc
+
+
+def _dataset_rows_for_ragas(ragas_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只保留 Ragas 真实评分需要的标准字段。"""
+    return [
         {
             "user_input": row["user_input"],
             "response": row["response"],
@@ -559,34 +813,110 @@ def run_ragas_metrics(ragas_rows: list[dict[str, Any]], output_csv: Path) -> dic
         }
         for row in ragas_rows
     ]
-    dataset = Dataset.from_list(dataset_rows)
-    evaluate_func = getattr(ragas, "evaluate", None)
-    if evaluate_func is None:
-        raise RuntimeError("当前 Ragas 版本没有 evaluate 入口，请在兼容层中补充 aevaluate 调用。")
-    run_config = None
-    try:
-        from ragas.run_config import RunConfig
 
-        run_config = RunConfig(timeout=float(os.getenv("RAGAS_EVAL_TIMEOUT_SECONDS", "60")))
-    except Exception:
-        run_config = None
-    result = evaluate_func(
-        dataset=dataset,
-        metrics=metrics,
-        llm=llm,
-        embeddings=embeddings,
-        run_config=run_config,
-        raise_exceptions=False,
-        show_progress=True,
-    )
-    frame = result.to_pandas()
-    frame.insert(0, "case_id", [row["case_id"] for row in ragas_rows])
+
+def _call_ragas_evaluate(ragas_module: Any, *, dataset: Any, adapter: RagasModelAdapter, run_config: Any | None) -> Any:
+    """优先调用 ragas.evaluate，没有时使用 aevaluate。"""
+    evaluate_func = getattr(ragas_module, "evaluate", None)
+    kwargs = {
+        "dataset": dataset,
+        "metrics": adapter.metrics,
+        "llm": adapter.llm,
+        "embeddings": adapter.embeddings,
+        "run_config": run_config,
+        "raise_exceptions": False,
+        "show_progress": True,
+    }
+    if evaluate_func is not None:
+        return evaluate_func(**kwargs)
+    aevaluate_func = getattr(ragas_module, "aevaluate", None)
+    if aevaluate_func is not None:
+        return asyncio.run(aevaluate_func(**kwargs))
+    raise RuntimeError("当前 Ragas 版本没有 evaluate 或 aevaluate 入口，无法运行真实评分。")
+
+
+def _rows_from_dataframe(frame: Any) -> list[dict[str, Any]]:
+    """把 pandas DataFrame 转成普通字典列表。"""
+    return list(frame.to_dict(orient="records"))
+
+
+def ragas_result_to_rows(result: Any) -> list[dict[str, Any]]:
+    """兼容 Ragas 不同结果形态，统一转换为行字典列表。"""
+    if hasattr(result, "to_pandas"):
+        return _rows_from_dataframe(result.to_pandas())
+    scores = getattr(result, "scores", None)
+    if scores is not None:
+        if isinstance(scores, list):
+            return [dict(row) for row in scores]
+        if isinstance(scores, dict):
+            keys = list(scores.keys())
+            lengths = [len(value) for value in scores.values() if isinstance(value, list)]
+            if lengths and len(set(lengths)) == 1:
+                return [{key: scores[key][index] for key in keys} for index in range(lengths[0])]
+            return [dict(scores)]
+    if isinstance(result, list):
+        return [dict(row) for row in result]
+    if isinstance(result, dict):
+        values = list(result.values())
+        if values and all(isinstance(value, list) for value in values):
+            lengths = {len(value) for value in values}
+            if len(lengths) == 1:
+                keys = list(result.keys())
+                return [{key: result[key][index] for key in keys} for index in range(next(iter(lengths)))]
+        return [dict(result)]
+    raise RuntimeError(f"无法识别 Ragas 评分结果类型：{type(result).__name__}")
+
+
+def write_ragas_scores_csv(output_csv: Path, result: Any, ragas_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """写出真实 Ragas 分数 CSV，并只聚合数值指标列。"""
+    import pandas as pd
+
+    rows = ragas_result_to_rows(result)
+    if len(rows) != len(ragas_rows):
+        raise RuntimeError(f"Ragas 结果行数与输入样本数不一致：结果 {len(rows)} 行，输入 {len(ragas_rows)} 行。")
+    normalized_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        normalized = dict(row)
+        normalized.pop("case_id", None)
+        normalized_rows.append({"case_id": ragas_rows[index]["case_id"], **normalized})
+    frame = pd.DataFrame(normalized_rows)
     frame.to_csv(output_csv, index=False, encoding="utf-8-sig")
     summary: dict[str, Any] = {}
     for column in frame.columns:
         if column == "case_id":
             continue
-        values = [float(value) for value in frame[column].tolist() if isinstance(value, (int, float)) and not math.isnan(float(value))]
-        if values:
-            summary[column] = round(sum(values) / len(values), 4)
+        numeric_values: list[float] = []
+        for value in frame[column].tolist():
+            if isinstance(value, bool):
+                numeric_values.append(float(value))
+            elif isinstance(value, (int, float)) and not math.isnan(float(value)):
+                numeric_values.append(float(value))
+        if numeric_values:
+            summary[column] = round(sum(numeric_values) / len(numeric_values), 4)
     return summary
+
+
+def run_ragas_metrics(
+    ragas_rows: list[dict[str, Any]],
+    output_csv: Path,
+    *,
+    settings: RagasEvalSettings | None = None,
+) -> RagasMetricsRunResult:
+    """运行真实 Ragas LLM 指标，并把结果写出为 CSV。"""
+    settings = settings or load_ragas_eval_settings()
+    require_ragas_core_dependencies()
+    ragas = importlib.import_module("ragas")
+    ragas_version = str(getattr(ragas, "__version__", "unknown"))
+    from datasets import Dataset
+
+    adapter = build_ragas_model_adapter(settings)
+    dataset = Dataset.from_list(_dataset_rows_for_ragas(ragas_rows))
+    run_config = _build_run_config(settings.timeout_seconds)
+    result = _call_ragas_evaluate(ragas, dataset=dataset, adapter=adapter, run_config=run_config)
+    summary = write_ragas_scores_csv(output_csv, result, ragas_rows)
+    return RagasMetricsRunResult(
+        summary=summary,
+        ragas_version=ragas_version,
+        model_adapter=adapter.adapter_name,
+        metric_names=adapter.metric_names,
+    )

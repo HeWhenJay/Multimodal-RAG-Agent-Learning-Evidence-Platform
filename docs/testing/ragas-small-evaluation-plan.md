@@ -29,9 +29,26 @@
 
 ## 依赖版本
 
-Python 依赖清单中使用 `ragas>=0.4,<0.5`。真实 Ragas 模式的指标创建集中在 `ai-python/tests/evaluation/ragas_eval_common.py` 的兼容层中，优先尝试 `ragas.metrics.collections`，失败时回退到 `ragas.metrics` 下的等价指标类。
+已验证目标版本为 `ragas==0.4.0` 与 `ragas==0.4.3`。Python 依赖清单中保留 `ragas>=0.4,<0.5`，其它 0.4 小版本按兼容层尽力支持。
+
+真实 Ragas 模式的指标创建集中在 `ai-python/tests/evaluation/ragas_eval_common.py` 的兼容层中。现代主路径使用 `ragas.evaluate` 或 `ragas.aevaluate`、`ragas.llms.llm_factory`、`ragas.embeddings.OpenAIEmbeddings` 和 `ragas.metrics.collections`，指标类为 `ContextPrecisionWithReference` 或 `ContextPrecision`、`ContextRecall`、`Faithfulness`、`AnswerRelevancy`。现代路径主要依赖 `ragas/openai/datasets`。
+
+仅当现代路径无法构造时，才回退到 `langchain_openai.ChatOpenAI`、`langchain_openai.OpenAIEmbeddings`、`LangchainLLMWrapper`、`LangchainEmbeddingsWrapper` 与 `ragas.metrics` 下的 legacy 指标。`langchain-openai` 只用于 legacy fallback，不与 `ragas.metrics.collections` 混用。
 
 离线模式不导入 Ragas，不需要评估模型 Key。
+
+依赖安装或同步命令：
+
+```powershell
+conda activate learning-evidence-rag
+conda env update -f ai-python/environment.yml --prune
+```
+
+也可以使用 pip 依赖清单：
+
+```powershell
+python -m pip install -r ai-python/requirements.txt
+```
 
 ## 执行边界
 
@@ -105,7 +122,19 @@ $env:RAGAS_EVAL_TEMPERATURE='0'
 python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas
 ```
 
-评估模型配置与项目 RAG 模型配置分离。`--mode ragas` 缺少 `RAGAS_EVAL_API_KEY`、`RAGAS_EVAL_LLM_MODEL` 或 `RAGAS_EVAL_EMBEDDING_MODEL` 时会直接报错，并提示改用 `--mode offline`，不会静默复用项目的 `DASHSCOPE_API_KEY`。
+评估模型配置与项目 RAG 模型配置分离。`--mode ragas` 缺少 `RAGAS_EVAL_API_KEY`、`RAGAS_EVAL_LLM_MODEL` 或 `RAGAS_EVAL_EMBEDDING_MODEL` 时，会先写出离线评估文件，再以非 0 返回真实评分失败原因，不会静默复用项目的 `DASHSCOPE_API_KEY`。
+
+真实评分环境变量规则：
+
+| 环境变量 | 必填 | 规则 |
+| --- | --- | --- |
+| `RAGAS_EVAL_PROVIDER` | 是 | 只允许 `openai-compatible` 或 `openai`；传给 Ragas 内部时统一映射为 `openai` |
+| `RAGAS_EVAL_BASE_URL` | openai-compatible 必填 | 必须以 `http://` 或 `https://` 开头；`openai` 模式为空时走官方 OpenAI，显式传入时同样校验协议 |
+| `RAGAS_EVAL_API_KEY` | 是 | 评估模型 Key，不写入输出文件，不复用项目业务 Key |
+| `RAGAS_EVAL_LLM_MODEL` | 是 | Ragas 评估 LLM 模型 |
+| `RAGAS_EVAL_EMBEDDING_MODEL` | 是 | Ragas 评估 embedding 模型 |
+| `RAGAS_EVAL_TIMEOUT_SECONDS` | 是 | 必须是数字且大于 0，会传给 OpenAI client、embedding 和 Ragas `RunConfig` |
+| `RAGAS_EVAL_TEMPERATURE` | 是 | 必须是数字且 `0 <= x <= 2`，会传给评估 LLM |
 
 ## 输出物
 
@@ -118,6 +147,8 @@ python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas
 | `ragas_scores.csv` | 真实 Ragas LLM 指标结果，仅 `--mode ragas` 生成 |
 | `manual_review.md` | 人工 5 分制复核入口、失败原因和下一步建议 |
 | `run_config.json` | 本次 RAG 配置、Ragas 版本、评估模型和汇总结果 |
+
+`--mode ragas` 会先创建输出目录、运行项目离线评估、写出 `ragas_input.jsonl` 和 `offline_scores.csv`，再校验 Ragas 配置并运行真实评分。真实评分失败时不会生成假的 `ragas_scores.csv`，但仍会写出 `manual_review.md` 与 `run_config.json`，其中包含 `ragas.failureReason` 和 `summary.ragas_failure_reason`，方便补齐配置后复跑。
 
 ## 通过门槛
 
@@ -149,7 +180,10 @@ python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas
 $env:PYTHONPATH='ai-python'
 python -B -m pytest ai-python/tests/test_ragas_eval_common.py -q
 python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
+python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --output-dir tmp/ragas-small-eval-missing-config
 ```
+
+第三条在未配置真实评估 Key 时预期返回非 0，但必须已经写出离线输出、`run_config.json` 和失败原因。
 
 如评估工具或测试依赖影响面扩大，再运行：
 
