@@ -209,7 +209,32 @@ def document_block_metadata(block: DocumentBlock) -> dict:
         "sourcePath": block.sourcePath,
         "blockMetadata": block.metadata,
     }
-    for key in ("mediaType", "evidenceChannel", "videoUrl", "playbackUrl", "mediaUrl", "sourceVideoUrl"):
+    promoted_keys = (
+        "mediaType",
+        "evidenceChannel",
+        "videoUrl",
+        "playbackUrl",
+        "mediaUrl",
+        "sourceVideoUrl",
+        "duplicateGroupId",
+        "contentHash",
+        "normalizedTextHash",
+        "representativeTime",
+        "timeRanges",
+        "mergedFrameCount",
+        "dedupStrategy",
+        "frameDuplicateGroupIds",
+        "frameTimeRanges",
+        "sourceFrameTimes",
+        "visualGroupId",
+        "suspectedVisualGroupId",
+        "visualDecision",
+        "visualTimeRanges",
+        "visualSourceFrameTimes",
+        "visualHash",
+        "visualHashDistance",
+    )
+    for key in promoted_keys:
         value = block.metadata.get(key)
         if value is not None and value != "":
             block_metadata[key] = value

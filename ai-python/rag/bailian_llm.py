@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.model_logging import log_model_call
 from rag.process_logger import logged_rag_method, process_event
 
 
@@ -128,8 +129,17 @@ class BailianChatClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+        with log_model_call(
+            stage="query.answer",
+            action="bailian_chat",
+            model_name=self.model,
+            event="基于 evidence 生成回答",
+            extra_context={"evidenceCount": len(evidences), "questionLength": len(question)},
+            recoverable=True,
+            fallback_message=f"使用 {self.model} 模型完成基于 evidence 生成回答事件失败，已降级到本地证据摘要继续处理",
+        ):
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()

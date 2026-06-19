@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.model_logging import log_model_call
 from rag.process_logger import logged_rag_method, process_event
 
 
@@ -113,8 +114,17 @@ class BailianRerankClient:
             "Content-Type": "application/json",
         }
         url = f"{self.base_url}/api/v1/services/rerank/text-rerank/text-rerank"
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(url, headers=headers, json=payload)
+        with log_model_call(
+            stage="query.rerank",
+            action="bailian_rerank",
+            model_name=self.model,
+            event="候选 evidence 重排",
+            extra_context={"candidateCount": len(evidences), "topK": top_k},
+            recoverable=True,
+            fallback_message=f"使用 {self.model} 模型完成候选 evidence 重排事件失败，已降级到本地关键词重排继续处理",
+        ):
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()

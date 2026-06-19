@@ -5,13 +5,17 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
+from math import ceil
 from pathlib import Path
+from typing import Any
 
 from video.asr.bailian_asr import BailianAsrClient
 from video.ocr.bailian_ocr import BailianOcrClient
 from app.schemas.rag import DocumentBlock
 from rag.process_logger import logged_rag_method, process_event
+from rag.progress import RagProgressReporter
 
 
 VIDEO_FILE_TYPES = {"mp4", "mov", "m4v", "webm", "mkv", "avi"}
@@ -24,6 +28,33 @@ class FrameImage:
     trigger: str = "interval"
     diff_score: float | None = None
     slide_index: int | None = None
+    visual_decision: str | None = None
+    visual_group_id: str | None = None
+    suspected_visual_group_id: str | None = None
+    visual_hash: str | None = None
+    visual_hash_distance: int | None = None
+    visual_time_ranges: list[dict[str, str]] = field(default_factory=list)
+    visual_source_frame_times: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FrameCandidateEvent:
+    frame: FrameImage
+    ocr_candidate: bool = True
+    priority: int = 0
+
+
+@dataclass
+class VisualFrameGroup:
+    group_id: str
+    hash_value: str
+    representative_path: Path
+    first_time: int
+    last_seen_time: int
+    last_ocr_candidate_time: int
+    slide_index: int | None = None
+    verification_count: int = 0
+    visual_only_times: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -61,6 +92,7 @@ def process_video_bytes(
     source_title: str,
     source_path: str | None,
     ocr_client: BailianOcrClient,
+    progress_reporter: RagProgressReporter | None = None,
 ) -> VideoProcessingResult:
     """处理原始视频字节，先落临时文件再进入统一视频处理流程。"""
     suffix = Path(filename).suffix or ".mp4"
@@ -75,6 +107,7 @@ def process_video_bytes(
             source_title=source_title,
             source_path=source_path,
             ocr_client=ocr_client,
+            progress_reporter=progress_reporter,
         )
 
 
@@ -86,6 +119,7 @@ def process_video_source(
     document_id: str,
     source_title: str,
     ocr_client: BailianOcrClient,
+    progress_reporter: RagProgressReporter | None = None,
 ) -> VideoProcessingResult:
     """按本地路径或公开视频 URL 处理长视频，避免 Java 转发完整视频字节。"""
     process_event(
@@ -102,6 +136,7 @@ def process_video_source(
             source_title=source_title,
             source_path=source_path,
             ocr_client=ocr_client,
+            progress_reporter=progress_reporter,
         )
     if source_path.startswith("oss://"):
         warning = stage_warning("video.source", "当前 sourcePath 是 oss:// 私有地址，Python 无法直接读取，请配置公开 OSS/CDN URL")
@@ -110,14 +145,7 @@ def process_video_source(
             parser="video-metadata-fallback",
             warnings=[warning, stage_warning("video.fallback", "视频未生成可检索字幕或关键帧 OCR 文本")],
         )
-    local_path = Path(source_path)
-    if not local_path.is_absolute():
-        candidates = [
-            Path.cwd().resolve() / source_path,
-            Path.cwd().resolve().parent / source_path,
-        ]
-        local_path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
-    local_path = local_path.resolve()
+    local_path = resolve_local_video_path(source_path)
     if not local_path.exists() or not local_path.is_file():
         warning = stage_warning("video.source", f"视频来源文件不存在或不可读取: {source_path}")
         return VideoProcessingResult(
@@ -132,6 +160,7 @@ def process_video_source(
         source_title=source_title,
         source_path=source_path,
         ocr_client=ocr_client,
+        progress_reporter=progress_reporter,
     )
 
 
@@ -144,12 +173,18 @@ def process_video_input(
     source_title: str,
     source_path: str | None,
     ocr_client: BailianOcrClient,
+    progress_reporter: RagProgressReporter | None = None,
 ) -> VideoProcessingResult:
     """统一处理本地文件或 URL 视频输入，生成字幕、关键帧 OCR 和视频元数据。"""
     warnings: list[str] = []
     with tempfile.TemporaryDirectory(prefix="rag-video-work-") as tmp:
         tmp_dir = Path(tmp)
-        transcript_text, transcript_parser, asr_warnings = transcribe_video_input(video_input, tmp_dir, source_path)
+        transcript_text, transcript_parser, asr_warnings = transcribe_video_input(
+            video_input,
+            tmp_dir,
+            source_path,
+            progress_reporter=progress_reporter,
+        )
         warnings.extend(asr_warnings)
 
         frames, frame_warnings = extract_keyframes(video_input, tmp_dir)
@@ -161,6 +196,7 @@ def process_video_input(
             source_title=source_title,
             source_path=source_path,
             ocr_client=ocr_client,
+            progress_reporter=progress_reporter,
         )
         warnings.extend(ocr_warnings)
 
@@ -175,13 +211,18 @@ def process_video_input(
     if transcript_text:
         if transcript_parser.startswith("sidecar-subtitle"):
             parser_parts.append("subtitle")
+        elif transcript_parser.startswith("embedded-subtitle"):
+            parser_parts.append("embedded-subtitle")
         elif transcript_parser.startswith("estimated-srt"):
             parser_parts.append("estimated-srt")
         else:
             parser_parts.append("bailian-asr")
-    if frame_blocks:
+    if any(block.metadata.get("evidenceChannel") == "frame_ocr" for block in frame_blocks):
         parser_parts.append("keyframe-ocr")
-    if any(block.metadata.get("frameTrigger") == "ppt_flip" for block in frame_blocks):
+    if any(
+        block.metadata.get("evidenceChannel") == "frame_ocr" and block.metadata.get("frameTrigger") == "ppt_flip"
+        for block in frame_blocks
+    ):
         parser_parts.append("ppt-flip-detect")
     return VideoProcessingResult(
         transcript_text=transcript_text,
@@ -193,20 +234,45 @@ def process_video_input(
 
 
 @logged_rag_method("parse.video.asr", "transcribe_video_input", "执行视频 ASR 转写")
-def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | None) -> tuple[str, str | None, list[str]]:
+def transcribe_video_input(
+    video_input: str,
+    tmp_dir: Path,
+    source_path: str | None,
+    *,
+    progress_reporter: RagProgressReporter | None = None,
+) -> tuple[str, str | None, list[str]]:
     """对视频输入执行 ASR；公开视频优先 filetrans，本地视频走重叠音频分段。"""
     client = BailianAsrClient()
     warnings: list[str] = []
     if is_public_url(source_path):
+        if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
+            emit_model_progress(
+                progress_reporter,
+                f"目前在使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
+                percent=16,
+                detail=f"目前在使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
+            )
         transcript_text, filetrans_warnings = client.transcribe_source_url(str(source_path))
         warnings.extend(stage_warning("video.asr", warning) for warning in filetrans_warnings)
         if transcript_text:
+            if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
+                emit_model_progress(
+                    progress_reporter,
+                    f"已使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
+                    percent=18,
+                    detail=f"已使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
+                )
             return transcript_text, "bailian-asr-transcript", warnings
 
     subtitle_text, subtitle_source, subtitle_warnings = load_sidecar_subtitle(video_input, source_path)
     warnings.extend(subtitle_warnings)
     if subtitle_text:
         return subtitle_text, "sidecar-subtitle-transcript", warnings
+
+    embedded_text, embedded_warnings = extract_embedded_subtitle(video_input, tmp_dir)
+    warnings.extend(embedded_warnings)
+    if embedded_text:
+        return embedded_text, "embedded-subtitle-transcript", warnings
 
     segments, segment_warnings = extract_audio_segments(video_input, tmp_dir)
     warnings.extend(segment_warnings)
@@ -216,10 +282,24 @@ def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | N
     cues: list[TranscriptCue] = []
     plain_parts: list[str] = []
     for segment_index, segment in enumerate(segments, start=1):
+        if client.should_call_dashscope and client.api_key:
+            emit_model_progress(
+                progress_reporter,
+                f"第 {segment_index}/{len(segments)} 段：目前在使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
+                percent=16,
+                detail=f"目前在使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
+            )
         segment_text, asr_warnings = client.transcribe_audio_file(segment.path)
         warnings.extend(stage_warning(f"video.asr.segment[{segment_index}]", warning) for warning in asr_warnings)
         if not segment_text:
             continue
+        if client.should_call_dashscope and client.api_key:
+            emit_model_progress(
+                progress_reporter,
+                f"第 {segment_index}/{len(segments)} 段：已使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
+                percent=18,
+                detail=f"已使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
+            )
         if transcript_has_timestamps(segment_text):
             segment_cues = parse_srt_cues(offset_srt_transcript(segment_text, segment.extract_start))
         else:
@@ -243,7 +323,7 @@ def transcribe_video_input(video_input: str, tmp_dir: Path, source_path: str | N
 
 @logged_rag_method("parse.video.subtitle", "load_sidecar_subtitle", "加载视频同目录字幕")
 def load_sidecar_subtitle(video_input: str, source_path: str | None) -> tuple[str, str | None, list[str]]:
-    """优先读取同名 .srt/.vtt 侧车字幕，作为无 FFmpeg 时的视频时间戳证据来源。"""
+    """优先读取同名 .srt/.vtt/.txt 侧车字幕，作为无 FFmpeg 时的视频时间戳证据来源。"""
     warnings: list[str] = []
     candidates = sidecar_subtitle_candidates(video_input, source_path)
     for candidate in candidates:
@@ -256,11 +336,18 @@ def load_sidecar_subtitle(video_input: str, source_path: str | None) -> tuple[st
         normalized = normalize_text(text.replace("\ufeff", ""))
         if not normalized:
             continue
-        if candidate.suffix.lower() not in {".srt", ".vtt"}:
+        if candidate.suffix.lower() not in {".srt", ".vtt", ".txt"}:
             continue
         if candidate.suffix.lower() == ".vtt" and not normalized.lstrip().startswith("webvtt"):
             normalized = f"WEBVTT\n\n{normalized}"
-        warnings.append(stage_warning("video.subtitle", f"已加载侧车字幕: {candidate.name}"))
+        if candidate.suffix.lower() == ".txt" and not transcript_has_timestamps(normalized):
+            continue
+        process_event(
+            stage="parse.video.subtitle",
+            action="load_sidecar_subtitle_found",
+            message=f"已加载侧车字幕: {candidate.name}",
+            context={"subtitlePath": str(candidate), "subtitleType": candidate.suffix.lower().lstrip(".")},
+        )
         return normalized, str(candidate), warnings
     return "", None, warnings
 
@@ -273,10 +360,12 @@ def sidecar_subtitle_candidates(video_input: str, source_path: str | None) -> li
         for stem in subtitle_stems(base.stem):
             candidates.append(base.with_name(f"{stem}.srt"))
             candidates.append(base.with_name(f"{stem}.vtt"))
+            candidates.append(base.with_name(f"{stem}.txt"))
     input_path = Path(video_input)
     for stem in subtitle_stems(input_path.stem):
         candidates.append(input_path.with_name(f"{stem}.srt"))
         candidates.append(input_path.with_name(f"{stem}.vtt"))
+        candidates.append(input_path.with_name(f"{stem}.txt"))
     unique: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -299,6 +388,44 @@ def subtitle_stems(stem: str) -> list[str]:
     if stripped and stripped not in stems:
         stems.append(stripped)
     return list(dict.fromkeys(stems))
+
+
+@logged_rag_method("parse.video.subtitle", "extract_embedded_subtitle", "抽取视频内嵌字幕")
+def extract_embedded_subtitle(video_input: str, tmp_dir: Path) -> tuple[str, list[str]]:
+    """尝试用 FFmpeg 抽取第一个内嵌字幕轨，适配 *.subtitled.mp4。"""
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        return "", [stage_warning("video.subtitle.embedded", "未找到 FFmpeg，跳过视频内嵌字幕提取")]
+    subtitle_path = tmp_dir / "embedded-subtitle.srt"
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        video_input,
+        "-map",
+        "0:s:0",
+        str(subtitle_path),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+    except Exception as exc:
+        return "", [stage_warning("video.subtitle.embedded", f"FFmpeg 未提取到内嵌字幕: {exc}")]
+    if not subtitle_path.exists() or subtitle_path.stat().st_size == 0:
+        return "", [stage_warning("video.subtitle.embedded", "FFmpeg 未生成可用内嵌字幕文件")]
+    try:
+        text = subtitle_path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = subtitle_path.read_text(encoding="gb18030", errors="ignore")
+    normalized = normalize_text(text.replace("\ufeff", ""))
+    if not normalized:
+        return "", [stage_warning("video.subtitle.embedded", "内嵌字幕文件为空")]
+    process_event(
+        stage="parse.video.subtitle",
+        action="extract_embedded_subtitle_found",
+        message="已提取视频内嵌字幕",
+        context={"subtitlePath": str(subtitle_path), "subtitleChars": len(normalized)},
+    )
+    return normalized, []
 
 
 @logged_rag_method("parse.video.audio", "extract_audio_segments", "抽取视频音频分段")
@@ -354,15 +481,78 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
 
 @logged_rag_method("parse.video.frame", "extract_keyframes", "抽取视频关键帧")
 def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage], list[str]]:
+    """按 V6 策略抽取全时长候选帧，再执行两阶段 OCR 预算选择。"""
     ffmpeg = ffmpeg_executable()
     if not ffmpeg:
         return [], [stage_warning("video.frame.extract", "未找到 FFmpeg，跳过视频关键帧抽取")]
     sample_interval = max(1, int(os.getenv("RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS", "5")))
     keep_interval = max(sample_interval, int(os.getenv("RAG_VIDEO_FRAME_INTERVAL_SECONDS", "30")))
     max_frames = max(1, int(os.getenv("RAG_VIDEO_MAX_FRAMES", "20")))
-    max_candidates = max(max_frames, int(os.getenv("RAG_VIDEO_FRAME_MAX_CANDIDATES", str(max_frames * 6))))
-    frame_dir = tmp_dir / "frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
+    max_candidates = max(max_frames, int(os.getenv("RAG_VIDEO_FRAME_MAX_CANDIDATES", "720")))
+    scan_mode = video_frame_scan_mode()
+    warnings: list[str] = []
+
+    candidates: list[FrameImage]
+    if scan_mode == "prefix":
+        candidates, prefix_warnings = extract_prefix_frame_candidates(
+            video_input,
+            tmp_dir,
+            ffmpeg=ffmpeg,
+            sample_interval=sample_interval,
+            max_candidates=max_candidates,
+        )
+        warnings.extend(prefix_warnings)
+    elif scan_mode == "full":
+        candidates, full_warnings = extract_full_frame_candidates(
+            video_input,
+            tmp_dir,
+            ffmpeg=ffmpeg,
+            sample_interval=sample_interval,
+            max_candidates=max_candidates,
+        )
+        warnings.extend(full_warnings)
+    else:
+        candidates, full_warnings = extract_full_frame_candidates(
+            video_input,
+            tmp_dir,
+            ffmpeg=ffmpeg,
+            sample_interval=sample_interval,
+            max_candidates=max_candidates,
+        )
+        warnings.extend(full_warnings)
+        if not candidates:
+            warnings.append(stage_warning("video.frame.extract", "auto 全时长抽帧失败，已降级为 prefix 开头扫描"))
+            candidates, prefix_warnings = extract_prefix_frame_candidates(
+                video_input,
+                tmp_dir,
+                ffmpeg=ffmpeg,
+                sample_interval=sample_interval,
+                max_candidates=max_candidates,
+            )
+            warnings.extend(prefix_warnings)
+
+    if not candidates:
+        return [], warnings or [stage_warning("video.frame.extract", "FFmpeg 未生成关键帧图片")]
+    selected, selection_warnings = select_ppt_slide_frames(
+        candidates,
+        keep_interval_seconds=keep_interval,
+        max_frames=max_frames,
+    )
+    warnings.extend(selection_warnings)
+    return selected, warnings
+
+
+def extract_prefix_frame_candidates(
+    video_input: str,
+    tmp_dir: Path,
+    *,
+    ffmpeg: str,
+    sample_interval: int,
+    max_candidates: int,
+) -> tuple[list[FrameImage], list[str]]:
+    """保留旧版开头扫描行为，按固定采样间隔最多抽取 max_candidates 帧。"""
+    frame_dir = tmp_dir / "frames-prefix"
+    reset_directory(frame_dir)
     frame_pattern = frame_dir / "frame-%04d.jpg"
     command = [
         ffmpeg,
@@ -379,16 +569,77 @@ def extract_keyframes(video_input: str, tmp_dir: Path) -> tuple[list[FrameImage]
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
     except Exception as exc:
         return [], [stage_warning("video.frame.extract", f"FFmpeg 抽取关键帧失败: {exc}")]
-    candidates = []
-    for index, path in enumerate(sorted(frame_dir.glob("frame-*.jpg"))):
-        candidates.append(FrameImage(time_seconds=index * sample_interval, path=path, trigger="candidate"))
+    return frame_candidates_from_directory(frame_dir, sample_interval), []
+
+
+def extract_full_frame_candidates(
+    video_input: str,
+    tmp_dir: Path,
+    *,
+    ffmpeg: str,
+    sample_interval: int,
+    max_candidates: int,
+) -> tuple[list[FrameImage], list[str]]:
+    """按视频总时长动态放大采样间隔，避免长视频只覆盖开头几分钟。"""
+    warnings: list[str] = []
+    duration = probe_media_duration_strict(video_input)
+    if duration is None:
+        return [], [stage_warning("video.frame.extract", "无法严格探测视频时长，full 抽帧不可用")]
+    target_candidates = max(1, int(os.getenv("RAG_VIDEO_FRAME_TARGET_CANDIDATES", "360")))
+    effective_interval = max(sample_interval, ceil(duration / target_candidates))
+    estimated_candidates = ceil(duration / effective_interval)
+    if estimated_candidates > max_candidates:
+        effective_interval = max(effective_interval, ceil(duration / max_candidates))
+    frame_dir = tmp_dir / "frames-full"
+    reset_directory(frame_dir)
+    frame_pattern = frame_dir / "frame-%04d.jpg"
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        video_input,
+        "-vf",
+        f"fps=1/{effective_interval}",
+        "-frames:v",
+        str(max_candidates),
+        str(frame_pattern),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=ffmpeg_timeout_seconds())
+    except Exception as exc:
+        reset_directory(frame_dir)
+        return [], [stage_warning("video.frame.extract", f"FFmpeg 全时长抽取关键帧失败: {exc}")]
+    candidates = frame_candidates_from_directory(frame_dir, effective_interval)
     if not candidates:
-        return [], [stage_warning("video.frame.extract", "FFmpeg 未生成关键帧图片")]
-    return select_ppt_slide_frames(
-        candidates,
-        keep_interval_seconds=keep_interval,
-        max_frames=max_frames,
-    )
+        warnings.append(stage_warning("video.frame.extract", "FFmpeg 全时长模式未生成关键帧图片"))
+    else:
+        process_event(
+            stage="parse.video.frame",
+            action="extract_full_frame_candidates_completed",
+            message="已完成视频全时长候选帧抽取",
+            context={
+                "durationSeconds": round(duration, 3),
+                "effectiveIntervalSeconds": effective_interval,
+                "candidateCount": len(candidates),
+                "maxCandidates": max_candidates,
+            },
+        )
+    return candidates, warnings
+
+
+def frame_candidates_from_directory(frame_dir: Path, interval_seconds: int) -> list[FrameImage]:
+    """根据抽帧目录和有效间隔生成全局时间递增的候选帧。"""
+    candidates: list[FrameImage] = []
+    for index, path in enumerate(sorted(frame_dir.glob("frame-*.jpg"))):
+        candidates.append(FrameImage(time_seconds=max(0, index * interval_seconds), path=path, trigger="candidate"))
+    return candidates
+
+
+def reset_directory(path: Path) -> None:
+    """重建抽帧目录，避免降级时残留图片污染时间轴。"""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
 
 @logged_rag_method("parse.video.frame", "select_ppt_slide_frames", "识别 PPT 翻页关键帧")
@@ -398,45 +649,532 @@ def select_ppt_slide_frames(
     keep_interval_seconds: int,
     max_frames: int,
 ) -> tuple[list[FrameImage], list[str]]:
-    """根据画面差异筛选 PPT 翻页关键帧，同时保留固定间隔兜底帧。"""
+    """先扫描全部候选帧生成事件，再按全时长时间桶选择 OCR 帧。"""
     if not candidates:
         return [], []
+    sorted_candidates = sorted(candidates, key=lambda item: item.time_seconds)
+    if visual_dedup_enabled():
+        events, warnings = build_visual_candidate_events(
+            sorted_candidates,
+            keep_interval_seconds=keep_interval_seconds,
+            max_frames=max_frames,
+        )
+    else:
+        events, warnings = build_basic_candidate_events(
+            sorted_candidates,
+            keep_interval_seconds=keep_interval_seconds,
+        )
+    selected = select_stage_b_ocr_frames(events, max_frames=max_frames)
+    return selected, warnings
+
+
+def build_basic_candidate_events(
+    candidates: list[FrameImage],
+    *,
+    keep_interval_seconds: int,
+) -> tuple[list[FrameCandidateEvent], list[str]]:
+    """关闭视觉去重时，沿用 PPT 翻页加固定间隔兜底事件。"""
     warnings: list[str] = []
-    threshold = float(os.getenv("RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD", "0.08"))
-    selected = [
-        FrameImage(
-            time_seconds=candidates[0].time_seconds,
-            path=candidates[0].path,
-            trigger="initial_slide",
-            diff_score=0.0,
-            slide_index=1,
+    threshold = ppt_flip_threshold()
+    first = candidates[0]
+    events = [
+        FrameCandidateEvent(
+            replace(first, trigger="initial_slide", diff_score=0.0, slide_index=1, visual_decision=None),
+            ocr_candidate=True,
+            priority=trigger_priority("initial_slide"),
         )
     ]
-    last_selected = candidates[0]
+    last_event_frame = first
+    last_event_time = first.time_seconds
     last_slide_index = 1
     for candidate in candidates[1:]:
-        if len(selected) >= max_frames:
-            break
         diff_score = None
         try:
-            diff_score = image_difference_score(last_selected.path, candidate.path)
+            diff_score = image_difference_score(last_event_frame.path, candidate.path)
         except Exception as exc:
             warnings.append(stage_warning("video.slide_detect", f"{candidate.path.name} 画面差异计算失败: {exc}"))
         is_flip = diff_score is not None and diff_score >= threshold
-        is_interval = candidate.time_seconds - selected[-1].time_seconds >= keep_interval_seconds
-        if is_flip or is_interval:
-            last_slide_index += 1 if is_flip else 0
-            selected.append(
-                FrameImage(
-                    time_seconds=candidate.time_seconds,
-                    path=candidate.path,
-                    trigger="ppt_flip" if is_flip else "interval",
-                    diff_score=diff_score,
-                    slide_index=last_slide_index,
+        is_interval = candidate.time_seconds - last_event_time >= keep_interval_seconds
+        if not is_flip and not is_interval:
+            continue
+        if is_flip:
+            last_slide_index += 1
+        trigger = "ppt_flip" if is_flip else "interval"
+        frame = replace(
+            candidate,
+            trigger=trigger,
+            diff_score=diff_score,
+            slide_index=last_slide_index,
+            visual_decision=None,
+        )
+        events.append(FrameCandidateEvent(frame, ocr_candidate=True, priority=trigger_priority(trigger)))
+        last_event_frame = candidate
+        last_event_time = candidate.time_seconds
+    return events, warnings
+
+
+def build_visual_candidate_events(
+    candidates: list[FrameImage],
+    *,
+    keep_interval_seconds: int,
+    max_frames: int,
+) -> tuple[list[FrameCandidateEvent], list[str]]:
+    """生成 V6 视觉四态事件，并把高置信重复中的少量样本提升为验证 OCR。"""
+    warnings: list[str] = []
+    try:
+        first_hash = visual_hash_for_image(candidates[0].path)
+    except Exception as exc:
+        warnings.append(stage_warning("video.visual_hash", f"视觉指纹不可用，已回退基础关键帧选择: {exc}"))
+        return build_basic_candidate_events(candidates, keep_interval_seconds=keep_interval_seconds)
+
+    first_group = VisualFrameGroup(
+        group_id="visual-0001",
+        hash_value=first_hash,
+        representative_path=candidates[0].path,
+        first_time=candidates[0].time_seconds,
+        last_seen_time=candidates[0].time_seconds,
+        last_ocr_candidate_time=candidates[0].time_seconds,
+        slide_index=1,
+    )
+    groups: list[VisualFrameGroup] = [first_group]
+    events: list[FrameCandidateEvent] = [
+        FrameCandidateEvent(
+            replace(
+                candidates[0],
+                trigger="initial_slide",
+                diff_score=0.0,
+                slide_index=1,
+                visual_decision="new_visual",
+                visual_group_id=first_group.group_id,
+                visual_hash=first_hash,
+            ),
+            ocr_candidate=True,
+            priority=trigger_priority("initial_slide"),
+        )
+    ]
+
+    threshold = ppt_flip_threshold()
+    last_event_frame = candidates[0]
+    last_event_time = candidates[0].time_seconds
+    last_slide_index = 1
+    for candidate in candidates[1:]:
+        try:
+            hash_value = visual_hash_for_image(candidate.path)
+        except Exception as exc:
+            warnings.append(stage_warning("video.visual_hash", f"{candidate.path.name} 视觉指纹计算失败: {exc}"))
+            continue
+        diff_score = None
+        try:
+            diff_score = image_difference_score(last_event_frame.path, candidate.path)
+        except Exception as exc:
+            warnings.append(stage_warning("video.slide_detect", f"{candidate.path.name} 画面差异计算失败: {exc}"))
+        is_flip = diff_score is not None and diff_score >= threshold
+        is_interval = candidate.time_seconds - last_event_time >= keep_interval_seconds
+        closest_group, hash_distance, group_diff_score = closest_visual_group(candidate.path, hash_value, groups)
+        decision = visual_decision_for(hash_distance, group_diff_score)
+
+        if decision == "repeat_visual_confident" and closest_group:
+            frame = replace(
+                candidate,
+                trigger="repeat_visual_confident",
+                diff_score=group_diff_score,
+                slide_index=None,
+                visual_decision=decision,
+                visual_group_id=closest_group.group_id,
+                suspected_visual_group_id=closest_group.group_id,
+                visual_hash=hash_value,
+                visual_hash_distance=hash_distance,
+            )
+            events.append(FrameCandidateEvent(frame, ocr_candidate=False, priority=trigger_priority("repeat_visual_confident")))
+            closest_group.last_seen_time = candidate.time_seconds
+            continue
+
+        if decision == "ambiguous_visual":
+            group = create_visual_group(groups, hash_value, candidate.path, candidate.time_seconds, None)
+            frame = replace(
+                candidate,
+                trigger="ambiguous_visual",
+                diff_score=group_diff_score,
+                slide_index=None,
+                visual_decision=decision,
+                visual_group_id=group.group_id,
+                suspected_visual_group_id=closest_group.group_id if closest_group else None,
+                visual_hash=hash_value,
+                visual_hash_distance=hash_distance,
+            )
+            events.append(FrameCandidateEvent(frame, ocr_candidate=True, priority=trigger_priority("ambiguous_visual")))
+            group.last_ocr_candidate_time = candidate.time_seconds
+            last_event_frame = candidate
+            last_event_time = candidate.time_seconds
+            continue
+
+        if is_flip:
+            last_slide_index += 1
+        trigger = "ppt_flip" if is_flip else "interval" if is_interval else "new_visual"
+        group = create_visual_group(groups, hash_value, candidate.path, candidate.time_seconds, last_slide_index)
+        frame = replace(
+            candidate,
+            trigger=trigger,
+            diff_score=diff_score,
+            slide_index=last_slide_index,
+            visual_decision="new_visual",
+            visual_group_id=group.group_id,
+            visual_hash=hash_value,
+            visual_hash_distance=hash_distance,
+        )
+        events.append(FrameCandidateEvent(frame, ocr_candidate=True, priority=trigger_priority(trigger)))
+        group.last_ocr_candidate_time = candidate.time_seconds
+        last_event_frame = candidate
+        last_event_time = candidate.time_seconds
+
+    events, verification_warnings = promote_visual_verification_events(events, max_frames=max_frames)
+    warnings.extend(verification_warnings)
+    return events, warnings
+
+
+def promote_visual_verification_events(
+    events: list[FrameCandidateEvent],
+    *,
+    max_frames: int,
+) -> tuple[list[FrameCandidateEvent], list[str]]:
+    """从高置信重复事件中抽少量验证 OCR，降低小字或数字变化漏检风险。"""
+    ratio = max(0.0, float(os.getenv("RAG_VIDEO_FRAME_VISUAL_VERIFICATION_RATIO", "0.25")))
+    budget = max(1, int(max_frames * ratio)) if ratio > 0 else 0
+    per_group_limit = max(0, int(os.getenv("RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP", "2")))
+    verify_interval = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_VERIFY_INTERVAL_SECONDS", "900")))
+    stay_seconds = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_STAY_VERIFY_SECONDS", "600")))
+    revisit_seconds = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_REVISIT_VERIFY_SECONDS", "1800")))
+    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], max_frames)
+    primary_buckets = {
+        event.frame.time_seconds // bucket_seconds
+        for event in events
+        if event.ocr_candidate and event.frame.trigger in {"initial_slide", "ppt_flip", "interval", "new_visual", "ambiguous_visual"}
+    }
+
+    last_ocr_time: dict[str, int] = {}
+    first_seen_time: dict[str, int] = {}
+    previous_seen_time: dict[str, int] = {}
+    verification_count: dict[str, int] = defaultdict(int)
+    used_budget = 0
+    skipped: list[dict[str, Any]] = []
+    promoted: list[FrameCandidateEvent] = []
+
+    for event in sorted(events, key=lambda item: item.frame.time_seconds):
+        frame = event.frame
+        group_id = frame.visual_group_id
+        if not group_id:
+            promoted.append(event)
+            continue
+        first_seen_time.setdefault(group_id, frame.time_seconds)
+        previous_time = previous_seen_time.get(group_id, frame.time_seconds)
+        previous_seen_time[group_id] = frame.time_seconds
+        if event.ocr_candidate:
+            last_ocr_time[group_id] = frame.time_seconds
+            promoted.append(event)
+            continue
+        if frame.trigger != "repeat_visual_confident":
+            promoted.append(event)
+            continue
+
+        bucket = frame.time_seconds // bucket_seconds
+        interval_due = frame.time_seconds - last_ocr_time.get(group_id, first_seen_time[group_id]) >= verify_interval
+        bucket_due = bucket not in primary_buckets
+        stay_due = frame.time_seconds - first_seen_time[group_id] >= stay_seconds
+        revisit_due = frame.time_seconds - previous_time >= revisit_seconds
+        should_verify = interval_due or bucket_due or stay_due or revisit_due
+        if not should_verify:
+            promoted.append(event)
+            continue
+        if verification_count[group_id] >= per_group_limit:
+            skipped.append({"time": seconds_to_timestamp(frame.time_seconds), "group": group_id, "reason": "per_group_limit"})
+            promoted.append(event)
+            continue
+        if used_budget >= budget:
+            skipped.append({"time": seconds_to_timestamp(frame.time_seconds), "group": group_id, "reason": "global_budget"})
+            promoted.append(event)
+            continue
+        verification_count[group_id] += 1
+        used_budget += 1
+        last_ocr_time[group_id] = frame.time_seconds
+        verified_frame = replace(frame, trigger="visual_verification", visual_decision="visual_verification", slide_index=None)
+        promoted.append(FrameCandidateEvent(verified_frame, ocr_candidate=True, priority=trigger_priority("visual_verification")))
+
+    warnings: list[str] = []
+    if skipped:
+        ranges = [{"startTime": item["time"], "endTime": item["time"], "reason": item["reason"], "visualGroupId": item["group"]} for item in skipped]
+        warnings.append(
+            stage_warning(
+                "video.frame.visual_verification",
+                "visualVerificationSkippedCount="
+                f"{len(skipped)}; visualVerificationSkippedRanges={ranges}; "
+                f"visualVerificationBudget={budget}; visualVerificationPerGroupLimit={per_group_limit}",
+            )
+        )
+    return promoted, warnings
+
+
+def select_stage_b_ocr_frames(events: list[FrameCandidateEvent], *, max_frames: int) -> list[FrameImage]:
+    """按全视频时间桶和最终预算选择 OCR 帧，避免前缀偏置。"""
+    ocr_events = [event for event in events if event.ocr_candidate]
+    if not ocr_events:
+        return []
+    initial_events = [event for event in ocr_events if event.frame.trigger == "initial_slide"]
+    selected: list[FrameCandidateEvent] = initial_events[:1]
+    selected_ids = {id(event) for event in selected}
+    remaining_budget = max(0, max_frames - len(selected))
+    if remaining_budget <= 0:
+        return attach_visual_only_ranges([event.frame for event in selected], events)
+
+    bucket_seconds = stage_b_bucket_seconds([event.frame for event in events], max_frames)
+    buckets: dict[int, list[FrameCandidateEvent]] = defaultdict(list)
+    for event in ocr_events:
+        if id(event) in selected_ids:
+            continue
+        buckets[event.frame.time_seconds // bucket_seconds].append(event)
+    for bucket, bucket_events in buckets.items():
+        bucket_center = bucket * bucket_seconds + bucket_seconds / 2
+        bucket_events.sort(key=lambda event, center=bucket_center: stage_b_event_sort_key(event, center))
+
+    group_counts = selected_visual_group_counts(selected)
+    min_interval = max(0, int(os.getenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "30")))
+    while remaining_budget > 0 and buckets:
+        made_progress = False
+        for bucket in stage_b_bucket_order(sorted(buckets.keys()), remaining_budget):
+            if remaining_budget <= 0:
+                break
+            bucket_events = buckets[bucket]
+            while bucket_events:
+                event = bucket_events.pop(0)
+                if not can_select_stage_b_event(event, selected, group_counts, min_interval):
+                    continue
+                selected.append(event)
+                selected_ids.add(id(event))
+                increment_visual_group_count(event, group_counts)
+                remaining_budget -= 1
+                made_progress = True
+                break
+            if not bucket_events:
+                buckets.pop(bucket, None)
+        if not made_progress:
+            break
+
+    selected_frames = [event.frame for event in sorted(selected, key=lambda item: item.frame.time_seconds)]
+    return attach_visual_only_ranges(selected_frames, events)
+
+
+def stage_b_bucket_order(bucket_keys: list[int], remaining_budget: int) -> list[int]:
+    """当时间桶多于预算时按全时长均匀取桶，避免只选择前缀桶。"""
+    if remaining_budget <= 0 or len(bucket_keys) <= remaining_budget:
+        return bucket_keys
+    if remaining_budget == 1:
+        return [bucket_keys[len(bucket_keys) // 2]]
+    selected_indexes = {
+        round(index * (len(bucket_keys) - 1) / (remaining_budget - 1))
+        for index in range(remaining_budget)
+    }
+    return [bucket_keys[index] for index in sorted(selected_indexes)]
+
+
+def can_select_stage_b_event(
+    event: FrameCandidateEvent,
+    selected: list[FrameCandidateEvent],
+    group_counts: dict[str, int],
+    min_interval: int,
+) -> bool:
+    """判断候选事件是否满足最终 OCR 最小间隔和视觉组代表上限。"""
+    frame = event.frame
+    if frame.trigger != "initial_slide" and min_interval > 0:
+        if any(abs(frame.time_seconds - item.frame.time_seconds) < min_interval for item in selected):
+            return False
+    group_id = frame.visual_group_id
+    if group_id and frame.trigger not in {"ambiguous_visual", "visual_verification"}:
+        max_representatives = max(1, int(os.getenv("RAG_VIDEO_FRAME_MAX_REPRESENTATIVES_PER_VISUAL_GROUP", "1")))
+        if group_counts.get(group_id, 0) >= max_representatives:
+            return False
+    return True
+
+
+def selected_visual_group_counts(selected: list[FrameCandidateEvent]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for event in selected:
+        increment_visual_group_count(event, counts)
+    return counts
+
+
+def increment_visual_group_count(event: FrameCandidateEvent, counts: dict[str, int]) -> None:
+    group_id = event.frame.visual_group_id
+    if group_id and event.frame.trigger not in {"ambiguous_visual", "visual_verification"}:
+        counts[group_id] += 1
+
+
+def stage_b_event_sort_key(event: FrameCandidateEvent, bucket_center: float) -> tuple[float, int, int]:
+    return (abs(event.frame.time_seconds - bucket_center), -event.priority, event.frame.time_seconds)
+
+
+def attach_visual_only_ranges(selected_frames: list[FrameImage], events: list[FrameCandidateEvent]) -> list[FrameImage]:
+    """把未 OCR 的高置信视觉重复时间只挂到 visual-only 字段。"""
+    visual_only_times: dict[str, list[int]] = defaultdict(list)
+    for event in events:
+        if event.ocr_candidate:
+            continue
+        group_id = event.frame.visual_group_id
+        if group_id:
+            visual_only_times[group_id].append(event.frame.time_seconds)
+    first_selected_index: dict[str, int] = {}
+    for index, frame in enumerate(selected_frames):
+        if frame.visual_group_id and frame.visual_group_id not in first_selected_index:
+            first_selected_index[frame.visual_group_id] = index
+    updated: list[FrameImage] = []
+    for index, frame in enumerate(selected_frames):
+        group_id = frame.visual_group_id
+        if group_id and first_selected_index.get(group_id) == index and visual_only_times.get(group_id):
+            times = sorted(dict.fromkeys(visual_only_times[group_id]))
+            updated.append(
+                replace(
+                    frame,
+                    visual_time_ranges=[{"startTime": seconds_to_timestamp(item), "endTime": seconds_to_timestamp(item)} for item in times],
+                    visual_source_frame_times=[seconds_to_timestamp(item) for item in times],
                 )
             )
-            last_selected = candidate
-    return selected, warnings
+        else:
+            updated.append(frame)
+    return updated
+
+
+def create_visual_group(
+    groups: list[VisualFrameGroup],
+    hash_value: str,
+    path: Path,
+    time_seconds: int,
+    slide_index: int | None,
+) -> VisualFrameGroup:
+    group = VisualFrameGroup(
+        group_id=f"visual-{len(groups) + 1:04d}",
+        hash_value=hash_value,
+        representative_path=path,
+        first_time=time_seconds,
+        last_seen_time=time_seconds,
+        last_ocr_candidate_time=time_seconds,
+        slide_index=slide_index,
+    )
+    groups.append(group)
+    return group
+
+
+def closest_visual_group(
+    path: Path,
+    hash_value: str,
+    groups: list[VisualFrameGroup],
+) -> tuple[VisualFrameGroup | None, int | None, float | None]:
+    closest: VisualFrameGroup | None = None
+    closest_distance: int | None = None
+    for group in groups:
+        distance = hamming_distance(hash_value, group.hash_value)
+        if closest_distance is None or distance < closest_distance:
+            closest = group
+            closest_distance = distance
+    if closest is None:
+        return None, None, None
+    diff_score = None
+    try:
+        diff_score = image_difference_score(closest.representative_path, path)
+    except Exception:
+        pass
+    return closest, closest_distance, diff_score
+
+
+def visual_decision_for(hash_distance: int | None, diff_score: float | None) -> str:
+    """基于保守 hash 距离和低像素差判断视觉重复状态。"""
+    if hash_distance is None:
+        return "new_visual"
+    max_distance = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_HASH_MAX_DISTANCE", "4")))
+    ambiguous_margin = max(0, int(os.getenv("RAG_VIDEO_FRAME_VISUAL_AMBIGUOUS_MARGIN", "2")))
+    same_diff_threshold = visual_same_diff_threshold()
+    if diff_score is not None and hash_distance <= max_distance and diff_score <= same_diff_threshold:
+        return "repeat_visual_confident"
+    if diff_score is not None and diff_score >= ppt_flip_threshold():
+        return "new_visual"
+    if hash_distance <= max_distance + ambiguous_margin:
+        return "ambiguous_visual"
+    if diff_score is not None and diff_score <= max(ppt_flip_threshold(), same_diff_threshold * 2):
+        return "ambiguous_visual"
+    return "new_visual"
+
+
+def visual_hash_for_image(path: Path) -> str:
+    """用 Pillow 实现轻量视觉指纹，不引入 OpenCV、SSIM 或 pHash 依赖。"""
+    algorithm = os.getenv("RAG_VIDEO_FRAME_VISUAL_HASH_ALGORITHM", "dhash").strip().lower()
+    if algorithm == "ahash":
+        return average_hash_for_image(path)
+    return difference_hash_for_image(path)
+
+
+def difference_hash_for_image(path: Path) -> str:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        pixels = list(image.convert("L").resize((9, 8)).getdata())
+    bits: list[str] = []
+    for row in range(8):
+        offset = row * 9
+        for col in range(8):
+            bits.append("1" if pixels[offset + col] > pixels[offset + col + 1] else "0")
+    return f"{int(''.join(bits), 2):016x}"
+
+
+def average_hash_for_image(path: Path) -> str:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        pixels = list(image.convert("L").resize((8, 8)).getdata())
+    average = sum(pixels) / max(len(pixels), 1)
+    bits = ["1" if pixel >= average else "0" for pixel in pixels]
+    return f"{int(''.join(bits), 2):016x}"
+
+
+def hamming_distance(left_hash: str, right_hash: str) -> int:
+    return (int(left_hash, 16) ^ int(right_hash, 16)).bit_count()
+
+
+def stage_b_bucket_seconds(frames: list[FrameImage], max_frames: int) -> int:
+    if not frames:
+        return 1
+    first_time = min(frame.time_seconds for frame in frames)
+    last_time = max(frame.time_seconds for frame in frames)
+    return max(1, ceil((last_time - first_time + 1) / max(1, max_frames)))
+
+
+def trigger_priority(trigger: str) -> int:
+    priorities = {
+        "initial_slide": 100,
+        "ppt_flip": 90,
+        "ambiguous_visual": 85,
+        "visual_verification": 82,
+        "new_visual": 70,
+        "interval": 60,
+        "repeat_visual_confident": 10,
+    }
+    return priorities.get(trigger, 0)
+
+
+def ppt_flip_threshold() -> float:
+    return float(os.getenv("RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD", "0.08"))
+
+
+def visual_same_diff_threshold() -> float:
+    configured = os.getenv("RAG_VIDEO_FRAME_VISUAL_SAME_DIFF_THRESHOLD")
+    if configured is not None and configured.strip() != "":
+        return max(0.0, float(configured))
+    return min(0.03, ppt_flip_threshold() * 0.5)
+
+
+def visual_dedup_enabled() -> bool:
+    return os.getenv("RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def video_frame_scan_mode() -> str:
+    value = os.getenv("RAG_VIDEO_FRAME_SCAN_MODE", "auto").strip().lower()
+    return value if value in {"auto", "prefix", "full"} else "auto"
 
 
 def image_difference_score(left_path: Path, right_path: Path) -> float:
@@ -455,24 +1193,46 @@ def image_difference_score(left_path: Path, right_path: Path) -> float:
 
 def probe_media_duration(video_input: str | Path) -> float:
     """读取视频时长，供同步 ASR 纯文本降级为估算时间戳字幕。"""
+    strict_duration = probe_media_duration_strict(video_input)
+    if strict_duration is not None:
+        return strict_duration
+    return 60.0
+
+
+def probe_media_duration_strict(video_input: str | Path) -> float | None:
+    """严格读取视频时长，失败返回 None，供全时长抽帧决定是否降级。"""
     ffprobe = os.getenv("FFPROBE_COMMAND") or shutil.which("ffprobe")
-    if not ffprobe:
-        return 60.0
-    command = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(video_input),
-    ]
+    if ffprobe:
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_input),
+        ]
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+            duration = float(result.stdout.strip())
+            return max(1.0, duration) if duration > 0 else None
+        except Exception:
+            pass
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        return None
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
-        return max(1.0, float(result.stdout.strip()))
+        result = subprocess.run([ffmpeg, "-i", str(video_input)], capture_output=True, text=True, timeout=30)
+        output = f"{result.stderr}\n{result.stdout}"
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+        if match:
+            hours, minutes, seconds = match.groups()
+            duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            return max(1.0, duration) if duration > 0 else None
     except Exception:
-        return 60.0
+        pass
+    return None
 
 
 def transcript_has_timestamps(text: str) -> bool:
@@ -615,6 +1375,7 @@ def ocr_video_frames(
     source_title: str,
     source_path: str | None,
     ocr_client: BailianOcrClient,
+    progress_reporter: RagProgressReporter | None = None,
 ) -> tuple[list[DocumentBlock], list[str]]:
     blocks: list[DocumentBlock] = []
     warnings: list[str] = []
@@ -622,10 +1383,33 @@ def ocr_video_frames(
     for index, frame in enumerate(frames, start=1):
         image_bytes = frame.path.read_bytes()
         try:
-            ocr_result = ocr_client.recognize_image_bytes(image_bytes=image_bytes, filename=frame.path.name)
+            if ocr_client.available:
+                emit_model_progress(
+                    progress_reporter,
+                    f"第 {index}/{len(frames)} 帧：目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+                    percent=20,
+                    detail=f"目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+                )
+            ocr_result = ocr_client.recognize_image_bytes(
+                image_bytes=image_bytes,
+                filename=frame.path.name,
+                retry_callback=lambda event, frame_index=index, total_frames=len(frames): emit_ocr_retry_progress(
+                    progress_reporter,
+                    event,
+                    frame_index=frame_index,
+                    total_frames=total_frames,
+                ),
+            )
         except Exception as exc:
             warnings.append(stage_warning(f"video.frame_ocr[{index}]", f"百炼 OCR 调用异常: {exc}"))
             ocr_result = None
+        if ocr_client.available and ocr_result and ocr_result.text:
+            emit_model_progress(
+                progress_reporter,
+                f"第 {index}/{len(frames)} 帧：已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+                percent=22,
+                detail=f"已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
+            )
         if ocr_result and ocr_result.warnings:
             warnings.extend(stage_warning(f"video.frame_ocr[{index}]", warning) for warning in ocr_result.warnings)
         text = normalize_text(ocr_result.text if ocr_result else "")
@@ -647,8 +1431,19 @@ def ocr_video_frames(
             "frameTrigger": frame.trigger,
             "frameDiffScore": frame.diff_score,
             "detectedSlideIndex": frame.slide_index,
+            "visualDecision": frame.visual_decision,
+            "visualGroupId": frame.visual_group_id,
+            "suspectedVisualGroupId": frame.suspected_visual_group_id,
+            "visualHash": frame.visual_hash,
+            "visualHashDistance": frame.visual_hash_distance,
+            "timeRanges": [{"startTime": start_time, "endTime": start_time}],
+            "sourceFrameTimes": [start_time],
             **(ocr_result.metadata if ocr_result else {}),
         }
+        if frame.visual_time_ranges:
+            metadata["visualTimeRanges"] = frame.visual_time_ranges
+        if frame.visual_source_frame_times:
+            metadata["visualSourceFrameTimes"] = frame.visual_source_frame_times
         if video_url:
             metadata["videoUrl"] = video_url
         blocks.append(
@@ -761,6 +1556,9 @@ def build_transcript_segment_summaries(
                 content_text="\n".join(content_parts),
                 source_block_ids=[block.blockId for block in group],
                 frame_block_ids=[block.blockId for block in matched_frames],
+                frame_duplicate_group_ids=collect_frame_duplicate_group_ids(matched_frames),
+                frame_time_ranges=collect_frame_time_ranges(matched_frames),
+                source_frame_times=collect_source_frame_times(matched_frames),
                 segment_kind="subtitle_frame",
             )
         )
@@ -783,7 +1581,7 @@ def build_frame_segment_summaries(
     current: list[DocumentBlock] = []
     current_start = 0
     for block in frame_blocks:
-        block_start = timestamp_to_seconds(block.startTime)
+        block_start, _block_end = frame_block_bounds(block)
         if not current:
             current = [block]
             current_start = block_start
@@ -800,7 +1598,7 @@ def build_frame_segment_summaries(
     summary_blocks: list[DocumentBlock] = []
     for index, group in enumerate(groups, start=1):
         start_time = group[0].startTime or "00:00:00"
-        end_time = group[-1].startTime or start_time
+        end_time = seconds_to_timestamp(max(frame_block_bounds(block)[1] for block in group))
         frame_text = summarize_text(" ".join(strip_frame_heading(block.contentText) for block in group), 320)
         summary_blocks.append(
             build_segment_summary_block(
@@ -819,6 +1617,9 @@ def build_frame_segment_summaries(
                 ),
                 source_block_ids=[],
                 frame_block_ids=[block.blockId for block in group],
+                frame_duplicate_group_ids=collect_frame_duplicate_group_ids(group),
+                frame_time_ranges=collect_frame_time_ranges(group),
+                source_frame_times=collect_source_frame_times(group),
                 segment_kind="frame_only",
             )
         )
@@ -838,6 +1639,9 @@ def build_segment_summary_block(
     source_block_ids: list[str],
     frame_block_ids: list[str],
     segment_kind: str,
+    frame_duplicate_group_ids: list[str] | None = None,
+    frame_time_ranges: list[dict[str, str]] | None = None,
+    source_frame_times: list[str] | None = None,
 ) -> DocumentBlock:
     metadata = {
         "segmentIndex": index,
@@ -849,6 +1653,12 @@ def build_segment_summary_block(
         "sourceBlockIds": source_block_ids,
         "frameBlockIds": frame_block_ids,
     }
+    if frame_duplicate_group_ids:
+        metadata["frameDuplicateGroupIds"] = frame_duplicate_group_ids
+    if frame_time_ranges:
+        metadata["frameTimeRanges"] = frame_time_ranges
+    if source_frame_times:
+        metadata["sourceFrameTimes"] = source_frame_times
     if is_public_url(source_path):
         metadata["videoUrl"] = source_path
     return DocumentBlock(
@@ -869,12 +1679,111 @@ def build_segment_summary_block(
 
 
 def frames_between(frame_blocks: list[DocumentBlock], start_seconds: int, end_seconds: int) -> list[DocumentBlock]:
-    result = []
+    result: list[DocumentBlock] = []
     for block in frame_blocks:
-        seconds = timestamp_to_seconds(block.startTime)
-        if start_seconds <= seconds <= end_seconds:
+        if any(ranges_overlap(start_seconds, end_seconds, frame_start, frame_end) for frame_start, frame_end in frame_ranges(block)):
             result.append(block)
-    return result[:3]
+    if len(result) <= 3:
+        return result
+    segment_center = (start_seconds + end_seconds) / 2
+    return sorted(result, key=lambda block: frame_match_sort_key(block, segment_center))[:3]
+
+
+def frame_match_sort_key(block: DocumentBlock, segment_center: float) -> tuple[float, int, int, float]:
+    ranges = frame_ranges(block)
+    nearest_distance = min(abs(((start + end) / 2) - segment_center) for start, end in ranges)
+    return (
+        nearest_distance,
+        -summary_trigger_priority(str((block.metadata or {}).get("frameTrigger") or "")),
+        -len(strip_frame_heading(block.contentText)),
+        -float(block.confidence or 0.0),
+    )
+
+
+def summary_trigger_priority(trigger: str) -> int:
+    priorities = {
+        "initial_slide": 6,
+        "ppt_flip": 5,
+        "ambiguous_visual": 4,
+        "visual_verification": 4,
+        "new_visual": 3,
+        "interval": 2,
+    }
+    return priorities.get(trigger, 0)
+
+
+def frame_block_bounds(block: DocumentBlock) -> tuple[int, int]:
+    ranges = frame_ranges(block)
+    starts = [item[0] for item in ranges]
+    ends = [item[1] for item in ranges]
+    return min(starts), max(ends)
+
+
+def frame_ranges(block: DocumentBlock) -> list[tuple[int, int]]:
+    metadata = block.metadata or {}
+    raw_ranges = metadata.get("timeRanges")
+    ranges: list[tuple[int, int]] = []
+    if isinstance(raw_ranges, list):
+        for item in raw_ranges:
+            if not isinstance(item, dict):
+                continue
+            start = timestamp_to_seconds(str(item.get("startTime") or item.get("start") or ""))
+            end = timestamp_to_seconds(str(item.get("endTime") or item.get("end") or item.get("startTime") or ""))
+            ranges.append((start, max(start, end)))
+    if ranges:
+        return ranges
+    start = timestamp_to_seconds(block.startTime)
+    end = timestamp_to_seconds(block.endTime) if block.endTime else start
+    return [(start, max(start, end))]
+
+
+def ranges_overlap(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
+    return max(left_start, right_start) <= min(left_end, right_end)
+
+
+def collect_frame_duplicate_group_ids(frame_blocks: list[DocumentBlock]) -> list[str]:
+    values: list[str] = []
+    for block in frame_blocks:
+        group_id = block.metadata.get("duplicateGroupId")
+        if group_id:
+            values.append(str(group_id))
+    return list(dict.fromkeys(values))
+
+
+def collect_frame_time_ranges(frame_blocks: list[DocumentBlock]) -> list[dict[str, str]]:
+    ranges: list[dict[str, str]] = []
+    for block in frame_blocks:
+        raw_ranges = block.metadata.get("timeRanges")
+        if isinstance(raw_ranges, list):
+            for item in raw_ranges:
+                if isinstance(item, dict) and item.get("startTime"):
+                    ranges.append({
+                        "startTime": str(item.get("startTime")),
+                        "endTime": str(item.get("endTime") or item.get("startTime")),
+                    })
+            continue
+        start_time = block.startTime or "00:00:00"
+        ranges.append({"startTime": start_time, "endTime": block.endTime or start_time})
+    unique: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in ranges:
+        key = (item["startTime"], item["endTime"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def collect_source_frame_times(frame_blocks: list[DocumentBlock]) -> list[str]:
+    times: list[str] = []
+    for block in frame_blocks:
+        raw_times = block.metadata.get("sourceFrameTimes")
+        if isinstance(raw_times, list):
+            times.extend(str(item) for item in raw_times)
+        elif block.startTime:
+            times.append(block.startTime)
+    return list(dict.fromkeys(times))
 
 
 def strip_frame_heading(text: str) -> str:
@@ -940,7 +1849,15 @@ def ffmpeg_executable() -> str | None:
     configured = os.getenv("FFMPEG_COMMAND")
     if configured:
         return configured
-    return shutil.which("ffmpeg")
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        return discovered
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def ffmpeg_timeout_seconds() -> int:
@@ -958,6 +1875,69 @@ def prepend_video_url_header(transcript_text: str, source_path: str) -> str:
     if "videourl:" in first_lines or "playbackurl:" in first_lines:
         return transcript_text
     return f"videoUrl: {source_path}\n\n{transcript_text}"
+
+
+def resolve_local_video_path(source_path: str) -> Path:
+    """解析 Java 传来的本地视频路径，兼容 Python 从仓库根或 ai-python 目录启动。"""
+    raw_path = Path(source_path)
+    if raw_path.is_absolute():
+        return raw_path.resolve()
+    cwd = Path.cwd().resolve()
+    candidates = [
+        cwd / source_path,
+        cwd.parent / source_path,
+        cwd / "backend-java" / source_path,
+        cwd.parent / "backend-java" / source_path,
+    ]
+    return next((candidate.resolve() for candidate in candidates if candidate.exists()), candidates[0].resolve())
+
+
+def emit_model_progress(
+    progress_reporter: RagProgressReporter | None,
+    message: str,
+    *,
+    percent: int,
+    detail: str,
+) -> None:
+    """把用户关心的模型调用事件同步到资料进度。"""
+    if progress_reporter is None:
+        return
+    progress_reporter.emit(
+        "parse.video",
+        message,
+        current_step=3,
+        total_steps=8,
+        percent=percent,
+        detail=detail,
+    )
+
+
+def emit_ocr_retry_progress(
+    progress_reporter: RagProgressReporter | None,
+    event: dict,
+    *,
+    frame_index: int,
+    total_frames: int,
+) -> None:
+    """把 OCR 重试失败同步到用户可见进度，避免长时间等待无反馈。"""
+    if progress_reporter is None:
+        return
+    attempt = event.get("attempt")
+    max_attempts = event.get("maxAttempts")
+    next_attempt = event.get("nextAttempt")
+    filename = event.get("filename")
+    if next_attempt:
+        message = f"第 {frame_index}/{total_frames} 帧 OCR 第 {attempt}/{max_attempts} 次错误，重试第 {next_attempt} 次"
+    else:
+        message = f"第 {frame_index}/{total_frames} 帧 OCR 第 {attempt}/{max_attempts} 次错误，已达到最大重试次数，等待降级处理"
+    progress_reporter.emit(
+        "parse.video",
+        message,
+        current_step=3,
+        total_steps=8,
+        percent=21,
+        detail=f"{filename}: {event.get('errorMessage')}",
+    )
 
 
 def normalize_video_file_type(filename: str) -> str:

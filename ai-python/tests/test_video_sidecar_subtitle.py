@@ -16,7 +16,7 @@ def test_load_sidecar_subtitle_prefers_source_path_same_stem(tmp_path: Path):
 
     assert "这里讲父子索引" in text
     assert source == str(subtitle)
-    assert any("video.subtitle:" in warning for warning in warnings)
+    assert warnings == []
 
 
 def test_load_sidecar_subtitle_handles_subtitled_mp4_with_plain_srt(tmp_path: Path):
@@ -32,7 +32,7 @@ def test_load_sidecar_subtitle_handles_subtitled_mp4_with_plain_srt(tmp_path: Pa
 
     assert "这里讲父子索引" in text
     assert source == str(subtitle)
-    assert warnings
+    assert warnings == []
 
 
 def test_load_sidecar_subtitle_reads_gb18030(tmp_path: Path):
@@ -45,4 +45,17 @@ def test_load_sidecar_subtitle_reads_gb18030(tmp_path: Path):
 
     assert "中文字幕" in text
     assert source == str(subtitle)
-    assert warnings
+    assert warnings == []
+
+
+def test_load_sidecar_subtitle_reads_timestamped_txt(tmp_path: Path):
+    source_video = tmp_path / "course.subtitled.mp4"
+    source_video.write_bytes(b"fake-video")
+    transcript = tmp_path / "course.txt"
+    transcript.write_text("[00:00:01] 这里讲 RAG-Fusion。\n[00:00:04] 然后讲 BM25。", encoding="utf-8")
+
+    text, source, warnings = load_sidecar_subtitle(str(source_video), str(source_video))
+
+    assert "RAG-Fusion" in text
+    assert source == str(transcript)
+    assert warnings == []

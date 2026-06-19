@@ -11,7 +11,8 @@ flowchart LR
     B --> D["Python FastAPI RAG 服务"]
     D --> E["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
     E --> F["DocumentBlock 统一模型"]
-    F --> G["递归切块"]
+    F --> V["视频画面 OCR 近重复治理<br/>frame_ocr 聚合与时间范围保留"]
+    V --> G["递归切块"]
     G --> H["摘要索引"]
     H --> I["BM25 + PostgreSQL/pgvector 检索"]
     I --> J["RRF / RAG-Fusion"]
@@ -27,8 +28,9 @@ flowchart LR
 3. 解析器统一输出 `DocumentBlock`，保留 block 类型、页码、幻灯片、sheet、cell range、来源路径和解析器置信度。
 4. 低置信、截图型或高精度模式时，Python 通过 LibreOffice 转 PDF 后补跑 MinerU/OCR；补跑失败但原生块可用时返回 `PARTIAL`。
 5. 按标题、章节、页面、幻灯片、段落、句子和长度预算做递归切块；表格、图片、代码块、公式和图表默认作为原子块。
-6. 为文档和章节建立摘要索引。
-7. 为 chunk 建 BM25 词项统计，调用百炼 `text-embedding-v4` 生成 1024 维向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`，evidence 元数据保存在 `rag_chunk.metadata`。
+6. 视频 `frame_ocr` 在递归切块前先做近重复聚合，保留 `duplicateGroupId`、`representativeTime`、`timeRanges` 和 `mergedFrameCount`，避免同一画面以多个原子块重复入库。
+7. 为文档和章节建立摘要索引。
+8. 为 chunk 建 BM25 词项统计，调用百炼 `text-embedding-v4` 生成 1024 维向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`，evidence 元数据保存在 `rag_chunk.metadata`。
 
 查询阶段：
 
@@ -36,7 +38,8 @@ flowchart LR
 2. 按 metadata 过滤用户、文档类型、来源和可见范围。
 3. 对每个 query 同时执行 BM25 和 pgvector 向量召回。
 4. 使用 Reciprocal Rank Fusion 合并多路排名。
-5. 返回可追溯 evidence，并生成确定性回答摘要。
+5. 对融合候选做 rerank，再按 `duplicateGroupId` 和视频时间窗执行 evidence 多样性过滤，避免重复画面占满最终上下文。
+6. 返回可追溯 evidence，并生成确定性回答摘要。
 
 ## Stitch 前端视觉基准
 

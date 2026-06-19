@@ -121,9 +121,62 @@ def test_raw_video_file_creates_traceable_partial_metadata(monkeypatch):
     assert parsed.blocks[0].metadata["mediaType"] == "video"
     assert parsed.blocks[0].metadata["evidenceChannel"] == "video_metadata"
     assert parsed.blocks[0].metadata["videoUrl"] == "https://example.com/course-rag.mp4"
+    assert not any(block.metadata.get("evidenceChannel") == "video_segment_summary" for block in parsed.blocks)
     assert any(message.startswith("video.audio.extract:") for message in parsed.parse_quality.messages)
     assert any(message.startswith("video.frame.extract:") for message in parsed.parse_quality.messages)
     assert any(message.startswith("video.fallback:") for message in parsed.parse_quality.messages)
+
+
+def test_video_source_with_sidecar_txt_indexes_subtitle_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "local")
+    source_video = tmp_path / "course.subtitled.mp4"
+    source_video.write_bytes(b"fake-video")
+    transcript = tmp_path / "course.txt"
+    transcript.write_text(
+        "[00:00:01] 这里讲 RAG-Fusion 如何融合 BM25 和向量召回。\n"
+        "[00:00:08] 然后介绍 RRF 排序。",
+        encoding="utf-8",
+    )
+    parser = DocumentParserRouter()
+
+    parsed = parser.parse_video_source(
+        document_id="doc-video-sidecar-txt",
+        title="RAG Fusion 视频",
+        document_type="mp4",
+        source="upload",
+        user_id="unit-user",
+        visibility_scope="private",
+        source_path=str(source_video),
+        filename=source_video.name,
+    )
+
+    assert parsed.status == "READY"
+    assert any(block.metadata.get("evidenceChannel") == "subtitle" for block in parsed.blocks)
+    assert any(block.metadata.get("evidenceChannel") == "video_segment_summary" for block in parsed.blocks)
+    assert not any(message.startswith("video.fallback:") for message in parsed.parse_quality.messages)
+
+
+def test_video_ocr_retry_progress_reports_attempt_message():
+    from rag.progress import RagProgressReporter
+    from video.chunking.video_processing import emit_ocr_retry_progress
+
+    reporter = RagProgressReporter(document_id="doc-video-retry", persist=False)
+
+    emit_ocr_retry_progress(
+        reporter,
+        {
+            "filename": "frame-0115.jpg",
+            "attempt": 1,
+            "maxAttempts": 3,
+            "nextAttempt": 2,
+            "errorMessage": "Bailian OCR request failed: The read operation timed out",
+        },
+        frame_index=20,
+        total_frames=20,
+    )
+
+    assert reporter.events[-1].message == "第 20/20 帧 OCR 第 1/3 次错误，重试第 2 次"
+    assert "frame-0115.jpg" in (reporter.events[-1].detail or "")
 
 
 # 校验 PPT 翻页检测会保留画面变化明显的候选帧。
@@ -131,6 +184,8 @@ def test_ppt_flip_detection_selects_changed_frame(tmp_path, monkeypatch):
     from PIL import Image
 
     monkeypatch.setenv("RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD", "0.05")
+    monkeypatch.setenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED", "false")
     first = tmp_path / "frame-0001.jpg"
     similar = tmp_path / "frame-0002.jpg"
     changed = tmp_path / "frame-0003.jpg"
@@ -182,7 +237,13 @@ def test_video_segment_summary_combines_subtitle_and_frame_ocr():
         parseEngine="bailian-qwen-ocr",
         sourceTitle="RAG 课程视频",
         sourcePath="https://example.com/rag-course.mp4",
-        metadata={"mediaType": "video", "evidenceChannel": "frame_ocr"},
+        metadata={
+            "mediaType": "video",
+            "evidenceChannel": "frame_ocr",
+            "duplicateGroupId": "doc-video-summary-frame-ocr-group-1",
+            "timeRanges": [{"startTime": "00:00:10", "endTime": "00:00:10"}],
+            "sourceFrameTimes": ["00:00:10"],
+        },
     )
 
     summary_blocks, warnings = build_video_segment_summary_blocks(
@@ -200,6 +261,65 @@ def test_video_segment_summary_combines_subtitle_and_frame_ocr():
     assert summary.metadata["evidenceChannel"] == "video_segment_summary"
     assert summary.metadata["sourceBlockIds"] == ["doc-video-summary-subtitle-1"]
     assert summary.metadata["frameBlockIds"] == ["doc-video-summary-frame-1"]
+    assert summary.metadata["frameDuplicateGroupIds"] == ["doc-video-summary-frame-ocr-group-1"]
     assert summary.metadata["videoUrl"] == "https://example.com/rag-course.mp4"
     assert "字幕要点" in summary.contentText
     assert "画面线索" in summary.contentText
+
+
+# 校验聚合画面块按时间范围参与片段摘要匹配。
+def test_video_segment_summary_matches_aggregated_frame_range():
+    transcript_block = DocumentBlock(
+        documentId="doc-video-summary",
+        blockId="doc-video-summary-subtitle-2",
+        fileType="mp4",
+        blockType="text",
+        startTime="00:08:20",
+        endTime="00:08:45",
+        sectionTitle="00:08:20 - 00:08:45",
+        contentText="这一段继续解释 RRF 分数累计过程。",
+        parseEngine="bailian-asr-transcript",
+        sourceTitle="RAG 课程视频",
+        sourcePath="https://example.com/rag-course.mp4",
+        metadata={"mediaType": "video", "evidenceChannel": "subtitle"},
+    )
+    aggregated_frame = DocumentBlock(
+        documentId="doc-video-summary",
+        blockId="doc-video-summary-frame-merged",
+        fileType="mp4",
+        blockType="image",
+        slideIndex=1,
+        startTime="00:06:00",
+        endTime="00:09:00",
+        sectionTitle="视频画面聚合 00:06:00 - 00:09:00",
+        contentText="视频画面聚合 00:06:00 - 00:09:00\n10_rag_fusion.py fused_scores += 1 / (rank + k)",
+        parseEngine="bailian-qwen-ocr",
+        sourceTitle="RAG 课程视频",
+        sourcePath="https://example.com/rag-course.mp4",
+        metadata={
+            "mediaType": "video",
+            "evidenceChannel": "frame_ocr",
+            "duplicateGroupId": "doc-video-summary-frame-ocr-group-2",
+            "timeRanges": [
+                {"startTime": "00:06:00", "endTime": "00:06:00"},
+                {"startTime": "00:08:30", "endTime": "00:08:30"},
+                {"startTime": "00:09:00", "endTime": "00:09:00"},
+            ],
+            "sourceFrameTimes": ["00:06:00", "00:08:30", "00:09:00"],
+        },
+    )
+
+    summary_blocks, warnings = build_video_segment_summary_blocks(
+        document_id="doc-video-summary",
+        file_type="mp4",
+        source_title="RAG 课程视频",
+        source_path="https://example.com/rag-course.mp4",
+        transcript_blocks=[transcript_block],
+        frame_blocks=[aggregated_frame],
+    )
+
+    assert warnings == []
+    assert len(summary_blocks) == 1
+    assert "画面线索" in summary_blocks[0].contentText
+    assert summary_blocks[0].metadata["frameDuplicateGroupIds"] == ["doc-video-summary-frame-ocr-group-2"]
+    assert {"startTime": "00:08:30", "endTime": "00:08:30"} in summary_blocks[0].metadata["frameTimeRanges"]

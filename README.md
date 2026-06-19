@@ -37,8 +37,8 @@ Python AI 服务现在使用类似 Java 的配置格式，默认读取 `ai-pytho
 | 配置项 | 默认值 | 何时修改 |
 | --- | --- | --- |
 | `mineru.command` / `MINERU_COMMAND` | 空 | 安装 MinerU 并希望优先用 MinerU 解析 PDF 时填写，例如 `mineru -p {input} -o {output}` |
-| `video.ffmpeg-command` / `FFMPEG_COMMAND` | 空 | `ffmpeg` 不在 PATH 时填写完整路径 |
-| `video.ffprobe-command` / `FFPROBE_COMMAND` | 空 | `ffprobe` 不在 PATH 时填写完整路径 |
+| `video.ffmpeg-command` / `FFMPEG_COMMAND` | 空 | conda 环境默认通过 `ffmpeg` 包提供；环境外运行且不在 PATH 时填写完整路径 |
+| `video.ffprobe-command` / `FFPROBE_COMMAND` | 空 | conda 环境默认随 `ffmpeg` 包提供；环境外运行且不在 PATH 时填写完整路径 |
 | `document.convert.libreoffice-command` / `LIBREOFFICE_COMMAND` | 空 | LibreOffice 不在 PATH 且需要 DOC/PPT 转 PDF 补充解析时填写 |
 | `ocr.lang` / `OCR_LANG` | `chi_sim+eng` | 本地 OCR 语言包不同时修改 |
 
@@ -371,7 +371,9 @@ $env:RAG_EMBEDDING_MODEL='text-embedding-v4'
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 ```
 
-已创建过环境时，使用 `conda env update -f environment.yml --prune` 同步依赖即可。`ai-python/requirements.txt` 保留为 pip 兼容依赖清单，正式本地开发以 Conda 环境为准。
+已创建过环境时，使用 `conda env update -f ai-python/environment.yml --prune` 同步依赖即可。`ai-python/requirements.txt` 保留为 pip 兼容依赖清单，正式本地开发以 Conda 环境为准。
+
+`environment.yml` 会安装视频解析需要的 `ffmpeg/ffprobe`、本地 OCR 降级需要的 `tesseract`、以及 Python 侧解析依赖。`OCR_LANG=chi_sim+eng` 还要求 Tesseract 环境中存在对应语言数据；如果本机没有中文语言包，可以先改成 `eng` 验证链路，或安装中文 traineddata 后再恢复。MinerU 和 LibreOffice 仍按外部可选命令接入：需要高精度 PDF 识别时配置 `MINERU_COMMAND`，需要 `.doc/.ppt` 或 DOCX/PPTX 转 PDF 补充解析时配置 `LIBREOFFICE_COMMAND` / `SOFFICE_COMMAND`。
 
 PostgreSQL/pgvector 建库和向量仓库创建语句见 [docs/database/postgresql-pgvector.md](docs/database/postgresql-pgvector.md)。完整初始化 SQL 在 [infra/sql/init.sql](infra/sql/init.sql)，增量迁移 SQL 在 [infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql](infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql)。
 
@@ -452,7 +454,7 @@ $env:MINERU_COMMAND='mineru -p {input} -o {output}'
 
 ## 百炼 OCR 接入
 
-图片资料和 PDF 扫描页的 OCR 优先在 Python RAG 服务中调用阿里云百炼 Qwen-OCR。Java 不持有 Key，也不实现 OCR 逻辑；未配置或调用失败时自动降级为本地 `pytesseract`。
+图片资料和 PDF 扫描页的 OCR 优先在 Python RAG 服务中调用阿里云百炼 Qwen-OCR。Java 不持有 Key，也不实现 OCR 逻辑；未配置或调用失败时自动降级为本地 `pytesseract`。本地降级依赖 `environment.yml` 中的 `tesseract` 可执行程序和 `OCR_LANG` 对应语言数据。
 
 ```powershell
 $env:DASHSCOPE_API_KEY='<your-dashscope-api-key>'

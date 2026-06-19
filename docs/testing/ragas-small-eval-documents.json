@@ -1,0 +1,122 @@
+[
+  {
+    "documentId": "ragas-d01",
+    "title": "RAG效果评估量化",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG效果评估量化.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG效果评估量化.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d02",
+    "title": "RAG检索评估",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG检索评估.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG检索评估.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d03",
+    "title": "RAG响应评估",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG响应评估.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG响应评估.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d04",
+    "title": "RAG常用评估工具",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG常用评估工具.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\RAG应用效果评估\\RAG常用评估工具.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d05",
+    "title": "Multi-Query多路召回-痛点分析",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\查询优化\\Multi-Query多路召回-痛点分析.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\查询优化\\Multi-Query多路召回-痛点分析.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d06",
+    "title": "RAG-Fusion-痛点分析",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Post-Retrieval后检索\\RAG-Fusion-痛点分析.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Post-Retrieval后检索\\RAG-Fusion-痛点分析.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d07",
+    "title": "RAG中检索优化",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\检索优化\\RAG中检索优化.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\检索优化\\RAG中检索优化.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d08",
+    "title": "元数据过滤-痛点分析",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\索引优化\\元数据过滤-痛点分析.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\索引优化\\元数据过滤-痛点分析.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d09",
+    "title": "摘要索引-痛点分析",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\索引优化\\摘要索引-痛点分析.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Pre-Retrieval预检索\\索引优化\\摘要索引-痛点分析.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  },
+  {
+    "documentId": "ragas-d10",
+    "title": "上下文压缩和过滤-痛点分析",
+    "documentType": "markdown",
+    "source": "ragas-small-eval",
+    "sourcePath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Post-Retrieval后检索\\上下文压缩和过滤-痛点分析.md",
+    "notesPath": "C:\\Users\\WhenJayHe\\notes\\study\\RAG相关\\Post-Retrieval后检索\\上下文压缩和过滤-痛点分析.md",
+    "visibilityScope": "private",
+    "userId": "ragas-small-eval",
+    "language": "zh-CN",
+    "parser": "ragas-eval-markdown"
+  }
+]

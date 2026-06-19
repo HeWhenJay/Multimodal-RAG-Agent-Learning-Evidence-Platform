@@ -27,6 +27,7 @@ from video.chunking.video_processing import (
     process_video_bytes,
     process_video_source,
 )
+from video.chunking.video_dedup import dedupe_video_frame_blocks
 from app.schemas.rag import DocumentBlock, ParseQuality
 
 
@@ -161,7 +162,7 @@ class DocumentParserRouter:
                 )
             elif file_type in VIDEO_FILE_TYPES:
                 blocks, quality, parser, warnings = self._parse_video(
-                    content, filename, document_id, source_title, source_path
+                    content, filename, document_id, source_title, source_path, progress_reporter
                 )
             else:
                 text = decode_text(content)
@@ -318,6 +319,7 @@ class DocumentParserRouter:
                 document_id=document_id,
                 source_title=title,
                 file_type=file_type if file_type in VIDEO_FILE_TYPES else "video",
+                progress_reporter=progress_reporter,
             )
         except Exception as exc:
             blocks = []
@@ -670,6 +672,7 @@ class DocumentParserRouter:
         document_id: str,
         source_title: str,
         source_path: str | None,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
         artifacts = process_video_bytes(
             content=content,
@@ -678,6 +681,7 @@ class DocumentParserRouter:
             source_title=source_title,
             source_path=source_path,
             ocr_client=self.ocr_client,
+            progress_reporter=progress_reporter,
         )
         blocks: list[DocumentBlock] = []
         transcript_blocks: list[DocumentBlock] = []
@@ -694,15 +698,25 @@ class DocumentParserRouter:
                 parse_engine="bailian-asr-transcript",
             )
             blocks.extend(transcript_blocks)
-        frame_blocks = artifacts.frame_blocks
+        frame_blocks, dedup_stats = dedupe_video_frame_blocks(
+            artifacts.frame_blocks,
+            document_id,
+            progress_reporter=progress_reporter,
+        )
+        if dedup_stats.get("dedupRemovedCount"):
+            warnings.append(
+                "video.frame_ocr.dedup: "
+                f"已合并 {dedup_stats.get('dedupRemovedCount')} 个近重复关键帧 OCR evidence"
+            )
         blocks.extend(frame_blocks)
+        summary_frame_blocks = [block for block in frame_blocks if block.metadata.get("evidenceChannel") == "frame_ocr"]
         summary_blocks, summary_warnings = build_video_segment_summary_blocks(
             document_id=document_id,
             file_type=file_type,
             source_title=source_title,
             source_path=source_path,
             transcript_blocks=transcript_blocks,
-            frame_blocks=frame_blocks,
+            frame_blocks=summary_frame_blocks,
         )
         blocks.extend(summary_blocks)
         warnings.extend(summary_warnings)
@@ -716,7 +730,7 @@ class DocumentParserRouter:
             high_precision=False,
         )
         if blocks and text_chars > 0:
-            quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
+            quality = mark_video_evidence_quality(quality, blocks)
         return blocks, quality, parser, warnings
 
     @logged_rag_method("parse.video", "parse_video_source", "解析已保存视频源")
@@ -728,6 +742,7 @@ class DocumentParserRouter:
         document_id: str,
         source_title: str,
         file_type: str,
+        progress_reporter: RagProgressReporter | None = None,
     ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
         artifacts = process_video_source(
             source_path=source_path,
@@ -735,6 +750,7 @@ class DocumentParserRouter:
             document_id=document_id,
             source_title=source_title,
             ocr_client=self.ocr_client,
+            progress_reporter=progress_reporter,
         )
         blocks: list[DocumentBlock] = []
         transcript_blocks: list[DocumentBlock] = []
@@ -750,15 +766,25 @@ class DocumentParserRouter:
                 parse_engine="bailian-asr-transcript",
             )
             blocks.extend(transcript_blocks)
-        frame_blocks = artifacts.frame_blocks
+        frame_blocks, dedup_stats = dedupe_video_frame_blocks(
+            artifacts.frame_blocks,
+            document_id,
+            progress_reporter=progress_reporter,
+        )
+        if dedup_stats.get("dedupRemovedCount"):
+            warnings.append(
+                "video.frame_ocr.dedup: "
+                f"已合并 {dedup_stats.get('dedupRemovedCount')} 个近重复关键帧 OCR evidence"
+            )
         blocks.extend(frame_blocks)
+        summary_frame_blocks = [block for block in frame_blocks if block.metadata.get("evidenceChannel") == "frame_ocr"]
         summary_blocks, summary_warnings = build_video_segment_summary_blocks(
             document_id=document_id,
             file_type=file_type,
             source_title=source_title,
             source_path=source_path,
             transcript_blocks=transcript_blocks,
-            frame_blocks=frame_blocks,
+            frame_blocks=summary_frame_blocks,
         )
         blocks.extend(summary_blocks)
         warnings.extend(summary_warnings)
@@ -772,7 +798,7 @@ class DocumentParserRouter:
             high_precision=False,
         )
         if blocks and text_chars > 0:
-            quality = quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
+            quality = mark_video_evidence_quality(quality, blocks)
         return blocks, quality, parser, warnings
 
     @logged_rag_method("parse.finalize", "finalize_parse_result", "汇总解析结果和质量状态")
@@ -2249,6 +2275,24 @@ def replace_parse_quality_messages(quality: ParseQuality, warnings: list[str]) -
 
 def mark_text_native_quality(quality: ParseQuality) -> ParseQuality:
     return quality.model_copy(update={"score": max(quality.score, 0.9), "needsSupplement": False})
+
+
+def mark_video_evidence_quality(quality: ParseQuality, blocks: list[DocumentBlock]) -> ParseQuality:
+    """视频已生成字幕或 OCR evidence 时按可检索质量处理，保留阶段告警但不误判为空解析。"""
+    channels = {block.metadata.get("evidenceChannel") for block in blocks}
+    has_textual_video_evidence = "subtitle" in channels or "frame_ocr" in channels
+    has_summary_from_real_evidence = any(
+        block.metadata.get("evidenceChannel") == "video_segment_summary"
+        and (
+            block.metadata.get("sourceBlockIds")
+            or block.metadata.get("frameBlockIds")
+            or block.metadata.get("frameDuplicateGroupIds")
+        )
+        for block in blocks
+    )
+    if has_textual_video_evidence or has_summary_from_real_evidence:
+        return quality.model_copy(update={"score": max(quality.score, 1.0), "needsSupplement": False})
+    return quality.model_copy(update={"score": max(quality.score, 0.72), "needsSupplement": False})
 
 
 def _summary_chunk(document_id: str, index: int, block: DocumentBlock):

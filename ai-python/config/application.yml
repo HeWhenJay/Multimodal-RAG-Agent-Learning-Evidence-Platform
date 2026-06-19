@@ -55,6 +55,8 @@ ocr:
     base-url: ${BAILIAN_OCR_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
     timeout-seconds: ${BAILIAN_OCR_TIMEOUT_SECONDS:60}
     max-image-bytes: ${BAILIAN_OCR_MAX_IMAGE_BYTES:10485760}
+    max-attempts: ${BAILIAN_OCR_MAX_ATTEMPTS:3}
+    retry-delay-seconds: ${BAILIAN_OCR_RETRY_DELAY_SECONDS:2}
 
 asr:
   provider: ${RAG_ASR_PROVIDER:auto}
@@ -75,11 +77,24 @@ video:
   ffmpeg-timeout-seconds: ${RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS:1800}
   audio-segment-seconds: ${RAG_VIDEO_AUDIO_SEGMENT_SECONDS:300}
   audio-overlap-seconds: ${RAG_VIDEO_AUDIO_OVERLAP_SECONDS:10}
+  frame-scan-mode: ${RAG_VIDEO_FRAME_SCAN_MODE:auto}
   frame-sample-interval-seconds: ${RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS:5}
   frame-interval-seconds: ${RAG_VIDEO_FRAME_INTERVAL_SECONDS:30}
+  frame-min-interval-seconds: ${RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS:30}
   max-frames: ${RAG_VIDEO_MAX_FRAMES:20}
-  frame-max-candidates: ${RAG_VIDEO_FRAME_MAX_CANDIDATES:120}
+  frame-target-candidates: ${RAG_VIDEO_FRAME_TARGET_CANDIDATES:360}
+  frame-max-candidates: ${RAG_VIDEO_FRAME_MAX_CANDIDATES:720}
   ppt-flip-diff-threshold: ${RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD:0.08}
+  frame-visual-dedup-enabled: ${RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED:true}
+  frame-visual-hash-algorithm: ${RAG_VIDEO_FRAME_VISUAL_HASH_ALGORITHM:dhash}
+  frame-visual-hash-max-distance: ${RAG_VIDEO_FRAME_VISUAL_HASH_MAX_DISTANCE:4}
+  frame-visual-ambiguous-margin: ${RAG_VIDEO_FRAME_VISUAL_AMBIGUOUS_MARGIN:2}
+  frame-max-representatives-per-visual-group: ${RAG_VIDEO_FRAME_MAX_REPRESENTATIVES_PER_VISUAL_GROUP:1}
+  frame-visual-verify-interval-seconds: ${RAG_VIDEO_FRAME_VISUAL_VERIFY_INTERVAL_SECONDS:900}
+  frame-visual-stay-verify-seconds: ${RAG_VIDEO_FRAME_VISUAL_STAY_VERIFY_SECONDS:600}
+  frame-visual-revisit-verify-seconds: ${RAG_VIDEO_FRAME_VISUAL_REVISIT_VERIFY_SECONDS:1800}
+  frame-visual-verification-ratio: ${RAG_VIDEO_FRAME_VISUAL_VERIFICATION_RATIO:0.25}
+  frame-max-verifications-per-visual-group: ${RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP:2}
   segment-seconds: ${RAG_VIDEO_SEGMENT_SECONDS:120}
   segment-max-cues: ${RAG_VIDEO_SEGMENT_MAX_CUES:6}
 

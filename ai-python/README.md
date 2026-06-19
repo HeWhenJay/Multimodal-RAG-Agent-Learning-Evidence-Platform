@@ -81,7 +81,16 @@ conda activate learning-evidence-rag
 python ai-python/run.py
 ```
 
-已创建过环境时，使用 `conda env update -f ai-python/environment.yml --prune` 同步依赖。`requirements.txt` 只作为 pip 兼容依赖清单保留。
+上面的命令需要在仓库根目录执行。如果当前已经进入 `ai-python/` 目录，则使用：
+
+```powershell
+conda env update -f environment.yml --prune
+python run.py
+```
+
+已创建过环境时，在仓库根目录使用 `conda env update -f ai-python/environment.yml --prune` 同步依赖；在 `ai-python/` 目录内使用 `conda env update -f environment.yml --prune`。`requirements.txt` 只作为 pip 兼容依赖清单保留。
+
+`environment.yml` 会安装视频抽音频、抽帧和内嵌字幕提取需要的 `ffmpeg/ffprobe`，以及本地 OCR 降级需要的 `tesseract`。`OCR_LANG=chi_sim+eng` 还需要 Tesseract 语言数据中存在 `chi_sim` 和 `eng`；中文语言包未安装时，可临时改为 `eng` 验证 OCR 调用链路。
 
 未配置 `RAG_DATABASE_URL` 时会退回内存后端，主要用于本地单元测试。正式运行使用 PostgreSQL/pgvector，建库和建表语句见 `docs/database/postgresql-pgvector.md` 与 `infra/sql/init.sql`。
 
@@ -112,7 +121,7 @@ python ai-python/run.py
 
 ## 百炼 OCR 接入
 
-图片文件和 PDF 扫描页优先使用百炼 Qwen-OCR；未配置 Key、调用失败或返回空文本时自动降级为本地 `pytesseract`。不要把 Key 写入配置文件或提交到 Git。
+图片文件和 PDF 扫描页优先使用百炼 Qwen-OCR；未配置 Key、调用失败或返回空文本时自动降级为本地 `pytesseract`。本地 OCR 需要 Conda 环境中的 `tesseract` 可执行程序和 `OCR_LANG` 对应语言数据。不要把 Key 写入配置文件或提交到 Git。
 
 ```powershell
 $env:DASHSCOPE_API_KEY='<your-dashscope-api-key>'
@@ -125,3 +134,5 @@ $env:BAILIAN_OCR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 - `BAILIAN_OCR_ENABLED`：默认 `auto`，存在 Key 时启用；设置为 `false` 可强制禁用。
 - `BAILIAN_OCR_TIMEOUT_SECONDS`：默认 `60`。
 - `BAILIAN_OCR_MAX_IMAGE_BYTES`：默认 `10485760`。
+- `BAILIAN_OCR_MAX_ATTEMPTS`：默认 `3`，单张图片或关键帧失败后会先重试，生产可按稳定性调到 `3-5`。
+- `BAILIAN_OCR_RETRY_DELAY_SECONDS`：默认 `2`，每次 OCR 失败后等待再重试的秒数。

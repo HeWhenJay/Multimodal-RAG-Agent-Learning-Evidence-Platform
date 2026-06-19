@@ -233,6 +233,87 @@ def test_video_metadata_filter_matches_promoted_block_metadata():
     assert response.evidences[0].playbackUrl == "https://example.com/rag-course.mp4#t=10"
 
 
+def test_query_diversity_filters_duplicate_video_frame_ocr(monkeypatch):
+    monkeypatch.setenv("RAG_QUERY_DIVERSITY_DEDUP_ENABLED", "true")
+    store = InMemoryRagStore()
+    duplicate_metadata = {
+        "mediaType": "video",
+        "evidenceChannel": "frame_ocr",
+        "duplicateGroupId": "doc-video-diversity-frame-group-1",
+        "normalizedTextHash": "same-normalized-hash",
+        "timeRanges": [{"startTime": "00:06:00", "endTime": "00:06:00"}],
+        "mergedFrameCount": 2,
+    }
+    blocks = [
+        DocumentBlock(
+            documentId="doc-video-diversity",
+            blockId="doc-video-diversity-frame-1",
+            fileType="mp4",
+            blockType="image",
+            startTime="00:06:00",
+            sectionTitle="视频画面 00:06:00",
+            contentText="视频画面 00:06:00\nRAG-Fusion 使用 RRF 融合 BM25 和向量检索结果。",
+            parseEngine="bailian-qwen-ocr",
+            sourceTitle="RAG 课程视频",
+            sourcePath="https://example.com/rag-course.mp4",
+            metadata=duplicate_metadata,
+        ),
+        DocumentBlock(
+            documentId="doc-video-diversity",
+            blockId="doc-video-diversity-frame-2",
+            fileType="mp4",
+            blockType="image",
+            startTime="00:06:30",
+            sectionTitle="视频画面 00:06:30",
+            contentText="视频画面 00:06:30\nRAG-Fusion 使用 RRF 融合 BM25 和向量检索结果。",
+            parseEngine="bailian-qwen-ocr",
+            sourceTitle="RAG 课程视频",
+            sourcePath="https://example.com/rag-course.mp4",
+            metadata={**duplicate_metadata, "timeRanges": [{"startTime": "00:06:30", "endTime": "00:06:30"}]},
+        ),
+        DocumentBlock(
+            documentId="doc-video-diversity",
+            blockId="doc-video-diversity-summary",
+            fileType="mp4",
+            blockType="text",
+            startTime="00:07:30",
+            endTime="00:08:00",
+            sectionTitle="视频片段摘要 00:07:30 - 00:08:00",
+            contentText="视频片段摘要：RAG-Fusion 会通过 RRF 将多路查询的 BM25 和向量召回排名融合。",
+            parseEngine="video-segment-summary",
+            sourceTitle="RAG 课程视频",
+            sourcePath="https://example.com/rag-course.mp4",
+            metadata={"mediaType": "video", "evidenceChannel": "video_segment_summary"},
+        ),
+    ]
+    store.index_blocks(
+        document_id="doc-video-diversity",
+        title="RAG 课程视频",
+        document_type="mp4",
+        source="unit-test",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="unit-video",
+        blocks=blocks,
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=200)),
+        status="READY",
+        source_path="https://example.com/rag-course.mp4",
+    )
+
+    response = store.query(QueryRequest(question="RAG-Fusion 如何融合 BM25 和向量召回？", topK=2))
+
+    group_ids = [
+        evidence.metadata.get("duplicateGroupId")
+        for evidence in response.evidences
+        if evidence.metadata.get("evidenceChannel") == "frame_ocr"
+    ]
+    assert group_ids.count("doc-video-diversity-frame-group-1") <= 1
+    assert response.diagnostics["candidateBudget"] == 20
+    assert response.diagnostics["dedupRemovedCount"] >= 1
+    assert response.diagnostics["diversityPolicy"] == "video_duplicate_group_and_time_window"
+
+
 def test_index_blocks_removes_postgres_nul_before_storage():
     nul = chr(0)
     store = InMemoryRagStore()

@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rag.model_logging import log_model_call
+
 
 DEFAULT_ASR_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ASR_TASK_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
@@ -129,18 +131,27 @@ class BailianAsrClient:
                 "enable_words": os.getenv("RAG_ASR_ENABLE_WORDS", "false").lower() in {"true", "1", "yes", "on"},
             },
         }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
-            if response.status_code >= 400:
-                raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
-            task_id = ((response.json().get("output") or {}).get("task_id"))
-            if not task_id:
-                raise RuntimeError("百炼 ASR 异步任务未返回 task_id")
-            transcription_url = self._wait_filetrans_result(client, task_id, headers)
-            result_response = client.get(transcription_url)
-            if result_response.status_code >= 400:
-                raise RuntimeError(f"下载 ASR 转写结果失败: HTTP {result_response.status_code}")
-            return transcription_json_to_srt(result_response.json())
+        with log_model_call(
+            stage="parse.video.asr",
+            action="bailian_filetrans_asr",
+            model_name=self.filetrans_model,
+            event="视频异步 ASR 转写",
+            extra_context={"sourceType": "url"},
+            recoverable=True,
+            fallback_message=f"使用 {self.filetrans_model} 模型完成视频异步 ASR 转写事件失败，已降级到同步 ASR、字幕或视频元数据继续处理",
+        ):
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
+                task_id = ((response.json().get("output") or {}).get("task_id"))
+                if not task_id:
+                    raise RuntimeError("百炼 ASR 异步任务未返回 task_id")
+                transcription_url = self._wait_filetrans_result(client, task_id, headers)
+                result_response = client.get(transcription_url)
+                if result_response.status_code >= 400:
+                    raise RuntimeError(f"下载 ASR 转写结果失败: HTTP {result_response.status_code}")
+                return transcription_json_to_srt(result_response.json())
 
     def _wait_filetrans_result(self, client: Any, task_id: str, headers: dict[str, str]) -> str:
         for _ in range(max(1, self.max_polls)):
@@ -189,8 +200,17 @@ class BailianAsrClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+        with log_model_call(
+            stage="parse.video.asr",
+            action="bailian_sync_asr",
+            model_name=self.model,
+            event="视频音频同步 ASR 转写",
+            extra_context={"audioFilename": audio_path.name, "audioBytes": audio_path.stat().st_size},
+            recoverable=True,
+            fallback_message=f"使用 {self.model} 模型完成视频音频同步 ASR 转写事件失败，已降级到字幕、关键帧 OCR 或视频元数据继续处理",
+        ):
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()
