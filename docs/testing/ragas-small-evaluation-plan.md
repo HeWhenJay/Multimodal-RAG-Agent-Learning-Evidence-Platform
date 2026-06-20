@@ -1,29 +1,29 @@
 # Ragas 小样本 RAG 效果评估方案
 
-更新日期：2026-06-19
+更新日期：2026-06-20
 
 ## 目标
 
-本方案用于验证当前项目的 RAG 闭环：资料入库、递归切块、Multi-Query、BM25 与向量召回、RRF/RAG-Fusion、重排、回答生成和 evidence 引用。评估数据来自本机笔记库 `C:\Users\WhenJayHe\notes\study`，首轮规模控制在人工 30 分钟内可核验。
+本方案用于验证当前项目的 RAG 闭环：资料入库、递归切块、Multi-Query、BM25 与向量召回、RRF/RAG-Fusion、重排、回答生成和 evidence 引用。评估数据来自本机笔记库 `C:\Users\WhenJayHe\notes\study\八股\llm相关`，首轮规模控制在人工 30 分钟内可核验。
 
-评估不覆盖 Agent 编排、长任务调度、自主规划或工具调用。当前阶段只评估 RAG 管道本身。实现范围只在 `ai-python/tests/evaluation/`、`ai-python/tests/test_ragas_eval_common.py`、`docs/testing/` 和 Python 依赖清单内，不修改 Java、前端、数据库脚本或生产 RAG 检索逻辑。
+评估不覆盖 Agent 编排、长任务调度、自主规划或工具调用。当前阶段只评估 RAG 管道本身。本轮评估集切换只更新 `docs/testing/ragas-small-evaluation-plan.md`、`docs/testing/ragas-small-eval-documents.json`、`docs/testing/ragas-small-eval-cases.jsonl` 和 `ai-python/tests/test_ragas_eval_common.py`，不修改 Java、前端、数据库脚本或生产 RAG 检索逻辑。
 
 ## 数据范围
 
-首轮只索引 10 篇 Markdown 笔记，避免把整个 Obsidian 知识库一次性放入评估，降低人工核验成本。固定文档清单位于 `docs/testing/ragas-small-eval-documents.json`，用例位于 `docs/testing/ragas-small-eval-cases.jsonl`。
+首轮只索引 `C:\Users\WhenJayHe\notes\study\八股\llm相关` 下 10 篇 Markdown 笔记，避免把整个 Obsidian 知识库一次性放入评估，降低人工核验成本。固定文档清单位于 `docs/testing/ragas-small-eval-documents.json`，用例位于 `docs/testing/ragas-small-eval-cases.jsonl`。
 
 | 编号 | documentId | 文件 | 覆盖能力 |
 | --- | --- | --- | --- |
-| D01 | `ragas-d01` | `RAG效果评估量化.md` | 评估必要性、评估依据 |
-| D02 | `ragas-d02` | `RAG检索评估.md` | Context Precision、Context Recall |
-| D03 | `ragas-d03` | `RAG响应评估.md` | Faithfulness、Response Relevancy |
-| D04 | `ragas-d04` | `RAG常用评估工具.md` | Ragas 使用范围和字段 |
-| D05 | `ragas-d05` | `Multi-Query多路召回-痛点分析.md` | Multi-Query 查询改写 |
-| D06 | `ragas-d06` | `RAG-Fusion-痛点分析.md` | RAG-Fusion、RRF |
-| D07 | `ragas-d07` | `RAG中检索优化.md` | 混合检索 |
-| D08 | `ragas-d08` | `元数据过滤-痛点分析.md` | 元数据过滤 |
-| D09 | `ragas-d09` | `摘要索引-痛点分析.md` | 摘要索引 |
-| D10 | `ragas-d10` | `上下文压缩和过滤-痛点分析.md` | 后检索压缩和过滤，作为干扰与扩展材料 |
+| D01 | `llm-ragas-d01` | `19_rag.md` | RAG 工作原理、RAG vs 微调、优势与局限 |
+| D02 | `llm-ragas-d02` | `20_chunk.md` | Chunking 策略、切分粒度、overlap |
+| D03 | `llm-ragas-d03` | `21_embedding.md` | Embedding、语义向量、模型选择 |
+| D04 | `llm-ragas-d04` | `22_rag_optimization.md` | RAG 检索质量优化技术 |
+| D05 | `llm-ragas-d05` | `23_rag_evaluate.md` | 检索/生成分阶段评估指标 |
+| D06 | `llm-ragas-d06` | `26_rag_search.md` | RAG 检索召回链路与检索方式 |
+| D07 | `llm-ragas-d07` | `29_rag_ops.md` | RAG 检索不到问题时的定位排查 |
+| D08 | `llm-ragas-d08` | `30_ragas.md` | RAGAS 指标、流程、数据构造 |
+| D09 | `llm-ragas-d09` | `33_rag_rerank.md` | Rerank 作用、落地和验证 |
+| D10 | `llm-ragas-d10` | `34_rag_store.md` | RAG 存储架构、权限隔离、多级索引 |
 
 其中 10 条 `case_type=ragas` 主样本进入自动评分，2 条 `case_type=manual_boundary` 只做人审契约检查。
 

@@ -33,8 +33,8 @@ def test_load_eval_cases_and_documents():
 
     assert len(cases) == 12
     assert len(documents) == 10
-    assert cases[0]["expected_document_ids"] == ["ragas-d01"]
-    assert documents[0]["documentId"] == "ragas-d01"
+    assert cases[0]["expected_document_ids"] == ["llm-ragas-d01"]
+    assert documents[0]["documentId"] == "llm-ragas-d01"
 
 
 def test_snake_case_query_to_project_request():
@@ -61,12 +61,12 @@ def test_normalize_path_uses_windows_style_comparison():
 
 def test_calculate_document_hit_top1_and_top3():
     """确认文档级 top1/top3 命中计算符合人工核验口径。"""
-    assert calculate_document_hit(["ragas-d02"], ["ragas-d02", "ragas-d01"])["top1_hit"]
-    top3 = calculate_document_hit(["ragas-d03"], ["ragas-d01", "ragas-d02", "ragas-d03"])
+    assert calculate_document_hit(["llm-ragas-d02"], ["llm-ragas-d02", "llm-ragas-d01"])["top1_hit"]
+    top3 = calculate_document_hit(["llm-ragas-d03"], ["llm-ragas-d01", "llm-ragas-d02", "llm-ragas-d03"])
     assert not top3["top1_hit"]
     assert top3["top3_hit"]
     assert top3["hit_rank"] == 3
-    assert not calculate_document_hit(["ragas-d04"], ["ragas-d01", "ragas-d02", "ragas-d03"])["top3_hit"]
+    assert not calculate_document_hit(["llm-ragas-d04"], ["llm-ragas-d01", "llm-ragas-d02", "llm-ragas-d03"])["top3_hit"]
 
 
 def test_has_valid_evidence_reference_requires_project_reference_fields():
@@ -99,7 +99,7 @@ def test_boundary_case_treats_low_score_as_insufficient_evidence():
     case = {"case_id": "B01", "expected_document_ids": []}
     response = {
         "answer": "根据知识库，没有检索到足够相关的证据。",
-        "evidences": [{"documentId": "ragas-d01", "score": 0.01}],
+        "evidences": [{"documentId": "llm-ragas-d01", "score": 0.01}],
     }
 
     result = evaluate_boundary_case(case, response, boundary_score_threshold=0.18)
@@ -114,14 +114,14 @@ def test_build_ragas_input_row_keeps_project_auxiliary_fields():
         "case_id": "R01",
         "question": "为什么要评估？",
         "reference": "需要评估风险。",
-        "expected_document_ids": ["ragas-d01"],
+        "expected_document_ids": ["llm-ragas-d01"],
     }
     response = {
         "answer": "因为存在不确定性。[chunk-1]",
         "evidences": [
             {
                 "evidenceId": "chunk-1",
-                "documentId": "ragas-d01",
+                "documentId": "llm-ragas-d01",
                 "snippet": "RAG 应用上线前需要评估。",
             }
         ],
@@ -134,8 +134,8 @@ def test_build_ragas_input_row_keeps_project_auxiliary_fields():
     assert row["retrieved_contexts"] == ["RAG 应用上线前需要评估。"]
     assert row["reference"] == "需要评估风险。"
     assert row["retrieved_context_ids"] == ["chunk-1"]
-    assert row["retrieved_document_ids"] == ["ragas-d01"]
-    assert row["expected_document_ids"] == ["ragas-d01"]
+    assert row["retrieved_document_ids"] == ["llm-ragas-d01"]
+    assert row["expected_document_ids"] == ["llm-ragas-d01"]
 
 
 def test_ragas_mode_requires_separate_eval_key(monkeypatch):
