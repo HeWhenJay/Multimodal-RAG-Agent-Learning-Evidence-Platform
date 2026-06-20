@@ -210,6 +210,8 @@ flowchart TD
 
 Agent 架构建议采用 PAE（Plan-and-Execute）为主，ReAct 作为执行节点内部的工具观察循环。原因是资料入库、简历/JD 匹配和学习路线规划都属于多步骤、可审查、需要暂停确认的流程，先规划再执行更适合 Human-in-the-Loop；而在某个执行节点内部，如检索证据不足、资料仍在解析、需要补跑高精度解析时，可以使用 ReAct 式“行动 -> 观察 -> 修正”循环。
 
+普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、重试、补跑建议或人工审批的场景介入，例如资料状态读取、evidence 覆盖审计、重建索引申请、JD/简历匹配分析和草稿生成。工具注册面以 Java 业务能力为准；即使未来 Agent 执行器使用 LangGraph/Python 实现，也只能通过 Java 暴露的工具网关触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。Agent 不直接调用 Python `/internal/*`，不直连数据库，不读取对象存储原始文件。
+
 ```mermaid
 flowchart TD
     A0["用户输入<br/>上传文件 / 粘贴资料 / 提交简历和岗位 JD"] --> A1["React 前端<br/>只调用 Java API，展示计划、确认项和执行结果"]
@@ -221,8 +223,8 @@ flowchart TD
     H1 -->|"取消"| AX["结束任务<br/>记录取消状态"]
     H1 -->|"确认"| R0{"任务类型"}
 
-    R0 -->|"文件知识抽取入库"| K1["Java RAG 资料能力<br/>上传、分片、状态查询、重建索引"]
-    K1 --> H2{"人工确认<br/>资料入库 / 高精度补跑 / 长视频高成本处理"}
+    R0 -->|"资料状态检查与证据补强"| K1["Java RAG 资料工具<br/>状态查询、受限预览、evidence 列表、重建索引建议/申请"]
+    K1 --> H2{"人工确认<br/>重建索引 / 高精度补跑 / 长视频高成本处理"}
     H2 -->|"确认"| K2["Java 触发 Python RAG 服务<br/>index-file / index-text / index-video-source"]
     H2 -->|"取消或稍后"| AX
     K2 --> K3["Python RAG 索引<br/>MinerU/OCR/ASR、递归切块、摘要索引、BM25、向量入库"]
@@ -245,9 +247,11 @@ flowchart TD
     E2 --> L1["日志与状态记录<br/>domain=agent、阶段、动作、错误码、contextJson"]
 ```
 
-未来 LangGraph 可按显式状态图落地，但在接口文档确认前只作为实现建议：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/evidences/draft/finalAnswer/status`；核心节点为 `intent_router -> planner -> human_plan_review -> execute_ingestion 或 execute_jd_match -> evidence_auditor -> human_output_review -> finalizer`；条件边根据 `taskType/reviewDecision/evidenceScore/riskLevel` 跳转。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、资料入库确认、高成本模型或长视频处理确认、简历改写确认、学习路线确认和最终输出确认。
+未来 LangGraph 可按显式状态图落地，但在接口文档确认前只作为实现建议：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/evidences/draft/finalAnswer/status`；核心节点为 `intent_router -> planner -> human_plan_review -> execute_material_quality_check 或 execute_jd_match -> evidence_auditor -> human_output_review -> finalizer`；条件边根据 `taskType/reviewDecision/evidenceScore/riskLevel` 跳转。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、重建索引确认、高精度补跑确认、长视频高成本处理确认、简历改写确认、学习路线确认和最终输出确认。
 
-未来工具也应按 Java 业务能力封装，而不是让 Agent 直接绕过后端边界：资料类工具对应上传、状态查询、重建索引、资料预览和 evidence 列表；岗位适配类工具对应 JD 技能抽取、RAG 混合检索、简历证据对齐、缺口分析、学习路线生成和简历改写草稿。所有结论必须带 evidence 引用；没有证据时只能输出“缺证据/需补充资料/需重新索引”，不能编造项目经历。
+工具节点设计同样只作为未来建议。固定图节点不作为 Planner 可选工具，包括 `intent_router`、Java/API 输入校验、受权限控制的上下文加载、`human_approval_gate`、`privacy_guard` 和 `citation_guard`。资料类工具候选只对应 `material_status_reader`、`material_evidence_reader`、受限版 `material_preview_reader`、`reindex_recommender` 和经人工确认后的 `material_reindex_request`；上传、分片上传和普通入库仍是确定性 Java 业务流程，不作为 Agent 自主工具。检索与证据类工具候选包括 `rag_query_tool`、`retrieval_coverage_probe` 和 `evidence_quality_auditor`；其中 `retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
+
+岗位适配类工具候选包括 `resume_evidence_aligner`、`gap_analyzer`、`resume_rewrite_drafter` 和 `learning_plan_builder`。`jd_skill_extractor` 与 `resume_parser` 先作为 JD/简历分析服务内部步骤，不作为普通 Tool，除非未来确实需要 Planner 选择、重试或跳过。所有工具输出都应结构化，字段至少包括 `toolName/taskId/status/message/evidenceIds/riskLevel/nextActionCandidates/errorCode/retryable/requiresApproval/approvalType/costLevel/idempotencyKey/diagnostics`；生成结论类工具必须带 evidence 或明确返回缺证据，不能编造项目经历。
 
 ### 细分 RAG 流程图
 
