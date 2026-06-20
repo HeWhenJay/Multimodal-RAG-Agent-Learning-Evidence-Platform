@@ -163,11 +163,41 @@ function renderInlineMarkdown(text: string): ReactNode[] {
   return nodes;
 }
 
-// 只允许常规站内、锚点和 http(s) 链接。
+// 只允许常规站内页面和 http(s) 链接；原 Markdown 目录锚点不对应当前应用目标。
 function normalizeMarkdownHref(rawHref: string) {
   const href = rawHref.trim().split(/\s+/)[0].replace(/^<|>$/g, '');
-  if (/^(https?:\/\/|#|\/)/i.test(href)) {
+  if (isCurrentAppHashOnlyLink(href)) {
+    return '';
+  }
+  if (/^(https?:\/\/|\/(?!\/))/i.test(href)) {
     return href;
   }
   return '';
+}
+
+// 原文目录链接可能被模型改写成当前应用根路径 hash，但页面没有对应文档锚点。
+function isCurrentAppHashOnlyLink(href: string) {
+  if (!/^https?:\/\//i.test(href) || typeof window === 'undefined') {
+    return false;
+  }
+  try {
+    const target = new URL(href);
+    const current = new URL(window.location.href);
+    const sameHost = target.hostname === current.hostname || (isLoopbackHost(target.hostname) && isLoopbackHost(current.hostname));
+    return (
+      sameHost
+      && target.protocol === current.protocol
+      && target.port === current.port
+      && target.pathname === '/'
+      && Boolean(target.hash)
+      && !target.search
+    );
+  } catch {
+    return false;
+  }
+}
+
+// 本地开发常在 localhost 和 127.0.0.1 之间切换，二者都指向当前应用。
+function isLoopbackHost(hostname: string) {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
 }

@@ -3,11 +3,11 @@ from rag.retrievers.retrieval import InMemoryRagStore
 from rag.progress import RagProgressReporter
 from rag.retrievers.evidence_diversity import dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
-from rag.bailian_llm import append_evidence_reference_summary, deterministic_grounded_answer
+from rag.bailian_llm import append_evidence_reference_summary, clean_evidence_location, deterministic_grounded_answer
 from rag.indexes.pgvector_store import build_filter_clause, vector_literal
 from rag.rerankers.reranking import local_rerank
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
-from app.schemas.rag import DocumentBlock, IndexTextRequest, QueryRequest
+from app.schemas.rag import DocumentBlock, Evidence, IndexTextRequest, QueryRequest
 
 
 def assert_no_postgres_nul(value):
@@ -214,6 +214,28 @@ def test_answer_reference_summary_keeps_source_location_and_score():
     assert "引用摘要笔记" in answer
     assert "uploads/rag/reference.md" in answer
     assert "分数：" in answer
+
+
+def test_answer_reference_summary_cleans_markdown_anchor_location():
+    """证据位置只展示章节文本，不把原 Markdown 目录锚点当作前端可跳转链接。"""
+    evidence = Evidence(
+        evidenceId="material-2-17",
+        documentId="material-2",
+        documentTitle="01_transform_attention.md",
+        sectionTitle="[1.1 自注意力机制到底在做什么](http://localhost:5178/#_1-1-自注意力机制到底在做什么)",
+        title="01_transform_attention.md",
+        snippet="自注意力会基于 Query、Key、Value 计算上下文权重。",
+        source="upload",
+        sourcePath="uploads/rag/attention.md",
+        sectionName="[1.1 自注意力机制到底在做什么](#_1-1-自注意力机制到底在做什么)",
+        documentType="markdown",
+        score=0.8116,
+    )
+    answer = append_evidence_reference_summary("根据资料回答。", [evidence])
+
+    assert "位置：1.1 自注意力机制到底在做什么" in answer
+    assert "](#" not in answer
+    assert clean_evidence_location("[**章节标题**](#anchor)") == "章节标题"
 
 
 def test_video_metadata_filter_matches_promoted_block_metadata():

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -171,7 +172,7 @@ def build_prompt(question: str, evidences: list[Evidence]) -> str:
 def render_evidence(item: Evidence, index: int) -> str:
     location_parts = []
     if item.sectionName:
-        location_parts.append(f"章节={item.sectionName}")
+        location_parts.append(f"章节={clean_evidence_location(item.sectionName)}")
     if item.pageIndex is not None:
         location_parts.append(f"页码={item.pageIndex}")
     if item.slideIndex is not None:
@@ -191,7 +192,7 @@ def deterministic_grounded_answer(question: str, evidences: list[Evidence]) -> s
         return "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
     top = evidences[:3]
     evidence_text = "；".join(
-        f"{item.title} / {item.sectionName} [{item.evidenceId}]"
+        f"{item.title} / {clean_evidence_location(item.sectionName)} [{item.evidenceId}]"
         for item in top
     )
     video_evidences = [item for item in top if item.startTime]
@@ -217,12 +218,25 @@ def append_evidence_reference_summary(answer: str, evidences: list[Evidence]) ->
         return answer
     lines = ["", "证据引用："]
     for item in evidences[:5]:
-        location = item.sectionName or item.sectionTitle or "全文"
+        location = clean_evidence_location(item.sectionName or item.sectionTitle or "全文")
         if item.startTime:
             location = f"{location}，时间={item.startTime}-{item.endTime}" if item.endTime else f"{location}，时间={item.startTime}"
         source = item.sourcePath or item.source or "未知来源"
         lines.append(f"- [{item.evidenceId}] {item.title}；位置：{location}；来源：{source}；分数：{item.score:.4f}")
     return answer.rstrip() + "\n" + "\n".join(lines)
+
+
+def clean_evidence_location(value: str | None) -> str:
+    """清洗 evidence 章节位置，避免把原 Markdown 的目录锚点误渲染成本应用链接。"""
+    text = (value or "").strip()
+    if not text:
+        return "全文"
+    text = re.sub(r"!\[([^\]]*)]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)]\((?:#[^)]+|https?://[^)]+)\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[*_`]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "全文"
 
 
 def extract_message_content(data: dict[str, Any]) -> str:

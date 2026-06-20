@@ -179,5 +179,17 @@ function formatEvidenceLocation(item: RagQueryResult['evidences'][number]) {
   if (item.pageIndex) return `第 ${item.pageIndex} 页`;
   if (item.slideIndex) return `第 ${item.slideIndex} 页幻灯片`;
   if (item.sheetName) return `${item.sheetName}${item.cellRange ? ` ${item.cellRange}` : ''}`;
-  return item.sectionTitle || item.sectionName;
+  return cleanEvidenceLocation(item.sectionTitle || item.sectionName);
+}
+
+// 清理解析来源里的 Markdown 链接，只在证据卡片展示可读位置文本。
+function cleanEvidenceLocation(value?: string | null) {
+  const text = (value || '').trim();
+  if (!text) return '全文';
+  return text
+    .replace(/!\[([^\]]*)]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)]\([^)]*\)/g, '$1')
+    .replace(/[*_`]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim() || '全文';
 }
