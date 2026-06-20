@@ -6,6 +6,7 @@ import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
+import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.Impl.RagIndexWorker;
@@ -14,17 +15,26 @@ import com.itxiang.evidence.service.Impl.RagUploadWorker;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -33,7 +43,9 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -45,6 +57,9 @@ class RagServiceImplTests {
 
     @Mock
     private LogEventMapper logEventMapper;
+
+    @Mock
+    private RagQueryHistoryMapper ragQueryHistoryMapper;
 
     @Mock
     private PythonRagClient pythonRagClient;
@@ -62,10 +77,32 @@ class RagServiceImplTests {
     private RagUploadWorker ragUploadWorker;
 
     @Mock
+    private TransactionTemplate transactionTemplate;
+
+    @Mock
     private ObjectMapper objectMapper;
 
     @InjectMocks
     private RagServiceImpl ragService;
+
+    @TempDir
+    private Path tempDir;
+
+    @BeforeEach
+    void setUp() {
+        ReflectionTestUtils.setField(ragService, "chunkRootOverride", tempDir.resolve("chunks"));
+        lenient().when(transactionTemplate.execute(any())).thenAnswer(invocation -> {
+            TransactionCallback<?> callback = invocation.getArgument(0);
+            return callback.doInTransaction(new SimpleTransactionStatus());
+        });
+        lenient().doAnswer(invocation -> {
+            Consumer<?> callback = invocation.getArgument(0);
+            @SuppressWarnings("unchecked")
+            Consumer<SimpleTransactionStatus> statusConsumer = (Consumer<SimpleTransactionStatus>) callback;
+            statusConsumer.accept(new SimpleTransactionStatus());
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
+    }
 
     @Test
     void indexTextPartialResultWritesErrorLocationLog() {
@@ -154,6 +191,7 @@ class RagServiceImplTests {
 
         assertThat(result.getCompleted()).isTrue();
         assertThat(result.getStatus()).isEqualTo("PROCESSING");
+        assertThat(result.getNextChunkIndex()).isEqualTo(1);
         assertThat(result.getMaterial()).isNotNull();
         assertThat(result.getMaterial().getId()).isEqualTo(88L);
         verify(ragUploadWorker).completeChunkedUpload(
@@ -200,6 +238,174 @@ class RagServiceImplTests {
 
         verify(logEventMapper).findRecentProgressByMaterialId(eq(89L), eq(40));
         verify(logEventMapper).findVideoProgressByMaterialId(eq(89L), eq(80));
+    }
+
+    @Test
+    void uploadMaterialChunkKeepsReceivedChunksWhenUploadIncomplete() throws Exception {
+        MockMultipartFile firstChunk = new MockMultipartFile(
+                "file",
+                "course.mp4",
+                "video/mp4",
+                "hello".getBytes(StandardCharsets.UTF_8)
+        );
+
+        MaterialUploadChunkVO result = ragService.uploadMaterialChunk(
+                firstChunk,
+                "resume-upload",
+                "course.mp4",
+                0,
+                3,
+                15L,
+                false,
+                "7"
+        );
+
+        Path chunkPath = tempDir.resolve("chunks").resolve("7").resolve("resume-upload").resolve("chunk-00000.part");
+        assertThat(result.getCompleted()).isFalse();
+        assertThat(result.getStatus()).isEqualTo("UPLOADING");
+        assertThat(result.getReceivedChunks()).isEqualTo(1);
+        assertThat(result.getNextChunkIndex()).isEqualTo(1);
+        assertThat(Files.exists(chunkPath)).isTrue();
+        verify(learningMaterialMapper, never()).insert(any(LearningMaterial.class));
+        verify(ragUploadWorker, never()).completeChunkedUpload(
+                any(),
+                anyString(),
+                any(Path.class),
+                any(Path.class),
+                anyString(),
+                anyString(),
+                anyString(),
+                any(),
+                any(),
+                any()
+        );
+    }
+
+    @Test
+    void uploadMaterialChunkReusesMaterialWhenFinalChunkIsRetried() {
+        MockMultipartFile chunk = new MockMultipartFile(
+                "file",
+                "course.mp4",
+                "video/mp4",
+                "hello".getBytes(StandardCharsets.UTF_8)
+        );
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(90L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        LearningMaterial existingMaterial = new LearningMaterial();
+        existingMaterial.setId(90L);
+        existingMaterial.setTitle("course.mp4");
+        existingMaterial.setUserId("7");
+        existingMaterial.setDocumentType("mp4");
+        existingMaterial.setSource("upload");
+        existingMaterial.setStatus("PENDING");
+        when(learningMaterialMapper.findByIdAndUserId(eq(90L), eq("7"))).thenReturn(existingMaterial);
+        when(logEventMapper.findRecentProgressByMaterialId(eq(90L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(90L), eq(80))).thenReturn(List.of());
+
+        MaterialUploadChunkVO firstResult = ragService.uploadMaterialChunk(
+                chunk,
+                "retry-final",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+        MaterialUploadChunkVO retryResult = ragService.uploadMaterialChunk(
+                chunk,
+                "retry-final",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+
+        assertThat(firstResult.getMaterial().getId()).isEqualTo(90L);
+        assertThat(retryResult.getCompleted()).isTrue();
+        assertThat(retryResult.getMaterial().getId()).isEqualTo(90L);
+        assertThat(retryResult.getNextChunkIndex()).isEqualTo(1);
+        verify(learningMaterialMapper, times(1)).insert(any(LearningMaterial.class));
+        verify(ragUploadWorker, times(1)).completeChunkedUpload(
+                eq(90L),
+                eq("7"),
+                any(Path.class),
+                any(Path.class),
+                eq("retry-final"),
+                eq("course.mp4"),
+                eq("video/mp4"),
+                eq(1),
+                eq(5L),
+                eq(false)
+        );
+    }
+
+    @Test
+    void uploadMaterialChunkReschedulesWhenPreviousBackgroundMergeFailed() {
+        MockMultipartFile chunk = new MockMultipartFile(
+                "file",
+                "course.mp4",
+                "video/mp4",
+                "hello".getBytes(StandardCharsets.UTF_8)
+        );
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(91L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        LearningMaterial failedMaterial = new LearningMaterial();
+        failedMaterial.setId(91L);
+        failedMaterial.setTitle("course.mp4");
+        failedMaterial.setUserId("7");
+        failedMaterial.setDocumentType("mp4");
+        failedMaterial.setSource("upload");
+        failedMaterial.setStatus("FAILED");
+        failedMaterial.setParser("upload-chunk-error");
+        when(learningMaterialMapper.findByIdAndUserId(eq(91L), eq("7"))).thenReturn(failedMaterial);
+        when(logEventMapper.findRecentProgressByMaterialId(eq(91L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(91L), eq(80))).thenReturn(List.of());
+
+        ragService.uploadMaterialChunk(
+                chunk,
+                "retry-failed-final",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+        MaterialUploadChunkVO retryResult = ragService.uploadMaterialChunk(
+                chunk,
+                "retry-failed-final",
+                "course.mp4",
+                0,
+                1,
+                5L,
+                false,
+                "7"
+        );
+
+        assertThat(retryResult.getCompleted()).isTrue();
+        assertThat(retryResult.getMaterial().getStatus()).isEqualTo("PENDING");
+        verify(learningMaterialMapper).updateStatus(eq(91L), eq("PENDING"));
+        verify(ragUploadWorker, times(2)).completeChunkedUpload(
+                eq(91L),
+                eq("7"),
+                any(Path.class),
+                any(Path.class),
+                eq("retry-failed-final"),
+                eq("course.mp4"),
+                eq("video/mp4"),
+                eq(1),
+                eq(5L),
+                eq(false)
+        );
     }
 
     /**

@@ -6,7 +6,14 @@ export const MATERIAL_FILE_ACCEPT = '.pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.x
 export const MATERIAL_UPLOADED_EVENT = 'learning-evidence:material-uploaded';
 const VIDEO_CHUNK_SIZE = 20 * 1024 * 1024;
 const PROGRESS_POLL_INTERVAL_MS = 2000;
+const CHUNK_UPLOAD_RETRY_LIMIT = 3;
+const CHUNK_UPLOAD_SESSION_PREFIX = 'learning-evidence:chunk-upload:';
 const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi'];
+
+interface ChunkUploadSession {
+  uploadId: string;
+  nextChunkIndex: number;
+}
 
 interface UseMaterialUploadOptions {
   highPrecision?: boolean;
@@ -141,28 +148,122 @@ async function uploadVideoInChunks(
   setUploadMessage: (message: string) => void
 ): Promise<LearningMaterial> {
   const totalChunks = Math.ceil(file.size / VIDEO_CHUNK_SIZE);
-  let uploadId = '';
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+  const sessionKey = chunkUploadSessionKey(file);
+  let session = readChunkUploadSession(sessionKey);
+  if (!session) {
+    session = {
+      uploadId: createUploadId(),
+      nextChunkIndex: 0
+    };
+    writeChunkUploadSession(sessionKey, session);
+  }
+
+  for (let chunkIndex = clampChunkIndex(session.nextChunkIndex, totalChunks); chunkIndex < totalChunks; chunkIndex += 1) {
     const start = chunkIndex * VIDEO_CHUNK_SIZE;
     const end = Math.min(file.size, start + VIDEO_CHUNK_SIZE);
     const chunk = file.slice(start, end, file.type || 'application/octet-stream');
-    setUploadMessage(`正在上传视频分片：${chunkIndex + 1}/${totalChunks}`);
-    const result = await uploadMaterialChunk({
-      chunk,
-      filename: file.name,
-      uploadId,
-      chunkIndex,
-      totalChunks,
-      totalSize: file.size,
-      highPrecision
-    });
-    uploadId = result.uploadId;
+    setUploadMessage(`正在上传视频分片：${chunkIndex + 1}/${totalChunks}，uploadId=${session.uploadId}`);
+    const result = await uploadChunkWithRetry(
+      {
+        chunk,
+        filename: file.name,
+        uploadId: session.uploadId,
+        chunkIndex,
+        totalChunks,
+        totalSize: file.size,
+        highPrecision
+      },
+      setUploadMessage
+    );
+    session = {
+      uploadId: result.uploadId || session.uploadId,
+      nextChunkIndex: clampChunkIndex(result.nextChunkIndex ?? chunkIndex + 1, totalChunks)
+    };
+    writeChunkUploadSession(sessionKey, session);
     if (result.message) {
       setUploadMessage(result.message);
     }
     if (result.completed && result.material) {
+      clearChunkUploadSession(sessionKey);
       return result.material;
     }
+    chunkIndex = session.nextChunkIndex - 1;
   }
   throw new Error('视频分片已上传，但后端未返回可轮询的资料记录');
+}
+
+// 单片上传失败只重试当前分片，避免已成功分片被重新上传。
+async function uploadChunkWithRetry(
+  payload: Parameters<typeof uploadMaterialChunk>[0],
+  setUploadMessage: (message: string) => void
+) {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= CHUNK_UPLOAD_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await uploadMaterialChunk(payload);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= CHUNK_UPLOAD_RETRY_LIMIT) {
+        break;
+      }
+      setUploadMessage(`第 ${payload.chunkIndex + 1}/${payload.totalChunks} 个视频分片上传失败，正在重试 ${attempt + 1}/${CHUNK_UPLOAD_RETRY_LIMIT}`);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('视频分片上传失败');
+}
+
+// 生成当前文件的续传状态键。
+function chunkUploadSessionKey(file: File) {
+  return `${CHUNK_UPLOAD_SESSION_PREFIX}${file.name}:${file.size}:${file.lastModified}`;
+}
+
+// 读取本地保存的续传状态。
+function readChunkUploadSession(key: string): ChunkUploadSession | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ChunkUploadSession;
+    if (!parsed.uploadId) return null;
+    return {
+      uploadId: parsed.uploadId,
+      nextChunkIndex: Number.isFinite(parsed.nextChunkIndex) ? parsed.nextChunkIndex : 0
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 保存本地续传状态，刷新或重新选择同一文件时继续使用同一个 uploadId。
+function writeChunkUploadSession(key: string, session: ChunkUploadSession) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.sessionStorage.setItem(key, JSON.stringify(session));
+}
+
+// 上传完成后清理本地续传状态。
+function clearChunkUploadSession(key: string) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.sessionStorage.removeItem(key);
+}
+
+// 生成前端上传批次 ID，避免首片响应丢失后无法续传。
+function createUploadId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
+
+// 限制续传分片序号，避免本地缓存异常导致越界。
+function clampChunkIndex(value: number, totalChunks: number) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(totalChunks, Math.trunc(value)));
 }

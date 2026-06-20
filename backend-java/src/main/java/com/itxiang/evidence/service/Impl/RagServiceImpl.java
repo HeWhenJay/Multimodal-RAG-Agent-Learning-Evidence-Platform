@@ -29,6 +29,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -36,6 +37,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.LinkedHashSet;
@@ -59,7 +61,9 @@ public class RagServiceImpl implements RagService {
     private final ObjectStorageService objectStorageService;
     private final RagIndexWorker ragIndexWorker;
     private final RagUploadWorker ragUploadWorker;
+    private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
+    private Path chunkRootOverride;
 
     /**
      * 汇总 Java 资料记录和 Python 向量仓库概览。
@@ -267,7 +271,6 @@ public class RagServiceImpl implements RagService {
      * 接收学习资料分片，全部到齐后合并文件并触发索引。
      */
     @Override
-    @Transactional
     public MaterialUploadChunkVO uploadMaterialChunk(MultipartFile file,
                                                     String uploadId,
                                                     String filename,
@@ -281,12 +284,9 @@ public class RagServiceImpl implements RagService {
         String safeUploadId = blankToDefault(sanitizeUploadToken(uploadId), UUID.randomUUID().toString().replace("-", ""));
         Path directory = chunkDirectory(scopedUserId, safeUploadId);
         try {
-            Files.createDirectories(directory);
-            Path chunkPath = directory.resolve(String.format("chunk-%05d.part", chunkIndex));
-            try (InputStream inputStream = file.getInputStream()) {
-                Files.copy(inputStream, chunkPath, StandardCopyOption.REPLACE_EXISTING);
-            }
+            saveChunkAtomically(file, directory, chunkIndex);
             int receivedChunks = countReceivedChunks(directory);
+            int nextChunkIndex = nextMissingChunkIndex(directory, totalChunks);
             if (receivedChunks < totalChunks) {
                 return MaterialUploadChunkVO.builder()
                         .uploadId(safeUploadId)
@@ -294,32 +294,56 @@ public class RagServiceImpl implements RagService {
                         .chunkIndex(chunkIndex)
                         .totalChunks(totalChunks)
                         .receivedChunks(receivedChunks)
+                        .nextChunkIndex(nextChunkIndex)
                         .status("UPLOADING")
-                        .message("已接收视频分片：" + receivedChunks + "/" + totalChunks)
+                        .message("已接收视频分片：" + receivedChunks + "/" + totalChunks + "，下次从第 " + (nextChunkIndex + 1) + " 片继续")
                         .completed(false)
                         .material(null)
                         .build();
             }
-            LearningMaterial material = createPendingUploadMaterial(filename, scopedUserId);
-            recordChunkProcessingProgress(material, safeUploadId, totalChunks);
-            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
-                    material.getId(),
+            LearningMaterial existingMaterial = findChunkUploadMaterial(directory, scopedUserId);
+            if (existingMaterial != null) {
+                rescheduleFailedChunkUploadIfNeeded(
+                        existingMaterial,
+                        scopedUserId,
+                        directory,
+                        safeUploadId,
+                        filename,
+                        file.getContentType(),
+                        totalChunks,
+                        totalSize,
+                        Boolean.TRUE.equals(highPrecision)
+                );
+                return MaterialUploadChunkVO.builder()
+                        .uploadId(safeUploadId)
+                        .filename(filename)
+                        .chunkIndex(chunkIndex)
+                        .totalChunks(totalChunks)
+                        .receivedChunks(totalChunks)
+                        .nextChunkIndex(totalChunks)
+                        .status("PROCESSING")
+                        .message("视频分片已收齐，继续沿用已有后台处理任务")
+                        .completed(true)
+                        .material(convertToVO(existingMaterial))
+                        .build();
+            }
+            LearningMaterial material = createPendingUploadMaterialAndScheduleChunkProcessing(
+                    filename,
                     scopedUserId,
                     directory,
-                    chunkRoot(),
                     safeUploadId,
-                    filename,
                     file.getContentType(),
                     totalChunks,
                     totalSize,
                     Boolean.TRUE.equals(highPrecision)
-            ));
+            );
             return MaterialUploadChunkVO.builder()
                     .uploadId(safeUploadId)
                     .filename(filename)
                     .chunkIndex(chunkIndex)
                     .totalChunks(totalChunks)
                     .receivedChunks(totalChunks)
+                    .nextChunkIndex(totalChunks)
                     .status("PROCESSING")
                     .message("视频分片已收齐，正在后台合并并上传对象存储")
                     .completed(true)
@@ -403,6 +427,92 @@ public class RagServiceImpl implements RagService {
         material.setStorageType("pending");
         learningMaterialMapper.insert(material);
         return material;
+    }
+
+    /**
+     * 原子保存单个上传分片，避免半写入文件被后续合并误读。
+     */
+    private void saveChunkAtomically(MultipartFile file, Path directory, Integer chunkIndex) throws IOException {
+        Files.createDirectories(directory);
+        Path chunkPath = directory.resolve(chunkFilename(chunkIndex));
+        Path tempPath = directory.resolve(chunkFilename(chunkIndex) + ".tmp");
+        try (InputStream inputStream = file.getInputStream()) {
+            Files.copy(inputStream, tempPath, StandardCopyOption.REPLACE_EXISTING);
+        }
+        try {
+            Files.move(tempPath, chunkPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicMoveError) {
+            Files.move(tempPath, chunkPath, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    /**
+     * 全部分片到齐后，用短事务创建资料记录并调度后台合并。
+     */
+    private LearningMaterial createPendingUploadMaterialAndScheduleChunkProcessing(String filename,
+                                                                                  String userId,
+                                                                                  Path directory,
+                                                                                  String uploadId,
+                                                                                  String contentType,
+                                                                                  Integer totalChunks,
+                                                                                  Long totalSize,
+                                                                                  Boolean highPrecision) {
+        LearningMaterial material = transactionTemplate.execute(status -> {
+            LearningMaterial pendingMaterial = createPendingUploadMaterial(filename, userId);
+            recordChunkProcessingProgress(pendingMaterial, uploadId, totalChunks);
+            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+                    pendingMaterial.getId(),
+                    userId,
+                    directory,
+                    chunkRoot(),
+                    uploadId,
+                    filename,
+                    contentType,
+                    totalChunks,
+                    totalSize,
+                    Boolean.TRUE.equals(highPrecision)
+            ));
+            return pendingMaterial;
+        });
+        if (material == null) {
+            throw new IllegalStateException("创建分片上传资料记录失败");
+        }
+        writeChunkUploadMaterialMarker(directory, material.getId());
+        return material;
+    }
+
+    /**
+     * 后台合并或对象存储失败后，复用已上传分片重新调度收尾任务。
+     */
+    private void rescheduleFailedChunkUploadIfNeeded(LearningMaterial material,
+                                                     String userId,
+                                                     Path directory,
+                                                     String uploadId,
+                                                     String filename,
+                                                     String contentType,
+                                                     Integer totalChunks,
+                                                     Long totalSize,
+                                                     Boolean highPrecision) {
+        if (!"FAILED".equals(material.getStatus()) || !"upload-chunk-error".equals(material.getParser())) {
+            return;
+        }
+        transactionTemplate.executeWithoutResult(status -> {
+            learningMaterialMapper.updateStatus(material.getId(), "PENDING");
+            material.setStatus("PENDING");
+            recordChunkProcessingProgress(material, uploadId, totalChunks);
+            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+                    material.getId(),
+                    userId,
+                    directory,
+                    chunkRoot(),
+                    uploadId,
+                    filename,
+                    contentType,
+                    totalChunks,
+                    totalSize,
+                    Boolean.TRUE.equals(highPrecision)
+            ));
+        });
     }
 
     /**
@@ -942,6 +1052,9 @@ public class RagServiceImpl implements RagService {
      * 获取分片暂存根目录，可通过环境变量覆盖。
      */
     private Path chunkRoot() {
+        if (chunkRootOverride != null) {
+            return chunkRootOverride.toAbsolutePath().normalize();
+        }
         return Path.of(System.getenv().getOrDefault("EVIDENCE_UPLOAD_CHUNK_ROOT", "uploads/chunks"))
                 .toAbsolutePath()
                 .normalize();
@@ -955,6 +1068,59 @@ public class RagServiceImpl implements RagService {
             return (int) files
                     .filter(path -> path.getFileName().toString().matches("chunk-\\d{5}\\.part"))
                     .count();
+        }
+    }
+
+    /**
+     * 查找最小缺失分片序号，供前端失败后从该分片继续上传。
+     */
+    private int nextMissingChunkIndex(Path directory, int totalChunks) {
+        for (int index = 0; index < totalChunks; index++) {
+            if (!Files.exists(directory.resolve(chunkFilename(index)))) {
+                return index;
+            }
+        }
+        return totalChunks;
+    }
+
+    /**
+     * 生成分片文件名。
+     */
+    private String chunkFilename(int chunkIndex) {
+        return String.format("chunk-%05d.part", chunkIndex);
+    }
+
+    /**
+     * 从分片目录读取已创建的资料记录，避免最后一片重试时重复创建资料。
+     */
+    private LearningMaterial findChunkUploadMaterial(Path directory, String userId) {
+        Path markerPath = directory.resolve("material.id");
+        if (!Files.exists(markerPath)) {
+            return null;
+        }
+        try {
+            String value = Files.readString(markerPath, StandardCharsets.UTF_8).trim();
+            if (value.isBlank()) {
+                return null;
+            }
+            return learningMaterialMapper.findByIdAndUserId(Long.parseLong(value), userId);
+        } catch (Exception e) {
+            log.debug("读取分片上传资料标记失败: path={}, reason={}", markerPath, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 写入分片上传资料标记，用于最终分片重试时保持幂等。
+     */
+    private void writeChunkUploadMaterialMarker(Path directory, Long materialId) {
+        if (materialId == null) {
+            return;
+        }
+        try {
+            Files.writeString(directory.resolve("material.id"), String.valueOf(materialId), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            log.debug("写入分片上传资料标记失败: materialId={}, reason={}", materialId, e.getMessage());
         }
     }
 

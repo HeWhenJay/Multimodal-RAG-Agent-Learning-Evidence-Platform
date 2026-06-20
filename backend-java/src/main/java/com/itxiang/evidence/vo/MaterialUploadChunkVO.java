@@ -12,6 +12,7 @@ public class MaterialUploadChunkVO {
     private Integer chunkIndex;
     private Integer totalChunks;
     private Integer receivedChunks;
+    private Integer nextChunkIndex;
     private String status;
     private String message;
     private Boolean completed;

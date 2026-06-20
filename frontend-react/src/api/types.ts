@@ -69,6 +69,7 @@ export interface MaterialUploadChunk {
   chunkIndex: number;
   totalChunks: number;
   receivedChunks: number;
+  nextChunkIndex?: number | null;
   status?: 'UPLOADING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | string;
   message?: string | null;
   completed: boolean;
