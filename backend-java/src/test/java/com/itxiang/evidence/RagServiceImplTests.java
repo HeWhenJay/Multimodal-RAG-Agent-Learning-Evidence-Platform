@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
+import com.itxiang.evidence.entity.RagQueryHistory;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
@@ -14,6 +15,7 @@ import com.itxiang.evidence.service.Impl.RagServiceImpl;
 import com.itxiang.evidence.service.Impl.RagUploadWorker;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
+import com.itxiang.evidence.vo.RagQueryTaskVO;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,6 +34,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -160,6 +163,37 @@ class RagServiceImplTests {
                 eq(endDate.plusDays(1).atStartOfDay()),
                 eq(10)
         );
+    }
+
+    @Test
+    void getQueryTaskUpdatesHistoryDurationFromTimestampWithTimezone() {
+        RagQueryHistory existing = new RagQueryHistory();
+        existing.setUserId("7");
+        existing.setTaskId("task-1");
+        existing.setStatus("RUNNING");
+        existing.setEvidenceCount(0);
+        existing.setExpandedQueriesJson("[]");
+        existing.setEvidencesJson("[]");
+        existing.setDiagnosticsJson("{}");
+        existing.setProgressEventsJson("[]");
+        existing.setCreatedAt(OffsetDateTime.parse("2026-06-20T22:19:30+08:00"));
+        RagQueryTaskVO task = RagQueryTaskVO.builder()
+                .taskId("task-1")
+                .status("RUNNING")
+                .updatedAt(LocalDateTime.of(2026, 6, 20, 22, 19, 39))
+                .progressEvents(List.of())
+                .build();
+        when(pythonRagClient.getQueryTask(eq("task-1"))).thenReturn(task);
+        when(ragQueryHistoryMapper.findByTaskIdAndUserId(eq("task-1"), eq("7"))).thenReturn(existing);
+
+        RagQueryTaskVO result = ragService.getQueryTask("task-1", "7");
+
+        assertThat(result.getTaskId()).isEqualTo("task-1");
+        verify(ragQueryHistoryMapper).updateByTaskId(argThat(history ->
+                "task-1".equals(history.getTaskId())
+                        && "RUNNING".equals(history.getStatus())
+                        && Integer.valueOf(9000).equals(history.getDurationMs())
+        ));
     }
 
     @Test

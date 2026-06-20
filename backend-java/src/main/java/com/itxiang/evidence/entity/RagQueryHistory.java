@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class RagQueryHistory {
@@ -21,6 +21,6 @@ public class RagQueryHistory {
     private String progressEventsJson;
     private String errorMessage;
     private Integer durationMs;
-    private LocalDateTime createdAt;
-    private LocalDateTime updatedAt;
+    private OffsetDateTime createdAt;
+    private OffsetDateTime updatedAt;
 }

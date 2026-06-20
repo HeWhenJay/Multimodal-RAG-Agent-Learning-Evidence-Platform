@@ -40,6 +40,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -850,8 +851,8 @@ public class RagServiceImpl implements RagService {
                 .progressEvents(fromJson(history.getProgressEventsJson(), new TypeReference<List<RagProgressVO>>() {}, List.of()))
                 .errorMessage(history.getErrorMessage())
                 .durationMs(history.getDurationMs())
-                .createdAt(history.getCreatedAt())
-                .updatedAt(history.getUpdatedAt())
+                .createdAt(toLocalDateTime(history.getCreatedAt()))
+                .updatedAt(toLocalDateTime(history.getUpdatedAt()))
                 .build();
     }
 
@@ -910,8 +911,15 @@ public class RagServiceImpl implements RagService {
         if (existing.getCreatedAt() == null || task.getUpdatedAt() == null) {
             return existing.getDurationMs();
         }
-        long duration = java.time.Duration.between(existing.getCreatedAt(), task.getUpdatedAt()).toMillis();
+        long duration = java.time.Duration.between(existing.getCreatedAt().toLocalDateTime(), task.getUpdatedAt()).toMillis();
         return safeDuration(duration);
+    }
+
+    /**
+     * 将数据库带时区时间转换为前端沿用的本地时间结构。
+     */
+    private LocalDateTime toLocalDateTime(OffsetDateTime value) {
+        return value == null ? null : value.toLocalDateTime();
     }
 
     /**
