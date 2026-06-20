@@ -113,26 +113,27 @@ python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
 ```powershell
 $env:PYTHONPATH='ai-python'
 $env:RAGAS_EVAL_PROVIDER='openai-compatible'
-$env:RAGAS_EVAL_BASE_URL='https://your-openai-compatible-endpoint/v1'
-$env:RAGAS_EVAL_API_KEY='<your-eval-key>'
-$env:RAGAS_EVAL_LLM_MODEL='<your-eval-llm>'
-$env:RAGAS_EVAL_EMBEDDING_MODEL='<your-eval-embedding>'
+$env:RAGAS_EVAL_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+$env:DASHSCOPE_API_KEY='<your-dashscope-api-key>'
+$env:RAGAS_EVAL_LLM_MODEL='qwen-plus'
+$env:RAGAS_EVAL_EMBEDDING_MODEL='text-embedding-v4'
 $env:RAGAS_EVAL_TIMEOUT_SECONDS='60'
 $env:RAGAS_EVAL_TEMPERATURE='0'
 python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas
 ```
 
-评估模型配置与项目 RAG 模型配置分离。`--mode ragas` 缺少 `RAGAS_EVAL_API_KEY`、`RAGAS_EVAL_LLM_MODEL` 或 `RAGAS_EVAL_EMBEDDING_MODEL` 时，会先写出离线评估文件，再以非 0 返回真实评分失败原因，不会静默复用项目的 `DASHSCOPE_API_KEY`。
+真实 Ragas 评分默认复用项目百炼配置。`RAGAS_EVAL_API_KEY` 优先级高于 `DASHSCOPE_API_KEY`；未配置 `RAGAS_EVAL_API_KEY` 时会直接读取 `DASHSCOPE_API_KEY`。`RAGAS_EVAL_LLM_MODEL` 和 `RAGAS_EVAL_EMBEDDING_MODEL` 未配置时，会分别回退到 `RAG_LLM_MODEL`、`RAG_EMBEDDING_MODEL` 或默认的 `qwen-plus`、`text-embedding-v4`。如果 Key 仍缺失，会先写出离线评估文件，再以非 0 返回真实评分失败原因。
 
 真实评分环境变量规则：
 
 | 环境变量 | 必填 | 规则 |
 | --- | --- | --- |
 | `RAGAS_EVAL_PROVIDER` | 是 | 只允许 `openai-compatible` 或 `openai`；传给 Ragas 内部时统一映射为 `openai` |
-| `RAGAS_EVAL_BASE_URL` | openai-compatible 必填 | 必须以 `http://` 或 `https://` 开头；`openai` 模式为空时走官方 OpenAI，显式传入时同样校验协议 |
-| `RAGAS_EVAL_API_KEY` | 是 | 评估模型 Key，不写入输出文件，不复用项目业务 Key |
-| `RAGAS_EVAL_LLM_MODEL` | 是 | Ragas 评估 LLM 模型 |
-| `RAGAS_EVAL_EMBEDDING_MODEL` | 是 | Ragas 评估 embedding 模型 |
+| `RAGAS_EVAL_BASE_URL` | openai-compatible 可选 | 必须以 `http://` 或 `https://` 开头；未配置时依次复用 `RAG_LLM_BASE_URL`、`RAG_EMBEDDING_BASE_URL`、`DASHSCOPE_EMBEDDING_BASE_URL`，再回退到百炼兼容地址 |
+| `RAGAS_EVAL_API_KEY` | 可选 | 评估模型 Key，不写入输出文件；未配置时复用 `DASHSCOPE_API_KEY` |
+| `DASHSCOPE_API_KEY` | `RAGAS_EVAL_API_KEY` 为空时必填 | 项目百炼 Key，可直接用于真实 Ragas 评分 |
+| `RAGAS_EVAL_LLM_MODEL` | 可选 | Ragas 评估 LLM 模型；未配置时复用 `RAG_LLM_MODEL`，再回退到 `qwen-plus` |
+| `RAGAS_EVAL_EMBEDDING_MODEL` | 可选 | Ragas 评估 embedding 模型；未配置时复用 `RAG_EMBEDDING_MODEL` 或 `DASHSCOPE_EMBEDDING_MODEL`，再回退到 `text-embedding-v4` |
 | `RAGAS_EVAL_TIMEOUT_SECONDS` | 是 | 必须是数字且大于 0，会传给 OpenAI client、embedding 和 Ragas `RunConfig` |
 | `RAGAS_EVAL_TEMPERATURE` | 是 | 必须是数字且 `0 <= x <= 2`，会传给评估 LLM |
 

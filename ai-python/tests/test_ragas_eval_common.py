@@ -138,19 +138,30 @@ def test_build_ragas_input_row_keeps_project_auxiliary_fields():
     assert row["expected_document_ids"] == ["llm-ragas-d01"]
 
 
-def test_ragas_mode_requires_separate_eval_key(monkeypatch):
-    """确认真实 Ragas 模式不会静默复用项目 DASHSCOPE_API_KEY。"""
+def test_ragas_mode_reuses_dashscope_key_by_default(monkeypatch):
+    """确认真实 Ragas 模式默认复用项目 DASHSCOPE_API_KEY。"""
     monkeypatch.delenv("RAGAS_EVAL_API_KEY", raising=False)
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "project-key")
-    monkeypatch.setenv("RAGAS_EVAL_LLM_MODEL", "eval-llm")
-    monkeypatch.setenv("RAGAS_EVAL_EMBEDDING_MODEL", "eval-embedding")
+    monkeypatch.delenv("RAGAS_EVAL_BASE_URL", raising=False)
+    monkeypatch.delenv("RAGAS_EVAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("RAGAS_EVAL_EMBEDDING_MODEL", raising=False)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
 
-    try:
-        ensure_ragas_eval_config()
-    except RuntimeError as exc:
-        assert "RAGAS_EVAL_API_KEY 未配置" in str(exc)
-    else:
-        raise AssertionError("缺少 RAGAS_EVAL_API_KEY 时必须报错")
+    settings = ensure_ragas_eval_config()
+
+    assert settings.api_key == "dashscope-key"
+    assert settings.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert settings.llm_model == "qwen-plus"
+    assert settings.embedding_model == "text-embedding-v4"
+
+
+def test_ragas_eval_key_overrides_dashscope_key(monkeypatch):
+    """确认显式 RAGAS_EVAL_API_KEY 优先于项目 DASHSCOPE_API_KEY。"""
+    _set_valid_ragas_env(monkeypatch)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
+
+    settings = ensure_ragas_eval_config()
+
+    assert settings.api_key == "eval-key"
 
 
 def _set_valid_ragas_env(monkeypatch, *, provider: str = "openai-compatible") -> None:
@@ -167,13 +178,17 @@ def _set_valid_ragas_env(monkeypatch, *, provider: str = "openai-compatible") ->
         monkeypatch.delenv("RAGAS_EVAL_BASE_URL", raising=False)
 
 
-def test_ragas_eval_config_requires_base_url_for_compatible(monkeypatch):
-    """确认 openai-compatible 模式必须配置 base_url。"""
+def test_ragas_eval_config_uses_dashscope_base_url_for_compatible(monkeypatch):
+    """确认 openai-compatible 模式可默认使用百炼兼容地址。"""
     _set_valid_ragas_env(monkeypatch)
     monkeypatch.delenv("RAGAS_EVAL_BASE_URL", raising=False)
+    monkeypatch.delenv("RAG_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("RAG_EMBEDDING_BASE_URL", raising=False)
+    monkeypatch.delenv("DASHSCOPE_EMBEDDING_BASE_URL", raising=False)
 
-    with pytest.raises(RuntimeError, match="RAGAS_EVAL_BASE_URL 未配置"):
-        load_ragas_eval_settings()
+    settings = load_ragas_eval_settings()
+
+    assert settings.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 def test_ragas_eval_config_allows_official_openai_without_base_url(monkeypatch):
@@ -197,16 +212,17 @@ def test_ragas_eval_config_rejects_invalid_provider(monkeypatch):
 
 
 def test_ragas_eval_config_requires_models_and_valid_numbers(monkeypatch):
-    """确认模型、timeout 和 temperature 配置都会被严格校验。"""
+    """确认模型支持默认复用，timeout 和 temperature 配置会严格校验。"""
     _set_valid_ragas_env(monkeypatch)
     monkeypatch.delenv("RAGAS_EVAL_LLM_MODEL", raising=False)
-    with pytest.raises(RuntimeError, match="RAGAS_EVAL_LLM_MODEL 未配置"):
-        load_ragas_eval_settings()
+    monkeypatch.delenv("RAG_LLM_MODEL", raising=False)
+    assert load_ragas_eval_settings().llm_model == "qwen-plus"
 
     _set_valid_ragas_env(monkeypatch)
     monkeypatch.delenv("RAGAS_EVAL_EMBEDDING_MODEL", raising=False)
-    with pytest.raises(RuntimeError, match="RAGAS_EVAL_EMBEDDING_MODEL 未配置"):
-        load_ragas_eval_settings()
+    monkeypatch.delenv("RAG_EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("DASHSCOPE_EMBEDDING_MODEL", raising=False)
+    assert load_ragas_eval_settings().embedding_model == "text-embedding-v4"
 
     _set_valid_ragas_env(monkeypatch)
     monkeypatch.setenv("RAGAS_EVAL_TIMEOUT_SECONDS", "abc")
@@ -531,6 +547,7 @@ def test_ragas_cli_missing_config_writes_offline_outputs(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.delenv("RAGAS_EVAL_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
     exit_code = run_ragas_small_eval.main()
 
@@ -539,6 +556,6 @@ def test_ragas_cli_missing_config_writes_offline_outputs(monkeypatch, tmp_path):
     assert (output_dir / "offline_scores.csv").exists()
     assert not (output_dir / "ragas_scores.csv").exists()
     run_config = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
-    assert "RAGAS_EVAL_API_KEY 未配置" in run_config["ragas"]["failureReason"]
+    assert "RAGAS_EVAL_API_KEY 或 DASHSCOPE_API_KEY 未配置" in run_config["ragas"]["failureReason"]
     assert "summary" in run_config
     assert "ragas_failure_reason" in run_config["summary"]

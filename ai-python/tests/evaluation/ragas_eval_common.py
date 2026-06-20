@@ -20,6 +20,9 @@ DEFAULT_CASES_PATH = PROJECT_ROOT / "docs" / "testing" / "ragas-small-eval-cases
 DEFAULT_DOCUMENTS_PATH = PROJECT_ROOT / "docs" / "testing" / "ragas-small-eval-documents.json"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tmp" / "ragas-small-eval"
 DEFAULT_BOUNDARY_SCORE_THRESHOLD = 0.18
+DEFAULT_RAGAS_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_RAGAS_LLM_MODEL = "qwen-plus"
+DEFAULT_RAGAS_EMBEDDING_MODEL = "text-embedding-v4"
 
 
 @dataclass(frozen=True)
@@ -571,6 +574,24 @@ def _require_env(name: str, description: str) -> str:
     return value.strip()
 
 
+def _first_env(*names: str) -> str | None:
+    """按优先级读取第一个非空环境变量。"""
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _require_first_env(names: tuple[str, ...], description: str) -> str:
+    """按优先级读取必填环境变量，全部缺失时输出中文错误。"""
+    value = _first_env(*names)
+    if value:
+        return value
+    joined = " 或 ".join(names)
+    raise RuntimeError(f"{joined} 未配置，请指定 Ragas 真实评分所需的{description}。")
+
+
 def _parse_positive_float(name: str, default: str) -> float:
     """读取必须大于 0 的数字环境变量。"""
     raw_value = (os.getenv(name) or default).strip()
@@ -610,10 +631,21 @@ def load_ragas_eval_settings() -> RagasEvalSettings:
     provider = (os.getenv("RAGAS_EVAL_PROVIDER") or "openai-compatible").strip()
     if provider not in {"openai-compatible", "openai"}:
         raise RuntimeError("RAGAS_EVAL_PROVIDER 只允许 openai-compatible 或 openai。")
-    api_key = _require_env("RAGAS_EVAL_API_KEY", "API Key")
-    llm_model = _require_env("RAGAS_EVAL_LLM_MODEL", "LLM 模型名称")
-    embedding_model = _require_env("RAGAS_EVAL_EMBEDDING_MODEL", "embedding 模型名称")
-    base_url = _validate_base_url(os.getenv("RAGAS_EVAL_BASE_URL"), required=provider == "openai-compatible")
+    api_key_names = ("RAGAS_EVAL_API_KEY",) if provider == "openai" else ("RAGAS_EVAL_API_KEY", "DASHSCOPE_API_KEY")
+    api_key = _require_first_env(api_key_names, "API Key")
+    llm_model = _first_env("RAGAS_EVAL_LLM_MODEL", "RAG_LLM_MODEL") or DEFAULT_RAGAS_LLM_MODEL
+    embedding_model = (
+        _first_env("RAGAS_EVAL_EMBEDDING_MODEL", "RAG_EMBEDDING_MODEL", "DASHSCOPE_EMBEDDING_MODEL")
+        or DEFAULT_RAGAS_EMBEDDING_MODEL
+    )
+    if provider == "openai-compatible":
+        base_url_value = (
+            _first_env("RAGAS_EVAL_BASE_URL", "RAG_LLM_BASE_URL", "RAG_EMBEDDING_BASE_URL", "DASHSCOPE_EMBEDDING_BASE_URL")
+            or DEFAULT_RAGAS_COMPATIBLE_BASE_URL
+        )
+    else:
+        base_url_value = os.getenv("RAGAS_EVAL_BASE_URL")
+    base_url = _validate_base_url(base_url_value, required=provider == "openai-compatible")
     return RagasEvalSettings(
         provider=provider,
         ragas_provider="openai",
