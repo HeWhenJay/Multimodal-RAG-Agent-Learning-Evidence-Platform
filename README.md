@@ -210,48 +210,77 @@ flowchart TD
 
 Agent 架构建议采用 PAE（Plan-and-Execute）为主，ReAct 作为执行节点内部的工具观察循环。原因是资料入库、简历/JD 匹配和学习路线规划都属于多步骤、可审查、需要暂停确认的流程，先规划再执行更适合 Human-in-the-Loop；而在某个执行节点内部，如检索证据不足、资料仍在解析、需要补跑高精度解析时，可以使用 ReAct 式“行动 -> 观察 -> 修正”循环。
 
-普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、重试、补跑建议或人工审批的场景介入，例如资料状态读取、evidence 覆盖审计、重建索引申请、JD/简历匹配分析和草稿生成。工具注册面以 Java 业务能力为准；即使未来 Agent 执行器使用 LangGraph/Python 实现，也只能通过 Java 暴露的工具网关触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。Agent 不直接调用 Python `/internal/*`，不直连数据库，不读取对象存储原始文件。
+普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、重试、补跑建议或人工审批的场景介入，例如资料状态读取、evidence 覆盖审计、重建索引申请、JD/简历匹配分析和草稿生成。工具注册面以 Java 业务能力为准；即使未来 Agent 执行器使用 LangGraph/Python 实现，也只能通过 Java 暴露的 Tool Gateway 触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。Agent 不直接调用 Python `/internal/*`，不直连数据库，不读取对象存储原始文件。
+
+查询和只读工具不需要 Human-in-the-Loop，但必须由 Java 从登录 token 解析当前用户，并在 Tool Gateway 或业务服务层强制资源归属过滤：只能查询当前用户自己上传或被明确授权的数据，不能读取其他用户上传的资料。资源过滤条件只能由 Java 服务端计算，等价于 `ownerUserId == currentUserId OR exists explicitGrant(currentUserId, resourceId)`；Agent 不接收、也不自行构造跨用户资源过滤条件。Create/Update/Delete 以及任何业务状态变更必须进入 `human_crud_review` 做具体操作审批。计划确认只批准任务目标和工具路线，不等于批准任何写操作。自动写入 `log_event/log_error` 属于平台审计和故障观测副作用，不作为 Agent 可选工具，也不因工具审批而阻断；但日志必须由服务端补齐当前 `userId`、`traceId`，脱敏后写入，不能记录简历正文、资料正文或模型密钥。
 
 ```mermaid
 flowchart TD
-    A0["用户输入<br/>上传文件 / 粘贴资料 / 提交简历和岗位 JD"] --> A1["React 前端<br/>只调用 Java API，展示计划、确认项和执行结果"]
-    A1 --> A2["Java 业务入口<br/>鉴权、用户隔离、任务状态、统一 Result 响应"]
-    A2 --> A3["Agent 意图识别<br/>knowledge_ingestion / jd_resume_match / 普通 RAG 问答"]
-    A3 --> A4["Planner 生成计划<br/>拆分工具步骤、风险点、预期 evidence 和审批点"]
-    A4 --> H1{"Human-in-the-Loop<br/>确认计划"}
-    H1 -->|"修改计划"| A4
+    A0["用户输入<br/>上传文件 / 粘贴资料 / 提交简历和岗位 JD"] --> A1["React 前端<br/>展示计划、读取范围、审批项和执行结果"]
+    A1 --> A2["Java Auth Resolver<br/>从 token 解析当前用户"]
+    A2 --> A3["Scope & Ownership Guard<br/>强制 scope=current_user_or_authorized<br/>ownerUserId=currentUserId 或 explicitGrant 命中"]
+    A3 --> A4["Agent Intent Router<br/>资料状态检查 / JD 适配 / 普通 RAG 问答"]
+    A4 -->|"普通 RAG 查询 / 资料状态 / evidence 读取 / 检索覆盖诊断"| TR["Tool Router<br/>只读查询快速通道，不进入 human_plan_review"]
+    A4 -->|"JD/简历适配 / 学习路线 / 可保存草稿 / 可能触发变更"| A5["Planner<br/>生成计划、候选工具和风险点"]
+    A5 --> H1{"human_plan_review<br/>确认任务目标和工具路线"}
+    H1 -->|"修改计划"| A5
     H1 -->|"取消"| AX["结束任务<br/>记录取消状态"]
-    H1 -->|"确认"| R0{"任务类型"}
+    H1 -->|"确认"| TR2["Tool Router<br/>规划通道，按计划和 Observation 选择工具"]
 
-    R0 -->|"资料状态检查与证据补强"| K1["Java RAG 资料工具<br/>状态查询、受限预览、evidence 列表、重建索引建议/申请"]
-    K1 --> H2{"人工确认<br/>重建索引 / 高精度补跑 / 长视频高成本处理"}
-    H2 -->|"确认"| K2["Java 触发 Python RAG 服务<br/>index-file / index-text / index-video-source"]
-    H2 -->|"取消或稍后"| AX
-    K2 --> K3["Python RAG 索引<br/>MinerU/OCR/ASR、递归切块、摘要索引、BM25、向量入库"]
-    K3 --> K4["evidence 读取与知识摘要<br/>资料标题、章节、片段、来源和分数"]
+    TR -->|"查询 / 只读，不需人工审批"| JRG["Java Read Tool Gateway<br/>只读网关，禁止直连 DB、Python /internal/*、对象存储<br/>强制 ownerUserId=currentUserId 或 explicitGrant 命中"]
+    TR2 -->|"计划内只读工具"| JRG
+    JRG --> RT["Read ToolNode<br/>只调用 Java 只读能力，返回结构化结果"]
+    RT --> RTOOLS["只读工具集合<br/>material_status_reader<br/>material_evidence_reader<br/>material_preview_reader<br/>rag_query_probe_non_persistent<br/>retrieval_coverage_probe<br/>evidence_quality_auditor<br/>resume_evidence_aligner<br/>gap_analyzer"]
+    RTOOLS --> OBS["Observation<br/>结构化工具结果"]
 
-    R0 -->|"简历 / JD 岗位适配"| J1["JD 能力项抽取<br/>技能、项目经验、工具栈、业务要求"]
-    J1 --> J2["Java 查询能力触发 RAG 检索<br/>当前用户 metadataFilter、Multi-Query、BM25、向量、RAG-Fusion"]
-    J2 --> J3["简历证据对齐<br/>supported / weak / missing"]
-    J3 --> J4["缺口分析<br/>能力差距、证据不足、资料缺失"]
-    J4 --> J5["学习路线与简历改写草稿<br/>只生成建议，不直接替用户修改简历"]
-    J5 --> H3{"Human-in-the-Loop<br/>确认简历改写和学习路线"}
-    H3 -->|"要求调整"| J4
-    H3 -->|"确认"| E1["输出候选方案"]
+    TR2 -->|"需要 CREATE / UPDATE / DELETE 或状态变更"| MP["Mutation Proposal Builder<br/>只生成变更候选，不执行"]
+    MP --> H2{"human_crud_review<br/>确认具体 CRUD / 状态变更"}
+    H2 -->|"取消"| TR2
+    H2 -->|"修改"| MP
+    H2 -->|"确认"| JTG["Java Tool Gateway<br/>二次校验 userId、权限、资源归属、幂等键"]
+    JTG --> SNAP1["Before Snapshot / Operation Prepare<br/>生成 beforeSnapshotRef、operationId、undoDeadline"]
+    SNAP1 --> MT["Mutation ToolNode<br/>只执行已审批变更工具"]
+    MT --> MTOOLS["变更工具集合<br/>material_reindex_request<br/>resume_revision_save<br/>jd_learning_plan_save<br/>agent_task_cancel_request<br/>operation_undo_request"]
+    MTOOLS --> SNAP2["Operation Log / After Snapshot<br/>生成 afterSnapshotRef、auditEventId、执行摘要"]
+    SNAP2 --> UWM["Undo Window Manager<br/>APPLIED_UNDOABLE 到 UNDONE / UNDO_EXPIRED / FINALIZED"]
+    UWM --> OBS
 
-    K4 --> E0["证据审计<br/>检查 evidence 覆盖率、引用完整性和风险等级"]
-    E0 --> H4{"Human-in-the-Loop<br/>确认最终输出"}
-    H4 -->|"要求补充证据"| A4
-    H4 -->|"确认"| E1
-    E1 --> E2["最终结果<br/>知识入库摘要 / JD 匹配报告 / 简历修改建议 / 学习计划"]
-    E2 --> L1["日志与状态记录<br/>domain=agent、阶段、动作、错误码、contextJson"]
+    OBS --> PG["Evidence Auditor / Policy Guard<br/>证据、隐私、引用、风险检查"]
+    PG -->|"纯只读任务证据不足且未超重试上限"| TR
+    PG -->|"规划任务证据不足且未超重试上限"| TR2
+    PG -->|"产生新的变更候选"| MP
+    PG -->|"纯只读可输出"| E2["最终结果<br/>知识摘要 / JD 匹配报告 / 简历修改建议 / 学习计划"]
+    PG -->|"规划草稿可输出"| H3{"human_output_review<br/>确认草稿和最终输出"}
+    H3 -->|"规划结果要求调整"| TR2
+    H3 -->|"确认"| E2
+    E2 --> AL["Audit Logging<br/>domain=agent 写 log_event/log_error<br/>审计副作用，不是 Agent 工具"]
 ```
 
-未来 LangGraph 可按显式状态图落地，但在接口文档确认前只作为实现建议：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/evidences/draft/finalAnswer/status`；核心节点为 `intent_router -> planner -> human_plan_review -> execute_material_quality_check 或 execute_jd_match -> evidence_auditor -> human_output_review -> finalizer`；条件边根据 `taskType/reviewDecision/evidenceScore/riskLevel` 跳转。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、重建索引确认、高精度补跑确认、长视频高成本处理确认、简历改写确认、学习路线确认和最终输出确认。
+未来 LangGraph 可按显式状态图落地，但在接口文档确认前只作为实现建议：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/observations/evidences/mutationProposal/draft/finalAnswer/status`。`intent_router` 根据任务类型分支：`pure_read_query -> scope_ownership_guard -> tool_router -> java_read_tool_gateway -> read_tool_node -> observation -> evidence_auditor_policy_guard -> finalizer`；`planning_task -> planner -> human_plan_review -> tool_router -> java_read_tool_gateway/read_tool_node 或 mutation_proposal_builder`；`mutation_task -> mutation_proposal_builder -> human_crud_review -> java_tool_gateway -> mutation_tool_node -> observation`。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批，纯只读结果也不进入输出审批；`human_crud_review` 才批准具体 Create/Update/Delete 或状态变更。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、重建索引确认、高精度补跑确认、长视频高成本处理确认、简历改写保存确认、学习路线保存确认、撤销操作确认和规划类最终输出确认。
 
-工具节点设计同样只作为未来建议。固定图节点不作为 Planner 可选工具，包括 `intent_router`、Java/API 输入校验、受权限控制的上下文加载、`human_approval_gate`、`privacy_guard` 和 `citation_guard`。资料类工具候选只对应 `material_status_reader`、`material_evidence_reader`、受限版 `material_preview_reader`、`reindex_recommender` 和经人工确认后的 `material_reindex_request`；上传、分片上传和普通入库仍是确定性 Java 业务流程，不作为 Agent 自主工具。检索与证据类工具候选包括 `rag_query_tool`、`retrieval_coverage_probe` 和 `evidence_quality_auditor`；其中 `retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
+工具节点设计同样只作为未来建议。固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤，只能返回当前用户自己上传或被授权的数据；网关必须由服务端计算 `ownerUserId == currentUserId OR exists explicitGrant(currentUserId, resourceId)`，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；如果未来要保存查询历史，则必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
 
-岗位适配类工具候选包括 `resume_evidence_aligner`、`gap_analyzer`、`resume_rewrite_drafter` 和 `learning_plan_builder`。`jd_skill_extractor` 与 `resume_parser` 先作为 JD/简历分析服务内部步骤，不作为普通 Tool，除非未来确实需要 Planner 选择、重试或跳过。所有工具输出都应结构化，字段至少包括 `toolName/taskId/status/message/evidenceIds/riskLevel/nextActionCandidates/errorCode/retryable/requiresApproval/approvalType/costLevel/idempotencyKey/diagnostics`；生成结论类工具必须带 evidence 或明确返回缺证据，不能编造项目经历。
+| 工具名 | 类型 | 何时调用 | 是否需要 HITL | Java 边界与权限约束 | 持久化副作用 |
+| --- | --- | --- | --- | --- | --- |
+| `material_status_reader` | 只读 | 用户查看资料解析、索引、失败原因或重试建议时 | 否 | 只走 `java_read_tool_gateway`，仅本人或明确授权资料 | 无 |
+| `material_evidence_reader` | 只读 | 需要列出资料标题、章节、片段、来源和分数时 | 否 | 只走 `java_read_tool_gateway`，仅本人或明确授权 evidence | 无 |
+| `material_preview_reader` | 只读 | 需要受限预览片段帮助判断是否补跑解析时 | 否 | 只走 `java_read_tool_gateway`，预览长度和字段由 Java 控制 | 无 |
+| `rag_query_probe_non_persistent` | 只读 | 普通 RAG 问答或 JD/简历适配需要临时检索时 | 否 | 只走 Java 查询能力，强制 `scope=current_user_or_authorized` | 不写查询历史，仅写脱敏审计日志 |
+| `retrieval_coverage_probe` | 只读 | evidence 覆盖不足，需要查看召回分布和覆盖率时 | 否 | 只读取 Java 返回的诊断摘要，不接触原始跨用户数据 | 无 |
+| `evidence_quality_auditor` | 只读 | 输出前检查引用完整性、证据充分性和风险等级时 | 否 | 只走 `java_read_tool_gateway`，只处理已授权 evidence 和工具结果 | 无 |
+| `resume_evidence_aligner` | 只读生成 | JD/简历适配时对齐 supported / weak / missing 证据 | 否 | 只走 `java_read_tool_gateway`，只读取当前用户简历、资料和授权 JD/资料 | 无，产出草稿 Observation |
+| `gap_analyzer` | 只读生成 | 根据 evidence 缺口生成能力差距和学习建议时 | 否 | 只走 `java_read_tool_gateway`，只处理已授权 evidence 和 JD 要求 | 无，产出草稿 Observation |
+| `material_reindex_request` | 变更 | 用户确认重建索引、高精度补跑或长视频高成本处理后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验资源归属、幂等键和成本提示 | 生成操作记录、任务状态和索引引用 |
+| `resume_revision_save` | 变更 | 用户确认保存简历改写版本后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验当前用户简历归属 | 保存草稿/版本，可撤销 |
+| `jd_learning_plan_save` | 变更 | 用户确认保存学习路线或计划后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验当前用户计划归属 | 保存计划，可撤销 |
+| `agent_task_cancel_request` | 变更 | 用户显式取消 Agent 任务或审批取消时 | 是，`human_crud_review` | 只走 Java Tool Gateway，只能取消本人任务 | 更新任务状态 |
+| `operation_undo_request` | 变更 | 用户在撤销窗口内确认撤销时 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验 operation 属于当前用户且未过期 | 写撤销状态和恢复记录 |
+
+变更工具候选包括 `material_reindex_request`、`resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 和 `operation_undo_request`。这些工具全部必须经过 `human_crud_review`、Java Tool Gateway 归属校验、幂等键校验、操作日志和撤销窗口；`agent_task_cancel_request` 与 `operation_undo_request` 本身也是状态变更，只有用户显式触发或确认后才能执行。`jd_skill_extractor` 与 `resume_parser` 先作为 JD/简历分析服务内部步骤，不作为普通 Tool，除非未来确实需要 Planner 选择、重试或跳过。
+
+变更操作的撤销窗口状态建议为：`PENDING_APPROVAL -> APPLIED_UNDOABLE -> UNDONE / UNDO_EXPIRED / FINALIZED / FAILED`。mutation 执行前必须生成 `beforeSnapshotRef`，执行后生成 `afterSnapshotRef/auditEventId/undoDeadline`。撤销只能恢复业务记录、草稿状态、计划记录或旧索引引用；模型调用成本、已消耗的长视频处理资源不可撤销，只能在审批时明确 `costLevel` 和不可逆部分。
+
+所有工具输出都应结构化，字段至少包括 `toolName/taskId/operationType/resourceType/resourceId/status/message/evidenceIds/riskLevel/nextActionCandidates/errorCode/retryable/requiresApproval/approvalType/costLevel/idempotencyKey/diagnostics/ownershipVerified/scope/beforeSnapshotRef/afterSnapshotRef/undoDeadline/undoable/auditEventId`。`ownerUserId` 仅服务端内部使用，不给普通前端展示；前端只看 `ownershipVerified=true` 和 `scope=current_user_or_authorized`。生成结论类工具必须带 evidence 或明确返回缺证据，不能编造项目经历。
 
 ### 细分 RAG 流程图
 
