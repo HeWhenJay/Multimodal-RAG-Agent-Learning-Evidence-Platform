@@ -204,6 +204,51 @@ flowchart TD
     FE --> UI["前端展示<br/>资料状态、证据卡片、视频播放定位、JD 匹配矩阵和学习计划"]
 ```
 
+### 第二阶段 Agent 规划（当前未实现）
+
+本节是后续 Agent 阶段的业务规划，当前代码仍只完成 RAG 闭环，不启动 Agent 自主规划、工具调用或长任务调度，也不新增接口契约。未来 Agent 编排层必须继续遵守现有边界：React 只调用 Java；Java 负责登录用户、权限、业务状态、资料记录、统一响应和日志；Python 仍作为 RAG 服务，负责解析、索引、检索、重排、回答和 evidence 引用。Agent 不直接绕过 Java 调用 Python 内部接口。
+
+Agent 架构建议采用 PAE（Plan-and-Execute）为主，ReAct 作为执行节点内部的工具观察循环。原因是资料入库、简历/JD 匹配和学习路线规划都属于多步骤、可审查、需要暂停确认的流程，先规划再执行更适合 Human-in-the-Loop；而在某个执行节点内部，如检索证据不足、资料仍在解析、需要补跑高精度解析时，可以使用 ReAct 式“行动 -> 观察 -> 修正”循环。
+
+```mermaid
+flowchart TD
+    A0["用户输入<br/>上传文件 / 粘贴资料 / 提交简历和岗位 JD"] --> A1["React 前端<br/>只调用 Java API，展示计划、确认项和执行结果"]
+    A1 --> A2["Java 业务入口<br/>鉴权、用户隔离、任务状态、统一 Result 响应"]
+    A2 --> A3["Agent 意图识别<br/>knowledge_ingestion / jd_resume_match / 普通 RAG 问答"]
+    A3 --> A4["Planner 生成计划<br/>拆分工具步骤、风险点、预期 evidence 和审批点"]
+    A4 --> H1{"Human-in-the-Loop<br/>确认计划"}
+    H1 -->|"修改计划"| A4
+    H1 -->|"取消"| AX["结束任务<br/>记录取消状态"]
+    H1 -->|"确认"| R0{"任务类型"}
+
+    R0 -->|"文件知识抽取入库"| K1["Java RAG 资料能力<br/>上传、分片、状态查询、重建索引"]
+    K1 --> H2{"人工确认<br/>资料入库 / 高精度补跑 / 长视频高成本处理"}
+    H2 -->|"确认"| K2["Java 触发 Python RAG 服务<br/>index-file / index-text / index-video-source"]
+    H2 -->|"取消或稍后"| AX
+    K2 --> K3["Python RAG 索引<br/>MinerU/OCR/ASR、递归切块、摘要索引、BM25、向量入库"]
+    K3 --> K4["evidence 读取与知识摘要<br/>资料标题、章节、片段、来源和分数"]
+
+    R0 -->|"简历 / JD 岗位适配"| J1["JD 能力项抽取<br/>技能、项目经验、工具栈、业务要求"]
+    J1 --> J2["Java 查询能力触发 RAG 检索<br/>当前用户 metadataFilter、Multi-Query、BM25、向量、RAG-Fusion"]
+    J2 --> J3["简历证据对齐<br/>supported / weak / missing"]
+    J3 --> J4["缺口分析<br/>能力差距、证据不足、资料缺失"]
+    J4 --> J5["学习路线与简历改写草稿<br/>只生成建议，不直接替用户修改简历"]
+    J5 --> H3{"Human-in-the-Loop<br/>确认简历改写和学习路线"}
+    H3 -->|"要求调整"| J4
+    H3 -->|"确认"| E1["输出候选方案"]
+
+    K4 --> E0["证据审计<br/>检查 evidence 覆盖率、引用完整性和风险等级"]
+    E0 --> H4{"Human-in-the-Loop<br/>确认最终输出"}
+    H4 -->|"要求补充证据"| A4
+    H4 -->|"确认"| E1
+    E1 --> E2["最终结果<br/>知识入库摘要 / JD 匹配报告 / 简历修改建议 / 学习计划"]
+    E2 --> L1["日志与状态记录<br/>domain=agent、阶段、动作、错误码、contextJson"]
+```
+
+未来 LangGraph 可按显式状态图落地，但在接口文档确认前只作为实现建议：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/evidences/draft/finalAnswer/status`；核心节点为 `intent_router -> planner -> human_plan_review -> execute_ingestion 或 execute_jd_match -> evidence_auditor -> human_output_review -> finalizer`；条件边根据 `taskType/reviewDecision/evidenceScore/riskLevel` 跳转。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、资料入库确认、高成本模型或长视频处理确认、简历改写确认、学习路线确认和最终输出确认。
+
+未来工具也应按 Java 业务能力封装，而不是让 Agent 直接绕过后端边界：资料类工具对应上传、状态查询、重建索引、资料预览和 evidence 列表；岗位适配类工具对应 JD 技能抽取、RAG 混合检索、简历证据对齐、缺口分析、学习路线生成和简历改写草稿。所有结论必须带 evidence 引用；没有证据时只能输出“缺证据/需补充资料/需重新索引”，不能编造项目经历。
+
 ### 细分 RAG 流程图
 
 这里把 RAG 拆成“索引流程”“查询流程”“检索流程”三张图。查询流程解决“用户问题如何进入 RAG 并形成响应”，检索流程解决“候选切块如何被召回、融合、重排并变成证据”。Java 只承载业务状态和统一响应，Python 承载 RAG 计算。
