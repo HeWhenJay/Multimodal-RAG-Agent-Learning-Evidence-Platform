@@ -15,7 +15,13 @@ export function VideoReview() {
   const targetStartTime = searchParams.get('startTime');
   const targetEndTime = searchParams.get('endTime');
   const targetSourcePath = searchParams.get('sourcePath');
-  const targetVideoUrl = resolveVideoUrl(searchParams.get('videoUrl'), targetSourcePath);
+  const targetPlaybackUrl = searchParams.get('playbackUrl');
+  const targetVideoUrl = resolveVideoUrl({
+    videoUrl: searchParams.get('videoUrl'),
+    playbackUrl: targetPlaybackUrl,
+    sourcePath: targetSourcePath,
+    source: searchParams.get('source')
+  });
   const targetSeconds = targetStartTime ? timestampToSeconds(targetStartTime) : 0;
 
   useEffect(() => {
@@ -28,8 +34,8 @@ export function VideoReview() {
     <div className="page-stack">
       <section className="page-heading">
         <div>
-          <h2>视频复习</h2>
-          <p>ASR、OCR、关键帧与时间戳证据</p>
+          <h2>{targetStartTime ? '视频证据播放' : '视频复习'}</h2>
+          <p>{targetStartTime ? 'RAG evidence 时间戳定位与播放' : 'ASR、OCR、关键帧与时间戳证据'}</p>
         </div>
       </section>
 
@@ -47,6 +53,13 @@ export function VideoReview() {
             <PlayCircle size={16} />
             播放定位
           </button>
+        </section>
+      )}
+
+      {targetStartTime && !targetVideoUrl && (
+        <section className="panel video-fallback-panel">
+          <strong>无法直接播放视频源</strong>
+          <p>当前 evidence 已定位到时间段，但来源不是浏览器可直接访问的视频 URL，请配置 ALIYUN_OSS_PUBLIC_BASE_URL 或补充签名 URL 服务。</p>
         </section>
       )}
 
@@ -91,20 +104,67 @@ export function VideoReview() {
   );
 }
 
-// 识别可直接播放的公开视频地址。
-function resolveVideoUrl(videoUrl: string | null, sourcePath: string | null) {
-  const candidate = videoUrl || sourcePath;
-  if (!candidate || !/^https?:\/\//i.test(candidate)) return null;
-  const lower = candidate.split('#', 1)[0].split('?', 1)[0].toLowerCase();
-  return /\.(mp4|mov|m4v|webm|mkv|avi)$/.test(lower) ? candidate : null;
+interface VideoUrlCandidates {
+  videoUrl: string | null;
+  playbackUrl: string | null;
+  sourcePath: string | null;
+  source: string | null;
 }
 
-// 将 HH:MM:SS 或 MM:SS 时间转为秒。
+// 识别可直接播放的公开视频地址，显式播放地址允许签名或转发接口。
+function resolveVideoUrl({ videoUrl, playbackUrl, sourcePath, source }: VideoUrlCandidates) {
+  const explicitUrl = firstHttpUrl(videoUrl, playbackUrl);
+  if (explicitUrl) return stripFragment(explicitUrl);
+  return firstConservativeVideoUrl(sourcePath, source);
+}
+
+function firstHttpUrl(...values: Array<string | null>) {
+  return values.find((value) => value && isHttpUrl(value)) || null;
+}
+
+function firstConservativeVideoUrl(...values: Array<string | null>) {
+  const candidate = values.find((value) => value && isConservativeVideoUrl(value));
+  return candidate ? stripFragment(candidate) : null;
+}
+
+function stripFragment(value: string) {
+  return value.split('#', 1)[0];
+}
+
+function isHttpUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isConservativeVideoUrl(value: string) {
+  if (!isHttpUrl(value)) return false;
+  const path = stripFragment(value).split('?', 1)[0];
+  return /\.(mp4|mov|m4v|webm|mkv|avi)$/i.test(path);
+}
+
+// 将 HH:MM:SS、MM:SS 和带毫秒的时间转为秒。
 function timestampToSeconds(value: string) {
-  const parts = value.replace(',', '.').split('.', 1)[0].split(':').map((part) => Number.parseInt(part, 10) || 0);
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  const normalized = value.trim().replace(',', '.');
+  if (!normalized) return 0;
+  const parts = normalized.split(':');
+  if (parts.length === 1) {
+    const seconds = Number.parseFloat(parts[0]);
+    return Number.isFinite(seconds) ? seconds : 0;
+  }
+  if (parts.length === 2) {
+    const minutes = Number.parseInt(parts[0], 10) || 0;
+    const seconds = Number.parseFloat(parts[1]) || 0;
+    return minutes * 60 + seconds;
+  }
   if (parts.length >= 3) {
-    const [hours, minutes, seconds] = parts.slice(-3);
+    const [hoursText, minutesText, secondsText] = parts.slice(-3);
+    const hours = Number.parseInt(hoursText, 10) || 0;
+    const minutes = Number.parseInt(minutesText, 10) || 0;
+    const seconds = Number.parseFloat(secondsText) || 0;
     return hours * 3600 + minutes * 60 + seconds;
   }
   return 0;

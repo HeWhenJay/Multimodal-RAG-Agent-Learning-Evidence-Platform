@@ -1833,6 +1833,24 @@ input:disabled {
   background: #111827;
 }
 
+.video-fallback-panel {
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+
+.video-fallback-panel strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #9a3412;
+}
+
+.video-fallback-panel p {
+  margin: 0;
+  color: #9a3412;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
 .video-thumb {
   height: 170px;
   display: grid;

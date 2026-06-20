@@ -1,10 +1,12 @@
 import { Database, FileText, PlayCircle, Search, Send } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { runRagQueryTask } from '../../api/rag';
 import type { RagProgress, RagQueryResult } from '../../api/types';
 import { MarkdownText } from '../../components/MarkdownText';
 import { RagQueryProgress } from '../../components/RagQueryProgress';
 import { markRagQueryProgressFailed } from '../../services/ragQueryProgress';
+import { buildVideoEvidenceLink } from '../../utils/videoEvidence';
 
 // 知识库页负责提交 RAG 问题并展示回答和证据。
 export function KnowledgeBase() {
@@ -141,25 +143,28 @@ export function KnowledgeBase() {
               <h3><FileText size={20} />证据引用</h3>
             </div>
             <div className="evidence-list">
-              {result.evidences.map((item) => (
-                <div className="evidence-card" key={item.evidenceId}>
-                  <div>
-                    <strong>{item.title}</strong>
-                    <span>
-                      {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || '融合检索'} · {item.parseEngine || '解析器未知'} · 分数 {item.score.toFixed(4)}
-                    </span>
-                  </div>
-                  <p>{item.snippet}</p>
-                  {item.playbackUrl && (
-                    <div className="evidence-card-actions">
-                      <a className="ghost-action evidence-play-link" href={item.playbackUrl}>
-                        <PlayCircle size={16} />
-                        从这里播放
-                      </a>
+              {result.evidences.map((item) => {
+                const videoEvidenceLink = buildVideoEvidenceLink(item);
+                return (
+                  <div className="evidence-card" key={item.evidenceId}>
+                    <div>
+                      <strong>{item.title}</strong>
+                      <span>
+                        {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || '融合检索'} · {item.parseEngine || '解析器未知'} · 分数 {item.score.toFixed(4)}
+                      </span>
                     </div>
-                  )}
-                </div>
-              ))}
+                    <p>{item.snippet}</p>
+                    {videoEvidenceLink && (
+                      <div className="evidence-card-actions">
+                        <Link className="ghost-action evidence-play-link" to={videoEvidenceLink}>
+                          <PlayCircle size={16} />
+                          播放定位
+                        </Link>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </article>
         </section>
