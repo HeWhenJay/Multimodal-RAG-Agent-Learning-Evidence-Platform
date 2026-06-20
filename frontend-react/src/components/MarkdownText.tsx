@@ -24,7 +24,7 @@ function renderMarkdownBlocks(content: string) {
   function flushParagraph() {
     if (!paragraphLines.length) return;
     const text = paragraphLines.join(' ');
-    blocks.push(<p key={`p-${blocks.length}`}>{renderInlineMarkdown(text)}</p>);
+    blocks.push(<p key={`p-${blocks.length}`}>{renderInlineMarkdown(text, text)}</p>);
     paragraphLines = [];
   }
 
@@ -33,7 +33,7 @@ function renderMarkdownBlocks(content: string) {
     const Tag = orderedList ? 'ol' : 'ul';
     blocks.push(
       <Tag key={`list-${blocks.length}`}>
-        {listItems.map((item, index) => <li key={`${index}-${item}`}>{renderInlineMarkdown(item)}</li>)}
+        {listItems.map((item, index) => <li key={`${index}-${item}`}>{renderInlineMarkdown(item, item)}</li>)}
       </Tag>
     );
     listItems = [];
@@ -93,7 +93,7 @@ function renderMarkdownBlocks(content: string) {
     if (quote) {
       flushParagraph();
       flushList();
-      blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1])}</blockquote>);
+      blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1], quote[1])}</blockquote>);
       return;
     }
 
@@ -120,16 +120,16 @@ function normalizeGeneratedMarkdown(content: string) {
 // 显式选择 HTML 标题标签，避免动态 JSX 标签被全局 Three 类型误判。
 function renderHeading(level: number, text: string, key: string) {
   if (level <= 4) {
-    return <h4 key={key}>{renderInlineMarkdown(text)}</h4>;
+    return <h4 key={key}>{renderInlineMarkdown(text, text)}</h4>;
   }
   if (level === 5) {
-    return <h5 key={key}>{renderInlineMarkdown(text)}</h5>;
+    return <h5 key={key}>{renderInlineMarkdown(text, text)}</h5>;
   }
-  return <h6 key={key}>{renderInlineMarkdown(text)}</h6>;
+  return <h6 key={key}>{renderInlineMarkdown(text, text)}</h6>;
 }
 
 // 渲染常见内联语法：链接、证据 ID、加粗、代码和简易数学片段。
-function renderInlineMarkdown(text: string): ReactNode[] {
+function renderInlineMarkdown(text: string, contextText = text): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\[evidenceId=([^\]]+)])|(\[([^\]]+)]\(([^)]+)\))|(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\$([^$\n]+)\$)/g;
   let lastIndex = 0;
@@ -143,14 +143,14 @@ function renderInlineMarkdown(text: string): ReactNode[] {
     if (match[2]) {
       nodes.push(<span className="markdown-evidence" key={key}>{match[2]}</span>);
     } else if (match[4] && match[5]) {
-      const href = normalizeMarkdownHref(match[5]);
+      const href = normalizeMarkdownHref(match[5], contextText);
       nodes.push(href
-        ? <a key={key} href={href} target={href.startsWith('http') ? '_blank' : undefined} rel="noreferrer">{renderInlineMarkdown(match[4])}</a>
-        : <span key={key}>{renderInlineMarkdown(match[4])}</span>);
+        ? <a key={key} href={href} target={href.startsWith('http') ? '_blank' : undefined} rel="noreferrer">{renderInlineMarkdown(match[4], contextText)}</a>
+        : <span key={key}>{renderInlineMarkdown(match[4], contextText)}</span>);
     } else if (match[7]) {
       nodes.push(<code key={key}>{match[7]}</code>);
     } else if (match[9]) {
-      nodes.push(<strong key={key}>{renderInlineMarkdown(match[9])}</strong>);
+      nodes.push(<strong key={key}>{renderInlineMarkdown(match[9], contextText)}</strong>);
     } else if (match[11]) {
       nodes.push(<span className="markdown-math" key={key}>{match[11]}</span>);
     }
@@ -164,15 +164,37 @@ function renderInlineMarkdown(text: string): ReactNode[] {
 }
 
 // 只允许常规站内页面和 http(s) 链接；原 Markdown 目录锚点不对应当前应用目标。
-function normalizeMarkdownHref(rawHref: string) {
+function normalizeMarkdownHref(rawHref: string, contextText = '') {
   const href = rawHref.trim().split(/\s+/)[0].replace(/^<|>$/g, '');
+  if (href.startsWith('#')) {
+    return buildSourceBackedHashLink(href, contextText);
+  }
   if (isCurrentAppHashOnlyLink(href)) {
-    return '';
+    return buildSourceBackedHashLink(href, contextText);
   }
   if (/^(https?:\/\/|\/(?!\/))/i.test(href)) {
     return href;
   }
   return '';
+}
+
+// 兼容旧回答：把“位置”的当前应用 hash 链接重写到同一行的 OSS 来源 URL。
+function buildSourceBackedHashLink(href: string, contextText: string) {
+  const source = extractHttpSourceFromEvidenceText(contextText);
+  if (!source) return '';
+  const hash = extractHash(href);
+  return hash ? `${source.split('#', 1)[0]}#${hash}` : source;
+}
+
+// 从“来源：https://...”字段提取浏览器可打开的资料 URL。
+function extractHttpSourceFromEvidenceText(text: string) {
+  const match = /来源：\s*(https?:\/\/[^\s；;，,]+)/i.exec(text);
+  return match?.[1] || '';
+}
+
+function extractHash(href: string) {
+  const hashIndex = href.indexOf('#');
+  return hashIndex >= 0 ? href.slice(hashIndex + 1) : '';
 }
 
 // 原文目录链接可能被模型改写成当前应用根路径 hash，但页面没有对应文档锚点。

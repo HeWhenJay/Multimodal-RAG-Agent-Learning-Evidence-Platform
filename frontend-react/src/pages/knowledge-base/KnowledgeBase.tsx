@@ -145,12 +145,18 @@ export function KnowledgeBase() {
             <div className="evidence-list">
               {result.evidences.map((item) => {
                 const videoEvidenceLink = buildVideoEvidenceLink(item);
+                const location = formatEvidenceLocation(item);
+                const locationLink = buildEvidenceLocationLink(item);
                 return (
                   <div className="evidence-card" key={item.evidenceId}>
                     <div>
                       <strong>{item.title}</strong>
                       <span>
-                        {item.documentType} · {formatEvidenceLocation(item)} · {item.retrievalSource || '融合检索'} · {item.parseEngine || '解析器未知'} · 分数 {item.score.toFixed(4)}
+                        {item.documentType} · {locationLink ? (
+                          <a className="evidence-location-link" href={locationLink} target="_blank" rel="noreferrer">
+                            {location}
+                          </a>
+                        ) : location} · {item.retrievalSource || '融合检索'} · {item.parseEngine || '解析器未知'} · 分数 {item.score.toFixed(4)}
                       </span>
                     </div>
                     <p>{item.snippet}</p>
@@ -192,4 +198,30 @@ function cleanEvidenceLocation(value?: string | null) {
     .replace(/[*_`]+/g, '')
     .replace(/\s+/g, ' ')
     .trim() || '全文';
+}
+
+// 使用 evidence 来源文件作为章节跳转目标，避免跳到当前 React 根页面的无效 hash。
+function buildEvidenceLocationLink(item: RagQueryResult['evidences'][number]) {
+  const source = normalizeHttpSource(item.sourcePath || item.source);
+  if (!source) return '';
+  const anchor = extractEvidenceAnchor(item.sectionTitle || item.sectionName);
+  if (!anchor) return source;
+  return `${source.split('#', 1)[0]}#${anchor}`;
+}
+
+// 只允许浏览器能直接打开的 http(s) 来源，oss:// 或本地路径继续只作来源追踪。
+function normalizeHttpSource(value?: string | null) {
+  const source = (value || '').trim();
+  if (!/^https?:\/\//i.test(source)) return '';
+  return source;
+}
+
+// 从 Markdown 目录链接或当前应用 hash 链接中提取原始章节锚点。
+function extractEvidenceAnchor(value?: string | null) {
+  const text = (value || '').trim();
+  const markdownLink = /\[[^\]]+]\(([^)]+)\)/.exec(text);
+  const href = markdownLink?.[1]?.trim().replace(/^<|>$/g, '') || '';
+  if (href.startsWith('#')) return href.slice(1);
+  const hashIndex = href.lastIndexOf('#');
+  return hashIndex >= 0 ? href.slice(hashIndex + 1) : '';
 }

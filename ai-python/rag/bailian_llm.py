@@ -218,12 +218,25 @@ def append_evidence_reference_summary(answer: str, evidences: list[Evidence]) ->
         return answer
     lines = ["", "证据引用："]
     for item in evidences[:5]:
-        location = clean_evidence_location(item.sectionName or item.sectionTitle or "全文")
+        raw_location = item.sectionName or item.sectionTitle or "全文"
+        location = clean_evidence_location(raw_location)
         if item.startTime:
             location = f"{location}，时间={item.startTime}-{item.endTime}" if item.endTime else f"{location}，时间={item.startTime}"
         source = item.sourcePath or item.source or "未知来源"
+        location_link = build_evidence_location_link(raw_location, source)
+        if location_link:
+            location = f"[{location}]({location_link})"
         lines.append(f"- [{item.evidenceId}] {item.title}；位置：{location}；来源：{source}；分数：{item.score:.4f}")
     return answer.rstrip() + "\n" + "\n".join(lines)
+
+
+def build_evidence_location_link(location: str | None, source: str | None) -> str:
+    """把 evidence 章节位置映射到浏览器可打开的原始资料 URL。"""
+    source_url = normalize_http_source_url(source)
+    if not source_url:
+        return ""
+    anchor = extract_markdown_anchor(location)
+    return attach_fragment(source_url, anchor)
 
 
 def clean_evidence_location(value: str | None) -> str:
@@ -237,6 +250,35 @@ def clean_evidence_location(value: str | None) -> str:
     text = re.sub(r"[*_`]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text or "全文"
+
+
+def extract_markdown_anchor(value: str | None) -> str:
+    """提取 Markdown 目录链接里的 hash，用于拼接到真实来源文件 URL。"""
+    text = (value or "").strip()
+    match = re.search(r"\[[^\]]+]\(([^)]+)\)", text)
+    if not match:
+        return ""
+    href = match.group(1).strip().strip("<>")
+    if href.startswith("#"):
+        return href[1:]
+    fragment_match = re.search(r"#([^#\s]+)$", href)
+    return fragment_match.group(1) if fragment_match else ""
+
+
+def normalize_http_source_url(source: str | None) -> str:
+    """只允许浏览器可直接打开的 http(s) 来源作为跳转目标。"""
+    value = (source or "").strip()
+    if not re.match(r"^https?://", value, flags=re.IGNORECASE):
+        return ""
+    return value
+
+
+def attach_fragment(source_url: str, fragment: str) -> str:
+    """为来源 URL 附加章节 fragment，保留原有查询参数。"""
+    if not fragment:
+        return source_url
+    base = source_url.split("#", 1)[0]
+    return f"{base}#{fragment}"
 
 
 def extract_message_content(data: dict[str, Any]) -> str:
