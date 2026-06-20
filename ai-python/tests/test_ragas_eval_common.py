@@ -445,7 +445,7 @@ def test_build_legacy_adapter_only_after_modern_signature_fails(monkeypatch):
 def test_legacy_missing_dependency_has_clear_hint(monkeypatch):
     """确认 legacy fallback 缺 langchain-openai 时提示 fallback 依赖。"""
     _install_modern_ragas_modules(monkeypatch, llm_supports_client=False)
-    monkeypatch.delitem(sys.modules, "langchain_openai", raising=False)
+    monkeypatch.setitem(sys.modules, "langchain_openai", None)
 
     with pytest.raises(RuntimeError) as exc_info:
         build_ragas_model_adapter(_settings())
