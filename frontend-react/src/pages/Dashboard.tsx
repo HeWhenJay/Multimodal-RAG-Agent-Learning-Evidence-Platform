@@ -19,8 +19,8 @@ import {
 import { DayPicker, type DateRange } from '@daypicker/react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { fetchDashboardData } from '../api/pageData';
-import { runRagQueryTask } from '../api/rag';
-import type { DashboardData, LearningMaterial, RagEvidence, RagProgress } from '../api/types';
+import { fetchRagQueryHistory, runRagQueryTask } from '../api/rag';
+import type { DashboardData, LearningMaterial, RagEvidence, RagProgress, RagQueryHistory } from '../api/types';
 import { MarkdownText } from '../components/MarkdownText';
 import { RagQueryProgress } from '../components/RagQueryProgress';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
@@ -45,6 +45,13 @@ export function Dashboard() {
   const [querying, setQuerying] = useState(false);
   const [queryProgressEvents, setQueryProgressEvents] = useState<RagProgress[]>([]);
   const queryAbortRef = useRef<AbortController | null>(null);
+  const [queryHistory, setQueryHistory] = useState<RagQueryHistory[]>([]);
+  const [queryHistoryLoading, setQueryHistoryLoading] = useState(false);
+  const [queryHistoryError, setQueryHistoryError] = useState('');
+  const [appliedQueryHistoryRange, setAppliedQueryHistoryRange] = useState<DateRange>(() => defaultRecentRange());
+  const [draftQueryHistoryRange, setDraftQueryHistoryRange] = useState<DateRange>(() => defaultRecentRange());
+  const [queryHistoryDatePickerOpen, setQueryHistoryDatePickerOpen] = useState(false);
+  const [queryHistoryLimit, setQueryHistoryLimit] = useState(5);
   const [error, setError] = useState('');
   const [appliedRecentRange, setAppliedRecentRange] = useState<DateRange>(() => defaultRecentRange());
   const [draftRecentRange, setDraftRecentRange] = useState<DateRange>(() => defaultRecentRange());
@@ -69,6 +76,25 @@ export function Dashboard() {
   );
   const channelMessage = uploadMessage || backgroundProgressMessage;
   const channelBusy = uploading || Boolean(backgroundProgressMessage);
+
+  // 拉取最近 RAG 询问历史，用于回答区回填。
+  const loadQueryHistory = useCallback(async () => {
+    try {
+      setQueryHistoryLoading(true);
+      setQueryHistoryError('');
+      const normalizedRange = completeRecentRange(appliedQueryHistoryRange, rangeBounds);
+      const items = await fetchRagQueryHistory({
+        startDate: formatDateParam(normalizedRange.from),
+        endDate: formatDateParam(normalizedRange.to),
+        limit: queryHistoryLimit
+      });
+      setQueryHistory(items);
+    } catch (historyError) {
+      setQueryHistoryError(historyError instanceof Error ? historyError.message : 'RAG 询问历史加载失败');
+    } finally {
+      setQueryHistoryLoading(false);
+    }
+  }, [appliedQueryHistoryRange, queryHistoryLimit, rangeBounds]);
 
   // 拉取工作台聚合数据。
   const loadDashboard = useCallback(async () => {
@@ -96,6 +122,10 @@ export function Dashboard() {
       window.removeEventListener(MATERIAL_UPLOADED_EVENT, loadDashboard);
     };
   }, [loadDashboard]);
+
+  useEffect(() => {
+    void loadQueryHistory();
+  }, [loadQueryHistory]);
 
   useEffect(() => {
     if (!dashboard?.recentMaterials?.some(isProcessingMaterial)) {
@@ -141,6 +171,35 @@ export function Dashboard() {
     setDatePickerOpen(false);
   }
 
+  // 打开 RAG 询问历史日期范围选择器。
+  function openQueryHistoryDatePicker() {
+    setDraftQueryHistoryRange(appliedQueryHistoryRange);
+    setQueryHistoryDatePickerOpen(true);
+  }
+
+  // 应用 RAG 询问历史日期筛选。
+  function applyQueryHistoryRange() {
+    setAppliedQueryHistoryRange(completeRecentRange(draftQueryHistoryRange, rangeBounds));
+    setQueryHistoryDatePickerOpen(false);
+  }
+
+  // 重置 RAG 询问历史为最近 7 天。
+  function resetQueryHistoryRange() {
+    const defaultRange = defaultRecentRange();
+    setDraftQueryHistoryRange(defaultRange);
+    setAppliedQueryHistoryRange(defaultRange);
+    setQueryHistoryDatePickerOpen(false);
+  }
+
+  // 点击历史询问后回填问题、回答、证据和阶段事件。
+  function applyQueryHistory(item: RagQueryHistory) {
+    setQuestion(item.question);
+    setAnswer(item.answer || item.errorMessage || '该次询问暂未生成回答。');
+    setEvidences(item.evidences || []);
+    setQueryProgressEvents(item.progressEvents || []);
+    setError(item.status === 'COMPLETED' ? '' : (item.errorMessage || '该次询问尚未完成'));
+  }
+
   // 执行一次 RAG 检索并刷新回答与证据列表。
   async function runQuery() {
     if (!question.trim()) {
@@ -172,6 +231,7 @@ export function Dashboard() {
       setAnswer(result.answer);
       setEvidences(result.evidences);
       setQueryProgressEvents(result.progressEvents || []);
+      void loadQueryHistory();
     } catch (queryError) {
       if (queryError instanceof Error && queryError.message === 'RAG 检索已取消') {
         return;
@@ -258,6 +318,80 @@ export function Dashboard() {
                 ))
               ) : <span><FileText size={15} />暂无证据引用</span>}
             </div>
+          </div>
+          <div className="query-history-panel">
+            <div className="task-toolbar">
+              <div className="task-heading">
+                <h4>近期询问记录</h4>
+                <small>{formatQueryHistoryScope(appliedQueryHistoryRange, queryHistoryLimit, queryHistoryLoading)}</small>
+              </div>
+              <div className="task-filters" aria-label="近期询问记录筛选">
+                <div className="task-date-range">
+                  <div className="task-date-field">
+                    <span>从</span>
+                    <button type="button" className="task-date-button" onClick={queryHistoryDatePickerOpen ? () => setQueryHistoryDatePickerOpen(false) : openQueryHistoryDatePicker}>
+                      <CalendarDays size={16} />
+                      {formatDateLabel((queryHistoryDatePickerOpen ? draftQueryHistoryRange : appliedQueryHistoryRange).from, '开始时间')}
+                    </button>
+                  </div>
+                  <div className="task-date-field">
+                    <span>到</span>
+                    <button type="button" className="task-date-button" onClick={queryHistoryDatePickerOpen ? () => setQueryHistoryDatePickerOpen(false) : openQueryHistoryDatePicker}>
+                      <CalendarDays size={16} />
+                      {formatDateLabel((queryHistoryDatePickerOpen ? draftQueryHistoryRange : appliedQueryHistoryRange).to, '结束时间')}
+                    </button>
+                  </div>
+                  {queryHistoryDatePickerOpen ? (
+                    <div className="task-calendar-popover" role="dialog" aria-label="选择近期询问记录日期范围">
+                      <DayPicker
+                        mode="range"
+                        weekStartsOn={0}
+                        selected={draftQueryHistoryRange}
+                        onSelect={(range) => setDraftQueryHistoryRange(clampRecentRange(range, rangeBounds))}
+                        disabled={[{ before: rangeBounds.minDate }, { after: rangeBounds.maxDate }]}
+                        defaultMonth={draftQueryHistoryRange.to || rangeBounds.maxDate}
+                        captionLayout="label"
+                        formatters={CALENDAR_FORMATTERS}
+                      />
+                      <div className="task-calendar-footer">
+                        <span>仅查询最近 7 天内询问</span>
+                        <button type="button" onClick={resetQueryHistoryRange}>
+                          重置
+                        </button>
+                        <button type="button" className="primary" onClick={applyQueryHistoryRange}>
+                          确定
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                <label>
+                  <span>条数</span>
+                  <input
+                    aria-label="近期询问记录条数"
+                    type="number"
+                    min={RECENT_LIMIT_MIN}
+                    max={RECENT_LIMIT_MAX}
+                    value={queryHistoryLimit}
+                    onChange={(event) => setQueryHistoryLimit(clampNumber(event.target.value, RECENT_LIMIT_MIN, RECENT_LIMIT_MAX))}
+                  />
+                </label>
+              </div>
+            </div>
+            <div className="query-history-list">
+              {queryHistory.map((item) => (
+                <button type="button" className="query-history-item" key={item.id} onClick={() => applyQueryHistory(item)}>
+                  <span>
+                    <strong>{item.question}</strong>
+                    <small>{formatQueryHistoryMeta(item)}</small>
+                  </span>
+                  <em className={item.status === 'COMPLETED' ? 'done' : 'pending'}>{formatQueryHistoryStatus(item.status)}</em>
+                </button>
+              ))}
+              {!queryHistoryLoading && queryHistory.length === 0 ? <div className="empty-state compact">暂无近期询问记录</div> : null}
+              {queryHistoryLoading ? <div className="empty-state compact">正在加载询问记录...</div> : null}
+            </div>
+            {queryHistoryError ? <p className="form-message danger">{queryHistoryError}</p> : null}
           </div>
           {error ? <p className="form-message danger">{error}</p> : null}
         </article>
@@ -487,6 +621,13 @@ function formatRecentTaskScope(dashboard: DashboardData | null) {
   return `已按 ${dashboard.recentTaskStartDate} 至 ${dashboard.recentTaskEndDate} 查询 · ${dashboard.recentTaskLimit || 5} 条`;
 }
 
+// 展示 RAG 询问历史当前筛选条件。
+function formatQueryHistoryScope(range: DateRange, limit: number, loading: boolean) {
+  const normalizedRange = completeRecentRange(range, recentRangeBounds());
+  const prefix = loading ? '正在查询' : '已按';
+  return `${prefix} ${formatDateParam(normalizedRange.from)} 至 ${formatDateParam(normalizedRange.to)} 查询 · ${limit} 条`;
+}
+
 // 格式化简短时间，方便任务列表扫描。
 function formatDateTime(value: string) {
   const date = new Date(value);
@@ -499,6 +640,31 @@ function formatDateTime(value: string) {
     hour: '2-digit',
     minute: '2-digit'
   });
+}
+
+// 展示历史询问的状态、证据数和发起时间。
+function formatQueryHistoryMeta(item: RagQueryHistory) {
+  const createdAt = item.createdAt ? formatDateTime(item.createdAt) : '时间未知';
+  const evidenceText = `${item.evidenceCount || item.evidences?.length || 0} 条证据`;
+  const durationText = item.durationMs ? `耗时 ${formatDuration(item.durationMs)}` : '';
+  return [createdAt, evidenceText, durationText].filter(Boolean).join(' · ');
+}
+
+// 将查询历史状态转换为中文展示。
+function formatQueryHistoryStatus(status: string) {
+  if (status === 'COMPLETED') return '已完成';
+  if (status === 'FAILED') return '失败';
+  if (status === 'EXPIRED') return '已过期';
+  if (status === 'RUNNING') return '检索中';
+  return status || '未知';
+}
+
+// 格式化查询耗时。
+function formatDuration(value: number) {
+  if (value < 1000) {
+    return `${value}ms`;
+  }
+  return `${(value / 1000).toFixed(1)}s`;
 }
 
 // 默认查询最近 7 天内的任务。

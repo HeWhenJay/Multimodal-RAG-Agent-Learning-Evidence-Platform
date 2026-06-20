@@ -6,6 +6,7 @@ import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import org.springframework.web.multipart.MultipartFile;
@@ -71,6 +72,11 @@ public interface RagService {
      * 执行 RAG 检索问答。
      */
     RagQueryVO query(RagQueryDTO dto, String userId);
+
+    /**
+     * 查询当前用户最近几次 RAG 询问历史。
+     */
+    List<RagQueryHistoryVO> listQueryHistory(String userId, LocalDate startDate, LocalDate endDate, Integer limit);
 
     /**
      * 创建 RAG 检索问答任务，供前端轮询进度详情。

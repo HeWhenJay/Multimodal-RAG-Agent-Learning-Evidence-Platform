@@ -120,6 +120,24 @@ export interface RagQueryTask {
   updatedAt?: string | null;
 }
 
+export interface RagQueryHistory {
+  id: number;
+  taskId?: string | null;
+  question: string;
+  answer?: string | null;
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'EXPIRED' | string;
+  topK: number;
+  evidenceCount: number;
+  expandedQueries: string[];
+  evidences: RagEvidence[];
+  diagnostics?: Record<string, unknown>;
+  progressEvents?: RagProgress[];
+  errorMessage?: string | null;
+  durationMs?: number | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface VideoSlice {
   id: number;
   title: string;

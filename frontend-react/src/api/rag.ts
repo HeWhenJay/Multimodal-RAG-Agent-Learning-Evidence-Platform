@@ -1,4 +1,4 @@
-import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagProgress, RagQueryResult, RagQueryTask, Result } from './types';
+import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagProgress, RagQueryHistory, RagQueryResult, RagQueryTask, Result } from './types';
 import { getStoredAuthToken } from './auth';
 
 const jsonHeaders = {
@@ -68,6 +68,20 @@ export function queryRag(payload: {
     headers: jsonHeaders,
     body: JSON.stringify(payload)
   });
+}
+
+// 查询最近几次 RAG 询问历史。
+export function fetchRagQueryHistory(params: {
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+} = {}): Promise<RagQueryHistory[]> {
+  const search = new URLSearchParams();
+  if (params.startDate) search.set('startDate', params.startDate);
+  if (params.endDate) search.set('endDate', params.endDate);
+  if (params.limit) search.set('limit', String(params.limit));
+  const query = search.toString();
+  return request<RagQueryHistory[]>(`/api/rag/query/history${query ? `?${query}` : ''}`);
 }
 
 // 创建 RAG 检索问答任务，前端通过轮询读取实时进度。

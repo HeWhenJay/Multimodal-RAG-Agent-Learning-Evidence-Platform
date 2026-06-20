@@ -11,6 +11,7 @@ import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
+import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import io.swagger.v3.oas.annotations.Operation;
@@ -32,6 +33,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
+import java.time.LocalDate;
 
 @Slf4j
 @RestController
@@ -210,6 +212,23 @@ public class RagController {
                         "topK", dto.getTopK() == null ? 5 : dto.getTopK()
                 ),
                 () -> ragService.query(dto, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 查询当前用户最近几次 RAG 询问历史。
+     */
+    @GetMapping("/query/history")
+    @Operation(summary = "查询 RAG 询问历史")
+    public Result<List<RagQueryHistoryVO>> queryHistory(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                                       @RequestParam(required = false) LocalDate startDate,
+                                                       @RequestParam(required = false) LocalDate endDate,
+                                                       @RequestParam(defaultValue = "5") Integer limit) {
+        log.info("查询 RAG 询问历史: startDate={}, endDate={}, limit={}", startDate, endDate, limit);
+        return execute(
+                RagOperationContext.operation("rag_query", "history", "rag_query_history_query", "查询 RAG 询问历史"),
+                context("startDate", startDate, "endDate", endDate, "limit", limit),
+                () -> ragService.listQueryHistory(currentUserId(authorization), startDate, endDate, limit)
         );
     }
 

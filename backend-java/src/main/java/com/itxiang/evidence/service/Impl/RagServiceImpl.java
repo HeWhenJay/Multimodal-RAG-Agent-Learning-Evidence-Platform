@@ -1,5 +1,6 @@
 package com.itxiang.evidence.service.Impl;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
@@ -7,8 +8,10 @@ import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.entity.LogEvent;
+import com.itxiang.evidence.entity.RagQueryHistory;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
+import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.RagService;
@@ -17,6 +20,7 @@ import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagProgressVO;
+import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
 import lombok.RequiredArgsConstructor;
@@ -49,6 +53,7 @@ public class RagServiceImpl implements RagService {
 
     private final LearningMaterialMapper learningMaterialMapper;
     private final LogEventMapper logEventMapper;
+    private final RagQueryHistoryMapper ragQueryHistoryMapper;
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
     private final ObjectStorageService objectStorageService;
@@ -442,6 +447,7 @@ public class RagServiceImpl implements RagService {
         );
         try {
             RagQueryVO result = pythonRagClient.query(scopedDto);
+            saveSynchronousQueryHistory(scopedDto, scopedUserId, result, System.currentTimeMillis() - start);
             Map<String, Object> context = queryContext(scopedDto, result, System.currentTimeMillis() - start);
             String action = result.getEvidences() == null || result.getEvidences().isEmpty()
                     ? "rag_query_no_evidence"
@@ -471,6 +477,24 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 查询当前用户最近几次 RAG 询问历史。
+     */
+    @Override
+    public List<RagQueryHistoryVO> listQueryHistory(String userId, LocalDate startDate, LocalDate endDate, Integer limit) {
+        String scopedUserId = requireUserId(userId);
+        int safeLimit = safeRecentLimit(limit);
+        DateRange range = normalizeRecentDateRange(startDate, endDate);
+        return ragQueryHistoryMapper.findRecentByUserIdBetween(
+                        scopedUserId,
+                        range.startDate().atStartOfDay(),
+                        range.endDate().plusDays(1).atStartOfDay(),
+                        safeLimit
+                ).stream()
+                .map(this::convertQueryHistoryToVO)
+                .toList();
+    }
+
+    /**
      * 创建 Python RAG 查询任务，前端通过任务 ID 轮询实时进度。
      */
     @Override
@@ -486,6 +510,7 @@ public class RagServiceImpl implements RagService {
         );
         try {
             RagQueryTaskVO task = pythonRagClient.startQueryTask(scopedDto);
+            saveQueryTaskHistory(scopedDto, scopedUserId, task);
             Map<String, Object> context = queryContext(scopedDto, null, null);
             context.put("taskId", task.getTaskId());
             context.put("taskStatus", task.getStatus());
@@ -518,11 +543,13 @@ public class RagServiceImpl implements RagService {
      */
     @Override
     public RagQueryTaskVO getQueryTask(String taskId, String userId) {
-        requireUserId(userId);
+        String scopedUserId = requireUserId(userId);
         if (taskId == null || taskId.isBlank()) {
             throw new IllegalArgumentException("查询任务 ID 不能为空");
         }
-        return pythonRagClient.getQueryTask(taskId.trim());
+        RagQueryTaskVO task = pythonRagClient.getQueryTask(taskId.trim());
+        updateQueryTaskHistory(scopedUserId, task);
+        return task;
     }
 
     /**
@@ -627,6 +654,164 @@ public class RagServiceImpl implements RagService {
         } catch (Exception e) {
             return objectMapper.createObjectNode();
         }
+    }
+
+    /**
+     * 保存同步 RAG 查询历史，便于刷新后查看最近询问。
+     */
+    private void saveSynchronousQueryHistory(RagQueryDTO dto, String userId, RagQueryVO result, long durationMs) {
+        RagQueryHistory history = new RagQueryHistory();
+        history.setUserId(userId);
+        history.setQuestion(dto.getQuestion());
+        history.setAnswer(result.getAnswer());
+        history.setStatus("COMPLETED");
+        history.setTopK(dto.getTopK() == null ? 5 : dto.getTopK());
+        history.setEvidenceCount(result.getEvidences() == null ? 0 : result.getEvidences().size());
+        history.setExpandedQueriesJson(toJson(result.getExpandedQueries(), "[]"));
+        history.setEvidencesJson(toJson(result.getEvidences(), "[]"));
+        history.setDiagnosticsJson(toJson(result.getDiagnostics(), "{}"));
+        history.setProgressEventsJson(toJson(result.getProgressEvents(), "[]"));
+        history.setDurationMs(safeDuration(durationMs));
+        ragQueryHistoryMapper.insert(history);
+    }
+
+    /**
+     * 创建任务时先保存一条运行中的查询历史。
+     */
+    private void saveQueryTaskHistory(RagQueryDTO dto, String userId, RagQueryTaskVO task) {
+        RagQueryHistory history = new RagQueryHistory();
+        history.setUserId(userId);
+        history.setTaskId(task.getTaskId());
+        history.setQuestion(dto.getQuestion());
+        history.setAnswer(null);
+        history.setStatus(defaultText(task.getStatus(), "RUNNING"));
+        history.setTopK(dto.getTopK() == null ? 5 : dto.getTopK());
+        history.setEvidenceCount(0);
+        history.setExpandedQueriesJson("[]");
+        history.setEvidencesJson("[]");
+        history.setDiagnosticsJson("{}");
+        history.setProgressEventsJson(toJson(task.getProgressEvents(), "[]"));
+        history.setErrorMessage(task.getErrorMessage());
+        ragQueryHistoryMapper.insert(history);
+    }
+
+    /**
+     * 轮询到任务终态后回写查询历史。
+     */
+    private void updateQueryTaskHistory(String userId, RagQueryTaskVO task) {
+        if (task == null || task.getTaskId() == null || task.getTaskId().isBlank()) {
+            return;
+        }
+        RagQueryHistory existing = ragQueryHistoryMapper.findByTaskIdAndUserId(task.getTaskId(), userId);
+        if (existing == null) {
+            return;
+        }
+        RagQueryVO result = task.getResult();
+        RagQueryHistory history = new RagQueryHistory();
+        history.setUserId(userId);
+        history.setTaskId(task.getTaskId());
+        history.setAnswer(result == null ? existing.getAnswer() : result.getAnswer());
+        history.setStatus(defaultText(task.getStatus(), existing.getStatus()));
+        history.setEvidenceCount(result == null || result.getEvidences() == null ? existing.getEvidenceCount() : result.getEvidences().size());
+        history.setExpandedQueriesJson(result == null ? existing.getExpandedQueriesJson() : toJson(result.getExpandedQueries(), "[]"));
+        history.setEvidencesJson(result == null ? existing.getEvidencesJson() : toJson(result.getEvidences(), "[]"));
+        history.setDiagnosticsJson(result == null ? existing.getDiagnosticsJson() : toJson(result.getDiagnostics(), "{}"));
+        history.setProgressEventsJson(toJson(task.getProgressEvents(), "[]"));
+        history.setErrorMessage(task.getErrorMessage());
+        history.setDurationMs(calculateDurationMs(existing, task));
+        ragQueryHistoryMapper.updateByTaskId(history);
+    }
+
+    /**
+     * 将历史实体转换为前端可直接回填的 VO。
+     */
+    private RagQueryHistoryVO convertQueryHistoryToVO(RagQueryHistory history) {
+        return RagQueryHistoryVO.builder()
+                .id(history.getId())
+                .taskId(history.getTaskId())
+                .question(history.getQuestion())
+                .answer(history.getAnswer())
+                .status(history.getStatus())
+                .topK(history.getTopK())
+                .evidenceCount(history.getEvidenceCount())
+                .expandedQueries(fromJson(history.getExpandedQueriesJson(), new TypeReference<List<String>>() {}, List.of()))
+                .evidences(fromJson(history.getEvidencesJson(), new TypeReference<List<RagEvidenceVO>>() {}, List.of()))
+                .diagnostics(fromJson(history.getDiagnosticsJson(), new TypeReference<Map<String, Object>>() {}, Map.of()))
+                .progressEvents(fromJson(history.getProgressEventsJson(), new TypeReference<List<RagProgressVO>>() {}, List.of()))
+                .errorMessage(history.getErrorMessage())
+                .durationMs(history.getDurationMs())
+                .createdAt(history.getCreatedAt())
+                .updatedAt(history.getUpdatedAt())
+                .build();
+    }
+
+    /**
+     * 将对象序列化为 JSON 字符串，失败时返回安全默认值。
+     */
+    private String toJson(Object value, String fallback) {
+        try {
+            return value == null ? fallback : objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            log.debug("RAG 查询历史 JSON 序列化失败: {}", e.getMessage());
+            return fallback;
+        }
+    }
+
+    /**
+     * 从历史 JSON 字符串读取结构化对象。
+     */
+    private <T> T fromJson(String value, TypeReference<T> type, T fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        try {
+            return objectMapper.readValue(value, type);
+        } catch (Exception e) {
+            log.debug("RAG 查询历史 JSON 解析失败: {}", e.getMessage());
+            return fallback;
+        }
+    }
+
+    /**
+     * 将近期历史日期范围限制在最近 7 天。
+     */
+    private DateRange normalizeRecentDateRange(LocalDate startDate, LocalDate endDate) {
+        LocalDate today = LocalDate.now();
+        LocalDate earliestDate = today.minusDays(6);
+        LocalDate safeEndDate = endDate == null ? today : clampDate(endDate, earliestDate, today);
+        LocalDate safeStartDate = startDate == null ? earliestDate : clampDate(startDate, earliestDate, today);
+        if (safeStartDate.isAfter(safeEndDate)) {
+            safeStartDate = safeEndDate;
+        }
+        return new DateRange(safeStartDate, safeEndDate);
+    }
+
+    /**
+     * 约束近期历史返回条数。
+     */
+    private int safeRecentLimit(Integer limit) {
+        return limit == null ? 5 : Math.max(1, Math.min(limit, 50));
+    }
+
+    /**
+     * 计算任务从创建到最近更新时间的耗时。
+     */
+    private Integer calculateDurationMs(RagQueryHistory existing, RagQueryTaskVO task) {
+        if (existing.getCreatedAt() == null || task.getUpdatedAt() == null) {
+            return existing.getDurationMs();
+        }
+        long duration = java.time.Duration.between(existing.getCreatedAt(), task.getUpdatedAt()).toMillis();
+        return safeDuration(duration);
+    }
+
+    /**
+     * 防止耗时超过 Integer 范围。
+     */
+    private Integer safeDuration(long durationMs) {
+        if (durationMs < 0) {
+            return 0;
+        }
+        return durationMs > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) durationMs;
     }
 
     /**
@@ -809,6 +994,12 @@ public class RagServiceImpl implements RagService {
      */
     private String blankToDefault(String value, String defaultValue) {
         return value == null || value.isBlank() ? defaultValue : value;
+    }
+
+    /**
+     * 最近日期查询范围。
+     */
+    private record DateRange(LocalDate startDate, LocalDate endDate) {
     }
 
     /**

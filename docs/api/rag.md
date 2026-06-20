@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、前端 Markdown 回答渲染，以及 Stage 1 父子索引、summary child、OCR occurrence 和父段聚合诊断。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染，以及 Stage 1 父子索引、summary child、OCR occurrence 和父段聚合诊断。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
 
 边界约定：
 
@@ -13,6 +13,7 @@
 - Python FastAPI 负责多格式解析路由、原始视频处理、MinerU/OCR 降级、`DocumentBlock` 统一模型、解析质量评分、递归切块、BM25、百炼 `text-embedding-v4` 1024 维向量索引、RRF/RAG-Fusion、百炼 rerank、百炼 LLM 回答生成和 evidence 引用。
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
 - RAG 进度事件复用 `log_event` 表，`event_type=rag_progress`，不新增独立进度表；Python 方法级控制面板日志使用 `event_type=rag_process`，错误仍写入 `log_error`。
+- RAG 询问历史由 Java 写入 `rag_query_history`，只保存业务查询快照、问题、回答、证据 JSON 和状态；Python 查询任务仍是进程内短期进度快照，不承担长期历史存储。
 - Git 提交时只维护 `infra/sql/init.sql`，本地增量迁移目录不作为必须提交内容。
 
 鉴权约定：
@@ -423,6 +424,75 @@ Java 调用 Python：
 | `EXPIRED` | 临时任务不存在或已过期 |
 
 前端轮询建议间隔 `300-500ms`。任务完成或失败后停止轮询。查询任务只用于当前 Python 进程内短期展示，不作为业务持久化记录；页面刷新后可重新发起查询。
+
+Java 在 `POST /api/rag/query/tasks` 创建任务时写入一条 `rag_query_history`，状态为 `RUNNING`；前端后续轮询 `GET /api/rag/query/tasks/{taskId}` 时，Java 会在任务进入 `COMPLETED/FAILED/EXPIRED` 后回写历史记录。历史记录是业务查询快照，供用户查看最近几次询问，不替代 Python 的实时进度任务。
+
+### 查询 RAG 询问历史
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/rag/query/history` |
+| Query | `startDate`、`endDate`、`limit` |
+| 响应 | `Result<List<RagQueryHistoryVO>>` |
+
+用途：按当前登录用户和日期范围查询最近几次 RAG 询问，前端可让用户自行选择“从/到/条数”并点击历史项回填回答和证据。
+
+查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `startDate` | 本地日期，格式 `YYYY-MM-DD`。为空时默认最近 7 天起始日。 |
+| `endDate` | 本地日期，格式 `YYYY-MM-DD`。为空时默认当天。 |
+| `limit` | 返回条数，默认 5，最小 1，最大 50。 |
+
+Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >= startDate 00:00:00` 且 `< endDate + 1 day 00:00:00`，并按 `created_at DESC, id DESC` 返回。
+
+响应示例：
+
+```json
+{
+  "code": 1,
+  "msg": null,
+  "data": [
+    {
+      "id": 12,
+      "taskId": "7d1b0e4a4e594a1ab4d9d5e0c9c0f2ab",
+      "question": "BM25 和向量检索如何融合？",
+      "answer": "可以通过 RRF/RAG-Fusion 合并多路召回结果...",
+      "status": "COMPLETED",
+      "topK": 6,
+      "evidenceCount": 3,
+      "expandedQueries": ["BM25 和向量检索如何融合？"],
+      "evidences": [
+        {
+          "evidenceId": "material-1:chunk-3",
+          "title": "RAG 优化笔记",
+          "sectionName": "Post-Retrieval",
+          "snippet": "RAG-Fusion 使用多重查询和倒数排名融合..."
+        }
+      ],
+      "diagnostics": {
+        "answerProvider": "dashscope"
+      },
+      "createdAt": "2026-06-20T10:30:00",
+      "updatedAt": "2026-06-20T10:30:08"
+    }
+  ]
+}
+```
+
+失败响应示例：
+
+```json
+{
+  "code": 0,
+  "msg": "查询 RAG 询问历史 [rag_query/history/rag_query_history_query] 失败：登录状态已失效",
+  "data": null
+}
+```
+
+历史查询只读取 Java 业务库，不调用 Python；`RagQueryHistoryVO.evidences` 与 `RagQueryVO.evidences` 使用同一 evidence 引用结构，保留资料标题、章节、片段、来源和分数。
 
 响应新增 `diagnostics`，用于前端和调试确认检索链路：
 
@@ -1008,6 +1078,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 - 上传支持格式文案扩展，包含 `.srt/.vtt` 字幕和带时间戳的 `.txt` 转写文本。
 - 工作台 `/api/page-data/dashboard` 支持 `startDate`、`endDate`、`recentDays` 和 `recentLimit` 查询参数；新前端使用 `startDate/endDate` 做“从/到”日期范围筛选，用户点击“确定”后才触发后端查询，范围限制在最近 7 天内，`recentDays` 仅作为旧调用兜底，`recentLimit` 默认 5 条、最多 50 条。
 - `DashboardVO` 会返回 `recentTaskStartDate`、`recentTaskEndDate` 和 `recentTaskLimit`，用于前端展示后端实际生效的任务查询范围；后端通过 `learning_material.updated_at >= startDate 00:00:00` 且 `< endDate + 1 day 00:00:00` 查询，已用单测校验 mapper 收到真实起止时间。
+- 工作台 RAG 快速检索区通过 `/api/rag/query/history` 展示“近期询问记录”，用户可选择最近 7 天内的从/到日期和条数，点击历史记录后回填该次回答、证据、问题和阶段事件快照。
 - 上传后的顶部栏、工作台上传区和资料页上传区不再只显示“已上传，正在后台解析”，而是轮询单个资料状态并显示类似“第 133/173 块：生成 embedding · 切块 133/173 · 77%”的主进度。
 - 资料列表显示 `PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING`。
 - 点击刷新时，如果接口短暂没有返回 `latestProgress`，前端保留该资料已有进度，避免大文件解析过程中进度块闪烁或消失；后端返回新的 `latestProgress` 时立即覆盖旧进度。
