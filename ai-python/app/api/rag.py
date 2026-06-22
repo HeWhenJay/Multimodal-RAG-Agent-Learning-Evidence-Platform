@@ -5,6 +5,12 @@ from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.process_logger import RagProcessLogger, logged_rag_method, process_event, use_process_logger
 from rag.progress import RagProgressReporter
 from rag.retrievers.retrieval import create_rag_store
+from rag.resume_template.docx_patch import (
+    apply_resume_patches_to_docx,
+    parse_resume_template_docx,
+    validate_resume_patches,
+)
+from rag.resume_template.patch_generation import generate_resume_patches
 from app.schemas.rag import (
     EvidenceListResponse,
     JdAnalyzeRequest,
@@ -20,7 +26,17 @@ from app.schemas.rag import (
     QueryTaskResponse,
     ResumeAlignmentResult,
 )
+from app.schemas.resume_template import (
+    ResumePatchGenerationRequest,
+    ResumePatchGenerationResponse,
+    ResumePatchValidationRequest,
+    ResumePatchValidationResponse,
+    ResumeTemplateExportRequest,
+    ResumeTemplateExportResponse,
+    ResumeTemplateParseResponse,
+)
 
+import base64
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -228,6 +244,99 @@ async def index_file(
                 source_path=source_path,
                 progress_reporter=progress,
             )
+
+
+@router.post("/resume/templates/parse", response_model=ResumeTemplateParseResponse)
+async def parse_resume_template(
+    file: UploadFile = File(...),
+    template_id: str | None = Form(None),
+    version: int = Form(1),
+) -> ResumeTemplateParseResponse:
+    """解析 Java 转发的受控 DOCX 文件，生成字段绑定和版式指纹。"""
+    filename = file.filename or "resume-template.docx"
+    process_logger = RagProcessLogger(document_id=template_id or "resume-template", module="resume-template")
+    with use_process_logger(process_logger):
+        with process_logger.step(
+            "api.resume-template.parse",
+            "parse_resume_template_pipeline",
+            "处理简历模板字段解析请求",
+            context={"filename": filename, "version": version},
+        ):
+            content = await file.read()
+            process_event(
+                stage="api.resume-template.parse",
+                action="resume_template_parse_received",
+                message="Python 已接收简历模板解析请求",
+                context={"filename": filename, "fileSize": len(content), "version": version},
+            )
+            try:
+                return parse_resume_template_docx(content, filename, template_id=template_id, version=version)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/resume/templates/patches/generate", response_model=ResumePatchGenerationResponse)
+def generate_resume_template_patches(request: ResumePatchGenerationRequest) -> ResumePatchGenerationResponse:
+    """基于 Structured Outputs 或严格 schema 校验生成字段级补丁草稿。"""
+    process_logger = RagProcessLogger(document_id=request.templateId, module="resume-template")
+    with use_process_logger(process_logger):
+        with process_logger.step(
+            "api.resume-template.patch-generate",
+            "generate_resume_template_patches_pipeline",
+            "处理简历模板补丁生成请求",
+            context={
+                "templateId": request.templateId,
+                "version": request.version,
+                "fieldCount": len(request.fields),
+                "evidenceCount": len(request.evidenceCandidates),
+                "jobDescriptionLength": len(request.jobDescription),
+            },
+        ):
+            process_event(
+                stage="api.resume-template.patch-generate",
+                action="resume_template_patch_generate_received",
+                message="Python 已接收简历字段补丁生成请求",
+                context={
+                    "templateId": request.templateId,
+                    "version": request.version,
+                    "fieldCount": len(request.fields),
+                    "evidenceCount": len(request.evidenceCandidates),
+                    "provider": request.provider,
+                },
+            )
+            return generate_resume_patches(request)
+
+
+@router.post("/resume/templates/patches/validate", response_model=ResumePatchValidationResponse)
+def validate_resume_template_patch_request(request: ResumePatchValidationRequest) -> ResumePatchValidationResponse:
+    """校验用户选择的字段补丁，拒绝排版字段和注入内容。"""
+    return validate_resume_patches(
+        template_id=request.templateId,
+        version=request.version,
+        fields=request.fields,
+        patches=request.patches,
+        allowed_evidence_ids=request.allowedEvidenceIds,
+    )
+
+
+@router.post("/resume/templates/exports", response_model=ResumeTemplateExportResponse)
+def export_resume_template(request: ResumeTemplateExportRequest) -> ResumeTemplateExportResponse:
+    """把确认后的字段补丁确定性应用到 DOCX 字节流。"""
+    try:
+        content = base64.b64decode(request.fileBase64)
+        return apply_resume_patches_to_docx(
+            content=content,
+            filename=request.filename,
+            template_id=request.templateId,
+            version=request.version,
+            fields=request.fields,
+            patches=request.patches,
+            allowed_evidence_ids=request.allowedEvidenceIds,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 409 if "RESUME_LAYOUT_CHANGED" in detail or "hash 已变化" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @router.get("/documents/{document_id}/evidences", response_model=EvidenceListResponse)

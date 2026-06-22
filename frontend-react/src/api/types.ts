@@ -139,6 +139,84 @@ export interface RagQueryHistory {
   updatedAt?: string | null;
 }
 
+export interface ResumeTemplateFieldBinding {
+  templateId: string;
+  version: number;
+  fieldId: string;
+  sectionKey: string;
+  displayName: string;
+  sourceText: string;
+  sourceTextHash: string;
+  locationRefs?: Record<string, unknown>[];
+  styleFingerprint?: Record<string, unknown>;
+  maxChars: number;
+  maxLines: number;
+  requiredEvidencePolicy: string;
+  unsupportedRegions: string[];
+}
+
+export interface ResumeTemplate {
+  templateId: string;
+  version: number;
+  status: string;
+  filename: string;
+  fileType: string;
+  fields: ResumeTemplateFieldBinding[];
+  unsupportedRegions: string[];
+  layoutFingerprint?: Record<string, unknown>;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface ResumeContentPatch {
+  fieldId: string;
+  sourceTextHash: string;
+  newText: string;
+  rewriteReason: string;
+  evidenceIds: string[];
+  confidence: number;
+  riskFlags: string[];
+  status: 'DRAFT' | 'VALIDATED' | 'CONFIRMED' | 'REJECTED' | 'EXPORTED' | string;
+}
+
+export interface ResumePatchEvidence {
+  evidenceId: string;
+  documentTitle?: string | null;
+  sectionName?: string | null;
+  snippet?: string | null;
+  source?: string | null;
+  score?: number | null;
+}
+
+export interface ResumePatchDraft {
+  patchDraftId: string;
+  templateId: string;
+  version: number;
+  status: string;
+  provider?: string | null;
+  patches: ResumeContentPatch[];
+  evidenceCandidates: ResumePatchEvidence[];
+  validationErrors: string[];
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface ResumeTemplateExport {
+  exportId: string;
+  templateId: string;
+  baseVersion: number;
+  exportVersion: number;
+  patchDraftId: string;
+  filename: string;
+  filePath: string;
+  storageType: string;
+  publicUrl?: string | null;
+  status: string;
+  layoutValidation?: Record<string, unknown>;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface VideoSlice {
   id: number;
   title: string;

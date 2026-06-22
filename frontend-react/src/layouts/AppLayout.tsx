@@ -3,6 +3,7 @@ import {
   BookOpen,
   Brain,
   Database,
+  FileText,
   FileSearch,
   LayoutDashboard,
   LifeBuoy,
@@ -28,6 +29,7 @@ const navItems = [
   { to: '/videos', label: '视频复习', icon: Video },
   { to: '/jd-analysis', label: 'JD 分析', icon: FileSearch },
   { to: '/resume', label: '简历适配', icon: UserCircle },
+  { to: '/resume-template', label: '模板补丁', icon: FileText },
   { to: '/agent-tasks', label: 'Agent 任务', icon: WandSparkles },
   { to: '/settings', label: '系统设置', icon: Settings }
 ];

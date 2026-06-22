@@ -7,6 +7,7 @@ import { JdAnalysis } from './pages/jd-analysis/JdAnalysis';
 import { KnowledgeBase } from './pages/knowledge-base/KnowledgeBase';
 import { LearningMaterials } from './pages/materials/LearningMaterials';
 import { ResumeAdaptation } from './pages/resume-adapter/ResumeAdaptation';
+import { ResumeTemplateWorkspace } from './pages/resume-template/ResumeTemplateWorkspace';
 import { Settings } from './pages/Settings';
 import { VideoReview } from './pages/video-review/VideoReview';
 import { RequireAuth } from './routes/RequireAuth';
@@ -44,6 +45,7 @@ const router = createBrowserRouter([
       { path: 'videos', element: <VideoReview /> },
       { path: 'jd-analysis', element: <JdAnalysis /> },
       { path: 'resume', element: <ResumeAdaptation /> },
+      { path: 'resume-template', element: <ResumeTemplateWorkspace /> },
       { path: 'agent-tasks', element: <AgentTasks /> },
       { path: 'settings', element: <Settings /> },
       { path: '*', element: <Navigate to="/" replace /> }

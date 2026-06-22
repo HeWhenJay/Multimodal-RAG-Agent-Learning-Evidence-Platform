@@ -1,4 +1,17 @@
-import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagProgress, RagQueryHistory, RagQueryResult, RagQueryTask, Result } from './types';
+import type {
+  LearningMaterial,
+  MaterialUploadChunk,
+  RagOverview,
+  RagProgress,
+  RagQueryHistory,
+  RagQueryResult,
+  RagQueryTask,
+  Result,
+  ResumeContentPatch,
+  ResumePatchDraft,
+  ResumeTemplate,
+  ResumeTemplateExport
+} from './types';
 import { getStoredAuthToken } from './auth';
 
 const jsonHeaders = {
@@ -187,5 +200,59 @@ export function uploadMaterialChunk(payload: {
 export function reindexMaterial(id: number, highPrecision = false): Promise<LearningMaterial> {
   return request<LearningMaterial>(`/api/rag/materials/${id}/reindex?highPrecision=${highPrecision}`, {
     method: 'POST'
+  });
+}
+
+// 上传 DOCX 简历模板并解析字段绑定。
+export function uploadResumeTemplate(file: File): Promise<ResumeTemplate> {
+  const form = new FormData();
+  form.append('file', file);
+  return request<ResumeTemplate>('/api/rag/resume-templates', {
+    method: 'POST',
+    body: form
+  });
+}
+
+// 查询简历模板字段绑定。
+export function fetchResumeTemplate(templateId: string): Promise<ResumeTemplate> {
+  return request<ResumeTemplate>(`/api/rag/resume-templates/${templateId}`);
+}
+
+// 基于 JD 和 evidence 生成字段级补丁草稿。
+export function generateResumePatches(templateId: string, payload: {
+  version: number;
+  jobDescription: string;
+  topK?: number;
+}): Promise<ResumePatchDraft> {
+  return request<ResumePatchDraft>(`/api/rag/resume-templates/${templateId}/patches/generate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 校验用户选择的字段级补丁。
+export function validateResumePatches(templateId: string, payload: {
+  version: number;
+  patchDraftId: string;
+  patches: ResumeContentPatch[];
+}): Promise<ResumePatchDraft> {
+  return request<ResumePatchDraft>(`/api/rag/resume-templates/${templateId}/patches/validate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 导出人工确认后的新 DOCX 版本。
+export function exportResumeTemplate(templateId: string, payload: {
+  version: number;
+  patchDraftId: string;
+  idempotencyKey: string;
+}): Promise<ResumeTemplateExport> {
+  return request<ResumeTemplateExport>(`/api/rag/resume-templates/${templateId}/exports`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
   });
 }

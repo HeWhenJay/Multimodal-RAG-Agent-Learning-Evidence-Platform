@@ -3,11 +3,21 @@ package com.itxiang.evidence;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
+import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.entity.RagQueryHistory;
+import com.itxiang.evidence.entity.ResumeTemplate;
+import com.itxiang.evidence.entity.ResumeTemplateExport;
+import com.itxiang.evidence.entity.ResumeTemplatePatchDraft;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateExportMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateFieldMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateMapper;
+import com.itxiang.evidence.mapper.ResumeTemplatePatchDraftMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.Impl.RagIndexWorker;
@@ -15,11 +25,16 @@ import com.itxiang.evidence.service.Impl.RagServiceImpl;
 import com.itxiang.evidence.service.Impl.RagUploadWorker;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
+import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
+import com.itxiang.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.vo.ResumePatchDraftVO;
+import com.itxiang.evidence.vo.ResumeTemplateExportVO;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -65,6 +80,18 @@ class RagServiceImplTests {
     private RagQueryHistoryMapper ragQueryHistoryMapper;
 
     @Mock
+    private ResumeTemplateMapper resumeTemplateMapper;
+
+    @Mock
+    private ResumeTemplateFieldMapper resumeTemplateFieldMapper;
+
+    @Mock
+    private ResumeTemplatePatchDraftMapper resumeTemplatePatchDraftMapper;
+
+    @Mock
+    private ResumeTemplateExportMapper resumeTemplateExportMapper;
+
+    @Mock
     private PythonRagClient pythonRagClient;
 
     @Mock
@@ -94,6 +121,7 @@ class RagServiceImplTests {
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(ragService, "chunkRootOverride", tempDir.resolve("chunks"));
+        ReflectionTestUtils.setField(ragService, "objectMapper", new ObjectMapper());
         lenient().when(transactionTemplate.execute(any())).thenAnswer(invocation -> {
             TransactionCallback<?> callback = invocation.getArgument(0);
             return callback.doInTransaction(new SimpleTransactionStatus());
@@ -442,11 +470,178 @@ class RagServiceImplTests {
         );
     }
 
+    @Test
+    void generateResumeTemplatePatchesUsesRagEvidenceWithoutWritingHistory() {
+        ResumeTemplate template = resumeTemplate("tpl-1", "7", 1, "READY");
+        ResumePatchGenerateDTO dto = new ResumePatchGenerateDTO();
+        dto.setVersion(1);
+        dto.setJobDescription("需要 RAG、FastAPI 和 Spring Boot 项目经验");
+        dto.setTopK(3);
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-1"), eq("7"))).thenReturn(template);
+        when(resumeTemplateFieldMapper.findByTemplateIdAndVersion(eq("tpl-1"), eq(1))).thenReturn(List.of());
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("命中项目证据")
+                .expandedQueries(List.of("RAG FastAPI 项目"))
+                .evidences(List.of(RagEvidenceVO.builder()
+                        .evidenceId("ev-1")
+                        .documentTitle("项目复盘")
+                        .title("项目复盘")
+                        .sectionName("RAG 平台")
+                        .snippet("实现 FastAPI 检索接口")
+                        .source("upload")
+                        .sourcePath("material.md")
+                        .score(0.91)
+                        .build()))
+                .diagnostics(Map.of())
+                .progressEvents(List.of())
+                .build());
+        when(pythonRagClient.generateResumePatches(any())).thenReturn(new PythonRagClient.ResumePatchGenerationResult(
+                "tpl-1",
+                1,
+                "local",
+                "resume_content_patch_response",
+                Map.of("type", "object"),
+                List.of(Map.of(
+                        "fieldId", "field-1",
+                        "sourceTextHash", "hash-1",
+                        "newText", "实现 FastAPI 检索接口",
+                        "rewriteReason", "突出岗位要求",
+                        "evidenceIds", List.of("ev-1"),
+                        "confidence", 0.9,
+                        "riskFlags", List.of("NONE"),
+                        "status", "DRAFT"
+                )),
+                List.of()
+        ));
+        ArgumentCaptor<RagQueryDTO> queryCaptor = ArgumentCaptor.forClass(RagQueryDTO.class);
+
+        ResumePatchDraftVO result = ragService.generateResumeTemplatePatches("tpl-1", dto, "7");
+
+        assertThat(result.getTemplateId()).isEqualTo("tpl-1");
+        assertThat(result.getPatches()).hasSize(1);
+        assertThat(result.getEvidenceCandidates()).hasSize(1);
+        verify(pythonRagClient).query(queryCaptor.capture());
+        assertThat(queryCaptor.getValue().getQuestion()).contains("需要 RAG、FastAPI");
+        verify(ragQueryHistoryMapper, never()).insert(any(RagQueryHistory.class));
+        verify(resumeTemplatePatchDraftMapper).insert(argThat(draft ->
+                "tpl-1".equals(draft.getTemplateId())
+                        && "7".equals(draft.getUserId())
+                        && draft.getJobDescriptionHash() != null
+                        && !draft.getJobDescriptionHash().isBlank()
+        ));
+    }
+
+    @Test
+    void exportResumeTemplateRejectsDraftBeforeConfirmation() {
+        ResumeTemplate template = resumeTemplate("tpl-2", "7", 1, "READY");
+        ResumeTemplatePatchDraft draft = patchDraft("draft-1", "tpl-2", "7", 1, "DRAFT");
+        ResumeTemplateExportDTO dto = new ResumeTemplateExportDTO();
+        dto.setVersion(1);
+        dto.setPatchDraftId("draft-1");
+        dto.setIdempotencyKey("export-key");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-2"), eq("7"))).thenReturn(template);
+        when(resumeTemplateExportMapper.findByIdempotencyKey(eq("tpl-2"), eq("7"), eq("export-key"))).thenReturn(null);
+        when(resumeTemplatePatchDraftMapper.findByIdAndTemplateIdAndUserId(eq("draft-1"), eq("tpl-2"), eq("7"))).thenReturn(draft);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.exportResumeTemplate("tpl-2", dto, "7")
+        );
+
+        verify(objectStorageService, never()).load(anyString(), anyString(), anyString(), anyString());
+        verify(pythonRagClient, never()).exportResumeTemplate(any());
+    }
+
+    @Test
+    void exportResumeTemplateReturnsExistingExportForIdempotencyKey() {
+        ResumeTemplate template = resumeTemplate("tpl-3", "7", 1, "READY");
+        ResumeTemplateExport existing = new ResumeTemplateExport();
+        existing.setId("export-1");
+        existing.setTemplateId("tpl-3");
+        existing.setUserId("7");
+        existing.setBaseVersion(1);
+        existing.setExportVersion(2);
+        existing.setPatchDraftId("draft-1");
+        existing.setFilename("resume-v2.docx");
+        existing.setFilePath("uploads/resume-v2.docx");
+        existing.setStorageType("local");
+        existing.setLayoutValidationJson("{\"status\":\"PASSED\"}");
+        existing.setIdempotencyKey("export-key");
+        existing.setStatus("EXPORTED");
+        ResumeTemplateExportDTO dto = new ResumeTemplateExportDTO();
+        dto.setVersion(1);
+        dto.setPatchDraftId("draft-1");
+        dto.setIdempotencyKey("export-key");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-3"), eq("7"))).thenReturn(template);
+        when(resumeTemplateExportMapper.findByIdempotencyKey(eq("tpl-3"), eq("7"), eq("export-key"))).thenReturn(existing);
+
+        ResumeTemplateExportVO result = ragService.exportResumeTemplate("tpl-3", dto, "7");
+
+        assertThat(result.getExportId()).isEqualTo("export-1");
+        assertThat(result.getExportVersion()).isEqualTo(2);
+        verify(resumeTemplatePatchDraftMapper, never()).findByIdAndTemplateIdAndUserId(anyString(), anyString(), anyString());
+        verify(pythonRagClient, never()).exportResumeTemplate(any());
+    }
+
+    @Test
+    void generateResumeTemplatePatchesRejectsVersionConflict() {
+        ResumeTemplate template = resumeTemplate("tpl-4", "7", 2, "READY");
+        ResumePatchGenerateDTO dto = new ResumePatchGenerateDTO();
+        dto.setVersion(1);
+        dto.setJobDescription("需要 RAG 经验");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-4"), eq("7"))).thenReturn(template);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.generateResumeTemplatePatches("tpl-4", dto, "7")
+        );
+
+        verify(pythonRagClient, never()).generateResumePatches(any());
+    }
+
     /**
      * 校验日志上下文中包含 Python 返回的具体报错位置。
      */
     private boolean containsErrorLocation(Map<String, Object> context, String expectedLocation) {
         Object location = context.get("errorLocation");
         return location != null && location.toString().contains(expectedLocation);
+    }
+
+    /**
+     * 构造测试用简历模板实体。
+     */
+    private ResumeTemplate resumeTemplate(String id, String userId, Integer version, String status) {
+        ResumeTemplate template = new ResumeTemplate();
+        template.setId(id);
+        template.setUserId(userId);
+        template.setTemplateName("resume.docx");
+        template.setOriginalFilename("resume.docx");
+        template.setCurrentFilename("resume.docx");
+        template.setCurrentFilePath("uploads/resume.docx");
+        template.setCurrentStorageType("local");
+        template.setVersion(version);
+        template.setStatus(status);
+        template.setFileType("docx");
+        template.setLayoutFingerprintJson("{}");
+        template.setUnsupportedRegionsJson("[]");
+        return template;
+    }
+
+    /**
+     * 构造测试用补丁草稿实体。
+     */
+    private ResumeTemplatePatchDraft patchDraft(String id, String templateId, String userId, Integer version, String status) {
+        ResumeTemplatePatchDraft draft = new ResumeTemplatePatchDraft();
+        draft.setId(id);
+        draft.setTemplateId(templateId);
+        draft.setUserId(userId);
+        draft.setTemplateVersion(version);
+        draft.setStatus(status);
+        draft.setJobDescriptionHash("hash");
+        draft.setPatchesJson("[]");
+        draft.setEvidenceCandidatesJson("[]");
+        draft.setValidationErrorsJson("[]");
+        draft.setProvider("local");
+        return draft;
     }
 }

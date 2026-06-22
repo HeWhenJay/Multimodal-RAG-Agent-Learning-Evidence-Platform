@@ -2,6 +2,9 @@ package com.itxiang.evidence.service;
 
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
+import com.itxiang.evidence.dto.ResumePatchValidateDTO;
+import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
@@ -9,6 +12,9 @@ import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.vo.ResumePatchDraftVO;
+import com.itxiang.evidence.vo.ResumeTemplateExportVO;
+import com.itxiang.evidence.vo.ResumeTemplateVO;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDate;
@@ -87,4 +93,29 @@ public interface RagService {
      * 查询 RAG 检索问答任务状态。
      */
     RagQueryTaskVO getQueryTask(String taskId, String userId);
+
+    /**
+     * 上传并解析简历模板字段绑定。
+     */
+    ResumeTemplateVO uploadResumeTemplate(MultipartFile file, String userId);
+
+    /**
+     * 查询简历模板字段绑定。
+     */
+    ResumeTemplateVO getResumeTemplate(String templateId, String userId);
+
+    /**
+     * 基于 JD 和当前用户 evidence 生成字段级补丁草稿。
+     */
+    ResumePatchDraftVO generateResumeTemplatePatches(String templateId, ResumePatchGenerateDTO dto, String userId);
+
+    /**
+     * 校验用户确认的字段级补丁。
+     */
+    ResumePatchDraftVO validateResumeTemplatePatches(String templateId, ResumePatchValidateDTO dto, String userId);
+
+    /**
+     * 应用已确认补丁并导出新的 DOCX 版本。
+     */
+    ResumeTemplateExportVO exportResumeTemplate(String templateId, ResumeTemplateExportDTO dto, String userId);
 }

@@ -1,10 +1,10 @@
 # RAG 接口文档
 
-更新日期：2026-06-20
+更新日期：2026-06-22
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染，以及 Stage 1 父子索引、summary child、OCR occurrence 和父段聚合诊断。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、Stage 1 父子索引、summary child、OCR occurrence 和父段聚合诊断，以及简历模板字段级内容补丁、人工确认和确定性 DOCX 导出。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
 
 边界约定：
 
@@ -12,9 +12,10 @@
 - Java 负责资料记录、文件上传、阿里 OSS 对象存储、原始文件路径、解析状态、登录用户边界、统一 `Result<T>` 响应和调用 Python。
 - Python FastAPI 负责多格式解析路由、原始视频处理、MinerU/OCR 降级、`DocumentBlock` 统一模型、解析质量评分、递归切块、BM25、百炼 `text-embedding-v4` 1024 维向量索引、RRF/RAG-Fusion、百炼 rerank、百炼 LLM 回答生成和 evidence 引用。
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
+- 简历模板字段级补丁能力属于 RAG 简历模板内部服务，不复用 Agent API、Agent 表、LangGraph 或 Tool Gateway。
 - RAG 进度事件复用 `log_event` 表，`event_type=rag_progress`，不新增独立进度表；Python 方法级控制面板日志使用 `event_type=rag_process`，错误仍写入 `log_error`。
 - RAG 询问历史由 Java 写入 `rag_query_history`，只保存业务查询快照、问题、回答、证据 JSON 和状态；Python 查询任务仍是进程内短期进度快照，不承担长期历史存储。
-- Git 提交时只维护 `infra/sql/init.sql`，本地增量迁移目录不作为必须提交内容。
+- 数据库变更需同步维护 `infra/sql/init.sql`、`infra/sql/alter-database/` 和 `backend-java/src/main/resources/schema.sql`，确保新库初始化和旧库迁移一致。
 
 鉴权约定：
 
@@ -1076,6 +1077,242 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 - 文本块按标题、章节、页面、幻灯片、段落、句子递归切分。
 - 表格、图片、代码块、公式和图表默认作为原子块保存，避免随意切碎。
 - chunk metadata 保留 `blockId/blockType/pageIndex/slideIndex/sheetName/cellRange/startTime/endTime/sectionTitle/sourcePath/assetPath/parseEngine`，并保留父子索引字段 `parentSegmentId/parentStartTime/parentEndTime/parentKind/childKind/occurrenceId/occurrenceTime/retrievalLayer/concepts/segmentRole/prerequisiteSegmentIds/relatedSegmentIds/matchedChildIds/matchedChildKinds/linkedVisualGroupIds/linkedDuplicateGroupIds`。
+
+## 简历模板字段级内容补丁接口
+
+更新日期：2026-06-22
+
+本节定义 RAG 内的简历模板字段级补丁能力。该能力不属于 Agent，不使用 LangGraph、Tool Gateway、`/internal/agent/*` 或任何 `agent_*` 表。Structured Outputs / JSON Schema 只用于约束 LLM 输出字段级补丁；DOCX 排版不变由 Python 确定性应用、人工确认和 layout fingerprint 校验保证。
+
+### 状态机和错误码
+
+模板状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `PARSING` | Java 已保存原文件，Python 正在解析字段 |
+| `READY` | 字段绑定可用 |
+| `FAILED` | 解析失败 |
+| `EXPORTED` | 已导出至少一个新版本 |
+
+补丁草稿状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `DRAFT` | Python 生成的待确认草稿 |
+| `VALIDATED` | 已通过 Java/Python 双重校验 |
+| `CONFIRMED` | 用户确认可应用 |
+| `REJECTED` | 用户拒绝 |
+| `EXPORTED` | 已被导出使用 |
+
+错误码：
+
+| 错误码 | HTTP/Result 行为 | 说明 |
+| --- | --- | --- |
+| `RESUME_TEMPLATE_NOT_FOUND` | `Result.error` | 模板不存在或不属于当前用户 |
+| `RESUME_TEMPLATE_VERSION_CONFLICT` | `Result.error` | 前端提交版本不是当前版本 |
+| `RESUME_PATCH_VALIDATION_FAILED` | `Result.error` | `fieldId/hash/evidenceIds/长度/行数/注入风险` 校验失败 |
+| `RESUME_EXPORT_REQUIRES_CONFIRMATION` | `Result.error` | 存在未确认补丁时尝试导出 |
+| `RESUME_LAYOUT_CHANGED` | `Result.error` | Python 应用后 layout fingerprint 变化 |
+| `RAG_PYTHON_4XX/RAG_PYTHON_5XX/RAG_PYTHON_TIMEOUT` | `Result.error` | Java 调 Python 内部接口失败 |
+
+### Java 对外 API
+
+#### 上传并解析简历模板
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/rag/resume-templates` |
+| 鉴权 | 必须携带 `Authorization: Bearer <token>` |
+| 请求类型 | `multipart/form-data`，字段 `file` |
+| 文件限制 | 首版只支持 `.docx`，建议不超过 10MB |
+| 响应 | `Result<ResumeTemplateVO>` |
+
+成功响应：
+
+```json
+{
+  "code": 1,
+  "data": {
+    "templateId": "d2f0...",
+    "version": 1,
+    "status": "READY",
+    "filename": "后端实习简历.docx",
+    "fields": [
+      {
+        "fieldId": "p-7aa1c3d091",
+        "sectionKey": "project_experience",
+        "displayName": "多模态 RAG 学习证据平台",
+        "sourceText": "多模态 RAG 学习证据平台...",
+        "sourceTextHash": "sha256...",
+        "maxChars": 280,
+        "maxLines": 3,
+        "requiredEvidencePolicy": "REQUIRED",
+        "unsupportedRegions": []
+      }
+    ],
+    "unsupportedRegions": [],
+    "createdAt": "2026-06-22T10:00:00"
+  }
+}
+```
+
+#### 查看字段绑定
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/rag/resume-templates/{templateId}` |
+| 响应 | `Result<ResumeTemplateVO>` |
+
+Java 必须按当前登录用户和 `templateId` 查询，不能返回其他用户模板。
+
+#### 生成字段补丁草稿
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/rag/resume-templates/{templateId}/patches/generate` |
+| 请求 | `ResumePatchGenerateDTO` |
+| 响应 | `Result<ResumePatchDraftVO>` |
+
+请求：
+
+```json
+{
+  "version": 1,
+  "jobDescription": "岗位 JD 文本",
+  "topK": 5
+}
+```
+
+Java 行为：
+
+1. 校验模板归属和版本。
+2. 使用当前用户 RAG 检索 evidence 候选，不写入 `rag_query_history`。
+3. 调 Python `/internal/rag/resume/templates/patches/generate`。
+4. 保存补丁草稿，状态为 `DRAFT` 或 `VALIDATED`。
+5. 不记录简历全文、JD 全文和模型原始补丁到日志。
+
+#### 校验用户选择的补丁
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/rag/resume-templates/{templateId}/patches/validate` |
+| 请求 | `ResumePatchValidateDTO` |
+| 响应 | `Result<ResumePatchDraftVO>` |
+
+请求：
+
+```json
+{
+  "version": 1,
+  "patchDraftId": "draft-uuid",
+  "patches": [
+    {
+      "fieldId": "p-7aa1c3d091",
+      "sourceTextHash": "sha256...",
+      "newText": "基于 RAG-Fusion 和 FastAPI 构建学习证据检索服务...",
+      "rewriteReason": "突出 JD 中的 RAG 和后端接口能力",
+      "evidenceIds": ["material-7-chunk-3"],
+      "confidence": 0.82,
+      "riskFlags": ["NONE"],
+      "status": "CONFIRMED"
+    }
+  ]
+}
+```
+
+Java 和 Python 都必须校验：
+
+- `templateId + version + fieldId + sourceTextHash` 匹配。
+- `newText` 不超过字段 `maxChars/maxLines`。
+- `evidenceIds` 属于本次候选集合。
+- `riskFlags/status` 为枚举值。
+- 不包含 `style/font/layout/xml/path/locationRefs/run/paragraph/table/cell` 等排版字段。
+- 不包含 Markdown 表格、HTML 或 DOCX XML。
+
+#### 导出确认后的新版本
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/rag/resume-templates/{templateId}/exports` |
+| 请求 | `ResumeTemplateExportDTO` |
+| 响应 | `Result<ResumeTemplateExportVO>` |
+
+请求：
+
+```json
+{
+  "version": 1,
+  "patchDraftId": "draft-uuid",
+  "idempotencyKey": "resume-export-20260622-001"
+}
+```
+
+导出约束：
+
+- `patchDraftId` 必须属于当前用户模板。
+- 所有将应用的补丁必须是 `CONFIRMED` 或 `VALIDATED`。
+- 幂等键重复时返回已有导出记录，不重复生成。
+- Python 返回 `RESUME_LAYOUT_CHANGED` 时，Java 不保存导出文件。
+- 导出保存为新对象，不覆盖原始模板。
+
+### Python 内部 API
+
+Python 内部接口只服务 Java，不能接收任意本地文件路径。
+
+| 方法 | 路径 | 请求 | 响应 |
+| --- | --- | --- | --- |
+| `POST` | `/internal/rag/resume/templates/parse` | multipart DOCX 字节、`template_id/version` | `ResumeTemplateParseResponse` |
+| `POST` | `/internal/rag/resume/templates/patches/generate` | `ResumePatchGenerationRequest` | `ResumePatchGenerationResponse` |
+| `POST` | `/internal/rag/resume/templates/patches/validate` | `ResumePatchValidationRequest` | `ResumePatchValidationResponse` |
+| `POST` | `/internal/rag/resume/templates/exports` | base64 DOCX、字段绑定、已确认补丁 | `ResumeTemplateExportResponse` |
+
+超时和重试：
+
+| 调用 | 超时 | 重试 |
+| --- | --- | --- |
+| Java -> Python parse | 30 秒 | 网络错误可重试 1 次 |
+| Java -> Python patch generate | 60 秒 | 只对网络错误重试 1 次，模型 schema 失败不盲目重试超过 2 次 |
+| Java -> Python validate | 10 秒 | 不重试业务校验失败 |
+| Java -> Python export | 30 秒 | 幂等键保障下网络错误可重试 1 次 |
+
+### Structured Outputs 约束
+
+OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type=json_schema`，在 `json_schema` 中设置 `strict:true`，并为所有 object 设置 `additionalProperties:false`。百炼 OpenAI 兼容路径当前不声明同等强保证，只作为 JSON 生成路径，必须经过 Pydantic/JSON Schema validation、必要 retry 和 reject fallback。
+
+字段补丁 schema 根对象：
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["patches"],
+  "properties": {
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fieldId",
+          "sourceTextHash",
+          "newText",
+          "rewriteReason",
+          "evidenceIds",
+          "confidence",
+          "riskFlags",
+          "status"
+        ]
+      }
+    }
+  }
+}
+```
 
 ## 前端影响
 

@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -293,6 +294,85 @@ public class PythonRagClient {
     }
 
     /**
+     * 调用 Python 简历模板解析接口，生成字段绑定和版式指纹。
+     */
+    public ResumeTemplateParseResult parseResumeTemplate(String templateId, Integer version, byte[] content, String filename) {
+        try {
+            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+            body.add("template_id", templateId);
+            body.add("version", version == null ? 1 : version);
+            body.add("file", new NamedByteArrayResource(content, filename));
+            byte[] response = restClient.post()
+                    .uri(resolve("/internal/rag/resume/templates/parse"))
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .body(body)
+                    .retrieve()
+                    .body(byte[].class);
+            JsonNode root = readJsonResponse("resume-template-parse", "/internal/rag/resume/templates/parse", response);
+            return new ResumeTemplateParseResult(
+                    text(root, "templateId"),
+                    root.path("version").asInt(1),
+                    text(root, "filename"),
+                    readObjectList(root.get("fields")),
+                    readTextArray(root.get("unsupportedRegions")),
+                    readObjectMap(root.get("layoutFingerprint"))
+            );
+        } catch (RestClientResponseException e) {
+            throw pythonException("resume-template-parse", "/internal/rag/resume/templates/parse", e);
+        } catch (PythonRagClientException e) {
+            throw e;
+        } catch (Exception e) {
+            throw pythonException("resume-template-parse", "/internal/rag/resume/templates/parse", e);
+        }
+    }
+
+    /**
+     * 调用 Python 简历字段补丁生成接口。
+     */
+    public ResumePatchGenerationResult generateResumePatches(Map<String, Object> payload) {
+        JsonNode root = postJson("/internal/rag/resume/templates/patches/generate", payload);
+        return new ResumePatchGenerationResult(
+                text(root, "templateId"),
+                root.path("version").asInt(1),
+                text(root, "provider"),
+                text(root, "schemaName"),
+                readObjectMap(root.get("strictSchema")),
+                readObjectList(root.get("patches")),
+                readTextArray(root.get("validationErrors"))
+        );
+    }
+
+    /**
+     * 调用 Python 简历字段补丁校验接口。
+     */
+    public ResumePatchValidationResult validateResumePatches(Map<String, Object> payload) {
+        JsonNode root = postJson("/internal/rag/resume/templates/patches/validate", payload);
+        return new ResumePatchValidationResult(
+                text(root, "templateId"),
+                root.path("version").asInt(1),
+                readObjectList(root.get("patches")),
+                readTextArray(root.get("validationErrors"))
+        );
+    }
+
+    /**
+     * 调用 Python DOCX 确定性应用接口。
+     */
+    public ResumeTemplateExportResult exportResumeTemplate(Map<String, Object> payload) {
+        JsonNode root = postJson("/internal/rag/resume/templates/exports", payload);
+        String fileBase64 = text(root, "fileBase64");
+        byte[] fileBytes = fileBase64 == null || fileBase64.isBlank() ? new byte[0] : Base64.getDecoder().decode(fileBase64);
+        return new ResumeTemplateExportResult(
+                text(root, "templateId"),
+                root.path("version").asInt(1),
+                text(root, "filename"),
+                fileBytes,
+                readObjectMap(root.get("layoutValidation")),
+                root.path("appliedPatchCount").asInt(0)
+        );
+    }
+
+    /**
      * 安全获取 Python RAG 概览；失败时返回空概览。
      */
     public PythonOverview fetchOverviewSafely() {
@@ -536,6 +616,20 @@ public class PythonRagClient {
     }
 
     /**
+     * 读取 JSON 对象数组。
+     */
+    private List<Map<String, Object>> readObjectList(JsonNode node) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return result;
+        }
+        for (JsonNode item : node) {
+            result.add(objectMapper.convertValue(item, Map.class));
+        }
+        return result;
+    }
+
+    /**
      * 读取 Python JD 技能分析数组。
      */
     private List<JdSkillResult> readSkillResults(JsonNode node) {
@@ -699,6 +793,57 @@ public class PythonRagClient {
      * Python 简历证据对齐结果。
      */
     public record ResumeAlignmentResult(String requirement, String evidence, String status) {
+    }
+
+    /**
+     * Python 简历模板解析结果。
+     */
+    public record ResumeTemplateParseResult(
+            String templateId,
+            Integer version,
+            String filename,
+            List<Map<String, Object>> fields,
+            List<String> unsupportedRegions,
+            Map<String, Object> layoutFingerprint
+    ) {
+    }
+
+    /**
+     * Python 简历补丁生成结果。
+     */
+    public record ResumePatchGenerationResult(
+            String templateId,
+            Integer version,
+            String provider,
+            String schemaName,
+            Map<String, Object> strictSchema,
+            List<Map<String, Object>> patches,
+            List<String> validationErrors
+    ) {
+    }
+
+    /**
+     * Python 简历补丁校验结果。
+     */
+    public record ResumePatchValidationResult(
+            String templateId,
+            Integer version,
+            List<Map<String, Object>> patches,
+            List<String> validationErrors
+    ) {
+    }
+
+    /**
+     * Python 简历模板导出结果。
+     */
+    public record ResumeTemplateExportResult(
+            String templateId,
+            Integer version,
+            String filename,
+            byte[] fileBytes,
+            Map<String, Object> layoutValidation,
+            Integer appliedPatchCount
+    ) {
     }
 
     /**

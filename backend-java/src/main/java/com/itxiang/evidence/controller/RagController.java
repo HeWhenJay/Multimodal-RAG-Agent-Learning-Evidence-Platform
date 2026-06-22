@@ -4,6 +4,9 @@ import com.itxiang.evidence.common.RagOperationContext;
 import com.itxiang.evidence.common.Result;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
+import com.itxiang.evidence.dto.ResumePatchValidateDTO;
+import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.service.AuthService;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.RagService;
@@ -14,6 +17,9 @@ import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.vo.ResumePatchDraftVO;
+import com.itxiang.evidence.vo.ResumeTemplateExportVO;
+import com.itxiang.evidence.vo.ResumeTemplateVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -262,6 +268,86 @@ public class RagController {
                 RagOperationContext.operation("rag_query", "retrieve", "rag_query_task_poll", "查询 RAG 检索问答任务状态"),
                 context("taskId", taskId),
                 () -> ragService.getQueryTask(taskId, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 上传并解析简历模板字段绑定。
+     */
+    @PostMapping("/resume-templates")
+    @Operation(summary = "上传并解析简历模板")
+    public Result<ResumeTemplateVO> uploadResumeTemplate(@RequestParam("file") MultipartFile file,
+                                                         @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("上传简历模板: filename={}, size={}", file.getOriginalFilename(), file.getSize());
+        return execute(
+                RagOperationContext.operation("resume_template", "parse", "resume_template_upload_request", "上传并解析简历模板"),
+                context("filename", file.getOriginalFilename(), "fileSize", file.getSize()),
+                () -> ragService.uploadResumeTemplate(file, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 查询简历模板字段绑定。
+     */
+    @GetMapping("/resume-templates/{templateId}")
+    @Operation(summary = "查询简历模板字段绑定")
+    public Result<ResumeTemplateVO> getResumeTemplate(@PathVariable String templateId,
+                                                      @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("查询简历模板字段绑定: templateId={}", templateId);
+        return execute(
+                RagOperationContext.operation("resume_template", "query", "resume_template_detail_query", "查询简历模板字段绑定"),
+                context("templateId", templateId),
+                () -> ragService.getResumeTemplate(templateId, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 基于 JD 和 evidence 生成字段级补丁草稿。
+     */
+    @PostMapping("/resume-templates/{templateId}/patches/generate")
+    @Operation(summary = "生成简历字段补丁草稿")
+    public Result<ResumePatchDraftVO> generateResumeTemplatePatches(@PathVariable String templateId,
+                                                                    @Valid @RequestBody ResumePatchGenerateDTO dto,
+                                                                    @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("生成简历字段补丁草稿: templateId={}, version={}, jdLength={}",
+                templateId, dto.getVersion(), dto.getJobDescription() == null ? 0 : dto.getJobDescription().length());
+        return execute(
+                RagOperationContext.operation("resume_template", "patch", "resume_template_patch_generate_request", "生成简历字段补丁草稿"),
+                context("templateId", templateId, "version", dto.getVersion(), "jobDescriptionLength", dto.getJobDescription() == null ? 0 : dto.getJobDescription().length()),
+                () -> ragService.generateResumeTemplatePatches(templateId, dto, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 校验用户确认的字段级补丁。
+     */
+    @PostMapping("/resume-templates/{templateId}/patches/validate")
+    @Operation(summary = "校验简历字段补丁")
+    public Result<ResumePatchDraftVO> validateResumeTemplatePatches(@PathVariable String templateId,
+                                                                    @Valid @RequestBody ResumePatchValidateDTO dto,
+                                                                    @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("校验简历字段补丁: templateId={}, version={}, patchCount={}",
+                templateId, dto.getVersion(), dto.getPatches() == null ? 0 : dto.getPatches().size());
+        return execute(
+                RagOperationContext.operation("resume_template", "patch", "resume_template_patch_validate_request", "校验简历字段补丁"),
+                context("templateId", templateId, "version", dto.getVersion(), "patchCount", dto.getPatches() == null ? 0 : dto.getPatches().size()),
+                () -> ragService.validateResumeTemplatePatches(templateId, dto, currentUserId(authorization))
+        );
+    }
+
+    /**
+     * 应用确认补丁并导出新的 DOCX 版本。
+     */
+    @PostMapping("/resume-templates/{templateId}/exports")
+    @Operation(summary = "导出确认后的简历 DOCX")
+    public Result<ResumeTemplateExportVO> exportResumeTemplate(@PathVariable String templateId,
+                                                              @Valid @RequestBody ResumeTemplateExportDTO dto,
+                                                              @RequestHeader(value = "Authorization", required = false) String authorization) {
+        log.info("导出简历模板: templateId={}, version={}, patchDraftId={}", templateId, dto.getVersion(), dto.getPatchDraftId());
+        return execute(
+                RagOperationContext.operation("resume_template", "export", "resume_template_export_request", "导出确认后的简历 DOCX"),
+                context("templateId", templateId, "version", dto.getVersion(), "patchDraftId", dto.getPatchDraftId()),
+                () -> ragService.exportResumeTemplate(templateId, dto, currentUserId(authorization))
         );
     }
 
