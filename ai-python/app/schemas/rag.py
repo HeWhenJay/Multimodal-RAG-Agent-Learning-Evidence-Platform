@@ -105,6 +105,7 @@ class IndexResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     topK: int = Field(default=5, ge=1, le=20)
+    candidateMultiplier: int = Field(default=4, ge=2, le=10)
     metadataFilter: dict[str, Any] | None = None
 
 

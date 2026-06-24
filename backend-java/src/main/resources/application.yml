@@ -40,6 +40,15 @@ evidence:
     max-stack-trace-bytes: 20480
     retention-days: 30
     internal-token: ${EVIDENCE_INTERNAL_LOG_TOKEN:}
+  agent:
+    internal-token: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
+    java-base-url: ${EVIDENCE_AGENT_JAVA_BASE_URL:http://127.0.0.1:7080}
+    start-timeout-seconds: ${EVIDENCE_AGENT_START_TIMEOUT_SECONDS:10}
+  tools:
+    tavily:
+      api-key: ${TAVILY_API_KEY:}
+      base-url: ${EVIDENCE_TAVILY_BASE_URL:https://api.tavily.com}
+      timeout-seconds: ${EVIDENCE_TAVILY_TIMEOUT_SECONDS:15}
   storage:
     provider: ${EVIDENCE_STORAGE_PROVIDER:local}
     local-root: ${EVIDENCE_UPLOAD_ROOT:uploads/rag}

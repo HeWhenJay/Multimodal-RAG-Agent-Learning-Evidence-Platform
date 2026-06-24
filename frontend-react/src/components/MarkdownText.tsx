@@ -3,16 +3,17 @@ import type { ReactNode } from 'react';
 interface MarkdownTextProps {
   content: string;
   className?: string;
+  rewriteHref?: (href: string, contextText?: string) => string;
 }
 
 // 渲染后端 RAG 回答中的 Markdown 子集，避免把模型文本作为 HTML 注入页面。
-export function MarkdownText({ content, className = '' }: MarkdownTextProps) {
-  const blocks = renderMarkdownBlocks(content || '');
+export function MarkdownText({ content, className = '', rewriteHref }: MarkdownTextProps) {
+  const blocks = renderMarkdownBlocks(content || '', rewriteHref);
   return <div className={`markdown-text ${className}`.trim()}>{blocks}</div>;
 }
 
 // 将 Markdown 行拆成标题、段落、列表、引用和代码块。
-function renderMarkdownBlocks(content: string) {
+function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, contextText?: string) => string) {
   const lines = normalizeGeneratedMarkdown(content).split('\n');
   const blocks: ReactNode[] = [];
   let paragraphLines: string[] = [];
@@ -24,7 +25,7 @@ function renderMarkdownBlocks(content: string) {
   function flushParagraph() {
     if (!paragraphLines.length) return;
     const text = paragraphLines.join(' ');
-    blocks.push(<p key={`p-${blocks.length}`}>{renderInlineMarkdown(text, text)}</p>);
+    blocks.push(<p key={`p-${blocks.length}`}>{renderInlineMarkdown(text, text, rewriteHref)}</p>);
     paragraphLines = [];
   }
 
@@ -33,7 +34,7 @@ function renderMarkdownBlocks(content: string) {
     const Tag = orderedList ? 'ol' : 'ul';
     blocks.push(
       <Tag key={`list-${blocks.length}`}>
-        {listItems.map((item, index) => <li key={`${index}-${item}`}>{renderInlineMarkdown(item, item)}</li>)}
+        {listItems.map((item, index) => <li key={`${index}-${item}`}>{renderInlineMarkdown(item, item, rewriteHref)}</li>)}
       </Tag>
     );
     listItems = [];
@@ -72,7 +73,7 @@ function renderMarkdownBlocks(content: string) {
       flushParagraph();
       flushList();
       const level = Math.min(heading[1].length + 3, 6);
-      blocks.push(renderHeading(level, heading[2], `heading-${blocks.length}`));
+      blocks.push(renderHeading(level, heading[2], `heading-${blocks.length}`, rewriteHref));
       return;
     }
 
@@ -93,7 +94,7 @@ function renderMarkdownBlocks(content: string) {
     if (quote) {
       flushParagraph();
       flushList();
-      blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1], quote[1])}</blockquote>);
+      blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1], quote[1], rewriteHref)}</blockquote>);
       return;
     }
 
@@ -118,18 +119,18 @@ function normalizeGeneratedMarkdown(content: string) {
 }
 
 // 显式选择 HTML 标题标签，避免动态 JSX 标签被全局 Three 类型误判。
-function renderHeading(level: number, text: string, key: string) {
+function renderHeading(level: number, text: string, key: string, rewriteHref?: (href: string, contextText?: string) => string) {
   if (level <= 4) {
-    return <h4 key={key}>{renderInlineMarkdown(text, text)}</h4>;
+    return <h4 key={key}>{renderInlineMarkdown(text, text, rewriteHref)}</h4>;
   }
   if (level === 5) {
-    return <h5 key={key}>{renderInlineMarkdown(text, text)}</h5>;
+    return <h5 key={key}>{renderInlineMarkdown(text, text, rewriteHref)}</h5>;
   }
-  return <h6 key={key}>{renderInlineMarkdown(text, text)}</h6>;
+  return <h6 key={key}>{renderInlineMarkdown(text, text, rewriteHref)}</h6>;
 }
 
 // 渲染常见内联语法：链接、证据 ID、加粗、代码和简易数学片段。
-function renderInlineMarkdown(text: string, contextText = text): ReactNode[] {
+function renderInlineMarkdown(text: string, contextText = text, rewriteHref?: (href: string, contextText?: string) => string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\[evidenceId=([^\]]+)])|(\[([^\]]+)]\(([^)]+)\))|(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\$([^$\n]+)\$)/g;
   let lastIndex = 0;
@@ -143,14 +144,14 @@ function renderInlineMarkdown(text: string, contextText = text): ReactNode[] {
     if (match[2]) {
       nodes.push(<span className="markdown-evidence" key={key}>{match[2]}</span>);
     } else if (match[4] && match[5]) {
-      const href = normalizeMarkdownHref(match[5], contextText);
+      const href = normalizeMarkdownHref(match[5], contextText, rewriteHref);
       nodes.push(href
-        ? <a key={key} href={href} target={href.startsWith('http') ? '_blank' : undefined} rel="noreferrer">{renderInlineMarkdown(match[4], contextText)}</a>
-        : <span key={key}>{renderInlineMarkdown(match[4], contextText)}</span>);
+        ? <a key={key} href={href} target={isExternalOrPreviewHref(href) ? '_blank' : undefined} rel="noreferrer">{renderInlineMarkdown(match[4], contextText, rewriteHref)}</a>
+        : <span key={key}>{renderInlineMarkdown(match[4], contextText, rewriteHref)}</span>);
     } else if (match[7]) {
       nodes.push(<code key={key}>{match[7]}</code>);
     } else if (match[9]) {
-      nodes.push(<strong key={key}>{renderInlineMarkdown(match[9], contextText)}</strong>);
+      nodes.push(<strong key={key}>{renderInlineMarkdown(match[9], contextText, rewriteHref)}</strong>);
     } else if (match[11]) {
       nodes.push(<span className="markdown-math" key={key}>{match[11]}</span>);
     }
@@ -164,13 +165,17 @@ function renderInlineMarkdown(text: string, contextText = text): ReactNode[] {
 }
 
 // 只允许常规站内页面和 http(s) 链接；原 Markdown 目录锚点不对应当前应用目标。
-function normalizeMarkdownHref(rawHref: string, contextText = '') {
+function normalizeMarkdownHref(rawHref: string, contextText = '', rewriteHref?: (href: string, contextText?: string) => string) {
   const href = rawHref.trim().split(/\s+/)[0].replace(/^<|>$/g, '');
+  const rewritten = rewriteHref?.(href, contextText);
+  if (rewritten) {
+    return rewritten;
+  }
   if (href.startsWith('#')) {
-    return buildSourceBackedHashLink(href, contextText);
+    return buildSourceBackedHashLink(href, contextText, rewriteHref);
   }
   if (isCurrentAppHashOnlyLink(href)) {
-    return buildSourceBackedHashLink(href, contextText);
+    return buildSourceBackedHashLink(href, contextText, rewriteHref);
   }
   if (/^(https?:\/\/|\/(?!\/))/i.test(href)) {
     return href;
@@ -179,11 +184,12 @@ function normalizeMarkdownHref(rawHref: string, contextText = '') {
 }
 
 // 兼容旧回答：把“位置”的当前应用 hash 链接重写到同一行的 OSS 来源 URL。
-function buildSourceBackedHashLink(href: string, contextText: string) {
+function buildSourceBackedHashLink(href: string, contextText: string, rewriteHref?: (href: string, contextText?: string) => string) {
   const source = extractHttpSourceFromEvidenceText(contextText);
   if (!source) return '';
   const hash = extractHash(href);
-  return hash ? `${source.split('#', 1)[0]}#${hash}` : source;
+  const sourceBackedHref = hash ? `${source.split('#', 1)[0]}#${hash}` : source;
+  return rewriteHref?.(sourceBackedHref, contextText) || sourceBackedHref;
 }
 
 // 从“来源：https://...”字段提取浏览器可打开的资料 URL。
@@ -222,4 +228,9 @@ function isCurrentAppHashOnlyLink(href: string) {
 // 本地开发常在 localhost 和 127.0.0.1 之间切换，二者都指向当前应用。
 function isLoopbackHost(hostname: string) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
+// 预览页和外部来源都应在新标签打开，站内普通导航可沿用当前页。
+function isExternalOrPreviewHref(href: string) {
+  return href.startsWith('http') || href.startsWith('/preview/') || href.startsWith('/videos');
 }

@@ -1,7 +1,7 @@
 import pytest
 
 from app.schemas.rag import DocumentBlock
-from rag.indexes.pgvector_store import PgVectorRagStore
+from rag.indexes.pgvector_store import PgVectorRagStore, normalize_table_prefix, quote_identifier
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.models import Chunk
 
@@ -23,7 +23,7 @@ class FakeCursor:
     def execute(self, sql, params=None):
         sql_text = str(sql)
         self.executed.append((sql_text, params))
-        if "INSERT INTO rag_chunk" in sql_text:
+        if "INSERT INTO " in sql_text and "rag_chunk" in sql_text:
             self.chunk_inserts += 1
 
     def fetchone(self):
@@ -118,8 +118,31 @@ def test_pgvector_index_blocks_writes_document_and_chunks_in_transaction(monkeyp
     sql = "\n".join(item[0] for item in cursor.executed)
     assert result.chunkCount == 1
     assert connection.transaction_opened is True
-    assert "INSERT INTO rag_document" in sql
-    assert "INSERT INTO rag_chunk" in sql
+    assert f"INSERT INTO {store.document_table}" in sql
+    assert f"INSERT INTO {store.chunk_table}" in sql
+
+
+def test_pgvector_store_uses_configured_test_table_prefix(monkeypatch):
+    """确认评估可通过 Ragas_Test 表名前缀隔离 pgvector 表。"""
+    monkeypatch.setenv("RAG_TABLE_PREFIX", "Ragas_Test_")
+
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+
+    assert store.document_table_name == "Ragas_Test_rag_document"
+    assert store.chunk_table_name == "Ragas_Test_rag_chunk"
+    assert store.document_table == '"Ragas_Test_rag_document"'
+    assert store.chunk_table == '"Ragas_Test_rag_chunk"'
+    assert store.index_prefix == "idx_Ragas_Test_"
+    assert normalize_table_prefix("Ragas_Test_") == "Ragas_Test_"
+    assert quote_identifier("Ragas_Test_rag_document") == '"Ragas_Test_rag_document"'
+
+
+def test_pgvector_store_rejects_invalid_table_prefix(monkeypatch):
+    """确认动态表名前缀只允许安全的 PostgreSQL 标识符。"""
+    monkeypatch.setenv("RAG_TABLE_PREFIX", "test-rag;")
+
+    with pytest.raises(RuntimeError, match="RAG_TABLE_PREFIX"):
+        PgVectorRagStore("postgresql://unused", ensure_schema=False)
 
 
 def test_pgvector_index_blocks_cleans_index_when_committed_count_mismatches(monkeypatch):

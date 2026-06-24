@@ -22,6 +22,11 @@ public interface ObjectStorageService {
     LoadedObject load(String storageType, String sourcePath, String objectKey, String filename);
 
     /**
+     * 删除已保存的私有文件，删除失败时由实现层记录日志并保持业务删除可完成。
+     */
+    void delete(String storageType, String sourcePath, String objectKey);
+
+    /**
      * 上传后的对象信息。
      */
     record StoredObject(

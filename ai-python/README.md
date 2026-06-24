@@ -96,11 +96,12 @@ python run.py
 
 ## RAG 评估
 
-小样本 Ragas 评估入口位于 `ai-python/tests/evaluation/run_ragas_small_eval.py`。离线基线不需要外部模型：
+小样本 Ragas 评估入口位于 `ai-python/tests/evaluation/run_ragas_small_eval.py`。评估脚本默认使用真实 PostgreSQL/pgvector 和百炼模型链路，并在同一个数据库中写入 `Ragas_Test_` 前缀表；`offline` 仅表示不额外运行 Ragas LLM 指标，不表示使用内存仓库或 hash embedding：
 
 ```powershell
 $env:PYTHONPATH='ai-python'
-python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
+$env:RAGAS_TEST_TABLE_PREFIX='Ragas_Test_'
+conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
 ```
 
 真实 Ragas 评分需要先按 `docs/testing/ragas-small-evaluation-plan.md` 配置 `RAGAS_EVAL_*` 环境变量。评估 Key 不会写入 `run_config.json` 或日志输出。

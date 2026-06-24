@@ -3,11 +3,27 @@ package com.itxiang.evidence;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
+import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
+import com.itxiang.evidence.dto.ResumeTemplateAnnotationSaveDTO;
+import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.entity.RagQueryHistory;
+import com.itxiang.evidence.entity.ResumeTemplate;
+import com.itxiang.evidence.entity.ResumeTemplateExport;
+import com.itxiang.evidence.entity.ResumeTemplateField;
+import com.itxiang.evidence.entity.ResumeTemplatePatchDraft;
+import com.itxiang.evidence.entity.ResumeTemplatePreviewPage;
+import com.itxiang.evidence.entity.ResumeTemplateRegionAnnotation;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateExportMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateFieldMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateMapper;
+import com.itxiang.evidence.mapper.ResumeTemplatePatchDraftMapper;
+import com.itxiang.evidence.mapper.ResumeTemplatePreviewPageMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateRegionAnnotationMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.Impl.RagIndexWorker;
@@ -15,11 +31,18 @@ import com.itxiang.evidence.service.Impl.RagServiceImpl;
 import com.itxiang.evidence.service.Impl.RagUploadWorker;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
+import com.itxiang.evidence.vo.MaterialPreviewVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
+import com.itxiang.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.vo.RagEvidenceVO;
+import com.itxiang.evidence.vo.ResumePatchDraftVO;
+import com.itxiang.evidence.vo.ResumeTemplateExportVO;
+import com.itxiang.evidence.vo.ResumeTemplateVO;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -65,6 +88,24 @@ class RagServiceImplTests {
     private RagQueryHistoryMapper ragQueryHistoryMapper;
 
     @Mock
+    private ResumeTemplateMapper resumeTemplateMapper;
+
+    @Mock
+    private ResumeTemplateFieldMapper resumeTemplateFieldMapper;
+
+    @Mock
+    private ResumeTemplatePatchDraftMapper resumeTemplatePatchDraftMapper;
+
+    @Mock
+    private ResumeTemplateExportMapper resumeTemplateExportMapper;
+
+    @Mock
+    private ResumeTemplatePreviewPageMapper resumeTemplatePreviewPageMapper;
+
+    @Mock
+    private ResumeTemplateRegionAnnotationMapper resumeTemplateRegionAnnotationMapper;
+
+    @Mock
     private PythonRagClient pythonRagClient;
 
     @Mock
@@ -94,6 +135,7 @@ class RagServiceImplTests {
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(ragService, "chunkRootOverride", tempDir.resolve("chunks"));
+        ReflectionTestUtils.setField(ragService, "objectMapper", new ObjectMapper());
         lenient().when(transactionTemplate.execute(any())).thenAnswer(invocation -> {
             TransactionCallback<?> callback = invocation.getArgument(0);
             return callback.doInTransaction(new SimpleTransactionStatus());
@@ -194,6 +236,129 @@ class RagServiceImplTests {
                         && "RUNNING".equals(history.getStatus())
                         && Integer.valueOf(9000).equals(history.getDurationMs())
         ));
+    }
+
+    @Test
+    void queryNormalizesMetadataFilterAndCandidateMultiplier() {
+        RagQueryDTO dto = new RagQueryDTO();
+        dto.setQuestion("只查我的 RAG 资料");
+        dto.setTopK(99);
+        dto.setCandidateMultiplier(1);
+        dto.setMetadataFilter(Map.of(
+                "documentType", " markdown ",
+                "source", List.of("upload", ""),
+                "pageIndex", 3,
+                "visibilityScope", "public",
+                "userId", "other-user",
+                "unknownKey", "unknown",
+                "emptyKey", "",
+                "emptyList", List.of()
+        ));
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("基于资料回答")
+                .expandedQueries(List.of())
+                .evidences(List.of())
+                .diagnostics(Map.of())
+                .progressEvents(List.of())
+                .build());
+        ArgumentCaptor<RagQueryDTO> captor = ArgumentCaptor.forClass(RagQueryDTO.class);
+
+        ragService.query(dto, "7");
+
+        verify(pythonRagClient).query(captor.capture());
+        RagQueryDTO normalized = captor.getValue();
+        assertThat(normalized.getTopK()).isEqualTo(20);
+        assertThat(normalized.getCandidateMultiplier()).isEqualTo(2);
+        assertThat(normalized.getMetadataFilter()).containsEntry("documentType", "markdown");
+        assertThat(normalized.getMetadataFilter()).containsEntry("source", List.of("upload"));
+        assertThat(normalized.getMetadataFilter()).containsEntry("pageIndex", "3");
+        assertThat(normalized.getMetadataFilter()).containsEntry("userId", "7");
+        assertThat(normalized.getMetadataFilter()).containsEntry("visibilityScope", "private");
+        assertThat(normalized.getMetadataFilter()).doesNotContainKeys("unknownKey", "emptyKey", "emptyList");
+        assertThat(String.valueOf(normalized.getMetadataFilter().get("__ignoredMetadataFilterKeys")))
+                .contains("unknownKey", "emptyKey", "emptyList", "userId", "visibilityScope");
+    }
+
+    @Test
+    void queryNonPersistentUsesScopedQueryAndDoesNotWriteHistory() {
+        RagQueryDTO dto = new RagQueryDTO();
+        dto.setQuestion("Agent 只读探针查询 Redis 证据");
+        dto.setTopK(3);
+        dto.setCandidateMultiplier(4);
+        dto.setMetadataFilter(Map.of("documentType", "markdown", "userId", "other-user"));
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("Redis 证据")
+                .expandedQueries(List.of("Redis 证据"))
+                .evidences(List.of())
+                .diagnostics(Map.of("candidateCount", 2))
+                .progressEvents(List.of())
+                .build());
+        ArgumentCaptor<RagQueryDTO> captor = ArgumentCaptor.forClass(RagQueryDTO.class);
+
+        RagQueryVO result = ragService.queryNonPersistent(dto, "7");
+
+        assertThat(result.getAnswer()).isEqualTo("Redis 证据");
+        verify(pythonRagClient).query(captor.capture());
+        RagQueryDTO scoped = captor.getValue();
+        assertThat(scoped.getMetadataFilter()).containsEntry("userId", "7");
+        assertThat(scoped.getMetadataFilter()).containsEntry("visibilityScope", "private");
+        assertThat(scoped.getMetadataFilter()).containsEntry("documentType", "markdown");
+        assertThat(String.valueOf(scoped.getMetadataFilter().get("__ignoredMetadataFilterKeys"))).contains("userId");
+        verify(ragQueryHistoryMapper, never()).insert(any(RagQueryHistory.class));
+    }
+
+    @Test
+    void previewMaterialLoadsMarkdownContentForCurrentUser() {
+        LearningMaterial material = new LearningMaterial();
+        material.setId(3L);
+        material.setTitle("02_llm_gateway.md");
+        material.setOriginalFilename("02_llm_gateway.md");
+        material.setUserId("7");
+        material.setDocumentType("markdown");
+        material.setStorageType("oss");
+        material.setOriginalFilePath("https://cdn.example.com/learning-evidence/1/markdown/02_llm_gateway.md");
+        material.setObjectKey("learning-evidence/1/markdown/02_llm_gateway.md");
+        material.setPublicUrl("https://cdn.example.com/learning-evidence/1/markdown/02_llm_gateway.md");
+        when(learningMaterialMapper.findByIdAndUserId(eq(3L), eq("7"))).thenReturn(material);
+        when(objectStorageService.load(eq("oss"), eq(material.getOriginalFilePath()), eq(material.getObjectKey()), eq("02_llm_gateway.md")))
+                .thenReturn(new ObjectStorageService.LoadedObject(
+                        "\uFEFF## 参考回答\nRAG 引用预览".getBytes(StandardCharsets.UTF_8),
+                        "02_llm_gateway.md",
+                        "application/octet-stream"
+                ));
+
+        MaterialPreviewVO result = ragService.previewMaterial(
+                3L,
+                "https://cdn.example.com/learning-evidence/1/markdown/02_llm_gateway.md#_2-参考回答",
+                "7"
+        );
+
+        assertThat(result.getMaterialId()).isEqualTo(3L);
+        assertThat(result.getTitle()).isEqualTo("02_llm_gateway.md");
+        assertThat(result.getContent()).startsWith("## 参考回答");
+        assertThat(result.getContentType()).isEqualTo("application/octet-stream");
+    }
+
+    @Test
+    void previewMaterialRejectsSourceFromAnotherObject() {
+        LearningMaterial material = new LearningMaterial();
+        material.setId(3L);
+        material.setTitle("02_llm_gateway.md");
+        material.setOriginalFilename("02_llm_gateway.md");
+        material.setUserId("7");
+        material.setDocumentType("markdown");
+        material.setStorageType("oss");
+        material.setOriginalFilePath("https://cdn.example.com/learning-evidence/1/markdown/02_llm_gateway.md");
+        material.setObjectKey("learning-evidence/1/markdown/02_llm_gateway.md");
+        material.setPublicUrl("https://cdn.example.com/learning-evidence/1/markdown/02_llm_gateway.md");
+        when(learningMaterialMapper.findByIdAndUserId(eq(3L), eq("7"))).thenReturn(material);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.previewMaterial(3L, "https://cdn.example.com/learning-evidence/9/markdown/other.md", "7")
+        );
+
+        verify(objectStorageService, never()).load(anyString(), anyString(), anyString(), anyString());
     }
 
     @Test
@@ -442,11 +607,370 @@ class RagServiceImplTests {
         );
     }
 
+    @Test
+    void listResumeTemplatesReturnsCurrentUserHistoryWithCurrentPath() {
+        ResumeTemplate template = resumeTemplate("tpl-history", "7", 2, "EXPORTED");
+        template.setCurrentFilename("resume-v2.docx");
+        template.setCurrentFilePath("uploads/resume-v2.docx");
+        when(resumeTemplateMapper.findRecentByUserId(eq("7"), eq(12))).thenReturn(List.of(template));
+        when(resumeTemplateFieldMapper.findByTemplateIdAndVersion(eq("tpl-history"), eq(2))).thenReturn(List.of());
+
+        List<ResumeTemplateVO> result = ragService.listResumeTemplates("7", null);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTemplateId()).isEqualTo("tpl-history");
+        assertThat(result.get(0).getFilename()).isEqualTo("resume-v2.docx");
+        assertThat(result.get(0).getCurrentFilePath()).isEqualTo("uploads/resume-v2.docx");
+        verify(resumeTemplateMapper).findRecentByUserId(eq("7"), eq(12));
+    }
+
+    @Test
+    void generateResumeTemplatePatchesUsesRagEvidenceWithoutWritingHistory() {
+        ResumeTemplate template = resumeTemplate("tpl-1", "7", 1, "READY");
+        ResumePatchGenerateDTO dto = new ResumePatchGenerateDTO();
+        dto.setVersion(1);
+        dto.setJobDescription("需要 RAG、FastAPI 和 Spring Boot 项目经验");
+        dto.setResumeMaterialId(42L);
+        dto.setResumeText("前端伪造摘要不应进入 Python");
+        dto.setTopK(3);
+        LearningMaterial resumeMaterial = new LearningMaterial();
+        resumeMaterial.setId(42L);
+        resumeMaterial.setUserId("7");
+        resumeMaterial.setDocumentSummary("服务端简历摘要：负责 FastAPI 检索、React 模板确认和 Java 联调。");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-1"), eq("7"))).thenReturn(template);
+        when(resumeTemplateFieldMapper.findByTemplateIdAndVersion(eq("tpl-1"), eq(1))).thenReturn(List.of());
+        when(learningMaterialMapper.findByIdAndUserId(eq(42L), eq("7"))).thenReturn(resumeMaterial);
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("命中项目证据")
+                .expandedQueries(List.of("RAG FastAPI 项目"))
+                .evidences(List.of(RagEvidenceVO.builder()
+                        .evidenceId("ev-1")
+                        .documentTitle("项目复盘")
+                        .title("项目复盘")
+                        .sectionName("RAG 平台")
+                        .snippet("实现 FastAPI 检索接口")
+                        .source("upload")
+                        .sourcePath("material.md")
+                        .score(0.91)
+                        .build()))
+                .diagnostics(Map.of())
+                .progressEvents(List.of())
+                .build());
+        when(pythonRagClient.generateResumePatches(any())).thenReturn(new PythonRagClient.ResumePatchGenerationResult(
+                "tpl-1",
+                1,
+                "local",
+                "resume_content_patch_response",
+                Map.of("type", "object"),
+                List.of(Map.of(
+                        "fieldId", "field-1",
+                        "sourceTextHash", "hash-1",
+                        "newText", "实现 FastAPI 检索接口",
+                        "rewriteReason", "突出岗位要求",
+                        "evidenceIds", List.of("ev-1"),
+                        "confidence", 0.9,
+                        "riskFlags", List.of("NONE"),
+                        "status", "DRAFT"
+                )),
+                List.of()
+        ));
+        ArgumentCaptor<RagQueryDTO> queryCaptor = ArgumentCaptor.forClass(RagQueryDTO.class);
+        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+
+        ResumePatchDraftVO result = ragService.generateResumeTemplatePatches("tpl-1", dto, "7");
+
+        assertThat(result.getTemplateId()).isEqualTo("tpl-1");
+        assertThat(result.getPatches()).hasSize(1);
+        assertThat(result.getEvidenceCandidates()).hasSize(1);
+        verify(pythonRagClient).query(queryCaptor.capture());
+        assertThat(queryCaptor.getValue().getQuestion()).contains("需要 RAG、FastAPI");
+        assertThat(queryCaptor.getValue().getQuestion()).contains("服务端简历摘要");
+        verify(pythonRagClient).generateResumePatches(payloadCaptor.capture());
+        assertThat(payloadCaptor.getValue()).containsEntry("resumeText", resumeMaterial.getDocumentSummary());
+        assertThat(payloadCaptor.getValue()).doesNotContainEntry("resumeText", "前端伪造摘要不应进入 Python");
+        verify(ragQueryHistoryMapper, never()).insert(any(RagQueryHistory.class));
+        verify(resumeTemplatePatchDraftMapper).insert(argThat(draft ->
+                "tpl-1".equals(draft.getTemplateId())
+                        && "7".equals(draft.getUserId())
+                        && draft.getJobDescriptionHash() != null
+                        && !draft.getJobDescriptionHash().isBlank()
+        ));
+    }
+
+    @Test
+    void generateResumeTemplatePatchesWithConfirmedAnnotationsFreezesAllowedFields() {
+        ResumeTemplate template = resumeTemplate("tpl-confirmed", "7", 1, "READY");
+        ResumeTemplateField allowedField = resumeField("tpl-confirmed", "7", 1, "field-allowed", "OPTIONAL");
+        ResumeTemplateField lockedField = resumeField("tpl-confirmed", "7", 1, "field-locked", "OPTIONAL");
+        ResumeTemplateRegionAnnotation annotation = editableAnnotation("field-allowed", "突出 RAG 平台证据", "REQUIRED");
+        ResumePatchGenerateDTO dto = new ResumePatchGenerateDTO();
+        dto.setVersion(1);
+        dto.setJobDescription("需要 RAG 平台和 FastAPI 项目经验");
+        dto.setUseConfirmedAnnotations(true);
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-confirmed"), eq("7"))).thenReturn(template);
+        when(resumeTemplateFieldMapper.findByTemplateIdAndVersion(eq("tpl-confirmed"), eq(1))).thenReturn(List.of(allowedField, lockedField));
+        when(resumeTemplateRegionAnnotationMapper.findEditableBoundActive(eq("tpl-confirmed"), eq(1), eq("7"))).thenReturn(List.of(annotation));
+        when(resumeTemplateRegionAnnotationMapper.maxRevision(eq("tpl-confirmed"), eq(1))).thenReturn(3);
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("命中证据")
+                .expandedQueries(List.of())
+                .evidences(List.of())
+                .diagnostics(Map.of())
+                .progressEvents(List.of())
+                .build());
+        when(pythonRagClient.generateResumePatches(any())).thenReturn(new PythonRagClient.ResumePatchGenerationResult(
+                "tpl-confirmed",
+                1,
+                "local",
+                "resume_content_patch_response",
+                Map.of("type", "object"),
+                List.of(Map.of(
+                        "fieldId", "field-allowed",
+                        "sourceTextHash", "hash-field-allowed",
+                        "newText", "项目：RAG 平台",
+                        "rewriteReason", "按图片确认区域生成",
+                        "evidenceIds", List.of(),
+                        "confidence", 0.8,
+                        "riskFlags", List.of("NONE"),
+                        "status", "DRAFT"
+                )),
+                List.of()
+        ));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+
+        ResumePatchDraftVO result = ragService.generateResumeTemplatePatches("tpl-confirmed", dto, "7");
+
+        assertThat(result.getAllowedFieldIds()).containsExactly("field-allowed");
+        assertThat(result.getAnnotationRevision()).isEqualTo(3);
+        verify(pythonRagClient).generateResumePatches(payloadCaptor.capture());
+        Map<String, Object> payload = payloadCaptor.getValue();
+        assertThat(String.valueOf(payload.get("fields"))).contains("field-allowed").doesNotContain("field-locked");
+        assertThat(String.valueOf(payload.get("fieldInstructions"))).contains("突出 RAG 平台证据");
+        assertThat(String.valueOf(payload.get("fieldEvidencePolicies"))).contains("REQUIRED");
+        verify(resumeTemplatePatchDraftMapper).insert(argThat(draft ->
+                draft.getAllowedFieldIdsJson().contains("field-allowed")
+                        && Integer.valueOf(3).equals(draft.getAnnotationRevision())
+        ));
+    }
+
+    @Test
+    void saveResumeTemplateAnnotationsRejectsEvidencePolicyDowngrade() {
+        ResumeTemplate template = resumeTemplate("tpl-policy", "7", 1, "READY");
+        ResumeTemplateField field = resumeField("tpl-policy", "7", 1, "field-required", "REQUIRED");
+        ResumeTemplateAnnotationSaveDTO dto = new ResumeTemplateAnnotationSaveDTO();
+        dto.setVersion(1);
+        ResumeTemplateAnnotationSaveDTO.AnnotationItem item = new ResumeTemplateAnnotationSaveDTO.AnnotationItem();
+        item.setFieldId("field-required");
+        item.setPageIndex(0);
+        item.setRect(Map.of("x", 0.1, "y", 0.1, "width", 0.2, "height", 0.08));
+        item.setSourceType("AUTO");
+        item.setEditable(true);
+        item.setSectionKey("project_experience");
+        item.setRequiredEvidencePolicy("OPTIONAL");
+        item.setStatus("ACTIVE");
+        dto.setAnnotations(List.of(item));
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-policy"), eq("7"))).thenReturn(template);
+        when(resumeTemplateFieldMapper.findByTemplateIdAndVersion(eq("tpl-policy"), eq(1))).thenReturn(List.of(field));
+        when(resumeTemplateRegionAnnotationMapper.maxRevision(eq("tpl-policy"), eq(1))).thenReturn(1);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.saveResumeTemplateAnnotations("tpl-policy", dto, "7")
+        );
+
+        verify(resumeTemplateRegionAnnotationMapper, never()).insert(any(ResumeTemplateRegionAnnotation.class));
+        verify(resumeTemplateRegionAnnotationMapper, never()).update(any(ResumeTemplateRegionAnnotation.class));
+    }
+
+    @Test
+    void exportResumeTemplateRejectsDraftBeforeConfirmation() {
+        ResumeTemplate template = resumeTemplate("tpl-2", "7", 1, "READY");
+        ResumeTemplatePatchDraft draft = patchDraft("draft-1", "tpl-2", "7", 1, "DRAFT");
+        ResumeTemplateExportDTO dto = new ResumeTemplateExportDTO();
+        dto.setVersion(1);
+        dto.setPatchDraftId("draft-1");
+        dto.setIdempotencyKey("export-key");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-2"), eq("7"))).thenReturn(template);
+        when(resumeTemplateExportMapper.findByIdempotencyKey(eq("tpl-2"), eq("7"), eq("export-key"))).thenReturn(null);
+        when(resumeTemplatePatchDraftMapper.findByIdAndTemplateIdAndUserId(eq("draft-1"), eq("tpl-2"), eq("7"))).thenReturn(draft);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.exportResumeTemplate("tpl-2", dto, "7")
+        );
+
+        verify(objectStorageService, never()).load(anyString(), anyString(), anyString(), anyString());
+        verify(pythonRagClient, never()).exportResumeTemplate(any());
+    }
+
+    @Test
+    void exportResumeTemplateReturnsExistingExportForIdempotencyKey() {
+        ResumeTemplate template = resumeTemplate("tpl-3", "7", 1, "READY");
+        ResumeTemplateExport existing = new ResumeTemplateExport();
+        existing.setId("export-1");
+        existing.setTemplateId("tpl-3");
+        existing.setUserId("7");
+        existing.setBaseVersion(1);
+        existing.setExportVersion(2);
+        existing.setPatchDraftId("draft-1");
+        existing.setFilename("resume-v2.docx");
+        existing.setFilePath("uploads/resume-v2.docx");
+        existing.setStorageType("local");
+        existing.setLayoutValidationJson("{\"status\":\"PASSED\"}");
+        existing.setIdempotencyKey("export-key");
+        existing.setStatus("EXPORTED");
+        ResumeTemplateExportDTO dto = new ResumeTemplateExportDTO();
+        dto.setVersion(1);
+        dto.setPatchDraftId("draft-1");
+        dto.setIdempotencyKey("export-key");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-3"), eq("7"))).thenReturn(template);
+        when(resumeTemplateExportMapper.findByIdempotencyKey(eq("tpl-3"), eq("7"), eq("export-key"))).thenReturn(existing);
+
+        ResumeTemplateExportVO result = ragService.exportResumeTemplate("tpl-3", dto, "7");
+
+        assertThat(result.getExportId()).isEqualTo("export-1");
+        assertThat(result.getExportVersion()).isEqualTo(2);
+        verify(resumeTemplatePatchDraftMapper, never()).findByIdAndTemplateIdAndUserId(anyString(), anyString(), anyString());
+        verify(pythonRagClient, never()).exportResumeTemplate(any());
+    }
+
+    @Test
+    void generateResumeTemplatePatchesRejectsVersionConflict() {
+        ResumeTemplate template = resumeTemplate("tpl-4", "7", 2, "READY");
+        ResumePatchGenerateDTO dto = new ResumePatchGenerateDTO();
+        dto.setVersion(1);
+        dto.setJobDescription("需要 RAG 经验");
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-4"), eq("7"))).thenReturn(template);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ragService.generateResumeTemplatePatches("tpl-4", dto, "7")
+        );
+
+        verify(pythonRagClient, never()).generateResumePatches(any());
+    }
+
+    @Test
+    void deleteResumeTemplateDeletesOwnedRecordAndStoredFiles() {
+        ResumeTemplate template = resumeTemplate("tpl-delete", "7", 1, "READY");
+        template.setOriginalFilePath(tempDir.resolve("original.docx").toString());
+        template.setObjectKey(template.getOriginalFilePath());
+        template.setCurrentFilePath(tempDir.resolve("current.docx").toString());
+        template.setCurrentObjectKey(template.getCurrentFilePath());
+        ResumeTemplatePreviewPage page = new ResumeTemplatePreviewPage();
+        page.setTemplateId("tpl-delete");
+        page.setStorageType("local");
+        page.setFilePath(tempDir.resolve("preview.png").toString());
+        page.setObjectKey(page.getFilePath());
+        ResumeTemplateExport export = new ResumeTemplateExport();
+        export.setTemplateId("tpl-delete");
+        export.setUserId("7");
+        export.setStorageType("local");
+        export.setFilePath(tempDir.resolve("export.docx").toString());
+        export.setObjectKey(export.getFilePath());
+        when(resumeTemplateMapper.findByIdAndUserId(eq("tpl-delete"), eq("7"))).thenReturn(template);
+        when(resumeTemplatePreviewPageMapper.findAllByTemplateId(eq("tpl-delete"))).thenReturn(List.of(page));
+        when(resumeTemplateExportMapper.findAllByTemplateId(eq("tpl-delete"), eq("7"))).thenReturn(List.of(export));
+
+        ragService.deleteResumeTemplate("tpl-delete", "7");
+
+        verify(resumeTemplateMapper).deleteByIdAndUserId(eq("tpl-delete"), eq("7"));
+        verify(objectStorageService).delete(eq("local"), eq(template.getOriginalFilePath()), eq(template.getObjectKey()));
+        verify(objectStorageService).delete(eq("local"), eq(template.getCurrentFilePath()), eq(template.getCurrentObjectKey()));
+        verify(objectStorageService).delete(eq("local"), eq(page.getFilePath()), eq(page.getObjectKey()));
+        verify(objectStorageService).delete(eq("local"), eq(export.getFilePath()), eq(export.getObjectKey()));
+    }
+
     /**
      * 校验日志上下文中包含 Python 返回的具体报错位置。
      */
     private boolean containsErrorLocation(Map<String, Object> context, String expectedLocation) {
         Object location = context.get("errorLocation");
         return location != null && location.toString().contains(expectedLocation);
+    }
+
+    /**
+     * 构造测试用简历模板实体。
+     */
+    private ResumeTemplate resumeTemplate(String id, String userId, Integer version, String status) {
+        ResumeTemplate template = new ResumeTemplate();
+        template.setId(id);
+        template.setUserId(userId);
+        template.setTemplateName("resume.docx");
+        template.setOriginalFilename("resume.docx");
+        template.setCurrentFilename("resume.docx");
+        template.setStorageType("local");
+        template.setCurrentFilePath("uploads/resume.docx");
+        template.setCurrentStorageType("local");
+        template.setVersion(version);
+        template.setStatus(status);
+        template.setFileType("docx");
+        template.setLayoutFingerprintJson("{}");
+        template.setUnsupportedRegionsJson("[]");
+        return template;
+    }
+
+    /**
+     * 构造测试用补丁草稿实体。
+     */
+    private ResumeTemplatePatchDraft patchDraft(String id, String templateId, String userId, Integer version, String status) {
+        ResumeTemplatePatchDraft draft = new ResumeTemplatePatchDraft();
+        draft.setId(id);
+        draft.setTemplateId(templateId);
+        draft.setUserId(userId);
+        draft.setTemplateVersion(version);
+        draft.setStatus(status);
+        draft.setPatchesJson("[]");
+        draft.setEvidenceCandidatesJson("[]");
+        draft.setValidationErrorsJson("[]");
+        draft.setAllowedFieldIdsJson("[]");
+        draft.setProvider("local");
+        return draft;
+    }
+
+    /**
+     * 构造测试用简历模板字段。
+     */
+    private ResumeTemplateField resumeField(String templateId, String userId, Integer version, String fieldId, String evidencePolicy) {
+        ResumeTemplateField field = new ResumeTemplateField();
+        field.setId("db-" + fieldId);
+        field.setTemplateId(templateId);
+        field.setUserId(userId);
+        field.setTemplateVersion(version);
+        field.setFieldId(fieldId);
+        field.setSectionKey("project_experience");
+        field.setDisplayName("项目经历");
+        field.setSourceText("项目：RAG 平台");
+        field.setSourceTextHash("hash-" + fieldId);
+        field.setLocationRefsJson("[{\"partName\":\"document\",\"containerType\":\"paragraph\",\"paragraphIndex\":0,\"runStart\":0,\"runEnd\":0,\"textStart\":0,\"textEnd\":7}]");
+        field.setStyleFingerprintJson("{}");
+        field.setMaxChars(300);
+        field.setMaxLines(3);
+        field.setRequiredEvidencePolicy(evidencePolicy);
+        field.setUnsupportedRegionsJson("[]");
+        return field;
+    }
+
+    /**
+     * 构造测试用已确认可编辑标注。
+     */
+    private ResumeTemplateRegionAnnotation editableAnnotation(String fieldId, String instruction, String evidencePolicy) {
+        ResumeTemplateRegionAnnotation annotation = new ResumeTemplateRegionAnnotation();
+        annotation.setId("ann-" + fieldId);
+        annotation.setTemplateId("tpl-confirmed");
+        annotation.setUserId("7");
+        annotation.setTemplateVersion(1);
+        annotation.setFieldId(fieldId);
+        annotation.setPageIndex(0);
+        annotation.setRectJson("{\"x\":0.1,\"y\":0.1,\"width\":0.2,\"height\":0.08}");
+        annotation.setSourceType("AUTO");
+        annotation.setEditable(true);
+        annotation.setSectionKey("project_experience");
+        annotation.setUserInstruction(instruction);
+        annotation.setRequiredEvidencePolicy(evidencePolicy);
+        annotation.setStatus("ACTIVE");
+        annotation.setAnnotationRevision(3);
+        return annotation;
     }
 }

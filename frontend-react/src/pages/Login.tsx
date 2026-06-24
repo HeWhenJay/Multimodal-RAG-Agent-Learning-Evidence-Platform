@@ -33,7 +33,11 @@ export function Login() {
   const [error, setError] = useState('');
 
   if (isAuthenticated) {
-    return <Navigate to="/" replace />;
+    const authenticatedState = location.state as LoginLocationState | null;
+    const authenticatedDestination = authenticatedState?.from
+      ? `${authenticatedState.from.pathname}${authenticatedState.from.search}${authenticatedState.from.hash}`
+      : '/';
+    return <Navigate to={authenticatedDestination} replace />;
   }
 
   const state = location.state as LoginLocationState | null;

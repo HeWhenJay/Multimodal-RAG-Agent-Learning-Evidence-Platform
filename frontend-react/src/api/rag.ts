@@ -1,4 +1,21 @@
-import type { LearningMaterial, MaterialUploadChunk, RagOverview, RagProgress, RagQueryHistory, RagQueryResult, RagQueryTask, Result } from './types';
+import type {
+  LearningMaterial,
+  MaterialPreview,
+  MaterialUploadChunk,
+  RagOverview,
+  RagProgress,
+  RagQueryHistory,
+  RagQueryPayload,
+  RagQueryResult,
+  RagQueryTask,
+  Result,
+  ResumeContentPatch,
+  ResumePatchDraft,
+  ResumeTemplate,
+  ResumeTemplateExport,
+  ResumeTemplatePreview,
+  ResumeTemplateRegionAnnotation
+} from './types';
 import { getStoredAuthToken } from './auth';
 
 const jsonHeaders = {
@@ -43,6 +60,16 @@ export function fetchMaterialEvidences(id: number, limit = 20): Promise<RagQuery
   return request<RagQueryResult['evidences']>(`/api/rag/materials/${id}/evidences?limit=${limit}`);
 }
 
+// 读取文本类学习资料原文，供新标签预览页渲染。
+export function fetchMaterialPreview(id: number, source?: string | null): Promise<MaterialPreview> {
+  const search = new URLSearchParams();
+  if (source) {
+    search.set('source', source);
+  }
+  const query = search.toString();
+  return request<MaterialPreview>(`/api/rag/materials/${id}/preview${query ? `?${query}` : ''}`);
+}
+
 // 提交文本学习资料并触发索引。
 export function indexText(payload: {
   title: string;
@@ -58,11 +85,7 @@ export function indexText(payload: {
 }
 
 // 提交 RAG 检索问答请求。
-export function queryRag(payload: {
-  question: string;
-  topK?: number;
-  metadataFilter?: Record<string, unknown>;
-}): Promise<RagQueryResult> {
+export function queryRag(payload: RagQueryPayload): Promise<RagQueryResult> {
   return request<RagQueryResult>('/api/rag/query', {
     method: 'POST',
     headers: jsonHeaders,
@@ -85,11 +108,7 @@ export function fetchRagQueryHistory(params: {
 }
 
 // 创建 RAG 检索问答任务，前端通过轮询读取实时进度。
-export function startRagQueryTask(payload: {
-  question: string;
-  topK?: number;
-  metadataFilter?: Record<string, unknown>;
-}): Promise<RagQueryTask> {
+export function startRagQueryTask(payload: RagQueryPayload): Promise<RagQueryTask> {
   return request<RagQueryTask>('/api/rag/query/tasks', {
     method: 'POST',
     headers: jsonHeaders,
@@ -104,11 +123,7 @@ export function fetchRagQueryTask(taskId: string): Promise<RagQueryTask> {
 
 // 创建并轮询 RAG 检索任务，持续把阶段事件回调给页面。
 export async function runRagQueryTask(
-  payload: {
-    question: string;
-    topK?: number;
-    metadataFilter?: Record<string, unknown>;
-  },
+  payload: RagQueryPayload,
   onProgress: (events: RagProgress[], task: RagQueryTask) => void,
   options: { pollIntervalMs?: number; signal?: AbortSignal } = {}
 ): Promise<RagQueryResult> {
@@ -187,5 +202,107 @@ export function uploadMaterialChunk(payload: {
 export function reindexMaterial(id: number, highPrecision = false): Promise<LearningMaterial> {
   return request<LearningMaterial>(`/api/rag/materials/${id}/reindex?highPrecision=${highPrecision}`, {
     method: 'POST'
+  });
+}
+
+// 上传 DOCX 简历模板并解析字段绑定。
+export function uploadResumeTemplate(file: File): Promise<ResumeTemplate> {
+  const form = new FormData();
+  form.append('file', file);
+  return request<ResumeTemplate>('/api/rag/resume-templates', {
+    method: 'POST',
+    body: form
+  });
+}
+
+// 查询当前用户上传过的 DOCX 简历模板历史。
+export function fetchResumeTemplates(limit = 12): Promise<ResumeTemplate[]> {
+  return request<ResumeTemplate[]>(`/api/rag/resume-templates?limit=${limit}`);
+}
+
+// 查询简历模板字段绑定。
+export function fetchResumeTemplate(templateId: string): Promise<ResumeTemplate> {
+  return request<ResumeTemplate>(`/api/rag/resume-templates/${templateId}`);
+}
+
+// 删除当前用户上传的简历模板及其派生内容。
+export function deleteResumeTemplate(templateId: string): Promise<void> {
+  return request<void>(`/api/rag/resume-templates/${templateId}`, {
+    method: 'DELETE'
+  });
+}
+
+// 查询或生成 DOCX 图片预览和字段区域标注。
+export function fetchResumeTemplatePreview(templateId: string, refresh = false): Promise<ResumeTemplatePreview> {
+  return request<ResumeTemplatePreview>(`/api/rag/resume-templates/${templateId}/preview?refresh=${refresh}`);
+}
+
+// 保存用户对图片区域的可改写约束。
+export function saveResumeTemplateAnnotations(templateId: string, payload: {
+  version: number;
+  annotations: ResumeTemplateRegionAnnotation[];
+}): Promise<ResumeTemplatePreview> {
+  return request<ResumeTemplatePreview>(`/api/rag/resume-templates/${templateId}/annotations`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 通过 Java 鉴权接口读取预览图片 blob。
+export async function fetchResumeTemplatePreviewImage(url: string): Promise<string> {
+  const token = getStoredAuthToken();
+  const headers = new Headers();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`预览图片读取失败：${response.status}`);
+  }
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
+// 基于 JD 和 evidence 生成字段级补丁草稿。
+export function generateResumePatches(templateId: string, payload: {
+  version: number;
+  jobDescription: string;
+  resumeText?: string;
+  resumeMaterialId?: number;
+  resumeMaterialTitle?: string;
+  topK?: number;
+  useConfirmedAnnotations?: boolean;
+}): Promise<ResumePatchDraft> {
+  return request<ResumePatchDraft>(`/api/rag/resume-templates/${templateId}/patches/generate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 校验用户选择的字段级补丁。
+export function validateResumePatches(templateId: string, payload: {
+  version: number;
+  patchDraftId: string;
+  patches: ResumeContentPatch[];
+}): Promise<ResumePatchDraft> {
+  return request<ResumePatchDraft>(`/api/rag/resume-templates/${templateId}/patches/validate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 导出人工确认后的新 DOCX 版本。
+export function exportResumeTemplate(templateId: string, payload: {
+  version: number;
+  patchDraftId: string;
+  idempotencyKey: string;
+}): Promise<ResumeTemplateExport> {
+  return request<ResumeTemplateExport>(`/api/rag/resume-templates/${templateId}/exports`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
   });
 }

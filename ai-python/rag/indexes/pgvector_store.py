@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 from collections import Counter
 from typing import Any
 
@@ -10,20 +11,24 @@ from rag.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.metadata_filters import (
+    BUSINESS_METADATA_FILTER_KEYS,
+    SYSTEM_METADATA_FILTER_KEYS,
+    build_metadata_filter_plan,
+    format_metadata_filter_plan,
+)
 from rag.process_logger import logged_rag_method, process_event
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
+from rag.retrievers.query_expansion import expand_queries_with_diagnostics, format_query_expansion_detail
 from rag.retrievers.retrieval import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     build_playback_url,
     chunk_percent,
     embed_text,
     embedding_model_name,
-    expand_queries,
     format_evidence_titles,
-    format_metadata_filter,
-    format_query_variants,
     format_ranked_hits,
     reciprocal_rank_fusion,
     tokenize,
@@ -55,10 +60,33 @@ FILTER_COLUMNS = {
     "source": "d.source",
     "userId": "d.user_id",
     "visibilityScope": "d.visibility_scope",
-    "language": "d.language",
     "parser": "d.parser",
+    "mediaType": "c.metadata ->> 'mediaType'",
+    "evidenceChannel": "c.metadata ->> 'evidenceChannel'",
+    "blockType": "c.metadata ->> 'blockType'",
     "sectionName": "c.section_name",
+    "pageIndex": "c.metadata ->> 'pageIndex'",
+    "slideIndex": "c.metadata ->> 'slideIndex'",
 }
+
+TABLE_PREFIX_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_table_prefix(value: str | None) -> str:
+    """校验测试表名前缀，避免动态 SQL 引入非法标识符。"""
+    prefix = (value or "").strip()
+    if not prefix:
+        return ""
+    if not TABLE_PREFIX_PATTERN.fullmatch(prefix):
+        raise RuntimeError("RAG_TABLE_PREFIX 只能包含字母、数字和下划线，并且必须以字母或下划线开头。")
+    return prefix
+
+
+def quote_identifier(value: str) -> str:
+    """引用 PostgreSQL 标识符，保留 Ragas_Test 等大小写前缀。"""
+    if not TABLE_PREFIX_PATTERN.fullmatch(value):
+        raise RuntimeError("PostgreSQL 标识符只能包含字母、数字和下划线，并且必须以字母或下划线开头。")
+    return f'"{value}"'
 
 
 class PgVectorRagStore:
@@ -67,11 +95,21 @@ class PgVectorRagStore:
     def __init__(self, database_url: str, dimensions: int | None = None, ensure_schema: bool = True) -> None:
         self.database_url = database_url
         self.schema = os.getenv("RAG_DATABASE_SCHEMA", "learning_evidence")
+        self.table_prefix = normalize_table_prefix(os.getenv("RAG_TABLE_PREFIX") or os.getenv("RAG_PGVECTOR_TABLE_PREFIX"))
+        self.document_table_name = f"{self.table_prefix}rag_document"
+        self.chunk_table_name = f"{self.table_prefix}rag_chunk"
+        self.document_table = quote_identifier(self.document_table_name)
+        self.chunk_table = quote_identifier(self.chunk_table_name)
+        self.index_prefix = f"idx_{self.table_prefix}"
         self.dimensions = dimensions or int(os.getenv("RAG_VECTOR_DIMENSIONS", str(DEFAULT_EMBEDDING_DIMENSIONS)))
         self.chunker = RecursiveChunker()
         self.summary_index = SummaryIndex()
         if ensure_schema:
             self.ensure_schema()
+
+    def _index_name(self, suffix: str) -> str:
+        """生成带表名前缀的安全索引名。"""
+        return quote_identifier(f"{self.index_prefix}{suffix}")
 
     @logged_rag_method("index.text", "pgvector_index_text", "pgvector 模式索引文本资料")
     def index_text(self, request: IndexTextRequest) -> IndexResponse:
@@ -253,10 +291,10 @@ class PgVectorRagStore:
         with self._connect() as conn:
             with conn.transaction():
                 with conn.cursor() as cursor:
-                    cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
+                    cursor.execute(f"DELETE FROM {self.document_table} WHERE document_id = %s", (document_id,))
                     cursor.execute(
-                        """
-                        INSERT INTO rag_document (
+                        f"""
+                        INSERT INTO {self.document_table} (
                             document_id,
                             title,
                             document_type,
@@ -310,8 +348,8 @@ class PgVectorRagStore:
                                 percent=chunk_percent(index, total_chunks, 48, 92),
                             )
                         cursor.execute(
-                            """
-                            INSERT INTO rag_chunk (
+                            f"""
+                            INSERT INTO {self.chunk_table} (
                                 chunk_id,
                                 document_id,
                                 chunk_position,
@@ -386,19 +424,21 @@ class PgVectorRagStore:
         """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
         progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
-        metadata_filter = request.metadataFilter or {}
-        expanded_queries = expand_queries(request.question)
+        filter_plan = build_metadata_filter_plan(request.metadataFilter)
+        query_expansion = expand_queries_with_diagnostics(request.question)
+        expanded_queries = query_expansion.queries
         progress_reporter.emit(
             "query.expand",
-            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体",
+            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体，生成方式：{query_expansion.provider}",
             status="COMPLETED",
             current_step=1,
             total_steps=7,
             percent=14,
-            detail=format_query_variants(expanded_queries),
+            detail=format_query_expansion_detail(query_expansion),
         )
         progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
-        filtered_chunks = self._load_filtered_chunks(metadata_filter)
+        scoped_chunks = self._load_filtered_chunks(filter_plan.system_filter)
+        filtered_chunks = self._load_filtered_chunks(filter_plan.effective_filter())
         progress_reporter.emit(
             "query.filter",
             f"元数据过滤完成：保留 {len(filtered_chunks)} 个候选切块",
@@ -406,16 +446,19 @@ class PgVectorRagStore:
             current_step=2,
             total_steps=7,
             percent=24,
-            detail=format_metadata_filter(metadata_filter),
+            detail=format_metadata_filter_plan(filter_plan, total_count=len(scoped_chunks), filtered_count=len(filtered_chunks)),
         )
         chunk_by_id = {row["chunk_id"]: row for row in filtered_chunks}
         ranked_lists: list[list[tuple[str, float]]] = []
-        diagnostics: dict[str, int | list[str]] = {
+        diagnostics: dict[str, Any] = {
             "expandedQueries": expanded_queries,
+            **query_expansion.diagnostics(),
+            "totalCandidateChunkCount": len(scoped_chunks),
             "filteredChunkCount": len(filtered_chunks),
+            **filter_plan.diagnostics(),
         }
 
-        candidate_budget = max(request.topK * 4, 20)
+        candidate_budget = max(request.topK * request.candidateMultiplier, 20)
         for query_text in expanded_queries:
             limit = candidate_budget
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
@@ -436,7 +479,7 @@ class PgVectorRagStore:
                 ),
             )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=7, percent=45)
-            vector_hits = self._vector_search(query_text, metadata_filter, limit=limit)
+            vector_hits = self._vector_search(query_text, filter_plan.effective_filter(), limit=limit)
             ranked_lists.append(vector_hits)
             progress_reporter.emit(
                 "query.vector",
@@ -544,18 +587,18 @@ class PgVectorRagStore:
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT
                         COUNT(1) AS document_count,
                         COALESCE(SUM(chunk_count), 0) AS chunk_count
-                    FROM rag_document
+                    FROM {self.document_table}
                     """
                 )
                 counts = cursor.fetchone() or {}
                 cursor.execute(
-                    """
+                    f"""
                     SELECT title
-                    FROM rag_document
+                    FROM {self.document_table}
                     ORDER BY updated_at DESC, document_id DESC
                     LIMIT 1
                     """
@@ -574,7 +617,7 @@ class PgVectorRagStore:
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT
                         c.chunk_id,
                         c.document_id,
@@ -587,8 +630,8 @@ class PgVectorRagStore:
                         d.title,
                         d.source,
                         d.document_type
-                    FROM rag_chunk c
-                    JOIN rag_document d ON d.document_id = c.document_id
+                    FROM {self.chunk_table} c
+                    JOIN {self.document_table} d ON d.document_id = c.document_id
                     WHERE c.document_id = %s
                     ORDER BY c.chunk_position ASC
                     LIMIT %s
@@ -604,8 +647,8 @@ class PgVectorRagStore:
             with conn.cursor() as cursor:
                 cursor.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
                 cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS rag_document (
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.document_table} (
                         document_id VARCHAR(120) PRIMARY KEY,
                         title VARCHAR(255) NOT NULL,
                         document_type VARCHAR(50) NOT NULL,
@@ -615,7 +658,7 @@ class PgVectorRagStore:
                         language VARCHAR(30) NOT NULL DEFAULT 'zh-CN',
                         parser VARCHAR(80),
                         document_summary TEXT,
-                        section_summaries JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        section_summaries JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                         chunk_count INTEGER NOT NULL DEFAULT 0,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -624,9 +667,9 @@ class PgVectorRagStore:
                 )
                 cursor.execute(
                     f"""
-                    CREATE TABLE IF NOT EXISTS rag_chunk (
+                    CREATE TABLE IF NOT EXISTS {self.chunk_table} (
                         chunk_id VARCHAR(180) PRIMARY KEY,
-                        document_id VARCHAR(120) NOT NULL REFERENCES rag_document(document_id) ON DELETE CASCADE,
+                        document_id VARCHAR(120) NOT NULL REFERENCES {self.document_table}(document_id) ON DELETE CASCADE,
                         chunk_position INTEGER NOT NULL,
                         section_name VARCHAR(255) NOT NULL DEFAULT '全文',
                         text TEXT NOT NULL,
@@ -645,49 +688,49 @@ class PgVectorRagStore:
                     JOIN pg_class klass ON klass.oid = attribute.attrelid
                     JOIN pg_namespace namespace ON namespace.oid = klass.relnamespace
                     WHERE namespace.nspname = %s
-                      AND klass.relname = 'rag_chunk'
+                      AND klass.relname = %s
                       AND attribute.attname = 'embedding'
                       AND NOT attribute.attisdropped
                     """,
-                    (self.schema,),
+                    (self.schema, self.chunk_table_name),
                 )
                 embedding_column = cursor.fetchone()
                 expected_column_type = f"vector({self.dimensions})"
                 actual_column_type = embedding_column.get("column_type") if embedding_column else None
                 if actual_column_type != expected_column_type:
                     raise RuntimeError(
-                        "rag_chunk.embedding 维度与当前配置不一致："
+                        f"{self.chunk_table_name}.embedding 维度与当前配置不一致："
                         f"数据库={actual_column_type}，配置={expected_column_type}。"
                         "请先执行 infra/sql/alter-database/20260617_0100_migrate_embedding_1024.sql 后重建资料索引。"
                     )
                 cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_rag_document_type
-                        ON rag_document(document_type)
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_rag_document_user_visibility
-                        ON rag_document(user_id, visibility_scope)
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._index_name("rag_document_type")}
+                        ON {self.document_table}(document_type)
                     """
                 )
                 cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_rag_chunk_document_position
-                        ON rag_chunk(document_id, chunk_position)
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_rag_chunk_metadata_gin
-                        ON rag_chunk USING GIN (metadata)
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._index_name("rag_document_user_visibility")}
+                        ON {self.document_table}(user_id, visibility_scope)
                     """
                 )
                 cursor.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._index_name("rag_chunk_document_position")}
+                        ON {self.chunk_table}(document_id, chunk_position)
                     """
-                    CREATE INDEX IF NOT EXISTS idx_rag_chunk_embedding_hnsw
-                        ON rag_chunk USING hnsw (embedding vector_cosine_ops)
+                )
+                cursor.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._index_name("rag_chunk_metadata_gin")}
+                        ON {self.chunk_table} USING GIN (metadata)
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS {self._index_name("rag_chunk_embedding_hnsw")}
+                        ON {self.chunk_table} USING hnsw (embedding vector_cosine_ops)
                     """
                 )
 
@@ -706,8 +749,8 @@ class PgVectorRagStore:
                     self._delete_document_index_with_cursor(cursor, document_id)
 
     def _delete_document_index_with_cursor(self, cursor, document_id: str) -> None:
-        cursor.execute("DELETE FROM rag_chunk WHERE document_id = %s", (document_id,))
-        cursor.execute("DELETE FROM rag_document WHERE document_id = %s", (document_id,))
+        cursor.execute(f"DELETE FROM {self.chunk_table} WHERE document_id = %s", (document_id,))
+        cursor.execute(f"DELETE FROM {self.document_table} WHERE document_id = %s", (document_id,))
 
     def _count_document_chunks(self, document_id: str) -> int:
         with self._connect() as conn:
@@ -715,7 +758,7 @@ class PgVectorRagStore:
                 return self._count_document_chunks_in_transaction(cursor, document_id)
 
     def _count_document_chunks_in_transaction(self, cursor, document_id: str) -> int:
-        cursor.execute("SELECT COUNT(1) AS chunk_count FROM rag_chunk WHERE document_id = %s", (document_id,))
+        cursor.execute(f"SELECT COUNT(1) AS chunk_count FROM {self.chunk_table} WHERE document_id = %s", (document_id,))
         row = cursor.fetchone() or {}
         return int(row.get("chunk_count") or 0)
 
@@ -758,8 +801,8 @@ class PgVectorRagStore:
                         d.title,
                         d.source,
                         d.document_type
-                    FROM rag_chunk c
-                    JOIN rag_document d ON d.document_id = c.document_id
+                    FROM {self.chunk_table} c
+                    JOIN {self.document_table} d ON d.document_id = c.document_id
                     {where_sql}
                     ORDER BY d.updated_at DESC, c.chunk_position ASC
                     """,
@@ -812,8 +855,8 @@ class PgVectorRagStore:
                     SELECT
                         c.chunk_id,
                         1 - (c.embedding <=> %s::vector) AS score
-                    FROM rag_chunk c
-                    JOIN rag_document d ON d.document_id = c.document_id
+                    FROM {self.chunk_table} c
+                    JOIN {self.document_table} d ON d.document_id = c.document_id
                     {where_sql}
                     ORDER BY c.embedding <=> %s::vector
                     LIMIT %s
@@ -865,13 +908,26 @@ class PgVectorRagStore:
 def build_filter_clause(metadata_filter: dict[str, Any]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
-    for key, value in metadata_filter.items():
-        if value is None or value == "" or value == []:
+    allowed_keys = BUSINESS_METADATA_FILTER_KEYS | SYSTEM_METADATA_FILTER_KEYS
+    for key, raw_value in metadata_filter.items():
+        if key not in allowed_keys:
+            continue
+        value = build_metadata_filter_plan({key: raw_value}).effective_filter().get(key)
+        if value is None:
+            continue
+        if key == "sectionKeyword":
+            values = value if isinstance(value, list) else [value]
+            keyword_clauses: list[str] = []
+            for item in values:
+                keyword_clauses.append("(c.section_name ILIKE %s OR c.metadata ->> 'sectionTitle' ILIKE %s)")
+                pattern = f"%{item}%"
+                params.extend([pattern, pattern])
+            if keyword_clauses:
+                clauses.append("(" + " OR ".join(keyword_clauses) + ")")
             continue
         expression = FILTER_COLUMNS.get(key)
         if expression is None:
-            expression = "c.metadata ->> %s"
-            params.append(key)
+            continue
 
         if isinstance(value, list):
             placeholders = ", ".join(["%s"] * len(value))

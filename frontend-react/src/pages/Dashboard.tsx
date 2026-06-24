@@ -3,6 +3,7 @@ import {
   Anchor,
   BarChart3,
   Bot,
+  ChevronDown,
   CheckCircle2,
   CloudUpload,
   Database,
@@ -13,6 +14,7 @@ import {
   PlayCircle,
   Search,
   Send,
+  SlidersHorizontal,
   TriangleAlert,
   Video
 } from 'lucide-react';
@@ -26,6 +28,18 @@ import { RagQueryProgress } from '../components/RagQueryProgress';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
 import { markRagQueryProgressFailed } from '../services/ragQueryProgress';
+import { buildPreviewHrefRewriter } from '../utils/evidencePreview';
+import {
+  BLOCK_TYPE_OPTIONS,
+  DEFAULT_RAG_ADVANCED_SEARCH,
+  DOCUMENT_TYPE_OPTIONS,
+  EVIDENCE_CHANNEL_OPTIONS,
+  SOURCE_OPTIONS,
+  buildRagQueryPayload,
+  clampNumber as clampRagNumber,
+  formatRagFilterSummary,
+  type RagAdvancedSearchState
+} from '../utils/ragAdvancedSearch';
 
 const RECENT_LIMIT_MIN = 1;
 const RECENT_LIMIT_MAX = 50;
@@ -43,6 +57,8 @@ export function Dashboard() {
   const [answer, setAnswer] = useState('');
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
   const [querying, setQuerying] = useState(false);
+  const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false);
+  const [advancedSearch, setAdvancedSearch] = useState<RagAdvancedSearchState>(() => ({ ...DEFAULT_RAG_ADVANCED_SEARCH, topK: 3 }));
   const [queryProgressEvents, setQueryProgressEvents] = useState<RagProgress[]>([]);
   const queryAbortRef = useRef<AbortController | null>(null);
   const [queryHistory, setQueryHistory] = useState<RagQueryHistory[]>([]);
@@ -217,7 +233,7 @@ export function Dashboard() {
       controller = new AbortController();
       queryAbortRef.current = controller;
       const result = await runRagQueryTask(
-        { question, topK: 3 },
+        buildRagQueryPayload(question, advancedSearch),
         (events) => {
           if (queryAbortRef.current === controller) {
             setQueryProgressEvents(events);
@@ -291,7 +307,15 @@ export function Dashboard() {
               <Search size={20} />
               知识库智能检索 (RAG)
             </h3>
-            <button className="chip-button">高级检索模式</button>
+            <button
+              type="button"
+              className={`chip-button ${advancedSearchOpen ? 'is-active' : ''}`}
+              onClick={() => setAdvancedSearchOpen((value) => !value)}
+              aria-pressed={advancedSearchOpen}
+            >
+              <SlidersHorizontal size={15} />
+              高级检索模式
+            </button>
           </div>
           <div className="rag-input-row">
             <textarea value={question} onChange={(event) => setQuestion(event.target.value)} />
@@ -299,6 +323,12 @@ export function Dashboard() {
               {querying ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
             </button>
           </div>
+          <AdvancedSearchPanel
+            open={advancedSearchOpen}
+            state={advancedSearch}
+            onToggle={() => setAdvancedSearchOpen((value) => !value)}
+            onChange={setAdvancedSearch}
+          />
           {(querying || queryProgressEvents.length > 0) ? (
             <RagQueryProgress events={queryProgressEvents} running={querying} />
           ) : null}
@@ -307,7 +337,10 @@ export function Dashboard() {
               <Bot size={17} />
               RAG 回复
             </div>
-            <MarkdownText content={answer || '提交问题后展示基于数据库证据检索生成的回答。'} />
+            <MarkdownText
+              content={answer || '提交问题后展示基于数据库证据检索生成的回答。'}
+              rewriteHref={buildPreviewHrefRewriter(evidences)}
+            />
             <div className="citation-row">
               {evidences.length > 0 ? (
                 evidences.slice(0, 3).map((item) => (
@@ -575,6 +608,75 @@ export function Dashboard() {
           </div>
         </article>
       </section>
+    </div>
+  );
+}
+
+// 工作台快速检索的高级过滤面板，和知识库页使用同一套 payload 构建逻辑。
+function AdvancedSearchPanel({
+  open,
+  state,
+  onToggle,
+  onChange
+}: {
+  open: boolean;
+  state: RagAdvancedSearchState;
+  onToggle: () => void;
+  onChange: (state: RagAdvancedSearchState) => void;
+}) {
+  const update = (patch: Partial<RagAdvancedSearchState>) => onChange({ ...state, ...patch });
+  return (
+    <div className="advanced-search-panel compact">
+      <button
+        type="button"
+        className={`advanced-search-toggle ${open ? 'is-open' : ''}`}
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <span><SlidersHorizontal size={16} />高级检索</span>
+        <ChevronDown size={16} />
+      </button>
+      <p className="advanced-search-summary">{formatRagFilterSummary(state)}</p>
+      {open ? (
+        <div className="advanced-search-grid">
+          <label>
+            <span>资料类型</span>
+            <select value={state.documentType} onChange={(event) => update({ documentType: event.target.value })}>
+              {DOCUMENT_TYPE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>来源</span>
+            <select value={state.source} onChange={(event) => update({ source: event.target.value })}>
+              {SOURCE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>证据通道</span>
+            <select value={state.evidenceChannel} onChange={(event) => update({ evidenceChannel: event.target.value })}>
+              {EVIDENCE_CHANNEL_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>块类型</span>
+            <select value={state.blockType} onChange={(event) => update({ blockType: event.target.value })}>
+              {BLOCK_TYPE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>章节关键词</span>
+            <input value={state.sectionKeyword} onChange={(event) => update({ sectionKeyword: event.target.value })} placeholder="例如 RAG-Fusion" />
+          </label>
+          <label>
+            <span>topK</span>
+            <input type="number" min={1} max={20} value={state.topK} onChange={(event) => update({ topK: clampRagNumber(Number(event.target.value), 1, 20) })} />
+          </label>
+          <label>
+            <span>候选倍率</span>
+            <input type="number" min={2} max={10} value={state.candidateMultiplier} onChange={(event) => update({ candidateMultiplier: clampRagNumber(Number(event.target.value), 2, 10) })} />
+          </label>
+        </div>
+      ) : null}
     </div>
   );
 }

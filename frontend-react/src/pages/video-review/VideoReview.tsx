@@ -1,6 +1,6 @@
-import { CheckCircle2, Clock, PlayCircle, Video } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, Clock, PlayCircle, Video } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { fetchVideoSlices } from '../../api/pageData';
 import type { VideoSlice } from '../../api/types';
 
@@ -8,7 +8,10 @@ import type { VideoSlice } from '../../api/types';
 export function VideoReview() {
   const [slices, setSlices] = useState<VideoSlice[]>([]);
   const [error, setError] = useState('');
+  const [segmentReached, setSegmentReached] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const segmentPromptHandledRef = useRef(false);
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const targetTitle = searchParams.get('title');
   const targetDocumentId = searchParams.get('documentId');
@@ -16,6 +19,7 @@ export function VideoReview() {
   const targetEndTime = searchParams.get('endTime');
   const targetSourcePath = searchParams.get('sourcePath');
   const targetPlaybackUrl = searchParams.get('playbackUrl');
+  const returnTo = normalizeInternalReturnTo(searchParams.get('returnTo'));
   const targetVideoUrl = resolveVideoUrl({
     videoUrl: searchParams.get('videoUrl'),
     playbackUrl: targetPlaybackUrl,
@@ -23,12 +27,18 @@ export function VideoReview() {
     source: searchParams.get('source')
   });
   const targetSeconds = targetStartTime ? timestampToSeconds(targetStartTime) : 0;
+  const targetEndSeconds = targetEndTime ? timestampToSeconds(targetEndTime) : 0;
 
   useEffect(() => {
     fetchVideoSlices()
       .then(setSlices)
       .catch((loadError) => setError(loadError instanceof Error ? loadError.message : '视频切片数据加载失败'));
   }, []);
+
+  useEffect(() => {
+    segmentPromptHandledRef.current = false;
+    setSegmentReached(false);
+  }, [targetStartTime, targetEndTime, targetVideoUrl]);
 
   return (
     <div className="page-stack">
@@ -49,7 +59,15 @@ export function VideoReview() {
             </p>
             {targetSourcePath ? <span>来源：{targetSourcePath}</span> : null}
           </div>
-          <button className="ghost-action" onClick={() => seekVideo(videoRef.current, targetSeconds)} disabled={!targetVideoUrl}>
+          <button
+            className="ghost-action"
+            onClick={() => {
+              segmentPromptHandledRef.current = false;
+              setSegmentReached(false);
+              seekVideo(videoRef.current, targetSeconds);
+            }}
+            disabled={!targetVideoUrl}
+          >
             <PlayCircle size={16} />
             播放定位
           </button>
@@ -71,8 +89,31 @@ export function VideoReview() {
             src={targetVideoUrl}
             controls
             preload="metadata"
-            onLoadedMetadata={(event) => seekVideo(event.currentTarget, targetSeconds)}
+            onLoadedMetadata={(event) => {
+              segmentPromptHandledRef.current = false;
+              setSegmentReached(false);
+              seekVideo(event.currentTarget, targetSeconds);
+            }}
+            onTimeUpdate={(event) => pauseAtSegmentEndOnce(event.currentTarget, targetSeconds, targetEndSeconds, segmentPromptHandledRef, setSegmentReached)}
           />
+          {segmentReached && targetEndTime ? (
+            <div className="video-segment-notice" role="dialog" aria-live="polite" aria-label="证据片段已结束">
+              <div className="video-segment-notice-text">
+                <CheckCircle2 size={16} />
+                <span>已到达证据片段结束时间 {targetEndTime}</span>
+              </div>
+              <div className="video-segment-actions">
+                <button type="button" onClick={() => continueVideo(videoRef.current, setSegmentReached)}>
+                  <PlayCircle size={15} />
+                  继续播放
+                </button>
+                <button type="button" onClick={() => navigate(returnTo)}>
+                  <ArrowLeft size={15} />
+                  返回检索页
+                </button>
+              </div>
+            </div>
+          ) : null}
         </section>
       )}
 
@@ -175,4 +216,35 @@ function seekVideo(video: HTMLVideoElement | null, seconds: number) {
   if (!video || Number.isNaN(seconds)) return;
   video.currentTime = Math.max(0, seconds);
   video.play().catch(() => undefined);
+}
+
+// 到达 evidence 片段结束点时暂停一次，并交给用户选择继续或返回。
+function pauseAtSegmentEndOnce(
+  video: HTMLVideoElement,
+  startSeconds: number,
+  endSeconds: number,
+  promptHandledRef: { current: boolean },
+  onReached: (reached: boolean) => void
+) {
+  if (promptHandledRef.current || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return;
+  if (video.currentTime >= endSeconds) {
+    promptHandledRef.current = true;
+    video.pause();
+    onReached(true);
+  }
+}
+
+// 用户选择继续时恢复播放，不再反复弹出同一段结束提示。
+function continueVideo(video: HTMLVideoElement | null, onReached: (reached: boolean) => void) {
+  onReached(false);
+  video?.play().catch(() => undefined);
+}
+
+// 返回地址只允许站内路径，避免把按钮变成任意外跳入口。
+function normalizeInternalReturnTo(value: string | null) {
+  const fallback = '/knowledge';
+  if (!value || !value.startsWith('/') || value.startsWith('//')) {
+    return fallback;
+  }
+  return value.startsWith('/videos') ? fallback : value;
 }

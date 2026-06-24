@@ -23,6 +23,8 @@
 - `log_error`
 - `rag_document`
 - `rag_chunk`
+- `"Ragas_Test_rag_document"`，Ragas 评估专用资料表，使用生产同库 pgvector 环境
+- `"Ragas_Test_rag_chunk"`，Ragas 评估专用切块表，使用生产同库 pgvector 环境
 - RAG 元数据 GIN 索引
 - pgvector HNSW 余弦索引
 
@@ -45,6 +47,21 @@ $env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?opti
 $env:RAG_DATABASE_SCHEMA='learning_evidence'
 $env:RAG_VECTOR_DIMENSIONS='1024'
 $env:RAG_EMBEDDING_MODEL='text-embedding-v4'
+```
+
+## Ragas 评估表
+
+Ragas 效果评估必须使用 `RAG_DATABASE_URL` 指向的同一个 PostgreSQL/pgvector 数据库，不再派生单独测试库。评估数据通过带双引号的 `Ragas_Test` 前缀表隔离：
+
+- `learning_evidence."Ragas_Test_rag_document"`
+- `learning_evidence."Ragas_Test_rag_chunk"`
+
+新增或升级现有数据库时执行迁移：
+
+```powershell
+Get-Content infra\sql\alter-database\20260621_0100_create_ragas_test_pgvector_store.sql -Encoding UTF8 |
+  docker exec -i -e PGPASSWORD=123456 pgvector-postgres `
+  psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 ```
 
 ## 128 维到 1024 维迁移

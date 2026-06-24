@@ -17,7 +17,8 @@ import java.lang.annotation.Target;
         "spring.datasource.url=jdbc:h2:mem:evidence-test;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1",
         "spring.datasource.username=sa",
         "spring.datasource.password=",
-        "spring.sql.init.mode=always"
+        "spring.sql.init.mode=always",
+        "evidence.agent.internal-token=agent-secret"
 })
 public @interface EvidenceSpringBootTest {
 }

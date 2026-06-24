@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AgentOperationSnapshotMapper">
+
+    <resultMap id="AgentOperationSnapshotResultMap" type="com.itxiang.evidence.entity.AgentOperationSnapshot">
+        <id property="id" column="id"/>
+        <result property="operationId" column="operation_id"/>
+        <result property="snapshotType" column="snapshot_type"/>
+        <result property="resourceType" column="resource_type"/>
+        <result property="resourceId" column="resource_id"/>
+        <result property="snapshotJson" column="snapshot_json"/>
+        <result property="contentHash" column="content_hash"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.AgentOperationSnapshot">
+        INSERT INTO agent_operation_snapshot (
+            id,
+            operation_id,
+            snapshot_type,
+            resource_type,
+            resource_id,
+            snapshot_json,
+            content_hash
+        )
+        VALUES (
+            #{id},
+            #{operationId},
+            #{snapshotType},
+            #{resourceType},
+            #{resourceId},
+            #{snapshotJson},
+            #{contentHash}
+        )
+    </insert>
+
+    <select id="findByOperationIdAndType" resultMap="AgentOperationSnapshotResultMap">
+        SELECT
+            id,
+            operation_id,
+            snapshot_type,
+            resource_type,
+            resource_id,
+            snapshot_json,
+            content_hash,
+            created_at
+        FROM agent_operation_snapshot
+        WHERE operation_id = #{operationId}
+          AND snapshot_type = #{snapshotType}
+    </select>
+</mapper>

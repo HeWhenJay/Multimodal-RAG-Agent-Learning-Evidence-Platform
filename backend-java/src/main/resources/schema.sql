@@ -57,6 +57,128 @@ CREATE TABLE IF NOT EXISTS learning_material (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS resume_template (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    template_name VARCHAR(255) NOT NULL,
+    original_filename VARCHAR(255) NOT NULL,
+    original_file_path VARCHAR(700) NOT NULL,
+    storage_type VARCHAR(30) NOT NULL DEFAULT 'local',
+    object_key VARCHAR(700),
+    public_url VARCHAR(700),
+    current_filename VARCHAR(255),
+    current_file_path VARCHAR(700),
+    current_storage_type VARCHAR(30),
+    current_object_key VARCHAR(700),
+    current_public_url VARCHAR(700),
+    file_type VARCHAR(20) NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(30) NOT NULL DEFAULT 'PARSING',
+    layout_fingerprint_json CLOB NOT NULL DEFAULT '{}',
+    unsupported_regions_json CLOB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS resume_template_field (
+    id VARCHAR(120) PRIMARY KEY,
+    template_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    template_version INTEGER NOT NULL,
+    field_id VARCHAR(120) NOT NULL,
+    section_key VARCHAR(60) NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    source_text CLOB NOT NULL,
+    source_text_hash VARCHAR(128) NOT NULL,
+    location_refs_json CLOB NOT NULL DEFAULT '[]',
+    style_fingerprint_json CLOB NOT NULL DEFAULT '{}',
+    max_chars INTEGER NOT NULL,
+    max_lines INTEGER NOT NULL,
+    required_evidence_policy VARCHAR(30) NOT NULL,
+    unsupported_regions_json CLOB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_resume_template_field_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
+    CONSTRAINT uk_resume_template_field UNIQUE (template_id, template_version, field_id)
+);
+
+CREATE TABLE IF NOT EXISTS resume_template_preview_page (
+    id VARCHAR(120) PRIMARY KEY,
+    template_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    template_version INTEGER NOT NULL,
+    page_index INTEGER NOT NULL,
+    storage_type VARCHAR(30) NOT NULL,
+    file_path VARCHAR(700),
+    object_key VARCHAR(700),
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_resume_preview_page_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
+    CONSTRAINT uk_resume_template_preview_page UNIQUE (template_id, template_version, page_index)
+);
+
+CREATE TABLE IF NOT EXISTS resume_template_region_annotation (
+    id VARCHAR(120) PRIMARY KEY,
+    template_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    template_version INTEGER NOT NULL,
+    field_id VARCHAR(120),
+    page_index INTEGER NOT NULL,
+    rect_json CLOB NOT NULL,
+    source_type VARCHAR(30) NOT NULL,
+    editable BOOLEAN NOT NULL DEFAULT FALSE,
+    section_key VARCHAR(60) NOT NULL,
+    user_instruction VARCHAR(500),
+    required_evidence_policy VARCHAR(30) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    annotation_revision INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_resume_region_annotation_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS resume_template_patch_draft (
+    id VARCHAR(120) PRIMARY KEY,
+    template_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    template_version INTEGER NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'DRAFT',
+    job_description_hash VARCHAR(128) NOT NULL,
+    patches_json CLOB NOT NULL DEFAULT '[]',
+    evidence_candidates_json CLOB NOT NULL DEFAULT '[]',
+    validation_errors_json CLOB NOT NULL DEFAULT '[]',
+    allowed_field_ids_json CLOB NOT NULL DEFAULT '[]',
+    annotation_revision INTEGER,
+    provider VARCHAR(40),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_resume_patch_draft_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS resume_template_export (
+    id VARCHAR(120) PRIMARY KEY,
+    template_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    base_version INTEGER NOT NULL,
+    export_version INTEGER NOT NULL,
+    patch_draft_id VARCHAR(120) NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    file_path VARCHAR(700) NOT NULL,
+    storage_type VARCHAR(30) NOT NULL,
+    object_key VARCHAR(700),
+    public_url VARCHAR(700),
+    layout_validation_json CLOB NOT NULL DEFAULT '{}',
+    idempotency_key VARCHAR(160) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'EXPORTED',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_resume_template_export_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
+    CONSTRAINT fk_resume_template_export_draft FOREIGN KEY (patch_draft_id) REFERENCES resume_template_patch_draft(id) ON DELETE CASCADE,
+    CONSTRAINT uk_resume_template_export_idempotency UNIQUE (template_id, user_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS rag_query_history (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
@@ -138,6 +260,226 @@ CREATE TABLE IF NOT EXISTS log_error (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS agent_task (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    task_type VARCHAR(40) NOT NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'CREATED',
+    title VARCHAR(255),
+    input_json CLOB NOT NULL DEFAULT '{}',
+    plan_json CLOB NOT NULL DEFAULT '{}',
+    draft_json CLOB NOT NULL DEFAULT '{}',
+    final_json CLOB NOT NULL DEFAULT '{}',
+    python_thread_id VARCHAR(160),
+    error_code VARCHAR(120),
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_task_user_status_updated
+    ON agent_task(user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_task_python_thread
+    ON agent_task(python_thread_id);
+
+CREATE TABLE IF NOT EXISTS agent_tool_call (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL,
+    tool_name VARCHAR(120) NOT NULL,
+    tool_type VARCHAR(30) NOT NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+    request_json CLOB NOT NULL DEFAULT '{}',
+    response_json CLOB NOT NULL DEFAULT '{}',
+    ownership_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    scope VARCHAR(80) NOT NULL DEFAULT 'current_user_or_authorized',
+    error_code VARCHAR(120),
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_tool_call_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_task_created
+    ON agent_tool_call(task_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tool_call_status
+    ON agent_tool_call(status);
+
+CREATE TABLE IF NOT EXISTS agent_human_review (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL,
+    review_type VARCHAR(30) NOT NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+    proposal_json CLOB NOT NULL DEFAULT '{}',
+    decision_json CLOB NOT NULL DEFAULT '{}',
+    reviewed_by VARCHAR(120),
+    reviewed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    CONSTRAINT fk_agent_human_review_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_human_review_task_status
+    ON agent_human_review(task_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_agent_human_review_expires
+    ON agent_human_review(expires_at);
+
+CREATE TABLE IF NOT EXISTS agent_operation (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL,
+    review_id VARCHAR(120),
+    user_id VARCHAR(120) NOT NULL,
+    operation_type VARCHAR(80) NOT NULL,
+    resource_type VARCHAR(80) NOT NULL,
+    resource_id VARCHAR(120) NOT NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'PENDING_APPROVAL',
+    before_snapshot_ref VARCHAR(180),
+    after_snapshot_ref VARCHAR(180),
+    idempotency_key VARCHAR(160) NOT NULL,
+    undo_deadline TIMESTAMP,
+    audit_event_id BIGINT,
+    error_code VARCHAR(120),
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_operation_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE,
+    CONSTRAINT fk_agent_operation_review FOREIGN KEY (review_id) REFERENCES agent_human_review(id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_operation_idempotency
+    ON agent_operation(user_id, operation_type, resource_type, resource_id, idempotency_key);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operation_task_status
+    ON agent_operation(task_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operation_user_status
+    ON agent_operation(user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operation_resource
+    ON agent_operation(resource_type, resource_id);
+
+CREATE TABLE IF NOT EXISTS agent_operation_snapshot (
+    id VARCHAR(120) PRIMARY KEY,
+    operation_id VARCHAR(120) NOT NULL,
+    snapshot_type VARCHAR(20) NOT NULL,
+    resource_type VARCHAR(80) NOT NULL,
+    resource_id VARCHAR(120) NOT NULL,
+    snapshot_json CLOB NOT NULL DEFAULT '{}',
+    content_hash VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_operation_snapshot_operation FOREIGN KEY (operation_id) REFERENCES agent_operation(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operation_snapshot_operation
+    ON agent_operation_snapshot(operation_id, snapshot_type);
+
+CREATE TABLE IF NOT EXISTS agent_memory_item (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    memory_type VARCHAR(40) NOT NULL,
+    namespace VARCHAR(80) NOT NULL,
+    scope_type VARCHAR(30) NOT NULL,
+    scope_id VARCHAR(120),
+    subject_key VARCHAR(120) NOT NULL,
+    content CLOB NOT NULL,
+    summary CLOB NOT NULL,
+    evidence_refs_json CLOB NOT NULL DEFAULT '[]',
+    source_task_id VARCHAR(120),
+    source_tool_call_id VARCHAR(120),
+    source_review_id VARCHAR(120),
+    source_hash VARCHAR(128) NOT NULL,
+    status VARCHAR(40) NOT NULL DEFAULT 'PENDING_REVIEW',
+    confidence DECIMAL(5, 4) NOT NULL DEFAULT 0.5000,
+    importance DECIMAL(5, 4) NOT NULL DEFAULT 0.5000,
+    sensitivity_level VARCHAR(20) NOT NULL DEFAULT 'LOW',
+    consent_source VARCHAR(40) NOT NULL DEFAULT 'AGENT_INFERRED',
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TIMESTAMP,
+    valid_from TIMESTAMP,
+    valid_until TIMESTAMP,
+    deleted_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_memory_item_task FOREIGN KEY (source_task_id) REFERENCES agent_task(id) ON DELETE SET NULL,
+    CONSTRAINT fk_agent_memory_item_tool_call FOREIGN KEY (source_tool_call_id) REFERENCES agent_tool_call(id) ON DELETE SET NULL,
+    CONSTRAINT fk_agent_memory_item_review FOREIGN KEY (source_review_id) REFERENCES agent_human_review(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_item_user_status_updated
+    ON agent_memory_item(user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_item_lookup
+    ON agent_memory_item(user_id, namespace, subject_key, scope_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_item_source_task
+    ON agent_memory_item(source_task_id);
+
+CREATE TABLE IF NOT EXISTS agent_memory_embedding (
+    id VARCHAR(120) PRIMARY KEY,
+    memory_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    chunk_id VARCHAR(180) NOT NULL,
+    retrieval_text CLOB NOT NULL,
+    term_counts CLOB NOT NULL DEFAULT '{}',
+    embedding CLOB NOT NULL DEFAULT '[]',
+    metadata CLOB NOT NULL DEFAULT '{}',
+    status VARCHAR(40) NOT NULL DEFAULT 'ACTIVE',
+    deleted_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_memory_embedding_memory FOREIGN KEY (memory_id) REFERENCES agent_memory_item(id) ON DELETE CASCADE,
+    CONSTRAINT uk_agent_memory_embedding_chunk UNIQUE (memory_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_embedding_memory
+    ON agent_memory_embedding(memory_id);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_embedding_user_status
+    ON agent_memory_embedding(user_id, status, deleted_at);
+
+CREATE TABLE IF NOT EXISTS agent_memory_version (
+    id VARCHAR(120) PRIMARY KEY,
+    memory_id VARCHAR(120) NOT NULL,
+    previous_memory_id VARCHAR(120),
+    relation_type VARCHAR(40) NOT NULL,
+    decision VARCHAR(40) NOT NULL,
+    reason VARCHAR(1000),
+    decided_by VARCHAR(60) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_memory_version_memory FOREIGN KEY (memory_id) REFERENCES agent_memory_item(id) ON DELETE CASCADE,
+    CONSTRAINT fk_agent_memory_version_previous FOREIGN KEY (previous_memory_id) REFERENCES agent_memory_item(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_version_memory
+    ON agent_memory_version(memory_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_version_previous
+    ON agent_memory_version(previous_memory_id);
+
+CREATE TABLE IF NOT EXISTS agent_memory_audit (
+    id VARCHAR(120) PRIMARY KEY,
+    memory_id VARCHAR(120),
+    user_id VARCHAR(120) NOT NULL,
+    task_id VARCHAR(120),
+    action VARCHAR(60) NOT NULL,
+    actor_type VARCHAR(60) NOT NULL,
+    before_hash VARCHAR(128),
+    after_hash VARCHAR(128),
+    summary VARCHAR(1000) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_memory_audit_memory FOREIGN KEY (memory_id) REFERENCES agent_memory_item(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_audit_memory_created
+    ON agent_memory_audit(memory_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_audit_user_created
+    ON agent_memory_audit(user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS video_slice (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,

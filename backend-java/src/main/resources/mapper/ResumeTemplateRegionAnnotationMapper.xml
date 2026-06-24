@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.ResumeTemplateRegionAnnotationMapper">
+
+    <resultMap id="ResumeTemplateRegionAnnotationResultMap" type="com.itxiang.evidence.entity.ResumeTemplateRegionAnnotation">
+        <id property="id" column="id"/>
+        <result property="templateId" column="template_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="templateVersion" column="template_version"/>
+        <result property="fieldId" column="field_id"/>
+        <result property="pageIndex" column="page_index"/>
+        <result property="rectJson" column="rect_json"/>
+        <result property="sourceType" column="source_type"/>
+        <result property="editable" column="editable"/>
+        <result property="sectionKey" column="section_key"/>
+        <result property="userInstruction" column="user_instruction"/>
+        <result property="requiredEvidencePolicy" column="required_evidence_policy"/>
+        <result property="status" column="status"/>
+        <result property="annotationRevision" column="annotation_revision"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.ResumeTemplateRegionAnnotation">
+        INSERT INTO resume_template_region_annotation (
+            id,
+            template_id,
+            user_id,
+            template_version,
+            field_id,
+            page_index,
+            rect_json,
+            source_type,
+            editable,
+            section_key,
+            user_instruction,
+            required_evidence_policy,
+            status,
+            annotation_revision
+        )
+        VALUES (
+            #{id},
+            #{templateId},
+            #{userId},
+            #{templateVersion},
+            #{fieldId},
+            #{pageIndex},
+            #{rectJson},
+            #{sourceType},
+            #{editable},
+            #{sectionKey},
+            #{userInstruction},
+            #{requiredEvidencePolicy},
+            #{status},
+            #{annotationRevision}
+        )
+    </insert>
+
+    <update id="update" parameterType="com.itxiang.evidence.entity.ResumeTemplateRegionAnnotation">
+        UPDATE resume_template_region_annotation
+        SET field_id = #{fieldId},
+            page_index = #{pageIndex},
+            rect_json = #{rectJson},
+            source_type = #{sourceType},
+            editable = #{editable},
+            section_key = #{sectionKey},
+            user_instruction = #{userInstruction},
+            required_evidence_policy = #{requiredEvidencePolicy},
+            status = #{status},
+            annotation_revision = #{annotationRevision},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </update>
+
+    <select id="findByTemplateIdAndVersion" resultMap="ResumeTemplateRegionAnnotationResultMap">
+        SELECT
+            id,
+            template_id,
+            user_id,
+            template_version,
+            field_id,
+            page_index,
+            rect_json,
+            source_type,
+            editable,
+            section_key,
+            user_instruction,
+            required_evidence_policy,
+            status,
+            annotation_revision,
+            created_at,
+            updated_at
+        FROM resume_template_region_annotation
+        WHERE template_id = #{templateId}
+          AND template_version = #{templateVersion}
+        ORDER BY page_index ASC, created_at ASC, id ASC
+    </select>
+
+    <select id="findEditableBoundActive" resultMap="ResumeTemplateRegionAnnotationResultMap">
+        SELECT
+            id,
+            template_id,
+            user_id,
+            template_version,
+            field_id,
+            page_index,
+            rect_json,
+            source_type,
+            editable,
+            section_key,
+            user_instruction,
+            required_evidence_policy,
+            status,
+            annotation_revision,
+            created_at,
+            updated_at
+        FROM resume_template_region_annotation
+        WHERE template_id = #{templateId}
+          AND template_version = #{templateVersion}
+          AND user_id = #{userId}
+          AND status = 'ACTIVE'
+          AND editable = TRUE
+          AND field_id IS NOT NULL
+    </select>
+
+    <select id="findByIdAndUserId" resultMap="ResumeTemplateRegionAnnotationResultMap">
+        SELECT
+            id,
+            template_id,
+            user_id,
+            template_version,
+            field_id,
+            page_index,
+            rect_json,
+            source_type,
+            editable,
+            section_key,
+            user_instruction,
+            required_evidence_policy,
+            status,
+            annotation_revision,
+            created_at,
+            updated_at
+        FROM resume_template_region_annotation
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </select>
+
+    <delete id="deleteAutoByTemplateIdAndVersion">
+        DELETE FROM resume_template_region_annotation
+        WHERE template_id = #{templateId}
+          AND template_version = #{templateVersion}
+          AND source_type = 'AUTO'
+    </delete>
+
+    <select id="maxRevision" resultType="java.lang.Integer">
+        SELECT COALESCE(MAX(annotation_revision), 0)
+        FROM resume_template_region_annotation
+        WHERE template_id = #{templateId}
+          AND template_version = #{templateVersion}
+    </select>
+</mapper>

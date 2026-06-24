@@ -2,7 +2,7 @@ import type { RagEvidence } from '../api/types';
 
 const VIDEO_PAGE_PATH = '/videos';
 const VIDEO_EXTENSION_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi)(?:[?#]|$)/i;
-const VIDEO_PAGE_PARAM_KEYS = ['documentId', 'title', 'startTime', 'endTime', 'sourcePath', 'videoUrl'];
+const VIDEO_PAGE_PARAM_KEYS = ['documentId', 'title', 'startTime', 'endTime', 'sourcePath', 'videoUrl', 'returnTo'];
 
 // 根据 RAG evidence 字段构造内部视频播放定位地址。
 export function buildVideoEvidenceLink(evidence: RagEvidence) {
@@ -35,6 +35,9 @@ export function buildVideoEvidenceLink(evidence: RagEvidence) {
   if (!cleanValue(params.get('videoUrl'))) {
     const directSourceUrl = sourcePath && isConservativeVideoUrl(sourcePath) ? sourcePath : sourceVideoUrl;
     setOptionalParam(params, 'videoUrl', directSourceUrl ? stripFragment(directSourceUrl) : null);
+  }
+  if (!cleanValue(params.get('returnTo')) && typeof window !== 'undefined') {
+    params.set('returnTo', `${window.location.pathname}${window.location.search}`);
   }
 
   const hasPlaybackEntry = Boolean(playbackUrl || sourcePath || sourceVideoUrl || cleanValue(params.get('videoUrl')));

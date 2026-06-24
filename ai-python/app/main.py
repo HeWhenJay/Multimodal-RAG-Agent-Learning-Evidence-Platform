@@ -14,6 +14,8 @@ if __name__ == "__main__":
 
 from fastapi import FastAPI
 
+from app.api.agent import router as agent_router
+from app.api.agent_memory import router as agent_memory_router
 from app.api.rag import router as rag_router
 
 
@@ -29,3 +31,5 @@ def health() -> dict:
 
 
 app.include_router(rag_router)
+app.include_router(agent_router)
+app.include_router(agent_memory_router)

@@ -84,6 +84,28 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
+     * 删除本地或 OSS 中的私有文件。
+     */
+    @Override
+    public void delete(String storageType, String sourcePath, String objectKey) {
+        String provider = storageType == null ? "local" : storageType.trim().toLowerCase(Locale.ROOT);
+        try {
+            if ("oss".equals(provider)) {
+                deleteFromOss(sourcePath, objectKey);
+                return;
+            }
+            if ("local".equals(provider)) {
+                deleteFromLocal(sourcePath);
+                return;
+            }
+            log.warn("跳过未知存储类型文件删除: storageType={}, sourcePath={}, objectKey={}", storageType, sourcePath, objectKey);
+        } catch (RuntimeException e) {
+            log.warn("删除存储文件失败: storageType={}, sourcePath={}, objectKey={}, message={}",
+                    storageType, sourcePath, objectKey, e.getMessage());
+        }
+    }
+
+    /**
      * 本地模式保存文件，主要用于开发和测试。
      */
     private StoredObject storeToLocal(MultipartFile file, String filename) {
@@ -231,6 +253,46 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
             throw new IllegalStateException("从阿里 OSS 读取原始文件失败: " + e.getMessage(), e);
         } catch (IOException e) {
             throw new IllegalStateException("读取 OSS 文件流失败: " + e.getMessage(), e);
+        } finally {
+            ossClient.shutdown();
+        }
+    }
+
+    /**
+     * 删除本地文件。
+     */
+    private void deleteFromLocal(String sourcePath) {
+        if (isBlank(sourcePath)) {
+            return;
+        }
+        Path target = resolveLocalPath(sourcePath);
+        try {
+            Files.deleteIfExists(target);
+        } catch (IOException e) {
+            log.warn("删除本地文件失败: path={}, message={}", sourcePath, e.getMessage());
+        }
+    }
+
+    /**
+     * 删除 OSS 文件。
+     */
+    private void deleteFromOss(String sourcePath, String objectKey) {
+        ObjectStorageProperties.Oss ossProperties = properties.getOss();
+        validateOssProperties(ossProperties);
+        String key = blankToDefault(objectKey, parseObjectKeyFromOssUri(sourcePath, ossProperties.getBucket()));
+        if (isBlank(key)) {
+            log.warn("跳过 OSS 文件删除，缺少 objectKey: sourcePath={}", sourcePath);
+            return;
+        }
+        OSS ossClient = new OSSClientBuilder().build(
+                ossProperties.getEndpoint(),
+                ossProperties.getAccessKeyId(),
+                ossProperties.getAccessKeySecret()
+        );
+        try {
+            ossClient.deleteObject(ossProperties.getBucket(), key);
+        } catch (OSSException | ClientException e) {
+            log.warn("删除 OSS 文件失败: bucket={}, objectKey={}, message={}", ossProperties.getBucket(), key, e.getMessage());
         } finally {
             ossClient.shutdown();
         }

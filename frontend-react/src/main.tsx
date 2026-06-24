@@ -1,12 +1,14 @@
 import React, { Suspense, lazy } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Navigate, RouterProvider, createBrowserRouter } from 'react-router-dom';
-import { AgentTasks } from './pages/AgentTasks';
+import { AgentWorkspace } from './pages/agent/AgentWorkspace';
 import { Dashboard } from './pages/Dashboard';
 import { JdAnalysis } from './pages/jd-analysis/JdAnalysis';
 import { KnowledgeBase } from './pages/knowledge-base/KnowledgeBase';
 import { LearningMaterials } from './pages/materials/LearningMaterials';
+import { MaterialPreview } from './pages/material-preview/MaterialPreview';
 import { ResumeAdaptation } from './pages/resume-adapter/ResumeAdaptation';
+import { ResumeTemplateWorkspace } from './pages/resume-template/ResumeTemplateWorkspace';
 import { Settings } from './pages/Settings';
 import { VideoReview } from './pages/video-review/VideoReview';
 import { RequireAuth } from './routes/RequireAuth';
@@ -40,11 +42,14 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Dashboard /> },
       { path: 'materials', element: <LearningMaterials /> },
+      { path: 'preview/material/:id', element: <MaterialPreview /> },
       { path: 'knowledge', element: <KnowledgeBase /> },
       { path: 'videos', element: <VideoReview /> },
       { path: 'jd-analysis', element: <JdAnalysis /> },
       { path: 'resume', element: <ResumeAdaptation /> },
-      { path: 'agent-tasks', element: <AgentTasks /> },
+      { path: 'resume-template', element: <ResumeTemplateWorkspace /> },
+      { path: 'agent', element: <AgentWorkspace /> },
+      { path: 'agent-tasks', element: <Navigate to="/agent" replace /> },
       { path: 'settings', element: <Settings /> },
       { path: '*', element: <Navigate to="/" replace /> }
     ]

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AgentMemoryAuditMapper">
+
+    <resultMap id="AgentMemoryAuditResultMap" type="com.itxiang.evidence.entity.AgentMemoryAudit">
+        <id property="id" column="id"/>
+        <result property="memoryId" column="memory_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="taskId" column="task_id"/>
+        <result property="action" column="action"/>
+        <result property="actorType" column="actor_type"/>
+        <result property="beforeHash" column="before_hash"/>
+        <result property="afterHash" column="after_hash"/>
+        <result property="summary" column="summary"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.AgentMemoryAudit">
+        INSERT INTO agent_memory_audit (
+            id,
+            memory_id,
+            user_id,
+            task_id,
+            action,
+            actor_type,
+            before_hash,
+            after_hash,
+            summary
+        )
+        VALUES (
+            #{id},
+            #{memoryId},
+            #{userId},
+            #{taskId},
+            #{action},
+            #{actorType},
+            #{beforeHash},
+            #{afterHash},
+            #{summary}
+        )
+    </insert>
+
+    <select id="findByMemoryId" resultMap="AgentMemoryAuditResultMap">
+        SELECT
+            id,
+            memory_id,
+            user_id,
+            task_id,
+            action,
+            actor_type,
+            before_hash,
+            after_hash,
+            summary,
+            created_at
+        FROM agent_memory_audit
+        WHERE user_id = #{userId}
+          AND memory_id = #{memoryId}
+        ORDER BY created_at DESC
+    </select>
+</mapper>

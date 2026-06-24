@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AgentMemoryItemMapper">
+
+    <resultMap id="AgentMemoryItemResultMap" type="com.itxiang.evidence.entity.AgentMemoryItem">
+        <id property="id" column="id"/>
+        <result property="userId" column="user_id"/>
+        <result property="memoryType" column="memory_type"/>
+        <result property="namespace" column="namespace"/>
+        <result property="scopeType" column="scope_type"/>
+        <result property="scopeId" column="scope_id"/>
+        <result property="subjectKey" column="subject_key"/>
+        <result property="content" column="content"/>
+        <result property="summary" column="summary"/>
+        <result property="evidenceRefsJson" column="evidence_refs_json"/>
+        <result property="sourceTaskId" column="source_task_id"/>
+        <result property="sourceToolCallId" column="source_tool_call_id"/>
+        <result property="sourceReviewId" column="source_review_id"/>
+        <result property="sourceHash" column="source_hash"/>
+        <result property="status" column="status"/>
+        <result property="confidence" column="confidence"/>
+        <result property="importance" column="importance"/>
+        <result property="sensitivityLevel" column="sensitivity_level"/>
+        <result property="consentSource" column="consent_source"/>
+        <result property="accessCount" column="access_count"/>
+        <result property="lastAccessedAt" column="last_accessed_at"/>
+        <result property="validFrom" column="valid_from"/>
+        <result property="validUntil" column="valid_until"/>
+        <result property="deletedAt" column="deleted_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="AgentMemoryColumns">
+        id,
+        user_id,
+        memory_type,
+        namespace,
+        scope_type,
+        scope_id,
+        subject_key,
+        content,
+        summary,
+        evidence_refs_json,
+        source_task_id,
+        source_tool_call_id,
+        source_review_id,
+        source_hash,
+        status,
+        confidence,
+        importance,
+        sensitivity_level,
+        consent_source,
+        access_count,
+        last_accessed_at,
+        valid_from,
+        valid_until,
+        deleted_at,
+        created_at,
+        updated_at
+    </sql>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.AgentMemoryItem">
+        INSERT INTO agent_memory_item (
+            id,
+            user_id,
+            memory_type,
+            namespace,
+            scope_type,
+            scope_id,
+            subject_key,
+            content,
+            summary,
+            evidence_refs_json,
+            source_task_id,
+            source_tool_call_id,
+            source_review_id,
+            source_hash,
+            status,
+            confidence,
+            importance,
+            sensitivity_level,
+            consent_source,
+            access_count,
+            last_accessed_at,
+            valid_from,
+            valid_until,
+            deleted_at
+        )
+        VALUES (
+            #{id},
+            #{userId},
+            #{memoryType},
+            #{namespace},
+            #{scopeType},
+            #{scopeId},
+            #{subjectKey},
+            #{content},
+            #{summary},
+            #{evidenceRefsJson},
+            #{sourceTaskId},
+            #{sourceToolCallId},
+            #{sourceReviewId},
+            #{sourceHash},
+            #{status},
+            #{confidence},
+            #{importance},
+            #{sensitivityLevel},
+            #{consentSource},
+            #{accessCount},
+            #{lastAccessedAt},
+            #{validFrom},
+            #{validUntil},
+            #{deletedAt}
+        )
+    </insert>
+
+    <select id="findById" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE id = #{id}
+    </select>
+
+    <select id="findByIdAndUserId" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </select>
+
+    <select id="findByUserIdAndSourceHash" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE user_id = #{userId}
+          AND source_hash = #{sourceHash}
+        ORDER BY created_at DESC
+        LIMIT 1
+    </select>
+
+    <select id="findByUser" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE user_id = #{userId}
+        <if test="status != null and status != ''">
+          AND status = #{status}
+        </if>
+        <if test="status == null or status == ''">
+          AND status != 'DELETED'
+        </if>
+        <if test="memoryType != null and memoryType != ''">
+          AND memory_type = #{memoryType}
+        </if>
+        <if test="namespace != null and namespace != ''">
+          AND namespace = #{namespace}
+        </if>
+        <if test="scopeType != null and scopeType != ''">
+          AND scope_type = #{scopeType}
+        </if>
+        ORDER BY updated_at DESC, created_at DESC
+    </select>
+
+    <select id="findPendingReviewByUser" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE user_id = #{userId}
+          AND status = 'PENDING_REVIEW'
+        ORDER BY updated_at DESC, created_at DESC
+    </select>
+
+    <select id="findActiveByUser" resultMap="AgentMemoryItemResultMap">
+        SELECT <include refid="AgentMemoryColumns"/>
+        FROM agent_memory_item
+        WHERE user_id = #{userId}
+          AND status = 'ACTIVE'
+          AND deleted_at IS NULL
+          AND (valid_until IS NULL OR valid_until &gt; CURRENT_TIMESTAMP)
+          AND sensitivity_level != 'HIGH'
+        ORDER BY updated_at DESC, created_at DESC
+    </select>
+
+    <update id="update" parameterType="com.itxiang.evidence.entity.AgentMemoryItem">
+        UPDATE agent_memory_item
+        SET memory_type = #{memoryType},
+            namespace = #{namespace},
+            scope_type = #{scopeType},
+            scope_id = #{scopeId},
+            subject_key = #{subjectKey},
+            content = #{content},
+            summary = #{summary},
+            evidence_refs_json = #{evidenceRefsJson},
+            source_task_id = #{sourceTaskId},
+            source_tool_call_id = #{sourceToolCallId},
+            source_review_id = #{sourceReviewId},
+            source_hash = #{sourceHash},
+            status = #{status},
+            confidence = #{confidence},
+            importance = #{importance},
+            sensitivity_level = #{sensitivityLevel},
+            consent_source = #{consentSource},
+            access_count = #{accessCount},
+            last_accessed_at = #{lastAccessedAt},
+            valid_from = #{validFrom},
+            valid_until = #{validUntil},
+            deleted_at = #{deletedAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </update>
+
+    <update id="markAccessed">
+        UPDATE agent_memory_item
+        SET access_count = COALESCE(access_count, 0) + 1,
+            last_accessed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status = 'ACTIVE'
+    </update>
+</mapper>

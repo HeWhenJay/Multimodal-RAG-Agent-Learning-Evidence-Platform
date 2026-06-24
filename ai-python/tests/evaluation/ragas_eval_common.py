@@ -23,6 +23,28 @@ DEFAULT_BOUNDARY_SCORE_THRESHOLD = 0.18
 DEFAULT_RAGAS_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_RAGAS_LLM_MODEL = "qwen-plus"
 DEFAULT_RAGAS_EMBEDDING_MODEL = "text-embedding-v4"
+DEFAULT_RAGAS_TEST_TABLE_PREFIX = "Ragas_Test_"
+RAG_PROFILE_ENV = "RAGAS_EVAL_RAG_PROFILE"
+RAGAS_METRICS_ENV = "RAGAS_EVAL_METRICS"
+RAGAS_TEST_PREFIX_ENV = "RAGAS_TEST_TABLE_PREFIX"
+DEFAULT_RAGAS_METRIC_KEYS = ("context_precision", "context_recall", "faithfulness", "answer_relevancy")
+RAGAS_METRIC_ALIASES = {
+    "context_precision": "context_precision",
+    "precision": "context_precision",
+    "contextprecision": "context_precision",
+    "context_precision_with_reference": "context_precision",
+    "llm_context_precision_with_reference": "context_precision",
+    "context_recall": "context_recall",
+    "recall": "context_recall",
+    "contextrecall": "context_recall",
+    "llm_context_recall": "context_recall",
+    "faithfulness": "faithfulness",
+    "answer_relevancy": "answer_relevancy",
+    "answer_relevance": "answer_relevancy",
+    "response_relevancy": "answer_relevancy",
+    "response_relevance": "answer_relevancy",
+    "relevancy": "answer_relevancy",
+}
 
 
 @dataclass(frozen=True)
@@ -45,7 +67,13 @@ class RagasEvalSettings:
     llm_model: str
     embedding_model: str
     timeout_seconds: float
+    max_retries: int
+    max_wait_seconds: float
+    max_workers: int
+    batch_size: int | None
     temperature: float
+    max_tokens: int | None
+    metric_keys: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -77,13 +105,42 @@ def ensure_ai_python_path() -> None:
         sys.path.insert(0, ai_path)
 
 
-def configure_deterministic_rag_environment() -> None:
-    """在导入 FastAPI app 前固定内存检索和本地模型，避免评估误连真实服务。"""
-    os.environ["RAG_STORE_BACKEND"] = "memory"
-    os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
-    os.environ["RAG_VECTOR_DIMENSIONS"] = "1024"
-    os.environ["RAG_ANSWER_PROVIDER"] = "local"
-    os.environ["RAG_RERANK_PROVIDER"] = "local"
+def load_current_project_rag_config() -> None:
+    """加载当前项目 Python RAG 配置，供 current 档直接复用现有流程。"""
+    ensure_ai_python_path()
+    from run import load_runtime_config, parse_args
+
+    load_runtime_config(parse_args([]))
+
+
+def configure_current_rag_environment() -> None:
+    """配置与生产一致的 RAG 组件，并在生产同库中用 Ragas_Test 前缀表隔离。"""
+    load_current_project_rag_config()
+    _require_first_env(("DASHSCOPE_API_KEY",), "百炼 API Key")
+    _require_first_env(("RAG_DATABASE_URL", "DATABASE_URL"), "PostgreSQL/pgvector 数据库地址")
+    if (os.getenv("RAG_STORE_BACKEND") or "").strip().lower() != "pgvector":
+        raise RuntimeError("Ragas 评估必须复用生产 PostgreSQL/pgvector 配置，RAG_STORE_BACKEND 需要为 pgvector。")
+    os.environ["RAG_TABLE_PREFIX"] = validate_ragas_test_table_prefix(
+        os.getenv(RAGAS_TEST_PREFIX_ENV) or DEFAULT_RAGAS_TEST_TABLE_PREFIX
+    )
+
+
+def validate_ragas_test_table_prefix(value: str) -> str:
+    """校验 Ragas 评估表前缀，必须显式带 Ragas_Test 并可作为 PostgreSQL 标识符片段。"""
+    prefix = value.strip()
+    if not prefix.startswith("Ragas_Test"):
+        raise RuntimeError(f"{RAGAS_TEST_PREFIX_ENV} 必须以 Ragas_Test 开头，避免误写生产 RAG 表。")
+    if not prefix.replace("_", "").isalnum() or not (prefix[0].isalpha() or prefix[0] == "_"):
+        raise RuntimeError(f"{RAGAS_TEST_PREFIX_ENV} 只能包含字母、数字和下划线，并且必须以字母或下划线开头。")
+    return prefix
+
+
+def normalize_rag_profile(profile: str | None) -> str:
+    """规范化评估调用项目 RAG 的运行档位。"""
+    value = (profile or os.getenv(RAG_PROFILE_ENV) or "current").strip().lower()
+    if value != "current":
+        raise ValueError("RAG 运行档位只允许 current，Ragas 评估必须使用真实 PostgreSQL/pgvector。")
+    return value
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -108,6 +165,29 @@ def load_json(path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError(f"{path} 顶层必须是数组")
     return data
+
+
+def filter_eval_cases(
+    cases: list[dict[str, Any]],
+    *,
+    case_id: str | None = None,
+    case_index: int | None = None,
+) -> list[dict[str, Any]]:
+    """按 case_id 或 1 基序号筛选评估用例，便于逐条排查慢指标。"""
+    if case_id and case_index is not None:
+        raise ValueError("--case-id 和 --case-index 只能二选一。")
+    if case_index is not None and case_index <= 0:
+        raise ValueError("--case-index 必须是大于 0 的 1 基序号。")
+    if case_id:
+        selected = [case for case in cases if str(case.get("case_id") or "") == case_id]
+        if not selected:
+            raise ValueError(f"未找到 case_id={case_id} 的评估用例。")
+        return selected
+    if case_index is not None:
+        if case_index > len(cases):
+            raise ValueError(f"--case-index 超出范围：当前候选用例 {len(cases)} 条，收到 {case_index}。")
+        return [cases[case_index - 1]]
+    return cases
 
 
 def normalize_path(value: str | None) -> str:
@@ -142,15 +222,19 @@ def build_index_request(document: dict[str, Any], content: str) -> dict[str, Any
     }
 
 
-def create_test_client():
+def create_test_client(rag_profile: str = "current"):
     """创建 Python RAG 内部接口测试客户端，必须在环境变量设置后导入 app。"""
     ensure_ai_python_path()
-    configure_deterministic_rag_environment()
+    profile = normalize_rag_profile(rag_profile)
+    os.environ[RAG_PROFILE_ENV] = profile
+    configure_current_rag_environment()
     from fastapi.testclient import TestClient
 
     from app.main import app
     from app.api import rag as rag_api
+    from rag.retrievers.retrieval import create_rag_store
 
+    rag_api.store = create_rag_store()
     clear_in_memory_store(rag_api.store)
     return TestClient(app)
 
@@ -164,7 +248,7 @@ def clear_in_memory_store(store: Any) -> None:
 
 
 def index_eval_documents(client: Any, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把评估文档索引进项目 Python RAG 内存仓库。"""
+    """把评估文档索引进项目 Python RAG 仓库。"""
     indexed: list[dict[str, Any]] = []
     for document in documents:
         notes_path = Path(document["notesPath"])
@@ -267,7 +351,7 @@ def evaluate_boundary_case(
     answer = str(response.get("answer") or "")
     no_effective_evidence = not evidences or max_score < boundary_score_threshold
     no_unexpected_document = not expected_ids and not retrieved_ids if case["case_id"] == "B02" else True
-    refusal_text = any(fragment in answer for fragment in ("没有检索到足够相关", "请先上传", "无可用证据", "知识库"))
+    refusal_text = has_refusal_intent(answer)
     if case["case_id"] == "B02":
         passed = not evidences and no_unexpected_document
     else:
@@ -280,6 +364,39 @@ def evaluate_boundary_case(
         "retrieved_document_ids": retrieved_ids,
         "reason": "边界样本通过" if passed else "边界样本返回了有效证据或未拒答",
     }
+
+
+def has_refusal_intent(answer: str) -> bool:
+    """识别模型是否明确表达证据不足、无法回答或需要补充资料。"""
+    text = " ".join(str(answer or "").split())
+    if not text:
+        return False
+    refusal_fragments = (
+        "没有检索到足够相关",
+        "请先上传",
+        "无可用证据",
+        "无法回答",
+        "无法确定",
+        "无法提供",
+        "不能确定",
+        "不能回答",
+        "证据不足",
+        "资料不足",
+        "信息不足",
+        "缺少",
+        "缺乏",
+        "需要补充",
+        "需要上传",
+        "不涉及",
+        "不包含",
+        "没有提及",
+        "未提及",
+        "未提供",
+        "关键信息缺口",
+        "不能基于",
+        "无法从现有",
+    )
+    return any(fragment in text for fragment in refusal_fragments)
 
 
 def build_ragas_input_row(case: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
@@ -369,11 +486,14 @@ def run_project_eval(
     *,
     cases_path: Path = DEFAULT_CASES_PATH,
     documents_path: Path = DEFAULT_DOCUMENTS_PATH,
+    rag_profile: str = "current",
+    case_id: str | None = None,
+    case_index: int | None = None,
 ) -> EvaluationRunResult:
     """执行索引、查询和离线评分，返回报告数据。"""
-    cases = load_jsonl(cases_path)
+    cases = filter_eval_cases(load_jsonl(cases_path), case_id=case_id, case_index=case_index)
     documents = load_json(documents_path)
-    client = create_test_client()
+    client = create_test_client(rag_profile=rag_profile)
     index_eval_documents(client, documents)
     rows: list[dict[str, Any]] = []
     ragas_rows: list[dict[str, Any]] = []
@@ -383,6 +503,36 @@ def run_project_eval(
         if case.get("case_type") == "ragas":
             ragas_rows.append(build_ragas_input_row(case, response))
     return EvaluationRunResult(rows=rows, ragas_rows=ragas_rows, summary=summarize_offline(rows))
+
+
+def run_project_ragas_input(
+    *,
+    cases_path: Path = DEFAULT_CASES_PATH,
+    documents_path: Path = DEFAULT_DOCUMENTS_PATH,
+    rag_profile: str = "current",
+    index_documents: bool = True,
+    case_id: str | None = None,
+    case_index: int | None = None,
+) -> EvaluationRunResult:
+    """只执行真实项目 RAG 并构造 Ragas 输入，不计算离线指标。"""
+    all_ragas_cases = [case for case in load_jsonl(cases_path) if case.get("case_type") == "ragas"]
+    cases = filter_eval_cases(all_ragas_cases, case_id=case_id, case_index=case_index)
+    client = create_test_client(rag_profile=rag_profile)
+    if index_documents:
+        documents = load_json(documents_path)
+        index_eval_documents(client, documents)
+    ragas_rows = [build_ragas_input_row(case, query_case(client, case)) for case in cases]
+    selected_case_ids = [row["case_id"] for row in ragas_rows]
+    return EvaluationRunResult(
+        rows=[],
+        ragas_rows=ragas_rows,
+        summary={
+            "main_case_count": len(ragas_rows),
+            "ragas_input_count": len(ragas_rows),
+            "index_documents": index_documents,
+            "selected_case_ids": selected_case_ids,
+        },
+    )
 
 
 def ensure_output_dir(output_dir: Path) -> None:
@@ -413,6 +563,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "expected_document_ids",
         "retrieved_document_ids",
         "missing_points",
+        "answer",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
@@ -441,11 +592,17 @@ def write_run_config(
         "mode": mode,
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "rag": {
+            "profile": os.getenv(RAG_PROFILE_ENV, "current"),
             "RAG_STORE_BACKEND": os.getenv("RAG_STORE_BACKEND"),
+            "RAG_DATABASE_SCHEMA": os.getenv("RAG_DATABASE_SCHEMA"),
+            "RAG_TABLE_PREFIX": os.getenv("RAG_TABLE_PREFIX"),
             "RAG_EMBEDDING_PROVIDER": os.getenv("RAG_EMBEDDING_PROVIDER"),
+            "RAG_EMBEDDING_MODEL": os.getenv("RAG_EMBEDDING_MODEL"),
             "RAG_VECTOR_DIMENSIONS": os.getenv("RAG_VECTOR_DIMENSIONS"),
             "RAG_ANSWER_PROVIDER": os.getenv("RAG_ANSWER_PROVIDER"),
+            "RAG_LLM_MODEL": os.getenv("RAG_LLM_MODEL"),
             "RAG_RERANK_PROVIDER": os.getenv("RAG_RERANK_PROVIDER"),
+            "RAG_RERANK_MODEL": os.getenv("RAG_RERANK_MODEL"),
         },
         "ragas": {
             "version": ragas_version,
@@ -455,6 +612,10 @@ def write_run_config(
             "llmModel": ragas_settings.llm_model if ragas_settings else os.getenv("RAGAS_EVAL_LLM_MODEL"),
             "embeddingModel": ragas_settings.embedding_model if ragas_settings else os.getenv("RAGAS_EVAL_EMBEDDING_MODEL"),
             "timeoutSeconds": ragas_settings.timeout_seconds if ragas_settings else os.getenv("RAGAS_EVAL_TIMEOUT_SECONDS"),
+            "maxRetries": ragas_settings.max_retries if ragas_settings else os.getenv("RAGAS_EVAL_MAX_RETRIES"),
+            "maxWaitSeconds": ragas_settings.max_wait_seconds if ragas_settings else os.getenv("RAGAS_EVAL_MAX_WAIT_SECONDS"),
+            "maxWorkers": ragas_settings.max_workers if ragas_settings else os.getenv("RAGAS_EVAL_MAX_WORKERS"),
+            "batchSize": ragas_settings.batch_size if ragas_settings else os.getenv("RAGAS_EVAL_BATCH_SIZE"),
             "temperature": ragas_settings.temperature if ragas_settings else os.getenv("RAGAS_EVAL_TEMPERATURE", "0"),
             "ragasModelAdapter": ragas_model_adapter,
             "metricNames": metric_names or [],
@@ -482,7 +643,9 @@ def write_manual_review(
         "",
         f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Ragas 版本：{ragas_version or '未运行真实 Ragas 评分'}",
+        f"- RAG 运行档位：`{os.getenv(RAG_PROFILE_ENV, 'current')}`",
         f"- RAG_STORE_BACKEND：`{os.getenv('RAG_STORE_BACKEND')}`",
+        f"- RAG_TABLE_PREFIX：`{os.getenv('RAG_TABLE_PREFIX')}`",
         f"- RAG_EMBEDDING_PROVIDER：`{os.getenv('RAG_EMBEDDING_PROVIDER')}`",
         f"- RAG_ANSWER_PROVIDER：`{os.getenv('RAG_ANSWER_PROVIDER')}`",
         f"- RAG_RERANK_PROVIDER：`{os.getenv('RAG_RERANK_PROVIDER')}`",
@@ -604,6 +767,44 @@ def _parse_positive_float(name: str, default: str) -> float:
     return value
 
 
+def _parse_non_negative_int(name: str, default: str) -> int:
+    """读取非负整数环境变量。"""
+    raw_value = (os.getenv(name) or default).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是整数，当前值为：{raw_value}") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} 必须大于或等于 0，当前值为：{raw_value}")
+    return value
+
+
+def _parse_positive_int(name: str, default: str) -> int:
+    """读取正整数环境变量。"""
+    raw_value = (os.getenv(name) or default).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是整数，当前值为：{raw_value}") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} 必须大于 0，当前值为：{raw_value}")
+    return value
+
+
+def _parse_optional_positive_int(name: str) -> int | None:
+    """读取可选正整数环境变量，空值表示交给 Ragas 默认处理。"""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = int(raw_value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是整数，当前值为：{raw_value}") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} 必须大于 0，当前值为：{raw_value}")
+    return value
+
+
 def _parse_temperature(name: str, default: str) -> float:
     """读取 0 到 2 范围内的 temperature 配置。"""
     raw_value = (os.getenv(name) or default).strip()
@@ -614,6 +815,31 @@ def _parse_temperature(name: str, default: str) -> float:
     if value < 0 or value > 2:
         raise RuntimeError(f"{name} 必须在 0 到 2 之间，当前值为：{raw_value}")
     return value
+
+
+def parse_ragas_metric_keys(raw_value: str | None) -> tuple[str, ...]:
+    """读取 Ragas 指标子集配置，未配置时默认运行四项指标。"""
+    if raw_value is None or not raw_value.strip():
+        return DEFAULT_RAGAS_METRIC_KEYS
+    result: list[str] = []
+    invalid: list[str] = []
+    for item in raw_value.split(","):
+        normalized = item.strip().lower().replace("-", "_").replace(" ", "_")
+        if not normalized:
+            continue
+        metric_key = RAGAS_METRIC_ALIASES.get(normalized)
+        if metric_key is None:
+            invalid.append(item.strip())
+            continue
+        if metric_key not in result:
+            result.append(metric_key)
+    if invalid:
+        allowed = "、".join(DEFAULT_RAGAS_METRIC_KEYS)
+        invalid_text = "、".join(invalid)
+        raise RuntimeError(f"{RAGAS_METRICS_ENV} 包含不支持的指标：{invalid_text}。允许值：{allowed}")
+    if not result:
+        raise RuntimeError(f"{RAGAS_METRICS_ENV} 至少需要配置一个有效指标。")
+    return tuple(result)
 
 
 def _validate_base_url(value: str | None, *, required: bool) -> str | None:
@@ -654,7 +880,13 @@ def load_ragas_eval_settings() -> RagasEvalSettings:
         llm_model=llm_model,
         embedding_model=embedding_model,
         timeout_seconds=_parse_positive_float("RAGAS_EVAL_TIMEOUT_SECONDS", "60"),
+        max_retries=_parse_non_negative_int("RAGAS_EVAL_MAX_RETRIES", "2"),
+        max_wait_seconds=_parse_positive_float("RAGAS_EVAL_MAX_WAIT_SECONDS", "10"),
+        max_workers=_parse_positive_int("RAGAS_EVAL_MAX_WORKERS", "2"),
+        batch_size=_parse_optional_positive_int("RAGAS_EVAL_BATCH_SIZE"),
         temperature=_parse_temperature("RAGAS_EVAL_TEMPERATURE", "0"),
+        max_tokens=_parse_optional_positive_int("RAGAS_EVAL_MAX_TOKENS"),
+        metric_keys=parse_ragas_metric_keys(os.getenv(RAGAS_METRICS_ENV)),
     )
 
 
@@ -678,12 +910,17 @@ def require_ragas_core_dependencies() -> None:
         )
 
 
-def _build_run_config(timeout_seconds: float) -> Any | None:
+def _build_run_config(settings: RagasEvalSettings) -> Any | None:
     """按可用 Ragas 版本创建 RunConfig。"""
     try:
         from ragas.run_config import RunConfig
 
-        return RunConfig(timeout=timeout_seconds)
+        return RunConfig(
+            timeout=int(settings.timeout_seconds),
+            max_retries=settings.max_retries,
+            max_wait=int(settings.max_wait_seconds),
+            max_workers=settings.max_workers,
+        )
     except Exception:
         return None
 
@@ -719,12 +956,57 @@ def _instantiate_metric(metric_class: Any, *, llm: Any, embeddings: Any) -> Any:
             return metric
 
 
+class _RagasEmbeddingCompatibilityWrapper:
+    """兼容 Ragas 0.4 新旧指标的 embedding 调用接口。"""
+
+    def __init__(self, embeddings: Any):
+        self.embeddings = embeddings
+
+    def embed_text(self, text: str, **kwargs: Any) -> list[float]:
+        """转发现代单文本向量接口。"""
+        return self.embeddings.embed_text(text, **kwargs)
+
+    async def aembed_text(self, text: str, **kwargs: Any) -> list[float]:
+        """转发现代异步单文本向量接口。"""
+        return await self.embeddings.aembed_text(text, **kwargs)
+
+    def embed_texts(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+        """转发现代批量向量接口。"""
+        return self.embeddings.embed_texts(texts, **kwargs)
+
+    async def aembed_texts(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+        """转发现代异步批量向量接口。"""
+        return await self.embeddings.aembed_texts(texts, **kwargs)
+
+    def embed_query(self, text: str) -> list[float]:
+        """兼容 legacy AnswerRelevancy 需要的查询向量接口。"""
+        return self.embed_text(text)
+
+    async def aembed_query(self, text: str) -> list[float]:
+        """兼容 legacy AnswerRelevancy 需要的异步查询向量接口。"""
+        return await self.aembed_text(text)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """兼容 legacy 指标需要的文档向量接口。"""
+        return self.embed_texts(texts)
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        """兼容 legacy 指标需要的异步文档向量接口。"""
+        return await self.aembed_texts(texts)
+
+
 def build_modern_ragas_adapter(settings: RagasEvalSettings) -> RagasModelAdapter:
-    """构造 Ragas 0.4 现代 OpenAI client 与 collections 指标路径。"""
+    """构造 Ragas 0.4 现代 OpenAI client 与 evaluate 兼容指标路径。
+
+    使用同步 openai.OpenAI 客户端，避免 AsyncOpenAI + asyncio.run 组合下
+    httpx.AsyncClient 跨线程死锁。Ragas 内部 _run_async_in_current_loop
+    会开子线程跑协程，同步客户端完全兼容。
+    """
     try:
-        from openai import AsyncOpenAI
+        from openai import OpenAI
         from ragas.embeddings import OpenAIEmbeddings
         from ragas.llms import llm_factory
+        from ragas.metrics import AnswerRelevancy, Faithfulness, LLMContextPrecisionWithReference, LLMContextRecall
     except ImportError as exc:
         raise RuntimeError(
             "运行 Ragas 现代评分路径缺少 ragas/openai 依赖，请执行：python -m pip install -r ai-python/requirements.txt"
@@ -740,32 +1022,26 @@ def build_modern_ragas_adapter(settings: RagasEvalSettings) -> RagasModelAdapter
     }
     if settings.base_url:
         client_kwargs["base_url"] = settings.base_url
-    client = AsyncOpenAI(**client_kwargs)
-    llm = llm_factory(
-        settings.llm_model,
-        provider=settings.ragas_provider,
-        client=client,
-        temperature=settings.temperature,
-    )
-    embeddings = OpenAIEmbeddings(client=client, model=settings.embedding_model)
-    collections = importlib.import_module("ragas.metrics.collections")
-    context_precision_class = getattr(collections, "ContextPrecisionWithReference", None) or getattr(
-        collections, "ContextPrecision", None
-    )
-    metric_classes = [
-        context_precision_class,
-        getattr(collections, "ContextRecall", None),
-        getattr(collections, "Faithfulness", None),
-        getattr(collections, "AnswerRelevancy", None),
-    ]
-    if any(metric_class is None for metric_class in metric_classes):
-        raise RuntimeError("当前 Ragas collections 指标不完整，无法构造现代评分路径。")
-    metrics = [
-        metric_classes[0](llm=llm),
-        metric_classes[1](llm=llm),
-        metric_classes[2](llm=llm),
-        metric_classes[3](llm=llm, embeddings=embeddings),
-    ]
+    client = OpenAI(**client_kwargs)
+    llm_kwargs: dict[str, Any] = {
+        "model": settings.llm_model,
+        "provider": settings.ragas_provider,
+        "client": client,
+        "temperature": settings.temperature,
+    }
+    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+    if settings.max_tokens is not None and has_kwargs:
+        llm_kwargs["max_tokens"] = settings.max_tokens
+    llm = llm_factory(**llm_kwargs)
+    embeddings = _RagasEmbeddingCompatibilityWrapper(OpenAIEmbeddings(client=client, model=settings.embedding_model))
+    metric_class_map = {
+        "context_precision": LLMContextPrecisionWithReference,
+        "context_recall": LLMContextRecall,
+        "faithfulness": Faithfulness,
+        "answer_relevancy": AnswerRelevancy,
+    }
+    metric_classes = [metric_class_map[key] for key in settings.metric_keys]
+    metrics = [_instantiate_metric(metric_class, llm=llm, embeddings=embeddings) for metric_class in metric_classes]
     return RagasModelAdapter(
         adapter_name="modern",
         llm=llm,
@@ -785,7 +1061,7 @@ def build_legacy_ragas_adapter(settings: RagasEvalSettings, previous_errors: lis
             "Ragas 现代路径不可用，fallback 需要 langchain-openai。请执行：python -m pip install -r ai-python/requirements.txt"
         ) from exc
 
-    run_config = _build_run_config(settings.timeout_seconds)
+    run_config = _build_run_config(settings)
     client_kwargs: dict[str, Any] = {
         "api_key": settings.api_key,
         "timeout": settings.timeout_seconds,
@@ -799,13 +1075,15 @@ def build_legacy_ragas_adapter(settings: RagasEvalSettings, previous_errors: lis
     llm = llm_wrapper_class(chat, run_config=run_config)
     embeddings = embedding_wrapper_class(embedding, run_config=run_config)
     metrics_module = importlib.import_module("ragas.metrics")
-    metric_classes = [
-        getattr(metrics_module, "LLMContextPrecisionWithReference", None)
+    metric_class_map = {
+        "context_precision": getattr(metrics_module, "LLMContextPrecisionWithReference", None)
         or getattr(metrics_module, "LLMContextPrecisionWithoutReference", None),
-        getattr(metrics_module, "LLMContextRecall", None) or getattr(metrics_module, "ContextRecall", None),
-        getattr(metrics_module, "Faithfulness", None),
-        getattr(metrics_module, "ResponseRelevancy", None) or getattr(metrics_module, "AnswerRelevancy", None),
-    ]
+        "context_recall": getattr(metrics_module, "LLMContextRecall", None) or getattr(metrics_module, "ContextRecall", None),
+        "faithfulness": getattr(metrics_module, "Faithfulness", None),
+        "answer_relevancy": getattr(metrics_module, "ResponseRelevancy", None)
+        or getattr(metrics_module, "AnswerRelevancy", None),
+    }
+    metric_classes = [metric_class_map[key] for key in settings.metric_keys]
     if any(metric_class is None for metric_class in metric_classes):
         raise RuntimeError("当前 Ragas legacy 指标不完整，无法构造真实评分指标。")
     metrics = [_instantiate_metric(metric_class, llm=llm, embeddings=embeddings) for metric_class in metric_classes]
@@ -847,9 +1125,19 @@ def _dataset_rows_for_ragas(ragas_rows: list[dict[str, Any]]) -> list[dict[str, 
     ]
 
 
-def _call_ragas_evaluate(ragas_module: Any, *, dataset: Any, adapter: RagasModelAdapter, run_config: Any | None) -> Any:
-    """优先调用 ragas.evaluate，没有时使用 aevaluate。"""
-    evaluate_func = getattr(ragas_module, "evaluate", None)
+def _call_ragas_evaluate(
+    ragas_module: Any,
+    *,
+    dataset: Any,
+    adapter: RagasModelAdapter,
+    run_config: Any | None,
+    batch_size: int | None,
+) -> Any:
+    """调用 Ragas 评分入口。
+
+    modern 适配器使用同步 openai.OpenAI 客户端，优先走 evaluate()
+    同步路径以避免 httpx.AsyncClient 跨线程死锁。
+    """
     kwargs = {
         "dataset": dataset,
         "metrics": adapter.metrics,
@@ -858,7 +1146,9 @@ def _call_ragas_evaluate(ragas_module: Any, *, dataset: Any, adapter: RagasModel
         "run_config": run_config,
         "raise_exceptions": False,
         "show_progress": True,
+        "batch_size": batch_size,
     }
+    evaluate_func = getattr(ragas_module, "evaluate", None)
     if evaluate_func is not None:
         return evaluate_func(**kwargs)
     aevaluate_func = getattr(ragas_module, "aevaluate", None)
@@ -943,8 +1233,14 @@ def run_ragas_metrics(
 
     adapter = build_ragas_model_adapter(settings)
     dataset = Dataset.from_list(_dataset_rows_for_ragas(ragas_rows))
-    run_config = _build_run_config(settings.timeout_seconds)
-    result = _call_ragas_evaluate(ragas, dataset=dataset, adapter=adapter, run_config=run_config)
+    run_config = _build_run_config(settings)
+    result = _call_ragas_evaluate(
+        ragas,
+        dataset=dataset,
+        adapter=adapter,
+        run_config=run_config,
+        batch_size=settings.batch_size,
+    )
     summary = write_ragas_scores_csv(output_csv, result, ragas_rows)
     return RagasMetricsRunResult(
         summary=summary,
@@ -952,3 +1248,133 @@ def run_ragas_metrics(
         model_adapter=adapter.adapter_name,
         metric_names=adapter.metric_names,
     )
+
+
+def run_ragas_case_by_case(
+    *,
+    cases_path: Path = DEFAULT_CASES_PATH,
+    documents_path: Path = DEFAULT_DOCUMENTS_PATH,
+    rag_profile: str = "current",
+    index_documents: bool = True,
+    output_dir: Path,
+    settings: RagasEvalSettings | None = None,
+) -> dict[str, Any]:
+    """逐条运行 ragas 用例的 RAG 查询和 Ragas 评分，汇总结果。
+
+    每条用例独立执行 RAG 检索 + Ragas LLM 评分，失败不影响后续用例。
+    最后合并所有成功用例的分数，写出汇总 CSV。
+    """
+    settings = settings or load_ragas_eval_settings()
+    all_cases = [case for case in load_jsonl(cases_path) if case.get("case_type") == "ragas"]
+    if not all_cases:
+        raise RuntimeError("没有找到 case_type=ragas 的评估用例。")
+    client = create_test_client(rag_profile=rag_profile)
+    if index_documents:
+        documents = load_json(documents_path)
+        index_eval_documents(client, documents)
+
+    per_case_results: list[dict[str, Any]] = []
+    success_count = 0
+    fail_count = 0
+    total = len(all_cases)
+
+    for idx, case in enumerate(all_cases):
+        case_id = case.get("case_id", f"case-{idx}")
+        print(f"\n{'='*60}")
+        print(f"[{idx+1}/{total}] 开始处理用例: {case_id}")
+        print(f"{'='*60}")
+        try:
+            response = query_case(client, case)
+            ragas_row = build_ragas_input_row(case, response)
+        except Exception as exc:
+            print(f"[{case_id}] RAG 查询失败: {exc}")
+            per_case_results.append({
+                "case_id": case_id,
+                "rag_query_ok": False,
+                "rag_query_error": str(exc),
+                "ragas_ok": False,
+                "ragas_scores": {},
+            })
+            fail_count += 1
+            continue
+
+        case_csv = output_dir / f"ragas_scores_{case_id}.csv"
+        try:
+            if case_csv.exists():
+                case_csv.unlink()
+            ragas_result = run_ragas_metrics([ragas_row], case_csv, settings=settings)
+            per_case_results.append({
+                "case_id": case_id,
+                "rag_query_ok": True,
+                "ragas_ok": True,
+                "ragas_scores": ragas_result.summary,
+                "ragas_version": ragas_result.ragas_version,
+                "metric_names": ragas_result.metric_names,
+            })
+            print(f"[{case_id}] Ragas 评分完成: {ragas_result.summary}")
+            success_count += 1
+        except Exception as exc:
+            print(f"[{case_id}] Ragas 评分失败: {exc}")
+            per_case_results.append({
+                "case_id": case_id,
+                "rag_query_ok": True,
+                "ragas_ok": False,
+                "ragas_error": str(exc),
+                "ragas_scores": {},
+            })
+            fail_count += 1
+
+    aggregated = _aggregate_per_case_results(per_case_results, output_dir)
+    print(f"\n汇总完成: 成功 {success_count}/{total}，失败 {fail_count}/{total}")
+    return aggregated
+
+
+def _aggregate_per_case_results(
+    per_case_results: list[dict[str, Any]],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """合并逐条结果，计算平均分，写出汇总 CSV。"""
+    import pandas as pd
+
+    metric_names_set: set[str] = set()
+    for item in per_case_results:
+        if item.get("ragas_ok"):
+            metric_names_set.update(item.get("metric_names", []))
+    metric_names = sorted(metric_names_set)
+
+    rows: list[dict[str, Any]] = []
+    for item in per_case_results:
+        row: dict[str, Any] = {"case_id": item["case_id"]}
+        if item.get("ragas_ok"):
+            for metric in metric_names:
+                row[metric] = item["ragas_scores"].get(metric)
+        else:
+            for metric in metric_names:
+                row[metric] = None
+        rows.append(row)
+
+    frame = pd.DataFrame(rows)
+    summary: dict[str, Any] = {
+        "total_cases": len(per_case_results),
+        "success_count": sum(1 for item in per_case_results if item.get("ragas_ok")),
+        "fail_count": sum(1 for item in per_case_results if not item.get("ragas_ok")),
+    }
+    for column in frame.columns:
+        if column == "case_id":
+            continue
+        numeric_values: list[float] = []
+        for value in frame[column].tolist():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                numeric_values.append(float(value))
+            elif isinstance(value, (int, float)) and not math.isnan(float(value)):
+                numeric_values.append(float(value))
+        if numeric_values:
+            summary[column] = round(sum(numeric_values) / len(numeric_values), 4)
+            summary[f"{column}_count"] = len(numeric_values)
+
+    summary_csv = output_dir / "ragas_scores_summary.csv"
+    frame.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+    summary["summary_csv"] = str(summary_csv)
+    return summary

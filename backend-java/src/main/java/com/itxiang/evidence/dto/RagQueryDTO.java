@@ -14,6 +14,7 @@ public class RagQueryDTO {
 
     private Integer topK = 5;
 
+    private Integer candidateMultiplier = 4;
+
     private Map<String, Object> metadataFilter = new HashMap<>();
 }
-

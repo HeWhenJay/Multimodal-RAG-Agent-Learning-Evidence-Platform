@@ -6,23 +6,44 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.client.PythonRagClient;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
+import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
+import com.itxiang.evidence.dto.ResumePatchValidateDTO;
+import com.itxiang.evidence.dto.ResumeTemplateAnnotationSaveDTO;
+import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.entity.LogEvent;
 import com.itxiang.evidence.entity.RagQueryHistory;
+import com.itxiang.evidence.entity.ResumeTemplate;
+import com.itxiang.evidence.entity.ResumeTemplateExport;
+import com.itxiang.evidence.entity.ResumeTemplateField;
+import com.itxiang.evidence.entity.ResumeTemplatePatchDraft;
+import com.itxiang.evidence.entity.ResumeTemplatePreviewPage;
+import com.itxiang.evidence.entity.ResumeTemplateRegionAnnotation;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateExportMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateFieldMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateMapper;
+import com.itxiang.evidence.mapper.ResumeTemplatePatchDraftMapper;
+import com.itxiang.evidence.mapper.ResumeTemplatePreviewPageMapper;
+import com.itxiang.evidence.mapper.ResumeTemplateRegionAnnotationMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import com.itxiang.evidence.service.RagService;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
+import com.itxiang.evidence.vo.MaterialPreviewVO;
 import com.itxiang.evidence.vo.RagEvidenceVO;
 import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagProgressVO;
 import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
+import com.itxiang.evidence.vo.ResumePatchDraftVO;
+import com.itxiang.evidence.vo.ResumeTemplateExportVO;
+import com.itxiang.evidence.vo.ResumeTemplatePreviewVO;
+import com.itxiang.evidence.vo.ResumeTemplateVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -34,18 +55,24 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -57,6 +84,12 @@ public class RagServiceImpl implements RagService {
     private final LearningMaterialMapper learningMaterialMapper;
     private final LogEventMapper logEventMapper;
     private final RagQueryHistoryMapper ragQueryHistoryMapper;
+    private final ResumeTemplateMapper resumeTemplateMapper;
+    private final ResumeTemplateFieldMapper resumeTemplateFieldMapper;
+    private final ResumeTemplatePatchDraftMapper resumeTemplatePatchDraftMapper;
+    private final ResumeTemplateExportMapper resumeTemplateExportMapper;
+    private final ResumeTemplatePreviewPageMapper resumeTemplatePreviewPageMapper;
+    private final ResumeTemplateRegionAnnotationMapper resumeTemplateRegionAnnotationMapper;
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
     private final ObjectStorageService objectStorageService;
@@ -65,6 +98,22 @@ public class RagServiceImpl implements RagService {
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
     private Path chunkRootOverride;
+    private static final int DEFAULT_TOP_K = 5;
+    private static final int DEFAULT_CANDIDATE_MULTIPLIER = 4;
+    private static final List<String> BUSINESS_METADATA_FILTER_KEYS = List.of(
+            "documentId",
+            "documentType",
+            "source",
+            "parser",
+            "mediaType",
+            "evidenceChannel",
+            "blockType",
+            "sectionName",
+            "sectionKeyword",
+            "pageIndex",
+            "slideIndex"
+    );
+    private static final String IGNORED_METADATA_FILTER_KEYS = "__ignoredMetadataFilterKeys";
 
     /**
      * 汇总 Java 资料记录和 Python 向量仓库概览。
@@ -154,6 +203,35 @@ public class RagServiceImpl implements RagService {
             );
             throw e;
         }
+    }
+
+    /**
+     * 读取文本类资料原文，供前端新标签页渲染预览。
+     */
+    @Override
+    public MaterialPreviewVO previewMaterial(Long id, String source, String userId) {
+        LearningMaterial material = learningMaterialMapper.findByIdAndUserId(id, requireUserId(userId));
+        if (material == null) {
+            throw new IllegalArgumentException("资料不存在");
+        }
+        if (!isPreviewableTextType(material.getDocumentType())) {
+            throw new IllegalArgumentException("当前资料类型暂不支持文本预览");
+        }
+        validatePreviewSource(material, source);
+        ObjectStorageService.LoadedObject loaded = objectStorageService.load(
+                material.getStorageType(),
+                material.getOriginalFilePath(),
+                material.getObjectKey(),
+                material.getOriginalFilename()
+        );
+        return MaterialPreviewVO.builder()
+                .materialId(material.getId())
+                .title(defaultText(material.getOriginalFilename(), material.getTitle()))
+                .documentType(material.getDocumentType())
+                .source(defaultText(firstNonBlank(source, material.getPublicUrl()), material.getOriginalFilePath()))
+                .contentType(defaultText(loaded.contentType(), previewContentType(material.getDocumentType())))
+                .content(stripUtf8Bom(new String(loaded.content(), StandardCharsets.UTF_8)))
+                .build();
     }
 
     /**
@@ -392,6 +470,370 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 上传受控 DOCX 简历模板并调用 Python 解析字段绑定。
+     */
+    @Override
+    @Transactional
+    public ResumeTemplateVO uploadResumeTemplate(MultipartFile file, String userId) {
+        String scopedUserId = requireUserId(userId);
+        validateResumeTemplateFile(file);
+        String filename = file.getOriginalFilename() == null ? "resume-template.docx" : file.getOriginalFilename();
+        byte[] content;
+        try {
+            content = file.getBytes();
+        } catch (IOException e) {
+            throw new IllegalStateException("读取简历模板文件失败: " + e.getMessage(), e);
+        }
+        ObjectStorageService.StoredObject storedObject = objectStorageService.store(file, filename, scopedUserId, "resume-template");
+        ResumeTemplate template = new ResumeTemplate();
+        template.setId(UUID.randomUUID().toString());
+        template.setUserId(scopedUserId);
+        template.setTemplateName(filename);
+        template.setOriginalFilename(filename);
+        template.setOriginalFilePath(storedObject.sourcePath());
+        template.setStorageType(storedObject.storageType());
+        template.setObjectKey(storedObject.objectKey());
+        template.setPublicUrl(storedObject.publicUrl());
+        template.setCurrentFilename(filename);
+        template.setCurrentFilePath(storedObject.sourcePath());
+        template.setCurrentStorageType(storedObject.storageType());
+        template.setCurrentObjectKey(storedObject.objectKey());
+        template.setCurrentPublicUrl(storedObject.publicUrl());
+        template.setFileType("docx");
+        template.setVersion(1);
+        template.setStatus("PARSING");
+        template.setLayoutFingerprintJson("{}");
+        template.setUnsupportedRegionsJson("[]");
+        resumeTemplateMapper.insert(template);
+
+        PythonRagClient.ResumeTemplateParseResult result = pythonRagClient.parseResumeTemplate(template.getId(), 1, content, filename);
+        resumeTemplateFieldMapper.deleteByTemplateIdAndVersion(template.getId(), 1);
+        for (Map<String, Object> field : result.fields()) {
+            resumeTemplateFieldMapper.insert(toResumeTemplateField(template, field));
+        }
+        resumeTemplateMapper.updateParseResult(
+                template.getId(),
+                "READY",
+                result.version(),
+                toJson(result.layoutFingerprint(), "{}"),
+                toJson(result.unsupportedRegions(), "[]")
+        );
+        template.setStatus("READY");
+        template.setVersion(result.version());
+        template.setLayoutFingerprintJson(toJson(result.layoutFingerprint(), "{}"));
+        template.setUnsupportedRegionsJson(toJson(result.unsupportedRegions(), "[]"));
+        return convertResumeTemplateToVO(template, resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()));
+    }
+
+    /**
+     * 查询当前用户最近上传或导出的简历模板，供 Agent 工作台选择复用。
+     */
+    @Override
+    public List<ResumeTemplateVO> listResumeTemplates(String userId, Integer limit) {
+        String scopedUserId = requireUserId(userId);
+        int safeLimit = limit == null ? 12 : Math.max(1, Math.min(limit, 30));
+        return resumeTemplateMapper.findRecentByUserId(scopedUserId, safeLimit).stream()
+                .map(template -> convertResumeTemplateToVO(
+                        template,
+                        resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion())
+                ))
+                .toList();
+    }
+
+    /**
+     * 查询当前用户的简历模板字段绑定。
+     */
+    @Override
+    public ResumeTemplateVO getResumeTemplate(String templateId, String userId) {
+        ResumeTemplate template = requireResumeTemplate(templateId, userId);
+        return convertResumeTemplateToVO(template, resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()));
+    }
+
+    /**
+     * 删除当前用户名下的简历模板，并在事务提交后清理私有文件。
+     */
+    @Override
+    @Transactional
+    public void deleteResumeTemplate(String templateId, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        List<StorageRef> files = new ArrayList<>();
+        appendStorageRef(files, template.getStorageType(), template.getOriginalFilePath(), template.getObjectKey());
+        appendStorageRef(files, template.getCurrentStorageType(), template.getCurrentFilePath(), template.getCurrentObjectKey());
+        for (ResumeTemplatePreviewPage page : resumeTemplatePreviewPageMapper.findAllByTemplateId(template.getId())) {
+            appendStorageRef(files, page.getStorageType(), page.getFilePath(), page.getObjectKey());
+        }
+        for (ResumeTemplateExport export : resumeTemplateExportMapper.findAllByTemplateId(template.getId(), scopedUserId)) {
+            appendStorageRef(files, export.getStorageType(), export.getFilePath(), export.getObjectKey());
+        }
+        resumeTemplateMapper.deleteByIdAndUserId(template.getId(), scopedUserId);
+        scheduleAfterCommit(() -> deleteStoredFiles(files));
+    }
+
+    /**
+     * 查询或生成简历模板图片预览，图片只通过 Java 鉴权接口读取。
+     */
+    @Override
+    @Transactional
+    public ResumeTemplatePreviewVO previewResumeTemplate(String templateId, Boolean refresh, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        List<ResumeTemplatePreviewPage> cachedPages = resumeTemplatePreviewPageMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        if (!Boolean.TRUE.equals(refresh) && !cachedPages.isEmpty()) {
+            return convertPreviewToVO(template, cachedPages, resumeTemplateRegionAnnotationMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()), List.of(), List.of(), "READY");
+        }
+        ObjectStorageService.LoadedObject loaded = objectStorageService.load(
+                template.getCurrentStorageType(),
+                template.getCurrentFilePath(),
+                template.getCurrentObjectKey(),
+                template.getCurrentFilename()
+        );
+        List<ResumeTemplateField> fields = resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("templateId", template.getId());
+        payload.put("version", template.getVersion());
+        payload.put("filename", defaultText(template.getCurrentFilename(), loaded.filename()));
+        payload.put("fileBase64", Base64.getEncoder().encodeToString(loaded.content()));
+        payload.put("fields", fields.stream().map(this::toFieldBindingMap).toList());
+        PythonRagClient.ResumeTemplatePreviewResult result = pythonRagClient.previewResumeTemplate(payload);
+        resumeTemplatePreviewPageMapper.deleteByTemplateIdAndVersion(template.getId(), template.getVersion());
+        List<ResumeTemplatePreviewPage> pages = savePreviewPages(template, scopedUserId, result.pages());
+        resumeTemplateRegionAnnotationMapper.deleteAutoByTemplateIdAndVersion(template.getId(), template.getVersion());
+        saveAutoAnnotations(template, scopedUserId, result.regions(), fieldsById(fields));
+        List<ResumeTemplateRegionAnnotation> annotations = resumeTemplateRegionAnnotationMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        return convertPreviewToVO(template, pages, annotations, result.unmappedFields(), result.warnings(), result.previewStatus());
+    }
+
+    /**
+     * 读取当前用户模板的预览页面图片。
+     */
+    @Override
+    public byte[] loadResumeTemplatePreviewImage(String templateId, Integer pageIndex, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        ResumeTemplatePreviewPage page = resumeTemplatePreviewPageMapper.findByTemplateIdVersionPageAndUserId(
+                template.getId(),
+                template.getVersion(),
+                pageIndex,
+                scopedUserId
+        );
+        if (page == null) {
+            throw new IllegalArgumentException("预览图片不存在或无权访问");
+        }
+        return objectStorageService.load(page.getStorageType(), page.getFilePath(), page.getObjectKey(), "resume-preview-" + pageIndex + ".png").content();
+    }
+
+    /**
+     * 保存用户对图片区域的可改写约束。
+     */
+    @Override
+    @Transactional
+    public ResumeTemplatePreviewVO saveResumeTemplateAnnotations(String templateId, ResumeTemplateAnnotationSaveDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        requireTemplateVersion(template, dto.getVersion());
+        Map<String, ResumeTemplateField> fieldsById = fieldsById(resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()));
+        int nextRevision = safeRevision(resumeTemplateRegionAnnotationMapper.maxRevision(template.getId(), template.getVersion())) + 1;
+        for (ResumeTemplateAnnotationSaveDTO.AnnotationItem item : dto.getAnnotations()) {
+            ResumeTemplateRegionAnnotation annotation = buildUserAnnotation(template, scopedUserId, item, fieldsById, nextRevision);
+            if (item.getAnnotationId() != null && !item.getAnnotationId().isBlank()) {
+                ResumeTemplateRegionAnnotation existing = resumeTemplateRegionAnnotationMapper.findByIdAndUserId(item.getAnnotationId(), scopedUserId);
+                if (existing == null || !template.getId().equals(existing.getTemplateId()) || !template.getVersion().equals(existing.getTemplateVersion())) {
+                    throw new IllegalArgumentException("标注不存在或不属于当前模板版本");
+                }
+                annotation.setId(existing.getId());
+                resumeTemplateRegionAnnotationMapper.update(annotation);
+            } else {
+                resumeTemplateRegionAnnotationMapper.insert(annotation);
+            }
+        }
+        List<ResumeTemplatePreviewPage> pages = resumeTemplatePreviewPageMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        List<ResumeTemplateRegionAnnotation> annotations = resumeTemplateRegionAnnotationMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        return convertPreviewToVO(template, pages, annotations, List.of(), List.of(), pages.isEmpty() ? "UNAVAILABLE" : "READY");
+    }
+
+    /**
+     * 基于 JD 和当前用户 evidence 生成字段级补丁草稿。
+     */
+    @Override
+    @Transactional
+    public ResumePatchDraftVO generateResumeTemplatePatches(String templateId, ResumePatchGenerateDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        requireTemplateVersion(template, dto.getVersion());
+        List<ResumeTemplateField> fields = resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion());
+        List<ResumeTemplateRegionAnnotation> confirmedAnnotations = Boolean.TRUE.equals(dto.getUseConfirmedAnnotations())
+                ? resumeTemplateRegionAnnotationMapper.findEditableBoundActive(template.getId(), template.getVersion(), scopedUserId)
+                : List.of();
+        List<String> allowedFieldIds = Boolean.TRUE.equals(dto.getUseConfirmedAnnotations())
+                ? confirmedAnnotations.stream().map(ResumeTemplateRegionAnnotation::getFieldId).distinct().toList()
+                : List.of();
+        if (Boolean.TRUE.equals(dto.getUseConfirmedAnnotations()) && allowedFieldIds.isEmpty()) {
+            throw new IllegalArgumentException("暂无已绑定且允许修改的区域");
+        }
+        List<ResumeTemplateField> generationFields = allowedFieldIds.isEmpty()
+                ? fields
+                : fields.stream().filter(field -> allowedFieldIds.contains(field.getFieldId())).toList();
+        List<Map<String, Object>> fieldPayload = generationFields.stream().map(this::toFieldBindingMap).toList();
+        String resumeSummary = resolveResumePatchResumeSummary(dto, scopedUserId);
+        List<Map<String, Object>> evidenceCandidates = retrieveResumePatchEvidence(dto, scopedUserId, resumeSummary);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("templateId", template.getId());
+        payload.put("version", template.getVersion());
+        payload.put("jobDescription", dto.getJobDescription());
+        payload.put("resumeText", resumeSummary);
+        payload.put("fields", fieldPayload);
+        payload.put("evidenceCandidates", evidenceCandidates);
+        payload.put("provider", "auto");
+        payload.put("fieldInstructions", fieldInstructions(confirmedAnnotations));
+        payload.put("fieldEvidencePolicies", fieldEvidencePolicies(confirmedAnnotations));
+        PythonRagClient.ResumePatchGenerationResult result = pythonRagClient.generateResumePatches(payload);
+
+        ResumeTemplatePatchDraft draft = new ResumeTemplatePatchDraft();
+        draft.setId(UUID.randomUUID().toString());
+        draft.setTemplateId(template.getId());
+        draft.setUserId(scopedUserId);
+        draft.setTemplateVersion(template.getVersion());
+        draft.setStatus(result.validationErrors().isEmpty() ? "DRAFT" : "DRAFT");
+        draft.setJobDescriptionHash(sha256(dto.getJobDescription()));
+        draft.setPatchesJson(toJson(result.patches(), "[]"));
+        draft.setEvidenceCandidatesJson(toJson(evidenceCandidates, "[]"));
+        draft.setValidationErrorsJson(toJson(result.validationErrors(), "[]"));
+        draft.setAllowedFieldIdsJson(toJson(allowedFieldIds, "[]"));
+        draft.setAnnotationRevision(allowedFieldIds.isEmpty() ? null : safeRevision(resumeTemplateRegionAnnotationMapper.maxRevision(template.getId(), template.getVersion())));
+        draft.setProvider(result.provider());
+        resumeTemplatePatchDraftMapper.insert(draft);
+        return convertPatchDraftToVO(draft);
+    }
+
+    /**
+     * 校验用户确认的补丁，校验通过后草稿可进入导出流程。
+     */
+    @Override
+    @Transactional
+    public ResumePatchDraftVO validateResumeTemplatePatches(String templateId, ResumePatchValidateDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        requireTemplateVersion(template, dto.getVersion());
+        ResumeTemplatePatchDraft draft = requirePatchDraft(dto.getPatchDraftId(), template.getId(), scopedUserId);
+        if (!template.getVersion().equals(draft.getTemplateVersion())) {
+            throw new IllegalArgumentException("RESUME_TEMPLATE_VERSION_CONFLICT");
+        }
+        List<ResumeTemplateField> fields = allowedFieldsForDraft(
+                resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()),
+                draft
+        );
+        requirePatchesWithinAllowedFields(dto.getPatches(), draft);
+        List<Map<String, Object>> evidenceCandidates = fromJson(draft.getEvidenceCandidatesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of());
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("templateId", template.getId());
+        payload.put("version", template.getVersion());
+        payload.put("fields", fields.stream().map(this::toFieldBindingMap).toList());
+        payload.put("patches", dto.getPatches());
+        payload.put("allowedEvidenceIds", evidenceCandidates.stream().map(item -> String.valueOf(item.get("evidenceId"))).toList());
+        PythonRagClient.ResumePatchValidationResult result = pythonRagClient.validateResumePatches(payload);
+        String nextStatus = result.validationErrors().isEmpty() ? resolvePatchDraftStatus(result.patches()) : "DRAFT";
+        resumeTemplatePatchDraftMapper.updateValidation(
+                draft.getId(),
+                nextStatus,
+                toJson(result.patches(), "[]"),
+                toJson(result.validationErrors(), "[]")
+        );
+        draft.setStatus(nextStatus);
+        draft.setPatchesJson(toJson(result.patches(), "[]"));
+        draft.setValidationErrorsJson(toJson(result.validationErrors(), "[]"));
+        return convertPatchDraftToVO(draft);
+    }
+
+    /**
+     * 调用 Python 确定性应用补丁并保存新的 DOCX 导出文件。
+     */
+    @Override
+    @Transactional
+    public ResumeTemplateExportVO exportResumeTemplate(String templateId, ResumeTemplateExportDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        ResumeTemplate template = requireResumeTemplate(templateId, scopedUserId);
+        requireTemplateVersion(template, dto.getVersion());
+        ResumeTemplateExport existing = resumeTemplateExportMapper.findByIdempotencyKey(template.getId(), scopedUserId, dto.getIdempotencyKey());
+        if (existing != null) {
+            return convertExportToVO(existing);
+        }
+        ResumeTemplatePatchDraft draft = requirePatchDraft(dto.getPatchDraftId(), template.getId(), scopedUserId);
+        if (!List.of("CONFIRMED", "VALIDATED").contains(draft.getStatus())) {
+            throw new IllegalArgumentException("RESUME_EXPORT_REQUIRES_CONFIRMATION");
+        }
+        if (!template.getVersion().equals(draft.getTemplateVersion())) {
+            throw new IllegalArgumentException("RESUME_TEMPLATE_VERSION_CONFLICT");
+        }
+        ObjectStorageService.LoadedObject loaded = objectStorageService.load(
+                template.getCurrentStorageType(),
+                template.getCurrentFilePath(),
+                template.getCurrentObjectKey(),
+                template.getCurrentFilename()
+        );
+        List<ResumeTemplateField> fields = allowedFieldsForDraft(
+                resumeTemplateFieldMapper.findByTemplateIdAndVersion(template.getId(), template.getVersion()),
+                draft
+        );
+        requirePatchesWithinAllowedFields(fromJson(draft.getPatchesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()), draft);
+        List<Map<String, Object>> evidenceCandidates = fromJson(draft.getEvidenceCandidatesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of());
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("templateId", template.getId());
+        payload.put("version", template.getVersion());
+        payload.put("filename", exportedFilename(template.getCurrentFilename(), template.getVersion() + 1));
+        payload.put("fileBase64", Base64.getEncoder().encodeToString(loaded.content()));
+        payload.put("fields", fields.stream().map(this::toFieldBindingMap).toList());
+        payload.put("patches", fromJson(draft.getPatchesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()));
+        payload.put("allowedEvidenceIds", evidenceCandidates.stream().map(item -> String.valueOf(item.get("evidenceId"))).toList());
+        PythonRagClient.ResumeTemplateExportResult result = pythonRagClient.exportResumeTemplate(payload);
+        PythonRagClient.ResumeTemplateParseResult parsedExport = pythonRagClient.parseResumeTemplate(
+                template.getId(),
+                result.version(),
+                result.fileBytes(),
+                result.filename()
+        );
+        ObjectStorageService.StoredObject stored = storeGeneratedDocx(result.fileBytes(), result.filename(), scopedUserId);
+
+        ResumeTemplateExport export = new ResumeTemplateExport();
+        export.setId(UUID.randomUUID().toString());
+        export.setTemplateId(template.getId());
+        export.setUserId(scopedUserId);
+        export.setBaseVersion(template.getVersion());
+        export.setExportVersion(result.version());
+        export.setPatchDraftId(draft.getId());
+        export.setFilename(result.filename());
+        export.setFilePath(stored.sourcePath());
+        export.setStorageType(stored.storageType());
+        export.setObjectKey(stored.objectKey());
+        export.setPublicUrl(stored.publicUrl());
+        export.setLayoutValidationJson(toJson(result.layoutValidation(), "{}"));
+        export.setIdempotencyKey(dto.getIdempotencyKey());
+        export.setStatus("EXPORTED");
+        resumeTemplateExportMapper.insert(export);
+        resumeTemplateFieldMapper.deleteByTemplateIdAndVersion(template.getId(), result.version());
+        ResumeTemplate exportedTemplate = new ResumeTemplate();
+        exportedTemplate.setId(template.getId());
+        exportedTemplate.setUserId(scopedUserId);
+        exportedTemplate.setVersion(result.version());
+        for (Map<String, Object> field : parsedExport.fields()) {
+            resumeTemplateFieldMapper.insert(toResumeTemplateField(exportedTemplate, field));
+        }
+        resumeTemplatePatchDraftMapper.updateStatus(draft.getId(), "EXPORTED");
+        resumeTemplateMapper.updateExportedVersion(
+                template.getId(),
+                result.version(),
+                "EXPORTED",
+                result.filename(),
+                stored.sourcePath(),
+                stored.storageType(),
+                stored.objectKey(),
+                stored.publicUrl(),
+                toJson(parsedExport.layoutFingerprint(), "{}")
+        );
+        return convertExportToVO(export);
+    }
+
+    /**
      * 对已保存的上传资料选择合适的 Python 索引入口。
      */
     private PythonRagClient.IndexResult indexStoredUpload(Long materialId,
@@ -580,6 +1022,47 @@ public class RagServiceImpl implements RagService {
                     "rag_query_failed",
                     resolveRagErrorCode(e),
                     "RAG 查询失败",
+                    e,
+                    context
+            );
+            throw e;
+        }
+    }
+
+    /**
+     * 执行 Agent Tool Gateway 专用非持久化查询，只记录脱敏观测日志，不写 rag_query_history。
+     */
+    @Override
+    public RagQueryVO queryNonPersistent(RagQueryDTO dto, String userId) {
+        String scopedUserId = requireUserId(userId);
+        RagQueryDTO scopedDto = scopedQuery(dto, scopedUserId);
+        long start = System.currentTimeMillis();
+        logService.recordRagEvent(
+                "rag_query",
+                "retrieve",
+                "rag_query_probe_non_persistent_start",
+                "开始 Agent 非持久化 RAG 探针",
+                queryContext(scopedDto, null, null)
+        );
+        try {
+            RagQueryVO result = pythonRagClient.query(scopedDto);
+            logService.recordRagEvent(
+                    "rag_query",
+                    "retrieve",
+                    "rag_query_probe_non_persistent_success",
+                    "Agent 非持久化 RAG 探针完成",
+                    queryContext(scopedDto, result, System.currentTimeMillis() - start)
+            );
+            return result;
+        } catch (Exception e) {
+            Map<String, Object> context = queryContext(scopedDto, null, System.currentTimeMillis() - start);
+            context.putAll(pythonExceptionContext(e));
+            logService.recordRagError(
+                    "rag_query",
+                    "retrieve",
+                    "rag_query_probe_non_persistent_failed",
+                    resolveRagErrorCode(e),
+                    "Agent 非持久化 RAG 探针失败",
                     e,
                     context
             );
@@ -884,6 +1367,713 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
+     * 将 Python 字段绑定转换为数据库字段记录。
+     */
+    private ResumeTemplateField toResumeTemplateField(ResumeTemplate template, Map<String, Object> field) {
+        ResumeTemplateField entity = new ResumeTemplateField();
+        entity.setId(UUID.randomUUID().toString());
+        entity.setTemplateId(template.getId());
+        entity.setUserId(template.getUserId());
+        entity.setTemplateVersion(template.getVersion());
+        entity.setFieldId(stringValue(field.get("fieldId")));
+        entity.setSectionKey(stringValue(field.get("sectionKey")));
+        entity.setDisplayName(stringValue(field.get("displayName")));
+        entity.setSourceText(stringValue(field.get("sourceText")));
+        entity.setSourceTextHash(stringValue(field.get("sourceTextHash")));
+        entity.setLocationRefsJson(toJson(field.get("locationRefs"), "[]"));
+        entity.setStyleFingerprintJson(toJson(field.get("styleFingerprint"), "{}"));
+        entity.setMaxChars(intValue(field.get("maxChars"), 300));
+        entity.setMaxLines(intValue(field.get("maxLines"), 3));
+        entity.setRequiredEvidencePolicy(stringValue(field.get("requiredEvidencePolicy")));
+        entity.setUnsupportedRegionsJson(toJson(field.get("unsupportedRegions"), "[]"));
+        return entity;
+    }
+
+    /**
+     * 将字段实体还原为 Python 和前端使用的绑定结构。
+     */
+    private Map<String, Object> toFieldBindingMap(ResumeTemplateField field) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("templateId", field.getTemplateId());
+        result.put("version", field.getTemplateVersion());
+        result.put("fieldId", field.getFieldId());
+        result.put("sectionKey", field.getSectionKey());
+        result.put("displayName", field.getDisplayName());
+        result.put("sourceText", field.getSourceText());
+        result.put("sourceTextHash", field.getSourceTextHash());
+        result.put("locationRefs", fromJson(field.getLocationRefsJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()));
+        result.put("styleFingerprint", fromJson(field.getStyleFingerprintJson(), new TypeReference<Map<String, Object>>() {}, Map.of()));
+        result.put("maxChars", field.getMaxChars());
+        result.put("maxLines", field.getMaxLines());
+        result.put("requiredEvidencePolicy", field.getRequiredEvidencePolicy());
+        result.put("unsupportedRegions", fromJson(field.getUnsupportedRegionsJson(), new TypeReference<List<String>>() {}, List.of()));
+        return result;
+    }
+
+    /**
+     * 保存 Python 返回的预览页面图片，前端只能通过 Java 鉴权接口读取。
+     */
+    private List<ResumeTemplatePreviewPage> savePreviewPages(ResumeTemplate template, String userId, List<Map<String, Object>> pages) {
+        List<ResumeTemplatePreviewPage> result = new ArrayList<>();
+        for (Map<String, Object> page : pages) {
+            String imageBase64 = stringValue(page.get("imageBase64"));
+            if (imageBase64 == null || imageBase64.isBlank()) {
+                continue;
+            }
+            byte[] imageBytes = Base64.getDecoder().decode(imageBase64);
+            Integer pageIndex = intValue(page.get("pageIndex"), 0);
+            ObjectStorageService.StoredObject stored = storePreviewImage(imageBytes, template.getId(), pageIndex, userId);
+            ResumeTemplatePreviewPage entity = new ResumeTemplatePreviewPage();
+            entity.setId(UUID.randomUUID().toString());
+            entity.setTemplateId(template.getId());
+            entity.setUserId(userId);
+            entity.setTemplateVersion(template.getVersion());
+            entity.setPageIndex(pageIndex);
+            entity.setStorageType(stored.storageType());
+            entity.setFilePath(stored.sourcePath());
+            entity.setObjectKey(stored.objectKey());
+            entity.setWidth(intValue(page.get("width"), 1));
+            entity.setHeight(intValue(page.get("height"), 1));
+            resumeTemplatePreviewPageMapper.insert(entity);
+            result.add(entity);
+        }
+        return result;
+    }
+
+    /**
+     * 保存单页 PNG 临时文件到统一对象存储。
+     */
+    private ObjectStorageService.StoredObject storePreviewImage(byte[] content, String templateId, Integer pageIndex, String userId) {
+        try {
+            Path tempFile = Files.createTempFile("resume-template-preview-", ".png");
+            try {
+                Files.write(tempFile, content);
+                return objectStorageService.store(
+                        tempFile,
+                        "resume-preview-" + templateId + "-p" + pageIndex + ".png",
+                        userId,
+                        "resume-template-preview",
+                        "image/png"
+                );
+            } finally {
+                Files.deleteIfExists(tempFile);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("保存简历预览图片失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 将自动识别区域保存为默认不可编辑标注。
+     */
+    private void saveAutoAnnotations(ResumeTemplate template, String userId, List<Map<String, Object>> regions, Map<String, ResumeTemplateField> fieldsById) {
+        for (Map<String, Object> region : regions) {
+            Map<String, Object> rect = objectMap(region.get("rect"));
+            ResumeTemplateRegionAnnotation annotation = new ResumeTemplateRegionAnnotation();
+            annotation.setId(UUID.randomUUID().toString());
+            annotation.setTemplateId(template.getId());
+            annotation.setUserId(userId);
+            annotation.setTemplateVersion(template.getVersion());
+            annotation.setFieldId(stringValue(region.get("fieldId")));
+            annotation.setPageIndex(intValue(region.get("pageIndex"), 0));
+            annotation.setRectJson(toJson(validateRect(rect), "{}"));
+            annotation.setSourceType("AUTO");
+            annotation.setEditable(false);
+            annotation.setSectionKey(blankToDefault(stringValue(region.get("sectionKey")), "other"));
+            annotation.setUserInstruction("");
+            ResumeTemplateField field = fieldsById.get(annotation.getFieldId());
+            annotation.setRequiredEvidencePolicy(field == null ? "OPTIONAL" : field.getRequiredEvidencePolicy());
+            annotation.setStatus("ACTIVE");
+            annotation.setAnnotationRevision(1);
+            resumeTemplateRegionAnnotationMapper.insert(annotation);
+        }
+    }
+
+    /**
+     * 将前端提交的区域约束转换为可入库标注。
+     */
+    private ResumeTemplateRegionAnnotation buildUserAnnotation(ResumeTemplate template,
+                                                               String userId,
+                                                               ResumeTemplateAnnotationSaveDTO.AnnotationItem item,
+                                                               Map<String, ResumeTemplateField> fieldsById,
+                                                               int revision) {
+        String fieldId = blankToNull(item.getFieldId());
+        ResumeTemplateField field = fieldId == null ? null : fieldsById.get(fieldId);
+        if (fieldId != null && field == null) {
+            throw new IllegalArgumentException("绑定字段不属于当前模板版本");
+        }
+        String sourceType = normalizeSourceType(item.getSourceType(), fieldId);
+        boolean editable = Boolean.TRUE.equals(item.getEditable());
+        if ("MANUAL_UNBOUND".equals(sourceType) || fieldId == null) {
+            editable = false;
+        }
+        String evidencePolicy = normalizeEvidencePolicy(item.getRequiredEvidencePolicy(), field == null ? "NONE" : field.getRequiredEvidencePolicy());
+        if (field != null && compareEvidencePolicy(evidencePolicy, field.getRequiredEvidencePolicy()) < 0) {
+            throw new IllegalArgumentException("证据要求只能升级，不能低于字段默认要求");
+        }
+        String instruction = sanitizeUserInstruction(item.getUserInstruction(), field);
+        ResumeTemplateRegionAnnotation annotation = new ResumeTemplateRegionAnnotation();
+        annotation.setId(UUID.randomUUID().toString());
+        annotation.setTemplateId(template.getId());
+        annotation.setUserId(userId);
+        annotation.setTemplateVersion(template.getVersion());
+        annotation.setFieldId(fieldId);
+        annotation.setPageIndex(item.getPageIndex());
+        annotation.setRectJson(toJson(validateRect(item.getRect()), "{}"));
+        annotation.setSourceType(sourceType);
+        annotation.setEditable(editable);
+        annotation.setSectionKey(blankToDefault(item.getSectionKey(), field == null ? "other" : field.getSectionKey()));
+        annotation.setUserInstruction(instruction);
+        annotation.setRequiredEvidencePolicy(evidencePolicy);
+        annotation.setStatus(normalizeAnnotationStatus(item.getStatus()));
+        annotation.setAnnotationRevision(revision);
+        return annotation;
+    }
+
+    /**
+     * 转换预览响应 VO，不暴露图片真实存储路径。
+     */
+    private ResumeTemplatePreviewVO convertPreviewToVO(ResumeTemplate template,
+                                                       List<ResumeTemplatePreviewPage> pages,
+                                                       List<ResumeTemplateRegionAnnotation> annotations,
+                                                       List<Map<String, Object>> unmappedFields,
+                                                       List<String> warnings,
+                                                       String previewStatus) {
+        return ResumeTemplatePreviewVO.builder()
+                .templateId(template.getId())
+                .version(template.getVersion())
+                .previewStatus(previewStatus == null ? "UNAVAILABLE" : previewStatus)
+                .pages(pages.stream().map(this::toPreviewPageMap).toList())
+                .annotations(annotations.stream().map(this::toAnnotationMap).toList())
+                .unmappedFields(unmappedFields == null ? List.of() : unmappedFields)
+                .warnings(warnings == null ? List.of() : warnings)
+                .generatedAt(LocalDateTime.now())
+                .build();
+    }
+
+    /**
+     * 转换预览页摘要，图片地址固定为 Java 鉴权接口。
+     */
+    private Map<String, Object> toPreviewPageMap(ResumeTemplatePreviewPage page) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("pageIndex", page.getPageIndex());
+        result.put("width", page.getWidth());
+        result.put("height", page.getHeight());
+        result.put("imageUrl", "/api/rag/resume-templates/" + page.getTemplateId() + "/preview/pages/" + page.getPageIndex() + "/image");
+        return result;
+    }
+
+    /**
+     * 转换区域标注摘要，隐藏 DOCX locationRefs 和图片存储路径。
+     */
+    private Map<String, Object> toAnnotationMap(ResumeTemplateRegionAnnotation annotation) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("annotationId", annotation.getId());
+        result.put("fieldId", annotation.getFieldId());
+        result.put("pageIndex", annotation.getPageIndex());
+        result.put("rect", fromJson(annotation.getRectJson(), new TypeReference<Map<String, Object>>() {}, Map.of()));
+        result.put("sourceType", annotation.getSourceType());
+        result.put("editable", Boolean.TRUE.equals(annotation.getEditable()));
+        result.put("sectionKey", annotation.getSectionKey());
+        result.put("userInstruction", annotation.getUserInstruction());
+        result.put("requiredEvidencePolicy", annotation.getRequiredEvidencePolicy());
+        result.put("status", annotation.getStatus());
+        result.put("annotationRevision", annotation.getAnnotationRevision());
+        return result;
+    }
+
+    /**
+     * 从字段列表建立 fieldId 索引。
+     */
+    private Map<String, ResumeTemplateField> fieldsById(List<ResumeTemplateField> fields) {
+        Map<String, ResumeTemplateField> result = new LinkedHashMap<>();
+        for (ResumeTemplateField field : fields) {
+            result.put(field.getFieldId(), field);
+        }
+        return result;
+    }
+
+    /**
+     * 根据草稿冻结字段边界过滤字段。
+     */
+    private List<ResumeTemplateField> allowedFieldsForDraft(List<ResumeTemplateField> fields, ResumeTemplatePatchDraft draft) {
+        List<String> allowed = fromJson(draft.getAllowedFieldIdsJson(), new TypeReference<List<String>>() {}, List.of());
+        if (allowed.isEmpty()) {
+            return fields;
+        }
+        Set<String> allowedSet = new HashSet<>(allowed);
+        return fields.stream().filter(field -> allowedSet.contains(field.getFieldId())).toList();
+    }
+
+    /**
+     * 校验用户提交补丁没有越过草稿冻结字段边界。
+     */
+    private void requirePatchesWithinAllowedFields(List<Map<String, Object>> patches, ResumeTemplatePatchDraft draft) {
+        List<String> allowed = fromJson(draft.getAllowedFieldIdsJson(), new TypeReference<List<String>>() {}, List.of());
+        if (allowed.isEmpty()) {
+            return;
+        }
+        Set<String> allowedSet = new HashSet<>(allowed);
+        for (Map<String, Object> patch : patches) {
+            String fieldId = stringValue(patch.get("fieldId"));
+            if (!allowedSet.contains(fieldId)) {
+                throw new IllegalArgumentException("补丁字段不在生成草稿时允许修改的范围内");
+            }
+        }
+    }
+
+    /**
+     * 提取字段级用户改写要求，供 Python 生成提示使用。
+     */
+    private Map<String, String> fieldInstructions(List<ResumeTemplateRegionAnnotation> annotations) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (ResumeTemplateRegionAnnotation annotation : annotations) {
+            if (annotation.getFieldId() != null && annotation.getUserInstruction() != null && !annotation.getUserInstruction().isBlank()) {
+                result.put(annotation.getFieldId(), annotation.getUserInstruction());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 提取字段级 evidence 策略，供 Python 生成提示使用。
+     */
+    private Map<String, String> fieldEvidencePolicies(List<ResumeTemplateRegionAnnotation> annotations) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (ResumeTemplateRegionAnnotation annotation : annotations) {
+            if (annotation.getFieldId() != null && annotation.getRequiredEvidencePolicy() != null) {
+                result.put(annotation.getFieldId(), annotation.getRequiredEvidencePolicy());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 转换简历模板详情返回对象。
+     */
+    private ResumeTemplateVO convertResumeTemplateToVO(ResumeTemplate template, List<ResumeTemplateField> fields) {
+        return ResumeTemplateVO.builder()
+                .templateId(template.getId())
+                .version(template.getVersion())
+                .status(template.getStatus())
+                .filename(defaultText(template.getCurrentFilename(), template.getOriginalFilename()))
+                .currentFilePath(template.getCurrentFilePath())
+                .currentPublicUrl(template.getCurrentPublicUrl())
+                .fileType(template.getFileType())
+                .fields(fields.stream().map(this::toFieldBindingMap).toList())
+                .unsupportedRegions(fromJson(template.getUnsupportedRegionsJson(), new TypeReference<List<String>>() {}, List.of()))
+                .layoutFingerprint(fromJson(template.getLayoutFingerprintJson(), new TypeReference<Map<String, Object>>() {}, Map.of()))
+                .createdAt(template.getCreatedAt())
+                .updatedAt(template.getUpdatedAt())
+                .build();
+    }
+
+    /**
+     * 转换补丁草稿返回对象。
+     */
+    private ResumePatchDraftVO convertPatchDraftToVO(ResumeTemplatePatchDraft draft) {
+        return ResumePatchDraftVO.builder()
+                .patchDraftId(draft.getId())
+                .templateId(draft.getTemplateId())
+                .version(draft.getTemplateVersion())
+                .status(draft.getStatus())
+                .provider(draft.getProvider())
+                .patches(fromJson(draft.getPatchesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()))
+                .evidenceCandidates(fromJson(draft.getEvidenceCandidatesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()))
+                .validationErrors(fromJson(draft.getValidationErrorsJson(), new TypeReference<List<String>>() {}, List.of()))
+                .allowedFieldIds(fromJson(draft.getAllowedFieldIdsJson(), new TypeReference<List<String>>() {}, List.of()))
+                .annotationRevision(draft.getAnnotationRevision())
+                .createdAt(draft.getCreatedAt())
+                .updatedAt(draft.getUpdatedAt())
+                .build();
+    }
+
+    /**
+     * 转换导出记录返回对象。
+     */
+    private ResumeTemplateExportVO convertExportToVO(ResumeTemplateExport export) {
+        return ResumeTemplateExportVO.builder()
+                .exportId(export.getId())
+                .templateId(export.getTemplateId())
+                .baseVersion(export.getBaseVersion())
+                .exportVersion(export.getExportVersion())
+                .patchDraftId(export.getPatchDraftId())
+                .filename(export.getFilename())
+                .filePath(export.getFilePath())
+                .storageType(export.getStorageType())
+                .publicUrl(export.getPublicUrl())
+                .status(export.getStatus())
+                .layoutValidation(fromJson(export.getLayoutValidationJson(), new TypeReference<Map<String, Object>>() {}, Map.of()))
+                .createdAt(export.getCreatedAt())
+                .updatedAt(export.getUpdatedAt())
+                .build();
+    }
+
+    /**
+     * 查询当前用户模板并做归属校验。
+     */
+    private ResumeTemplate requireResumeTemplate(String templateId, String userId) {
+        String scopedUserId = requireUserId(userId);
+        if (templateId == null || templateId.isBlank()) {
+            throw new IllegalArgumentException("RESUME_TEMPLATE_NOT_FOUND");
+        }
+        ResumeTemplate template = resumeTemplateMapper.findByIdAndUserId(templateId.trim(), scopedUserId);
+        if (template == null) {
+            throw new IllegalArgumentException("RESUME_TEMPLATE_NOT_FOUND");
+        }
+        return template;
+    }
+
+    /**
+     * 查询补丁草稿并校验归属。
+     */
+    private ResumeTemplatePatchDraft requirePatchDraft(String patchDraftId, String templateId, String userId) {
+        if (patchDraftId == null || patchDraftId.isBlank()) {
+            throw new IllegalArgumentException("补丁草稿不存在");
+        }
+        ResumeTemplatePatchDraft draft = resumeTemplatePatchDraftMapper.findByIdAndTemplateIdAndUserId(patchDraftId, templateId, userId);
+        if (draft == null) {
+            throw new IllegalArgumentException("补丁草稿不存在");
+        }
+        return draft;
+    }
+
+    /**
+     * 校验前端提交版本是否仍是当前模板版本。
+     */
+    private void requireTemplateVersion(ResumeTemplate template, Integer requestVersion) {
+        if (requestVersion == null || !requestVersion.equals(template.getVersion())) {
+            throw new IllegalArgumentException("RESUME_TEMPLATE_VERSION_CONFLICT");
+        }
+    }
+
+    /**
+     * 追加待删除存储引用，避免同一文件被重复删除。
+     */
+    private void appendStorageRef(List<StorageRef> files, String storageType, String sourcePath, String objectKey) {
+        if ((sourcePath == null || sourcePath.isBlank()) && (objectKey == null || objectKey.isBlank())) {
+            return;
+        }
+        StorageRef ref = new StorageRef(storageType, sourcePath, objectKey);
+        if (!files.contains(ref)) {
+            files.add(ref);
+        }
+    }
+
+    /**
+     * 删除模板关联的原始文件、预览图片和导出文件。
+     */
+    private void deleteStoredFiles(List<StorageRef> files) {
+        for (StorageRef file : files) {
+            objectStorageService.delete(file.storageType(), file.sourcePath(), file.objectKey());
+        }
+    }
+
+    /**
+     * 统一描述需要清理的对象存储文件。
+     */
+    private record StorageRef(String storageType, String sourcePath, String objectKey) {
+    }
+
+    /**
+     * 校验简历模板上传文件。
+     */
+    private void validateResumeTemplateFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("简历模板文件不能为空");
+        }
+        String filename = file.getOriginalFilename() == null ? "" : file.getOriginalFilename().toLowerCase(Locale.ROOT);
+        if (!filename.endsWith(".docx")) {
+            throw new IllegalArgumentException("当前只支持 DOCX 简历模板");
+        }
+        if (file.getSize() > 10L * 1024 * 1024) {
+            throw new IllegalArgumentException("简历模板文件不能超过 10MB");
+        }
+    }
+
+    /**
+     * 为简历补丁生成构造当前用户 evidence 候选，不写 RAG 查询历史。
+     */
+    private List<Map<String, Object>> retrieveResumePatchEvidence(ResumePatchGenerateDTO dto, String userId, String resumeSummary) {
+        RagQueryDTO query = new RagQueryDTO();
+        query.setQuestion("根据以下岗位 JD 和用户已上传简历摘要，检索可用于简历字段改写的项目、技能和学习证据：\n岗位 JD："
+                + dto.getJobDescription()
+                + (resumeSummary.isBlank() ? "" : "\n简历摘要：" + truncate(resumeSummary, 1200)));
+        query.setTopK(clampNumber(dto.getTopK(), 1, 10, DEFAULT_TOP_K));
+        query.setCandidateMultiplier(DEFAULT_CANDIDATE_MULTIPLIER);
+        query.setMetadataFilter(Map.of("userId", userId, "visibilityScope", "private"));
+        RagQueryVO result = pythonRagClient.query(scopedQuery(query, userId));
+        if (result.getEvidences() == null) {
+            return List.of();
+        }
+        return result.getEvidences().stream()
+                .map(this::toResumePatchEvidence)
+                .toList();
+    }
+
+    /**
+     * 解析简历补丁生成使用的简历摘要，优先使用当前用户已上传资料的服务端摘要。
+     */
+    private String resolveResumePatchResumeSummary(ResumePatchGenerateDTO dto, String userId) {
+        if (dto.getResumeMaterialId() != null) {
+            LearningMaterial material = learningMaterialMapper.findByIdAndUserId(dto.getResumeMaterialId(), userId);
+            if (material == null) {
+                throw new IllegalArgumentException("选中的简历资料不存在或无权访问");
+            }
+            String summary = defaultText(material.getDocumentSummary(), "").trim();
+            if (summary.isBlank()) {
+                throw new IllegalArgumentException("选中的简历资料尚未生成摘要，请等待解析完成或重新上传");
+            }
+            return summary;
+        }
+        return defaultText(dto.getResumeText(), "").trim();
+    }
+
+    /**
+     * 将 RAG evidence 转为 Python 补丁生成候选结构。
+     */
+    private Map<String, Object> toResumePatchEvidence(RagEvidenceVO evidence) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("evidenceId", evidence.getEvidenceId());
+        item.put("documentTitle", defaultText(evidence.getDocumentTitle(), evidence.getTitle()));
+        item.put("sectionName", defaultText(evidence.getSectionName(), evidence.getSectionTitle()));
+        item.put("snippet", truncate(evidence.getSnippet(), 500));
+        item.put("source", defaultText(evidence.getSourcePath(), evidence.getSource()));
+        item.put("score", evidence.getScore() == null ? 0.0 : evidence.getScore());
+        return item;
+    }
+
+    /**
+     * 根据校验后的 patch 状态决定草稿状态。
+     */
+    private String resolvePatchDraftStatus(List<Map<String, Object>> patches) {
+        if (patches == null || patches.isEmpty()) {
+            return "DRAFT";
+        }
+        boolean allConfirmed = patches.stream().allMatch(item -> "CONFIRMED".equals(String.valueOf(item.get("status"))));
+        return allConfirmed ? "CONFIRMED" : "VALIDATED";
+    }
+
+    /**
+     * 保存 Python 导出的 DOCX 字节到对象存储。
+     */
+    private ObjectStorageService.StoredObject storeGeneratedDocx(byte[] content, String filename, String userId) {
+        if (content == null || content.length == 0) {
+            throw new IllegalStateException("Python 未返回有效 DOCX 文件");
+        }
+        try {
+            Path tempFile = Files.createTempFile("resume-template-export-", ".docx");
+            try {
+                Files.write(tempFile, content);
+                return objectStorageService.store(
+                        tempFile,
+                        filename,
+                        userId,
+                        "resume-template-export",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                );
+            } finally {
+                Files.deleteIfExists(tempFile);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("保存导出简历文件失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 生成导出文件名。
+     */
+    private String exportedFilename(String filename, int version) {
+        String base = filename == null || filename.isBlank() ? "resume-template.docx" : filename;
+        if (base.toLowerCase(Locale.ROOT).endsWith(".docx")) {
+            base = base.substring(0, base.length() - 5);
+        }
+        return base + "-v" + version + ".docx";
+    }
+
+    /**
+     * 读取 Map 中的字符串字段。
+     */
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    /**
+     * 读取 Map 中的整数字段。
+     */
+    private Integer intValue(Object value, Integer fallback) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 读取 Map 中的浮点数字段。
+     */
+    private double doubleValue(Object value, String fieldName) {
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value == null) {
+            throw new IllegalArgumentException("区域坐标缺少 " + fieldName);
+        }
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("区域坐标 " + fieldName + " 不合法");
+        }
+    }
+
+    /**
+     * 将未知对象安全转换为 Map。
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> objectMap(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            map.forEach((key, item) -> result.put(String.valueOf(key), item));
+            return result;
+        }
+        return Map.of();
+    }
+
+    /**
+     * 校验并标准化 0..1 相对坐标。
+     */
+    private Map<String, Object> validateRect(Map<String, Object> rect) {
+        double x = doubleValue(rect.get("x"), "x");
+        double y = doubleValue(rect.get("y"), "y");
+        double width = doubleValue(rect.get("width"), "width");
+        double height = doubleValue(rect.get("height"), "height");
+        if (x < 0 || x > 1 || y < 0 || y > 1 || width <= 0 || width > 1 || height <= 0 || height > 1 || x + width > 1.001 || y + height > 1.001) {
+            throw new IllegalArgumentException("区域坐标必须位于 0..1 范围内且宽高大于 0");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("x", x);
+        result.put("y", y);
+        result.put("width", width);
+        result.put("height", height);
+        return result;
+    }
+
+    /**
+     * 规范化标注来源类型。
+     */
+    private String normalizeSourceType(String sourceType, String fieldId) {
+        String value = sourceType == null || sourceType.isBlank() ? (fieldId == null ? "MANUAL_UNBOUND" : "MANUAL_BOUND") : sourceType.trim();
+        if (!List.of("AUTO", "MANUAL_BOUND", "MANUAL_UNBOUND").contains(value)) {
+            throw new IllegalArgumentException("标注来源类型不合法");
+        }
+        if ("MANUAL_UNBOUND".equals(value) && fieldId != null) {
+            return "MANUAL_BOUND";
+        }
+        return value;
+    }
+
+    /**
+     * 规范化标注状态。
+     */
+    private String normalizeAnnotationStatus(String status) {
+        String value = status == null || status.isBlank() ? "ACTIVE" : status.trim();
+        if (!List.of("ACTIVE", "IGNORED").contains(value)) {
+            throw new IllegalArgumentException("标注状态不合法");
+        }
+        return value;
+    }
+
+    /**
+     * 规范化 evidence 要求。
+     */
+    private String normalizeEvidencePolicy(String requested, String fallback) {
+        String value = requested == null || requested.isBlank() ? fallback : requested.trim();
+        if (!List.of("NONE", "OPTIONAL", "REQUIRED").contains(value)) {
+            throw new IllegalArgumentException("证据要求不合法");
+        }
+        return value;
+    }
+
+    /**
+     * 比较 evidence 策略强度。
+     */
+    private int compareEvidencePolicy(String left, String right) {
+        return evidencePolicyRank(left) - evidencePolicyRank(right);
+    }
+
+    /**
+     * 返回 evidence 策略强度。
+     */
+    private int evidencePolicyRank(String value) {
+        if ("REQUIRED".equals(value)) {
+            return 2;
+        }
+        if ("OPTIONAL".equals(value)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
+     * 过滤用户改写要求中的不可信定位和排版指令。
+     */
+    private String sanitizeUserInstruction(String instruction, ResumeTemplateField field) {
+        if (instruction == null || instruction.isBlank()) {
+            return "";
+        }
+        String trimmed = instruction.trim();
+        if (trimmed.length() > 500) {
+            throw new IllegalArgumentException("用户要求不能超过 500 字");
+        }
+        String lower = trimmed.toLowerCase(Locale.ROOT);
+        List<String> forbidden = List.of("xml", "xpath", "location", "locationrefs", "run", "paragraph", "table", "cell", "style", "font", "layout", "路径", "定位", "排版", "样式", "字体", "段落", "表格", "单元格", "字段名");
+        if (forbidden.stream().anyMatch(lower::contains)) {
+            throw new IllegalArgumentException("用户要求不能包含定位、排版、XML、路径或字段名等指令");
+        }
+        if (field != null && field.getFieldId() != null && lower.contains(field.getFieldId().toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException("用户要求不能直接引用字段名");
+        }
+        return trimmed;
+    }
+
+    /**
+     * 空白字符串转 null。
+     */
+    private String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    /**
+     * 安全读取标注修订号。
+     */
+    private int safeRevision(Integer value) {
+        return value == null ? 0 : Math.max(0, value);
+    }
+
+    /**
+     * 计算文本 sha256，用于记录 JD 脱敏摘要。
+     */
+    private String sha256(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(defaultText(value, "").getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder();
+            for (byte item : hash) {
+                builder.append(String.format("%02x", item));
+            }
+            return builder.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("当前运行环境缺少 SHA-256 算法", e);
+        }
+    }
+
+    /**
      * 将近期历史日期范围限制在最近 7 天。
      */
     private DateRange normalizeRecentDateRange(LocalDate startDate, LocalDate endDate) {
@@ -1021,6 +2211,95 @@ public class RagServiceImpl implements RagService {
             return "avi";
         }
         return "text";
+    }
+
+    /**
+     * 当前预览页只渲染能按 UTF-8 文本读取的资料。
+     */
+    private boolean isPreviewableTextType(String documentType) {
+        if (documentType == null) {
+            return false;
+        }
+        return List.of("markdown", "md", "txt", "text", "srt", "vtt").contains(documentType.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 校验 evidence 来源确实指向当前资料，避免预览接口成为任意来源代理。
+     */
+    private void validatePreviewSource(LearningMaterial material, String source) {
+        String normalizedSource = normalizePreviewSource(source);
+        if (normalizedSource == null) {
+            return;
+        }
+        boolean matched = Stream.of(
+                        material.getOriginalFilePath(),
+                        material.getPublicUrl(),
+                        material.getObjectKey(),
+                        material.getObjectKey() == null ? null : "oss://" + material.getObjectKey()
+                )
+                .map(this::normalizePreviewSource)
+                .anyMatch(allowed -> previewSourceMatches(allowed, normalizedSource));
+        if (!matched) {
+            throw new IllegalArgumentException("预览来源不属于当前资料");
+        }
+    }
+
+    /**
+     * 预览来源比较时去掉章节 hash 和尖括号包装。
+     */
+    private String normalizePreviewSource(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String text = value.trim().replaceAll("^<|>$", "");
+        int hashIndex = text.indexOf('#');
+        if (hashIndex >= 0) {
+            text = text.substring(0, hashIndex);
+        }
+        return text.replace('\\', '/');
+    }
+
+    /**
+     * 支持完整 URL、oss key 和文件名三种来源匹配。
+     */
+    private boolean previewSourceMatches(String allowedSource, String requestedSource) {
+        if (allowedSource == null || requestedSource == null) {
+            return false;
+        }
+        return requestedSource.equals(allowedSource)
+                || requestedSource.endsWith("/" + allowedSource)
+                || allowedSource.endsWith("/" + requestedSource);
+    }
+
+    /**
+     * 根据资料类型返回预览内容类型。
+     */
+    private String previewContentType(String documentType) {
+        String type = documentType == null ? "" : documentType.toLowerCase(Locale.ROOT);
+        if ("markdown".equals(type) || "md".equals(type)) {
+            return "text/markdown; charset=UTF-8";
+        }
+        if ("srt".equals(type) || "vtt".equals(type)) {
+            return "text/plain; charset=UTF-8";
+        }
+        return "text/plain; charset=UTF-8";
+    }
+
+    /**
+     * UTF-8 BOM 会影响 Markdown 首行标题识别，这里统一去掉。
+     */
+    private String stripUtf8Bom(String content) {
+        if (content == null || content.isEmpty()) {
+            return "";
+        }
+        return content.charAt(0) == '\uFEFF' ? content.substring(1) : content;
+    }
+
+    /**
+     * 返回第一段非空文本。
+     */
+    private String firstNonBlank(String first, String second) {
+        return first != null && !first.isBlank() ? first : second;
     }
 
     /**
@@ -1216,20 +2495,82 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 将查询强制限定在当前登录用户资料范围内。
+     * 归一化查询参数，并将查询强制限定在当前登录用户资料范围内。
      */
     private RagQueryDTO scopedQuery(RagQueryDTO dto, String userId) {
         RagQueryDTO scoped = new RagQueryDTO();
         scoped.setQuestion(dto.getQuestion());
-        scoped.setTopK(dto.getTopK());
+        scoped.setTopK(clampNumber(dto.getTopK(), 1, 20, DEFAULT_TOP_K));
+        scoped.setCandidateMultiplier(clampNumber(dto.getCandidateMultiplier(), 2, 10, DEFAULT_CANDIDATE_MULTIPLIER));
         Map<String, Object> metadataFilter = new LinkedHashMap<>();
+        List<String> ignoredKeys = new java.util.ArrayList<>();
         if (dto.getMetadataFilter() != null) {
-            metadataFilter.putAll(dto.getMetadataFilter());
+            dto.getMetadataFilter().forEach((key, value) -> {
+                if (!BUSINESS_METADATA_FILTER_KEYS.contains(key)) {
+                    ignoredKeys.add(key);
+                    return;
+                }
+                Object normalizedValue = normalizeMetadataFilterValue(key, value);
+                if (normalizedValue == null) {
+                    ignoredKeys.add(key);
+                    return;
+                }
+                metadataFilter.put(key, normalizedValue);
+            });
         }
         metadataFilter.put("userId", userId);
-        metadataFilter.putIfAbsent("visibilityScope", "private");
+        metadataFilter.put("visibilityScope", "private");
+        if (!ignoredKeys.isEmpty()) {
+            metadataFilter.put(IGNORED_METADATA_FILTER_KEYS, ignoredKeys.stream().distinct().toList());
+        }
         scoped.setMetadataFilter(metadataFilter);
         return scoped;
+    }
+
+    /**
+     * 将 topK 和候选倍率限制在接口契约范围内。
+     */
+    private int clampNumber(Integer value, int min, int max, int defaultValue) {
+        int safeValue = value == null ? defaultValue : value;
+        return Math.max(min, Math.min(max, safeValue));
+    }
+
+    /**
+     * 清理业务元数据过滤值，页码和幻灯片序号统一按字符串传给 Python。
+     */
+    private Object normalizeMetadataFilterValue(String key, Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof String text) {
+            String trimmed = text.trim();
+            return trimmed.isEmpty() ? null : trimmed;
+        }
+        if (value instanceof Iterable<?> iterable) {
+            List<String> items = new java.util.ArrayList<>();
+            for (Object item : iterable) {
+                String normalized = normalizeSingleFilterValue(item);
+                if (normalized != null) {
+                    items.add(normalized);
+                }
+            }
+            return items.isEmpty() ? null : items;
+        }
+        if ("pageIndex".equals(key) || "slideIndex".equals(key)) {
+            return normalizeSingleFilterValue(value);
+        }
+        return value;
+    }
+
+    /**
+     * 将单个过滤值转换为非空字符串。
+     */
+    private String normalizeSingleFilterValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String text = String.valueOf(value).trim();
+        return text.isEmpty() ? null : text;
     }
 
     /**
@@ -1408,11 +2749,11 @@ public class RagServiceImpl implements RagService {
     private Map<String, Object> queryContext(RagQueryDTO dto, RagQueryVO result, Long elapsedMs) {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("questionLength", dto.getQuestion() == null ? 0 : dto.getQuestion().length());
-        context.put("topK", dto.getTopK() == null ? 5 : dto.getTopK());
+        context.put("topK", dto.getTopK() == null ? DEFAULT_TOP_K : dto.getTopK());
+        context.put("candidateMultiplier", dto.getCandidateMultiplier() == null ? DEFAULT_CANDIDATE_MULTIPLIER : dto.getCandidateMultiplier());
         context.put("hasMetadataFilter", dto.getMetadataFilter() != null && !dto.getMetadataFilter().isEmpty());
-        context.put("metadataFilterKeys", dto.getMetadataFilter() == null
-                ? List.of()
-                : dto.getMetadataFilter().keySet().stream().toList());
+        context.put("metadataFilterKeys", visibleMetadataFilterKeys(dto.getMetadataFilter()));
+        context.put("ignoredMetadataFilterKeys", ignoredMetadataFilterKeys(dto.getMetadataFilter()));
         if (result != null) {
             context.put("expandedQueryCount", result.getExpandedQueries() == null ? 0 : result.getExpandedQueries().size());
             context.put("evidenceCount", result.getEvidences() == null ? 0 : result.getEvidences().size());
@@ -1422,6 +2763,33 @@ public class RagServiceImpl implements RagService {
             context.put("elapsedMs", elapsedMs);
         }
         return context;
+    }
+
+    /**
+     * 返回可观测日志中的过滤字段名，排除内部诊断字段。
+     */
+    private List<String> visibleMetadataFilterKeys(Map<String, Object> metadataFilter) {
+        if (metadataFilter == null || metadataFilter.isEmpty()) {
+            return List.of();
+        }
+        return metadataFilter.keySet().stream()
+                .filter(key -> !IGNORED_METADATA_FILTER_KEYS.equals(key))
+                .toList();
+    }
+
+    /**
+     * 读取被归一化流程忽略的过滤字段名。
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> ignoredMetadataFilterKeys(Map<String, Object> metadataFilter) {
+        if (metadataFilter == null) {
+            return List.of();
+        }
+        Object ignored = metadataFilter.get(IGNORED_METADATA_FILTER_KEYS);
+        if (ignored instanceof List<?> items) {
+            return items.stream().map(String::valueOf).toList();
+        }
+        return List.of();
     }
 
     /**

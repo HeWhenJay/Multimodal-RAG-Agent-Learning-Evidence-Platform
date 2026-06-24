@@ -3,6 +3,7 @@ from rag.retrievers.retrieval import InMemoryRagStore
 from rag.progress import RagProgressReporter
 from rag.retrievers.evidence_diversity import dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
+from rag.retrievers.query_expansion import expand_queries_with_diagnostics
 from rag.bailian_llm import append_evidence_reference_summary, build_evidence_location_link, clean_evidence_location, deterministic_grounded_answer
 from rag.indexes.pgvector_store import build_filter_clause, vector_literal
 from rag.rerankers.reranking import local_rerank
@@ -45,6 +46,7 @@ def test_rag_store_indexes_and_queries_with_evidence():
     assert response.evidences[0].retrievalSource == "rerank"
     assert response.diagnostics["answerProvider"] == "local"
     assert response.diagnostics["rerankProvider"] == "local"
+    assert response.diagnostics["queryExpansionProvider"] == "local"
     assert len(response.expandedQueries) >= 3
 
 
@@ -72,23 +74,102 @@ def test_query_progress_reporter_streams_multi_query_details():
     bm25_events = [event for event in streamed_events if event.stageCode == "query.bm25" and event.status == "COMPLETED"]
     assert response.progressEvents == streamed_events
     assert expand_events[-1].detail is not None
-    assert "鸡蛋怎么做 学习资料 笔记" in expand_events[-1].detail
+    assert "生成方式：local" in expand_events[-1].detail
+    assert "鸡蛋怎么做 步骤 方法" in expand_events[-1].detail
     assert len(bm25_events) == len(response.expandedQueries)
 
 
-def test_pgvector_filter_clause_supports_columns_and_metadata():
+def test_local_multi_query_expansion_adapts_review_intent():
+    result = expand_queries_with_diagnostics("我忘了自注意力机制，帮我复习一下")
+
+    assert result.provider == "local"
+    assert result.queries[0] == "我忘了自注意力机制，帮我复习一下"
+    assert 3 <= len(result.queries) <= 5
+    assert any("核心概念" in query for query in result.queries)
+    assert any("公式" in query for query in result.queries)
+    assert all("学习资料 笔记" not in query for query in result.queries)
+
+
+def test_dashscope_multi_query_expansion_parses_json_array(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "[\"我忘了自注意力机制，帮我复习一下\", "
+                                "\"自注意力机制的核心概念是什么？\", "
+                                "\"Q K V 如何计算注意力权重？\", "
+                                "\"自注意力有哪些常见例子和易混点？\"]"
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def post(self, url, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["payload"] = json
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setenv("RAG_QUERY_EXPANSION_PROVIDER", "dashscope")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.delenv("RAG_QUERY_EXPANSION_MODEL", raising=False)
+    monkeypatch.delenv("RAG_LLM_MODEL", raising=False)
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    result = expand_queries_with_diagnostics("我忘了自注意力机制，帮我复习一下")
+
+    assert result.provider == "dashscope"
+    assert result.model == "qwen-plus"
+    assert result.fallback_reason is None
+    assert result.queries == [
+        "我忘了自注意力机制，帮我复习一下",
+        "自注意力机制的核心概念是什么？",
+        "Q K V 如何计算注意力权重？",
+        "自注意力有哪些常见例子和易混点？",
+    ]
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert "只输出 JSON 字符串数组" in captured["payload"]["messages"][0]["content"]
+
+
+def test_pgvector_filter_clause_supports_whitelist_and_ignores_unknown_keys():
     where_sql, params = build_filter_clause(
         {
             "documentType": "markdown",
             "sectionName": ["自动配置", "事务"],
+            "sectionKeyword": "RAG",
+            "pageIndex": [1, "2"],
             "customTag": "spring",
         }
     )
 
     assert "d.document_type = %s" in where_sql
     assert "c.section_name IN (%s, %s)" in where_sql
-    assert "c.metadata ->> %s = %s" in where_sql
-    assert params == ["markdown", "自动配置", "事务", "customTag", "spring"]
+    assert "(c.section_name ILIKE %s OR c.metadata ->> 'sectionTitle' ILIKE %s)" in where_sql
+    assert "c.metadata ->> 'pageIndex' IN (%s, %s)" in where_sql
+    assert "customTag" not in where_sql
+    assert params == ["markdown", "自动配置", "事务", "%RAG%", "%RAG%", "1", "2"]
 
 
 def test_vector_literal_matches_pgvector_input_format():
@@ -239,26 +320,114 @@ def test_answer_reference_summary_links_location_to_source_path():
     assert build_evidence_location_link("[章节](#anchor)", "oss://private/path.md") == ""
 
 
+def test_memory_metadata_filter_supports_in_section_keyword_and_page_index():
+    store = InMemoryRagStore()
+    blocks = [
+        DocumentBlock(
+            documentId="doc-filter-contract",
+            blockId="doc-filter-contract-page-1",
+            fileType="pdf",
+            blockType="text",
+            pageIndex=1,
+            sectionTitle="RAG 元数据过滤",
+            contentText="元数据过滤可以先缩小候选范围，再执行 BM25 和向量召回。",
+            parseEngine="unit-parser",
+            sourceTitle="过滤契约笔记",
+        ),
+        DocumentBlock(
+            documentId="doc-filter-contract",
+            blockId="doc-filter-contract-page-2",
+            fileType="pdf",
+            blockType="text",
+            pageIndex=2,
+            sectionTitle="普通章节",
+            contentText="这里描述默认查询，不包含高级过滤关键词。",
+            parseEngine="unit-parser",
+            sourceTitle="过滤契约笔记",
+        ),
+    ]
+    store.index_blocks(
+        document_id="doc-filter-contract",
+        title="过滤契约笔记",
+        document_type="pdf",
+        source="upload",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="unit-parser",
+        blocks=blocks,
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=120)),
+        status="READY",
+    )
+
+    response = store.query(
+        QueryRequest(
+            question="元数据过滤怎么缩小候选范围？",
+            topK=3,
+            metadataFilter={
+                "documentType": ["pdf", "markdown"],
+                "sectionKeyword": "rag",
+                "pageIndex": "1",
+                "unknown": "ignored",
+            },
+        )
+    )
+    number_response = store.query(
+        QueryRequest(
+            question="元数据过滤怎么缩小候选范围？",
+            topK=3,
+            metadataFilter={"pageIndex": 1},
+        )
+    )
+
+    assert response.evidences
+    assert {evidence.pageIndex for evidence in response.evidences} == {1}
+    assert response.diagnostics["totalCandidateChunkCount"] >= response.diagnostics["filteredChunkCount"]
+    assert response.diagnostics["effectiveMetadataFilter"]["sectionKeyword"] == "rag"
+    assert "unknown" in response.diagnostics["ignoredMetadataFilterKeys"]
+    assert number_response.evidences
+    assert {evidence.pageIndex for evidence in number_response.evidences} == {1}
+
+
 def test_video_metadata_filter_matches_promoted_block_metadata():
     store = InMemoryRagStore()
-    block = DocumentBlock(
-        documentId="doc-video-filter",
-        blockId="doc-video-filter-subtitle-1",
-        fileType="srt",
-        blockType="text",
-        startTime="00:00:10",
-        endTime="00:00:20",
-        sectionTitle="视频字幕",
-        contentText="这里讲到了 RAG-Fusion 和 Multi-Query 检索。",
-        parseEngine="unit-subtitle",
-        sourceTitle="视频检索课",
-        sourcePath="https://example.com/rag-course.mp4",
-        metadata={
-            "mediaType": "video",
-            "evidenceChannel": "subtitle",
-            "videoUrl": "https://example.com/rag-course.mp4",
-        },
-    )
+    blocks = [
+        DocumentBlock(
+            documentId="doc-video-filter",
+            blockId="doc-video-filter-subtitle-1",
+            fileType="srt",
+            blockType="text",
+            startTime="00:00:10",
+            endTime="00:00:20",
+            sectionTitle="视频字幕",
+            contentText="这里讲到了 RAG-Fusion 和 Multi-Query 检索。",
+            parseEngine="unit-subtitle",
+            sourceTitle="视频检索课",
+            sourcePath="https://example.com/rag-course.mp4",
+            metadata={
+                "mediaType": "video",
+                "evidenceChannel": "subtitle",
+                "videoUrl": "https://example.com/rag-course.mp4",
+            },
+        ),
+        DocumentBlock(
+            documentId="doc-video-filter",
+            blockId="doc-video-filter-frame-1",
+            fileType="mp4",
+            blockType="image",
+            startTime="00:00:30",
+            sectionTitle="视频画面 00:00:30",
+            contentText="关键帧 OCR：RAG-Fusion 会把 BM25 和向量召回融合。",
+            parseEngine="unit-frame-ocr",
+            sourceTitle="视频检索课",
+            sourcePath="https://example.com/rag-course.mp4",
+            metadata={
+                "mediaType": "video",
+                "evidenceChannel": "frame_ocr",
+                "videoUrl": "https://example.com/rag-course.mp4",
+            },
+        ),
+    ]
     store.index_blocks(
         document_id="doc-video-filter",
         title="视频检索课",
@@ -268,8 +437,8 @@ def test_video_metadata_filter_matches_promoted_block_metadata():
         visibility_scope="private",
         language="zh-CN",
         parser="unit-subtitle",
-        blocks=[block],
-        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=len(block.contentText))),
+        blocks=blocks,
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=sum(len(block.contentText) for block in blocks))),
         status="READY",
         source_path="https://example.com/rag-course.mp4",
     )
@@ -285,6 +454,17 @@ def test_video_metadata_filter_matches_promoted_block_metadata():
     assert response.evidences
     assert response.evidences[0].startTime == "00:00:10"
     assert response.evidences[0].playbackUrl == "https://example.com/rag-course.mp4#t=10"
+
+    frame_response = store.query(
+        QueryRequest(
+            question="关键帧 OCR 讲了什么？",
+            topK=3,
+            metadataFilter={"evidenceChannel": "frame_ocr"},
+        )
+    )
+
+    assert frame_response.evidences
+    assert {evidence.metadata.get("evidenceChannel") for evidence in frame_response.evidences} == {"frame_ocr"}
 
 
 def test_query_diversity_filters_duplicate_video_frame_ocr(monkeypatch):

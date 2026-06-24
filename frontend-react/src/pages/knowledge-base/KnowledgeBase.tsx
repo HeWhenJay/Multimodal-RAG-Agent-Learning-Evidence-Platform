@@ -1,4 +1,4 @@
-import { Database, FileText, PlayCircle, Search, Send } from 'lucide-react';
+import { ChevronDown, Database, FileText, PlayCircle, Search, Send, SlidersHorizontal } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { runRagQueryTask } from '../../api/rag';
@@ -6,6 +6,18 @@ import type { RagProgress, RagQueryResult } from '../../api/types';
 import { MarkdownText } from '../../components/MarkdownText';
 import { RagQueryProgress } from '../../components/RagQueryProgress';
 import { markRagQueryProgressFailed } from '../../services/ragQueryProgress';
+import { buildMaterialPreviewLink, buildPreviewHrefRewriter, extractEvidenceAnchor, normalizeComparableSource } from '../../utils/evidencePreview';
+import {
+  BLOCK_TYPE_OPTIONS,
+  DEFAULT_RAG_ADVANCED_SEARCH,
+  DOCUMENT_TYPE_OPTIONS,
+  EVIDENCE_CHANNEL_OPTIONS,
+  SOURCE_OPTIONS,
+  buildRagQueryPayload,
+  clampNumber,
+  formatRagFilterSummary,
+  type RagAdvancedSearchState
+} from '../../utils/ragAdvancedSearch';
 import { buildVideoEvidenceLink } from '../../utils/videoEvidence';
 
 // 知识库页负责提交 RAG 问题并展示回答和证据。
@@ -13,9 +25,8 @@ export function KnowledgeBase() {
   const [question, setQuestion] = useState('');
   const [result, setResult] = useState<RagQueryResult | null>(null);
   const [error, setError] = useState('');
-  const [documentType, setDocumentType] = useState('');
-  const [mediaType, setMediaType] = useState('');
-  const [evidenceChannel, setEvidenceChannel] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advancedSearch, setAdvancedSearch] = useState<RagAdvancedSearchState>(() => ({ ...DEFAULT_RAG_ADVANCED_SEARCH, topK: 6 }));
   const [querying, setQuerying] = useState(false);
   const [queryProgressEvents, setQueryProgressEvents] = useState<RagProgress[]>([]);
   const queryAbortRef = useRef<AbortController | null>(null);
@@ -31,10 +42,6 @@ export function KnowledgeBase() {
     }
     let controller: AbortController | null = null;
     try {
-      const metadataFilter: Record<string, string> = {};
-      if (documentType) metadataFilter.documentType = documentType;
-      if (mediaType) metadataFilter.mediaType = mediaType;
-      if (evidenceChannel) metadataFilter.evidenceChannel = evidenceChannel;
       setResult(null);
       setQuerying(true);
       setQueryProgressEvents([]);
@@ -42,7 +49,7 @@ export function KnowledgeBase() {
       controller = new AbortController();
       queryAbortRef.current = controller;
       const response = await runRagQueryTask(
-        { question, topK: 6, metadataFilter },
+        buildRagQueryPayload(question, advancedSearch),
         (events) => {
           if (queryAbortRef.current === controller) {
             setQueryProgressEvents(events);
@@ -89,28 +96,12 @@ export function KnowledgeBase() {
             <Send size={18} />
           </button>
         </div>
-        <div className="query-filter-row">
-          <select value={documentType} onChange={(event) => setDocumentType(event.target.value)} aria-label="资料类型过滤">
-            <option value="">全部资料类型</option>
-            <option value="pdf">PDF</option>
-            <option value="pptx">PPTX</option>
-            <option value="markdown">Markdown</option>
-            <option value="srt">字幕 SRT</option>
-            <option value="vtt">字幕 VTT</option>
-            <option value="mp4">视频 MP4</option>
-            <option value="webm">视频 WEBM</option>
-          </select>
-          <select value={mediaType} onChange={(event) => setMediaType(event.target.value)} aria-label="媒体类型过滤">
-            <option value="">全部媒体类型</option>
-            <option value="video">视频</option>
-          </select>
-          <select value={evidenceChannel} onChange={(event) => setEvidenceChannel(event.target.value)} aria-label="证据通道过滤">
-            <option value="">全部证据通道</option>
-            <option value="subtitle">字幕 / ASR</option>
-            <option value="frame_ocr">关键帧 OCR</option>
-            <option value="video_metadata">视频元数据</option>
-          </select>
-        </div>
+        <AdvancedSearchPanel
+          open={advancedOpen}
+          state={advancedSearch}
+          onToggle={() => setAdvancedOpen((value) => !value)}
+          onChange={setAdvancedSearch}
+        />
         {error && <p className="form-message danger">{error}</p>}
       </section>
 
@@ -125,7 +116,7 @@ export function KnowledgeBase() {
               <h3>回答</h3>
               <span className="status-pill">{result.evidences.length} 条证据</span>
             </div>
-            <MarkdownText className="answer-copy" content={result.answer} />
+            <MarkdownText className="answer-copy" content={result.answer} rewriteHref={buildPreviewHrefRewriter(result.evidences)} />
             <div className="query-tags">
               {result.expandedQueries.map((query) => <span key={query}>{query}</span>)}
             </div>
@@ -179,6 +170,75 @@ export function KnowledgeBase() {
   );
 }
 
+// 高级检索控件只生成结构化 metadataFilter，不展示用户权限字段。
+function AdvancedSearchPanel({
+  open,
+  state,
+  onToggle,
+  onChange
+}: {
+  open: boolean;
+  state: RagAdvancedSearchState;
+  onToggle: () => void;
+  onChange: (state: RagAdvancedSearchState) => void;
+}) {
+  const update = (patch: Partial<RagAdvancedSearchState>) => onChange({ ...state, ...patch });
+  return (
+    <div className="advanced-search-panel">
+      <button
+        type="button"
+        className={`advanced-search-toggle ${open ? 'is-open' : ''}`}
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <span><SlidersHorizontal size={16} />高级检索</span>
+        <ChevronDown size={16} />
+      </button>
+      <p className="advanced-search-summary">{formatRagFilterSummary(state)}</p>
+      {open ? (
+        <div className="advanced-search-grid">
+          <label>
+            <span>资料类型</span>
+            <select value={state.documentType} onChange={(event) => update({ documentType: event.target.value })}>
+              {DOCUMENT_TYPE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>来源</span>
+            <select value={state.source} onChange={(event) => update({ source: event.target.value })}>
+              {SOURCE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>证据通道</span>
+            <select value={state.evidenceChannel} onChange={(event) => update({ evidenceChannel: event.target.value })}>
+              {EVIDENCE_CHANNEL_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>块类型</span>
+            <select value={state.blockType} onChange={(event) => update({ blockType: event.target.value })}>
+              {BLOCK_TYPE_OPTIONS.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>章节关键词</span>
+            <input value={state.sectionKeyword} onChange={(event) => update({ sectionKeyword: event.target.value })} placeholder="例如 RAG-Fusion" />
+          </label>
+          <label>
+            <span>topK</span>
+            <input type="number" min={1} max={20} value={state.topK} onChange={(event) => update({ topK: clampNumber(Number(event.target.value), 1, 20) })} />
+          </label>
+          <label>
+            <span>候选倍率</span>
+            <input type="number" min={2} max={10} value={state.candidateMultiplier} onChange={(event) => update({ candidateMultiplier: clampNumber(Number(event.target.value), 2, 10) })} />
+          </label>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // 根据页码、幻灯片、表格区域或章节名生成证据位置。
 function formatEvidenceLocation(item: RagQueryResult['evidences'][number]) {
   if (item.startTime) return item.endTime ? `${item.startTime} - ${item.endTime}` : item.startTime;
@@ -202,26 +262,11 @@ function cleanEvidenceLocation(value?: string | null) {
 
 // 使用 evidence 来源文件作为章节跳转目标，避免跳到当前 React 根页面的无效 hash。
 function buildEvidenceLocationLink(item: RagQueryResult['evidences'][number]) {
-  const source = normalizeHttpSource(item.sourcePath || item.source);
+  const previewLink = buildMaterialPreviewLink(item);
+  if (previewLink) return previewLink;
+  const source = normalizeComparableSource(item.sourcePath || item.source);
   if (!source) return '';
   const anchor = extractEvidenceAnchor(item.sectionTitle || item.sectionName);
   if (!anchor) return source;
   return `${source.split('#', 1)[0]}#${anchor}`;
-}
-
-// 只允许浏览器能直接打开的 http(s) 来源，oss:// 或本地路径继续只作来源追踪。
-function normalizeHttpSource(value?: string | null) {
-  const source = (value || '').trim();
-  if (!/^https?:\/\//i.test(source)) return '';
-  return source;
-}
-
-// 从 Markdown 目录链接或当前应用 hash 链接中提取原始章节锚点。
-function extractEvidenceAnchor(value?: string | null) {
-  const text = (value || '').trim();
-  const markdownLink = /\[[^\]]+]\(([^)]+)\)/.exec(text);
-  const href = markdownLink?.[1]?.trim().replace(/^<|>$/g, '') || '';
-  if (href.startsWith('#')) return href.slice(1);
-  const hashIndex = href.lastIndexOf('#');
-  return hashIndex >= 0 ? href.slice(hashIndex + 1) : '';
 }

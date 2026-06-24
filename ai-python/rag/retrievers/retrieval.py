@@ -13,12 +13,24 @@ from rag.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
+from rag.metadata_filters import (
+    MetadataFilterPlan,
+    build_metadata_filter_plan,
+    format_metadata_filter_plan,
+    matches_metadata_filter,
+)
 from rag.model_logging import log_model_call
 from rag.process_logger import logged_rag_method, process_event
 from rag.progress import RagProgressReporter
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
+from rag.retrievers.query_expansion import (
+    expand_queries,
+    expand_queries_with_diagnostics,
+    format_query_expansion_detail,
+    format_query_variants,
+)
 from rag.indexes.summary_index import SummaryIndex
 from rag.text_sanitizer import (
     clean_postgres_text,
@@ -258,19 +270,25 @@ class InMemoryRagStore:
         """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
         progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
-        expanded_queries = expand_queries(request.question)
+        query_expansion = expand_queries_with_diagnostics(request.question)
+        expanded_queries = query_expansion.queries
         progress_reporter.emit(
             "query.expand",
-            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体",
+            f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体，生成方式：{query_expansion.provider}",
             status="COMPLETED",
             current_step=1,
             total_steps=7,
             percent=14,
-            detail=format_query_variants(expanded_queries),
+            detail=format_query_expansion_detail(query_expansion),
         )
-        metadata_filter = request.metadataFilter or {}
+        filter_plan = build_metadata_filter_plan(request.metadataFilter)
         progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
-        filtered_chunks = self._filter_chunks(request.metadataFilter or {})
+        scoped_chunks = self._filter_chunks(filter_plan.system_filter)
+        filtered_chunks = [
+            chunk
+            for chunk in scoped_chunks
+            if matches_metadata_filter(chunk.metadata, MetadataFilterPlan(business_filter=filter_plan.business_filter))
+        ]
         progress_reporter.emit(
             "query.filter",
             f"元数据过滤完成：保留 {len(filtered_chunks)} 个候选切块",
@@ -278,15 +296,18 @@ class InMemoryRagStore:
             current_step=2,
             total_steps=7,
             percent=24,
-            detail=format_metadata_filter(metadata_filter),
+            detail=format_metadata_filter_plan(filter_plan, total_count=len(scoped_chunks), filtered_count=len(filtered_chunks)),
         )
         ranked_lists: list[list[tuple[str, float]]] = []
-        diagnostics: dict[str, int | list[str]] = {
+        diagnostics: dict[str, Any] = {
             "expandedQueries": expanded_queries,
+            **query_expansion.diagnostics(),
+            "totalCandidateChunkCount": len(scoped_chunks),
             "filteredChunkCount": len(filtered_chunks),
+            **filter_plan.diagnostics(),
         }
 
-        candidate_budget = max(request.topK * 4, 20)
+        candidate_budget = max(request.topK * request.candidateMultiplier, 20)
         for query_text in expanded_queries:
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
             bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=candidate_budget)
@@ -438,21 +459,10 @@ class InMemoryRagStore:
         if not metadata_filter:
             return list(self.chunks.values())
 
+        filter_plan = build_metadata_filter_plan(metadata_filter)
         result = []
         for chunk in self.chunks.values():
-            metadata = chunk.metadata
-            matched = True
-            for key, value in metadata_filter.items():
-                if value is None or value == "":
-                    continue
-                if isinstance(value, list):
-                    if metadata.get(key) not in value:
-                        matched = False
-                        break
-                elif metadata.get(key) != value:
-                    matched = False
-                    break
-            if matched:
+            if matches_metadata_filter(chunk.metadata, filter_plan):
                 result.append(chunk)
         return result
 
@@ -707,25 +717,6 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
-
-
-def expand_queries(question: str) -> list[str]:
-    base = question.strip()
-    variants = [
-        base,
-        f"{base} 关键证据",
-        f"{base} 学习资料 笔记",
-    ]
-    if any(term in base.lower() for term in ["jd", "岗位", "招聘", "能力"]):
-        variants.append(f"{base} 岗位要求 能力缺口")
-    if any(term in base.lower() for term in ["简历", "resume", "项目"]):
-        variants.append(f"{base} 简历证据 项目经历")
-    return list(dict.fromkeys(variants))
-
-
-def format_query_variants(queries: list[str]) -> str:
-    """格式化 Multi-Query 改写结果，供前端展示每个查询变体。"""
-    return "；".join(f"{index}. {query}" for index, query in enumerate(queries, start=1))
 
 
 def format_metadata_filter(metadata_filter: dict[str, Any]) -> str:
