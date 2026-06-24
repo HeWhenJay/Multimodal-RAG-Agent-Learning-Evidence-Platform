@@ -4,7 +4,7 @@
 
 ## 1. 背景输入
 
-本计划综合了 Codex 对话 `019ee61f-2662-7eb0-b046-ce7ebfe630ce` 与 OpenCode 会话 `ses_119a1169fffeJAkQ4qOeqkAikT`、`ses_119ac8a5cffeWi92d5VE6X8igI` 的结论，并以当前仓库代码和 README 中“第二阶段 Agent 规划（当前未实现）”为边界。
+本计划综合了 Codex 对话 `019ee61f-2662-7eb0-b046-ce7ebfe630ce` 与 OpenCode 会话 `ses_119a1169fffeJAkQ4qOeqkAikT`、`ses_119ac8a5cffeWi92d5VE6X8igI` 的结论；当前 README 已按代码实现更新为“第二阶段 Agent 能力现状与后续边界”，本文件保留阶段性设计背景和后续扩展清单。
 
 已确认的硬约束：
 
@@ -287,11 +287,11 @@ flowchart TD
 
 | 工具 | 说明 |
 | --- | --- |
-| `material_reindex_request` | 重建索引、高精度补跑、长视频重处理 |
+| `material_reindex_request` | 后续接入重建索引、高精度补跑、长视频重处理；当前继续走现有 RAG 接口 |
 | `resume_revision_save` | 保存简历改写版本或模板填充结果 |
 | `jd_learning_plan_save` | 保存学习路线或计划 |
 | `agent_task_cancel_request` | 取消本人 Agent 任务 |
-| `operation_undo_request` | 撤销窗口内回滚已执行操作 |
+| `operation_undo_request` | 当前不作为 Python Tool Gateway 工具；前端通过 Java 撤销 API 回滚已执行操作 |
 
 ## 8. LangGraph 设计
 
@@ -452,9 +452,9 @@ frontend-react/src/pages/agent/AgentWorkspace.tsx
 目标：完成完整 Human-in-the-Loop 写操作。
 
 - 实现 `human_crud_review`。
-- 实现 `material_reindex_request`。
+- `material_reindex_request` 保留为后续资料重建链路扩展，当前不作为已暴露工具。
 - 实现 `resume_revision_save`、`jd_learning_plan_save`。
-- 实现 `agent_task_cancel_request`、`operation_undo_request`。
+- 实现 `agent_task_cancel_request`，撤销窗口通过 Java `POST /api/agent/operations/{operationId}/undo` 暴露给前端。
 - 实现 before/after snapshot 和撤销窗口状态机。
 - 实现 `agent_operation_snapshot` 写入、`idempotency_key` 唯一约束、查询时 `UNDO_EXPIRED` 流转和同用户撤销校验。
 - 前端展示 CRUD 审批、成本提示和撤销倒计时。

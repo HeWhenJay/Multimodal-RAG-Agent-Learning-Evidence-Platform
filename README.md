@@ -222,61 +222,53 @@ flowchart TD
     FE --> UI["前端展示<br/>资料状态、证据卡片、视频播放定位、JD 匹配矩阵、学习计划、Agent 执行轨迹、记忆列表和模板预览"]
 ```
 
-### 第二阶段 Agent 规划（阶段 7 Agent 记忆最小闭环已实现）
+### 第二阶段 Agent 能力现状与后续边界（阶段 0-7 已实现）
 
-本节是后续 Agent 阶段的业务规划。阶段 0 已新增 [Agent 接口契约](docs/api/agent.md) 和 `agent_*` 表结构；阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、严格内部 token 校验和 `RagService.queryNonPersistent()`；阶段 2 已实现 Python LangGraph 纯只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 最小页面；阶段 3 已实现规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批；阶段 4 初版已实现 Agent 自身范围内的 `resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 变更网关、CRUD 审批、before/after snapshot、幂等键、撤销窗口和前端撤销入口；阶段 5 已实现 `web_search_probe` 联网参考工具，用于补充公司背景、技能趋势和外部学习资源，外部结果不写入 RAG evidence 库；阶段 6 已实现确定性 `resume_template_fill` DOCX 占位符填充核心，并补齐简历模板上传、字段绑定、图片预览、区域标注、补丁草稿和导出链路；阶段 7 已实现 Agent 记忆最小闭环，包括当前用户记忆 CRUD、待审确认/拒绝、归档/删除、版本和审计、Python 记忆候选提炼、索引/检索、Agent 任务 `memoryContext` 预取和前端记忆管理。当前仍未实现 MCP、`web_page_fetcher`、自主长任务调度或多 Agent 协作，也未把资料重建索引、普通上传、分片上传或确定性 RAG 入库纳入 Agent 工具。未来 Agent 编排层必须继续遵守现有边界：React 只调用 Java；Java 负责登录用户、权限、业务状态、资料记录、统一响应和日志；Python 仍作为 RAG 服务，负责解析、索引、检索、重排、回答和 evidence 引用。Agent 不直接绕过 Java 调用 Python 内部接口。
+本节记录当前已经落地的 Agent 能力和仍保留的后续边界。阶段 0 已新增 [Agent 接口契约](docs/api/agent.md) 和 `agent_*` 表结构；阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、严格内部 token 校验和 `RagService.queryNonPersistent()`；阶段 2 已实现 Python LangGraph 纯只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 页面；阶段 3 已实现规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批；阶段 4 已实现 Agent 自身范围内的 `resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 变更网关、CRUD 审批、before/after snapshot、幂等键、撤销窗口和前端撤销入口；阶段 5 已实现 `web_search_probe` 联网参考工具，用于补充公司背景、技能趋势和外部学习资源，外部结果不写入 RAG evidence 库；阶段 6 已补齐简历模板上传、字段绑定、图片预览、区域标注、补丁草稿、校验和导出链路，旧 `resume_template_fill` 仅保留为兼容型确定性填充能力；阶段 7 已实现 Agent 记忆最小闭环，包括当前用户记忆 CRUD、待审确认/拒绝、归档/删除、版本和审计、Python 记忆候选提炼、索引/检索、Agent 任务 `memoryContext` 预取和前端记忆管理。
 
-Agent 架构建议采用 PAE（Plan-and-Execute）为主，ReAct 作为执行节点内部的工具观察循环。原因是资料入库、简历/JD 匹配和学习路线规划都属于多步骤、可审查、需要暂停确认的流程，先规划再执行更适合 Human-in-the-Loop；而在某个执行节点内部，如检索证据不足、资料仍在解析、需要补跑高精度解析时，可以使用 ReAct 式“行动 -> 观察 -> 修正”循环。
+当前仍未实现 MCP、`web_page_fetcher`、自主长任务调度、多 Agent 协作，也未把资料重建索引、普通上传、分片上传或确定性 RAG 入库纳入 Agent 工具。已落地的 Agent 编排继续遵守边界：React 只调用 Java；Java 负责登录用户、权限、业务状态、资料记录、统一响应和日志；Python 负责 Agent 图执行、RAG 计算、解析、索引、检索、重排、回答和 evidence 引用。Agent 不直接绕过 Java 调用 Python 内部接口、数据库或对象存储。
 
-普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、重试、补跑建议或人工审批的场景介入，例如资料状态读取、evidence 覆盖审计、重建索引申请、JD/简历匹配分析和草稿生成。工具注册面以 Java 业务能力为准；即使未来 Agent 执行器使用 LangGraph/Python 实现，也只能通过 Java 暴露的 Tool Gateway 触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。Agent 不直接调用 Python `/internal/*`，不直连数据库，不读取对象存储原始文件。
+已落地的规划类任务采用 PAE（Plan-and-Execute）为主，ReAct 式“行动 -> 观察 -> 修正”作为执行节点内部的工具观察循环思路。普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、联网参考、evidence 对齐、JD/简历匹配、草稿生成、记忆提炼或人工审批的场景介入。工具注册面以 Java 业务能力为准；当前 Agent 执行器已使用 LangGraph/Python 实现，但只能通过 Java Tool Gateway 触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。
 
 查询和只读工具不需要 Human-in-the-Loop，但必须由 Java 从登录 token 解析当前用户，并在 Tool Gateway 或业务服务层强制资源归属过滤：当前只能查询当前用户自己上传的数据，不能读取其他用户上传的资料。`explicitGrant(currentUserId, resourceId)` 是后续授权表的预留语义，未落表前非 owner 资源一律拒绝；Agent 不接收、也不自行构造跨用户资源过滤条件。Create/Update/Delete 以及任何业务状态变更必须进入 `human_crud_review` 做具体操作审批。计划确认只批准任务目标和工具路线，不等于批准任何写操作。自动写入 `log_event/log_error` 属于平台审计和故障观测副作用，不作为 Agent 可选工具，也不因工具审批而阻断；但日志必须由服务端补齐当前 `userId`、`traceId`，脱敏后写入，不能记录简历正文、资料正文或模型密钥。
 
 ```mermaid
 flowchart TD
-    A0["用户输入<br/>上传文件 / 粘贴资料 / 提交简历和岗位 JD"] --> A1["React 前端<br/>展示计划、读取范围、审批项和执行结果"]
-    A1 --> A2["Java Auth Resolver<br/>从 token 解析当前用户"]
-    A2 --> A3["Scope & Ownership Guard<br/>强制 scope=current_user_or_authorized<br/>当前仅 ownerUserId=currentUserId<br/>explicitGrant 预留"]
-    A3 --> A4["Agent Intent Router<br/>资料状态检查 / JD 适配 / 普通 RAG 问答"]
-    A4 -->|"普通 RAG 查询 / 资料状态 / evidence 读取 / 检索覆盖诊断"| TR["Tool Router<br/>只读查询快速通道，不进入 human_plan_review"]
-    A4 -->|"JD/简历适配 / 学习路线 / 可保存草稿 / 可能触发变更"| A5["Planner<br/>生成计划、候选工具和风险点"]
-    A5 --> H1{"human_plan_review<br/>确认任务目标和工具路线"}
-    H1 -->|"修改计划"| A5
-    H1 -->|"取消"| AX["结束任务<br/>记录取消状态"]
-    H1 -->|"确认"| TR2["Tool Router<br/>规划通道，按计划和 Observation 选择工具"]
+    A0["用户在 React Agent 工作台提交任务<br/>pure_read_query / planning_task / 记忆管理"] --> A1["Java AgentController / AgentMemoryController<br/>校验 Bearer Token，绑定当前 userId"]
+    A1 --> A2["AgentService / AgentMemoryService<br/>创建 agent_task、审批、工具调用、记忆状态"]
+    A2 --> ADB["业务表<br/>agent_task / agent_human_review / agent_tool_call / agent_operation<br/>agent_memory_item / agent_memory_version / agent_memory_audit"]
+    A2 -->|"PythonAgentClient + X-Agent-Internal-Token"| PY["Python Agent LangGraph<br/>read_only_graph / planning_graph"]
 
-    TR -->|"查询 / 只读，不需人工审批"| JRG["Java Read Tool Gateway<br/>只读网关，禁止直连 DB、Python /internal/*、对象存储<br/>当前强制 ownerUserId=currentUserId"]
-    TR2 -->|"计划内只读工具"| JRG
-    JRG --> RT["Read ToolNode<br/>只调用 Java 只读能力，返回结构化结果"]
-    RT --> RTOOLS["只读工具集合<br/>material_status_reader<br/>material_evidence_reader<br/>material_preview_reader<br/>rag_query_probe_non_persistent<br/>retrieval_coverage_probe<br/>evidence_quality_auditor<br/>resume_evidence_aligner<br/>gap_analyzer<br/>utc_time_provider<br/>agent_memory_retriever<br/>agent_memory_candidate_proposer"]
+    PY --> MEM["memory_prefetch<br/>通过 Java Tool Gateway 调 agent_memory_retriever"]
+    MEM --> TASK{"任务类型"}
+    TASK -->|"pure_read_query"| READ["只读图<br/>prepare_tool -> call_java_gateway -> finalize"]
+    TASK -->|"planning_task"| PLAN["规划图<br/>计划生成、evidence 对齐、gap_analyzer、草稿和记忆候选"]
+    PLAN --> H1{"human_plan_review / human_output_review<br/>前端确认计划或最终输出"}
+    H1 -->|"要求调整"| PLAN
+    H1 -->|"确认"| ROUTE["按计划执行工具或生成变更候选"]
+
+    READ --> JRG["Java Read Tool Gateway<br/>从 taskId 反查 owner，禁止 Python 传入用户范围"]
+    ROUTE -->|"计划内只读工具"| JRG
+    JRG --> RTOOLS["当前只读工具<br/>material_status_reader<br/>material_evidence_reader<br/>material_preview_reader<br/>rag_query_probe_non_persistent<br/>retrieval_coverage_probe<br/>evidence_quality_auditor<br/>resume_evidence_aligner<br/>gap_analyzer<br/>utc_time_provider<br/>web_search_probe<br/>agent_memory_retriever<br/>agent_memory_candidate_proposer"]
     RTOOLS --> OBS["Observation<br/>结构化工具结果"]
 
-    TR2 -->|"需要 CREATE / UPDATE / DELETE 或状态变更"| MP["Mutation Proposal Builder<br/>只生成变更候选，不执行"]
-    MP --> H2{"human_crud_review<br/>确认具体 CRUD / 状态变更"}
-    H2 -->|"取消"| TR2
-    H2 -->|"修改"| MP
-    H2 -->|"确认"| JTG["Java Tool Gateway<br/>二次校验 userId、权限、资源归属、幂等键"]
-    JTG --> SNAP1["Before Snapshot / Operation Prepare<br/>生成 beforeSnapshotRef、operationId、undoDeadline"]
-    SNAP1 --> MT["Mutation ToolNode<br/>只执行已审批变更工具"]
-    MT --> MTOOLS["变更工具集合<br/>material_reindex_request<br/>resume_revision_save<br/>jd_learning_plan_save<br/>agent_task_cancel_request<br/>operation_undo_request<br/>agent_memory_candidate_save"]
-    MTOOLS --> SNAP2["Operation Log / After Snapshot<br/>生成 afterSnapshotRef、auditEventId、执行摘要"]
-    SNAP2 --> UWM["Undo Window Manager<br/>APPLIED_UNDOABLE 到 UNDONE / UNDO_EXPIRED / FINALIZED"]
+    ROUTE -->|"需要保存草稿 / 取消任务 / 保存记忆"| MP["Mutation Proposal Builder<br/>只生成变更候选，不执行"]
+    MP --> H2{"human_crud_review<br/>确认具体变更"}
+    H2 -->|"取消或修改"| ROUTE
+    H2 -->|"确认"| JTG["Java Mutation Tool Gateway<br/>权限、幂等、before/after snapshot、撤销窗口"]
+    JTG --> MTOOLS["当前变更工具<br/>resume_revision_save<br/>jd_learning_plan_save<br/>agent_task_cancel_request<br/>agent_memory_candidate_save"]
+    MTOOLS --> UWM["撤销窗口<br/>前端调用 Java POST /api/agent/operations/:id/undo"]
     UWM --> OBS
 
-    OBS --> PG["Evidence Auditor / Policy Guard<br/>证据、隐私、引用、风险检查"]
-    PG -->|"纯只读任务证据不足且未超重试上限"| TR
-    PG -->|"规划任务证据不足且未超重试上限"| TR2
-    PG -->|"产生新的变更候选"| MP
-    PG -->|"纯只读可输出"| E2["最终结果<br/>知识摘要 / JD 匹配报告 / 简历修改建议 / 学习计划"]
-    PG -->|"规划草稿可输出"| H3{"human_output_review<br/>确认草稿和最终输出"}
-    H3 -->|"规划结果要求调整"| TR2
-    H3 -->|"确认"| E2
-    E2 --> AL["Audit Logging<br/>domain=agent 写 log_event/log_error<br/>审计副作用，不是 Agent 工具"]
+    OBS --> AL["Audit Logging<br/>Java domain=agent 写 log_event/log_error<br/>审计副作用，不是 Agent 工具"]
+    OBS --> CB["Java AgentInternalController<br/>接收 Python task/tool events"]
+    CB --> A2
+    A2 --> FEOUT["React 展示<br/>任务状态、审批卡片、工具观察、最终输出、撤销入口和记忆候选"]
 ```
 
-未来 LangGraph 按 `docs/api/agent.md` 契约分阶段落地：`StateGraph` 状态包含 `taskId/userId/taskType/input/plan/humanReview/toolResults/observations/evidences/mutationProposal/draft/finalAnswer/status`。`intent_router` 根据任务类型分支：`pure_read_query -> scope_ownership_guard -> tool_router -> java_read_tool_gateway -> read_tool_node -> observation -> evidence_auditor_policy_guard -> finalizer`；`planning_task -> planner -> human_plan_review -> tool_router -> java_read_tool_gateway/read_tool_node 或 mutation_proposal_builder`；`mutation_task -> mutation_proposal_builder -> human_crud_review -> java_tool_gateway -> mutation_tool_node -> observation`。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批，纯只读结果也不进入输出审批；`human_crud_review` 才批准具体 Create/Update/Delete 或状态变更。Human-in-the-Loop 依赖 checkpoint 和同一个 `thread_id` 恢复，审批点至少覆盖计划确认、重建索引确认、高精度补跑确认、长视频高成本处理确认、简历改写保存确认、学习路线保存确认、撤销操作确认和规划类最终输出确认。
+当前 LangGraph 按 `docs/api/agent.md` 契约分阶段落地：`read_only_graph` 已包含 `memory_prefetch -> prepare_tool -> call_java_gateway -> finalize`，`planning_graph` 已覆盖计划审批、只读 evidence 对齐、联网参考、能力缺口草稿、输出审批和记忆候选提炼。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口当前通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
-工具节点设计同样只作为未来建议。固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤；`utc_time_provider` 为纯系统工具，不访问用户数据。当前网关只允许服务端计算 `ownerUserId == currentUserId`，`explicitGrant` 是预留能力，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；如果未来要保存查询历史，则必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
+固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤；`utc_time_provider` 为纯系统工具，不访问用户数据。当前网关只允许服务端计算 `ownerUserId == currentUserId`，`explicitGrant` 是预留能力，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；如果未来要保存查询历史，则必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
 
 | 工具名 | 类型 | 何时调用 | 是否需要 HITL | Java 边界与权限约束 | 持久化副作用 |
 | --- | --- | --- | --- | --- | --- |
@@ -289,16 +281,15 @@ flowchart TD
 | `resume_evidence_aligner` | 只读生成 | JD/简历适配时对齐 supported / weak / missing 证据 | 否 | 只走 `java_read_tool_gateway`，只读取当前用户简历、资料和授权 JD/资料 | 无，产出草稿 Observation |
 | `gap_analyzer` | 只读生成 | 根据 evidence 缺口生成能力差距和学习建议时 | 否 | 只走 `java_read_tool_gateway`，只处理已授权 evidence 和 JD 要求 | 无，产出草稿 Observation |
 | `utc_time_provider` | 只读 | Agent 需要获取当前 UTC 时间以判断技能、资料、证书时效性时 | 否 | 纯系统时间读取，不涉及用户数据 | 无 |
+| `web_search_probe` | 只读 | 需要联网参考公司背景、技能趋势或外部学习资源时 | 否 | 只走 Java Tool Gateway，由 Java 调 Tavily，未配置密钥时返回可重试错误 | 无，外部结果不写入 RAG evidence |
 | `agent_memory_retriever` | 只读 | Agent 任务启动或执行前需要读取当前用户可注入记忆时 | 否 | 只走 Java Tool Gateway，Java 负责用户归属和 ACTIVE 状态二次过滤 | 无，只返回 `memoryContext` |
 | `agent_memory_candidate_proposer` | 只读生成 | 任务完成后需要提炼待确认记忆候选时 | 否 | Python 只做候选和冲突判断，Java 保存前做用户归属、去重和脱敏审计 | 无，候选默认不激活 |
-| `material_reindex_request` | 变更 | 用户确认重建索引、高精度补跑或长视频高成本处理后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验资源归属、幂等键和成本提示 | 生成操作记录、任务状态和索引引用 |
 | `resume_revision_save` | 变更 | 用户确认保存简历改写版本后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验当前用户简历归属 | 保存草稿/版本，可撤销 |
 | `jd_learning_plan_save` | 变更 | 用户确认保存学习路线或计划后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验当前用户计划归属 | 保存计划，可撤销 |
 | `agent_task_cancel_request` | 变更 | 用户显式取消 Agent 任务或审批取消时 | 是，`human_crud_review` | 只走 Java Tool Gateway，只能取消本人任务 | 更新任务状态 |
-| `operation_undo_request` | 变更 | 用户在撤销窗口内确认撤销时 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验 operation 属于当前用户且未过期 | 写撤销状态和恢复记录 |
 | `agent_memory_candidate_save` | 变更 | 用户确认保存记忆候选或显式记住一条偏好时 | 是，`human_crud_review` | 只走 Java Tool Gateway，保存为当前用户记忆并触发 Python 索引 | 写 `agent_memory_item`、版本/审计和索引 |
 
-变更工具候选包括 `material_reindex_request`、`resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request`、`operation_undo_request` 和 `agent_memory_candidate_save`。这些工具全部必须经过 `human_crud_review`、Java Tool Gateway 归属校验、幂等键校验、操作日志和撤销窗口；`agent_task_cancel_request` 与 `operation_undo_request` 本身也是状态变更，只有用户显式触发或确认后才能执行。`jd_skill_extractor` 与 `resume_parser` 先作为 JD/简历分析服务内部步骤，不作为普通 Tool，除非未来确实需要 Planner 选择、重试或跳过。
+当前已暴露的变更工具包括 `resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 和 `agent_memory_candidate_save`。这些工具全部必须经过 `human_crud_review`、Java Tool Gateway 归属校验、幂等键校验、操作日志和撤销窗口；撤销操作由前端显式调用 Java `POST /api/agent/operations/:id/undo`，不是 Python Agent 可自行选择的工具。`material_reindex_request` 仍是后续资料重建链路规划，当前普通上传、分片上传、重建索引和确定性 RAG 入库继续走现有 RAG 接口。`jd_skill_extractor` 与 `resume_parser` 先作为 JD/简历分析服务内部步骤，不作为普通 Tool，除非未来确实需要 Planner 选择、重试或跳过。
 
 变更操作的撤销窗口状态建议为：`PENDING_APPROVAL -> APPLIED_UNDOABLE -> UNDONE / UNDO_EXPIRED / FINALIZED / FAILED`。mutation 执行前必须生成 `beforeSnapshotRef`，执行后生成 `afterSnapshotRef/auditEventId/undoDeadline`。撤销只能恢复业务记录、草稿状态、计划记录或旧索引引用；模型调用成本、已消耗的长视频处理资源不可撤销，只能在审批时明确 `costLevel` 和不可逆部分。
 
