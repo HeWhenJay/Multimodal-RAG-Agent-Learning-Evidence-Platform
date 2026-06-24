@@ -1,5 +1,6 @@
 ﻿from rag.retrievers.retrieval import cached_embedding, embed_text, embedding_provider_name
 from rag.retrievers.retrieval import InMemoryRagStore
+from rag.retrievers.answer_guard import evaluate_answer_guard
 from rag.progress import RagProgressReporter
 from rag.retrievers.evidence_diversity import dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
@@ -9,6 +10,29 @@ from rag.indexes.pgvector_store import build_filter_clause, vector_literal
 from rag.rerankers.reranking import local_rerank
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from app.schemas.rag import DocumentBlock, Evidence, IndexTextRequest, QueryRequest
+
+
+def make_evidence(
+    evidence_id: str,
+    snippet: str,
+    *,
+    score: float = 0.5,
+    metadata: dict | None = None,
+) -> Evidence:
+    """构造 answer guard 单测所需的最小 evidence。"""
+    return Evidence(
+        evidenceId=evidence_id,
+        documentId="doc-guard",
+        documentTitle="Guard 测试资料",
+        title="Guard 测试资料",
+        snippet=snippet,
+        source="unit-test",
+        sectionName="测试章节",
+        documentType="markdown",
+        score=score,
+        retrievalSource="rerank",
+        metadata=metadata or {},
+    )
 
 
 def assert_no_postgres_nul(value):
@@ -42,12 +66,116 @@ def test_rag_store_indexes_and_queries_with_evidence():
 
     assert response.evidences
     assert response.evidences[0].documentId == "doc-spring"
+    assert response.answerStatus == "ANSWERED"
+    assert response.supportingEvidenceIds == [item.evidenceId for item in response.evidences]
     assert "自动配置" in response.answer
     assert response.evidences[0].retrievalSource == "rerank"
     assert response.diagnostics["answerProvider"] == "local"
     assert response.diagnostics["rerankProvider"] == "local"
     assert response.diagnostics["queryExpansionProvider"] == "local"
+    assert response.diagnostics["answerGuard"]["answerStatus"] == "ANSWERED"
     assert len(response.expandedQueries) >= 3
+
+
+def test_rag_store_refuses_when_no_evidence_without_calling_llm(monkeypatch):
+    def forbid_generate(*args, **kwargs):
+        raise AssertionError("拒答场景不应调用 LLM 回答生成")
+
+    monkeypatch.setattr("rag.retrievers.retrieval.generate_grounded_answer", forbid_generate)
+    store = InMemoryRagStore()
+
+    response = store.query(QueryRequest(question="当前知识库没有资料时应该怎么办？", topK=3))
+
+    assert response.answerStatus == "REFUSED"
+    assert response.refusalReason == "NO_EVIDENCE"
+    assert response.evidences == []
+    assert response.supportingEvidenceIds == []
+    assert response.refusalMessage == "知识库暂无证据"
+    assert response.diagnostics["answerGuard"]["answerStatus"] == "REFUSED"
+    assert response.diagnostics["answerGuard"]["refusalReason"] == "NO_EVIDENCE"
+
+
+def test_rag_store_refuses_when_filtered_out_without_calling_llm(monkeypatch):
+    def forbid_generate(*args, **kwargs):
+        raise AssertionError("拒答场景不应调用 LLM 回答生成")
+
+    monkeypatch.setattr("rag.retrievers.retrieval.generate_grounded_answer", forbid_generate)
+    store = InMemoryRagStore()
+    store.index_text(
+        IndexTextRequest(
+            documentId="doc-filter",
+            title="过滤测试笔记",
+            documentType="markdown",
+            source="unit-test",
+            userId="unit-user",
+            content="## 过滤测试\n这里只是用来验证 metadataFilter 过滤结果。",
+        )
+    )
+
+    response = store.query(
+        QueryRequest(
+            question="这个问题会命中现有资料吗？",
+            topK=3,
+            metadataFilter={"documentType": "not-exists"},
+        )
+    )
+
+    assert response.answerStatus == "REFUSED"
+    assert response.refusalReason == "FILTERED_OUT"
+    assert response.evidences == []
+    assert response.supportingEvidenceIds == []
+    assert response.diagnostics["answerGuard"]["refusalReason"] == "FILTERED_OUT"
+
+
+def test_answer_guard_refuses_low_confidence_candidates():
+    decision = evaluate_answer_guard(
+        question="酸面包二次发酵温湿度曲线",
+        expanded_queries=["酸面包二次发酵温湿度曲线"],
+        evidences=[
+            make_evidence(
+                "doc-guard-chunk-1",
+                "RAG-Fusion 使用 Multi-Query 和 RRF 融合多路召回结果，用于提升检索覆盖。",
+                score=0.09,
+            )
+        ],
+        diagnostics={"totalCandidateChunkCount": 3, "filteredChunkCount": 3, "rerankProvider": "local"},
+    )
+
+    assert decision.answerStatus == "REFUSED"
+    assert decision.refusalReason == "LOW_CONFIDENCE"
+    assert decision.supportingEvidenceIds == []
+
+
+def test_answer_guard_refuses_weak_snippet_candidate():
+    decision = evaluate_answer_guard(
+        question="RAGAS 的四个指标怎么计算？",
+        expanded_queries=["RAGAS 的四个指标怎么计算？"],
+        evidences=[make_evidence("doc-guard-chunk-2", "目录", score=0.8)],
+        diagnostics={"totalCandidateChunkCount": 3, "filteredChunkCount": 3, "rerankProvider": "dashscope"},
+    )
+
+    assert decision.answerStatus == "REFUSED"
+    assert decision.refusalReason == "WEAK_SNIPPET"
+
+
+def test_answer_guard_refuses_only_summary_child_candidates():
+    decision = evaluate_answer_guard(
+        question="Transformer 自注意力细节是什么？",
+        expanded_queries=["Transformer 自注意力细节是什么？"],
+        evidences=[
+            make_evidence(
+                "doc-guard-summary-0001",
+                "父段摘要：这里概括了 Transformer 和自注意力机制，但没有原始推导细节。",
+                score=0.8,
+                metadata={"childKind": "summary", "retrievalLayer": "child"},
+            )
+        ],
+        diagnostics={"totalCandidateChunkCount": 3, "filteredChunkCount": 3, "rerankProvider": "dashscope"},
+    )
+
+    assert decision.answerStatus == "REFUSED"
+    assert decision.refusalReason == "ONLY_DIAGNOSTIC_CANDIDATES"
+    assert decision.candidateEvidenceSummaries[0]["diagnosticOnly"] is True
 
 
 def test_query_progress_reporter_streams_multi_query_details():

@@ -121,6 +121,12 @@ export interface RagQueryPayload {
 
 export interface RagQueryResult {
   answer: string;
+  answerStatus?: 'ANSWERED' | 'REFUSED' | string;
+  refusalReason?: string | null;
+  refusalPolicy?: string | null;
+  confidence?: number | null;
+  supportingEvidenceIds?: string[];
+  refusalMessage?: string | null;
   expandedQueries: string[];
   evidences: RagEvidence[];
   diagnostics?: Record<string, unknown>;
@@ -143,6 +149,12 @@ export interface RagQueryHistory {
   taskId?: string | null;
   question: string;
   answer?: string | null;
+  answerStatus?: 'ANSWERED' | 'REFUSED' | string;
+  refusalReason?: string | null;
+  refusalPolicy?: string | null;
+  confidence?: number | null;
+  supportingEvidenceIds?: string[];
+  refusalMessage?: string | null;
   status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'EXPIRED' | string;
   topK: number;
   evidenceCount: number;

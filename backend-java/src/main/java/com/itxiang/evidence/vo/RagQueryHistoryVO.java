@@ -15,6 +15,12 @@ public class RagQueryHistoryVO {
     private String taskId;
     private String question;
     private String answer;
+    private String answerStatus;
+    private String refusalReason;
+    private String refusalPolicy;
+    private Double confidence;
+    private List<String> supportingEvidenceIds;
+    private String refusalMessage;
     private String status;
     private Integer topK;
     private Integer evidenceCount;

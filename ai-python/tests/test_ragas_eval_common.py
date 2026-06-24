@@ -40,7 +40,7 @@ def test_load_eval_cases_and_documents():
     cases = load_jsonl(Path("docs/testing/ragas-small-eval-cases.jsonl"))
     documents = load_json(Path("docs/testing/ragas-small-eval-documents.json"))
 
-    assert len(cases) == 12
+    assert len(cases) == 15
     assert len(documents) == 10
     assert cases[0]["expected_document_ids"] == ["llm-ragas-d01"]
     assert documents[0]["documentId"] == "llm-ragas-d01"
@@ -186,6 +186,28 @@ def test_boundary_case_blocks_metadata_leakage():
 
     assert result["passed"]
     assert result["evidence_count"] == 0
+
+
+def test_boundary_case_prefers_structured_refusal_reason():
+    """确认新响应优先使用 answerStatus/refusalReason 判定边界样本。"""
+    case = {"case_id": "B03", "expected_document_ids": [], "expected_refusal_reasons": ["LOW_CONFIDENCE"]}
+    response = {
+        "answerStatus": "REFUSED",
+        "refusalReason": "LOW_CONFIDENCE",
+        "answer": "当前知识库没有检索到足够相关的证据。",
+        "evidences": [],
+        "diagnostics": {
+            "answerGuard": {
+                "candidateEvidenceSummaries": [{"evidenceId": "weak-1"}]
+            }
+        },
+    }
+
+    result = evaluate_boundary_case(case, response)
+
+    assert result["passed"]
+    assert result["answer_status"] == "REFUSED"
+    assert result["refusal_reason"] == "LOW_CONFIDENCE"
 
 
 def test_boundary_case_treats_low_score_as_insufficient_evidence():

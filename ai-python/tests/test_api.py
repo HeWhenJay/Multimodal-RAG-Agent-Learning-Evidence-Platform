@@ -1,4 +1,5 @@
 import os
+import time
 
 from fastapi.testclient import TestClient
 
@@ -31,6 +32,8 @@ def test_index_and_query_api():
 
     assert query_response.status_code == 200
     data = query_response.json()
+    assert data["answerStatus"] == "ANSWERED"
+    assert data["supportingEvidenceIds"]
     assert data["evidences"]
     assert "RAG 项目笔记" in data["evidences"][0]["title"]
 
@@ -99,6 +102,7 @@ def test_subtitle_index_and_query_returns_video_time_range():
 
     assert query_response.status_code == 200
     query_data = query_response.json()
+    assert query_data["answerStatus"] == "ANSWERED"
     assert "某课程视频 01:23:10-01:25:42" in query_data["answer"]
     assert "从这里播放" in query_data["answer"]
     evidence = query_data["evidences"][0]
@@ -108,3 +112,37 @@ def test_subtitle_index_and_query_returns_video_time_range():
     assert evidence["playbackUrl"].startswith("/videos?")
     assert "documentId=doc-video-api" in evidence["playbackUrl"]
     assert "startTime=01%3A23%3A10" in evidence["playbackUrl"]
+
+
+def test_query_task_refuses_without_calling_llm(monkeypatch):
+    def forbid_generate(*args, **kwargs):
+        raise AssertionError("拒答任务不应调用 LLM 回答生成")
+
+    monkeypatch.setattr("rag.retrievers.retrieval.generate_grounded_answer", forbid_generate)
+    client = TestClient(app)
+    start_response = client.post(
+        "/internal/rag/query/tasks",
+        json={
+            "question": "完全没有资料的用户问 RAG guard 应该如何拒答？",
+            "topK": 3,
+            "metadataFilter": {"userId": "task-refused-user"},
+        },
+    )
+    assert start_response.status_code == 200
+    task_id = start_response.json()["taskId"]
+
+    task_data = start_response.json()
+    for _ in range(30):
+        if task_data["status"] != "RUNNING":
+            break
+        time.sleep(0.05)
+        task_data = client.get(f"/internal/rag/query/tasks/{task_id}").json()
+
+    assert task_data["status"] == "COMPLETED"
+    assert task_data["result"]["answerStatus"] == "REFUSED"
+    assert task_data["result"]["refusalReason"] == "NO_EVIDENCE"
+    assert task_data["result"]["evidences"] == []
+    assert task_data["result"]["supportingEvidenceIds"] == []
+    stages = [event["stageCode"] for event in task_data["result"]["progressEvents"]]
+    assert "query.guard" in stages
+    assert stages[-1] == "query.answer"

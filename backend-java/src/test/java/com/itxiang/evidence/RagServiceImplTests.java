@@ -1,7 +1,9 @@
 package com.itxiang.evidence;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.itxiang.evidence.client.PythonRagClient;
+import com.itxiang.evidence.config.PythonRagProperties;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
@@ -59,6 +61,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -277,6 +280,145 @@ class RagServiceImplTests {
         assertThat(normalized.getMetadataFilter()).doesNotContainKeys("unknownKey", "emptyKey", "emptyList");
         assertThat(String.valueOf(normalized.getMetadataFilter().get("__ignoredMetadataFilterKeys")))
                 .contains("unknownKey", "emptyKey", "emptyList", "userId", "visibilityScope");
+    }
+
+    @Test
+    void queryRefusedWritesGuardFieldsToHistoryAndLogsBusinessSuccess() {
+        RagQueryDTO dto = new RagQueryDTO();
+        dto.setQuestion("酸面包二次发酵温湿度曲线");
+        dto.setTopK(3);
+        dto.setCandidateMultiplier(4);
+        when(pythonRagClient.query(any(RagQueryDTO.class))).thenReturn(RagQueryVO.builder()
+                .answer("当前知识库没有检索到足够相关的证据，无法基于个人资料回答该问题。")
+                .answerStatus("REFUSED")
+                .refusalReason("LOW_CONFIDENCE")
+                .refusalPolicy("STRICT_EVIDENCE_GUARD_V1")
+                .confidence(0.21)
+                .supportingEvidenceIds(List.of())
+                .refusalMessage("证据相关性不足")
+                .expandedQueries(List.of("酸面包二次发酵温湿度曲线"))
+                .evidences(List.of())
+                .diagnostics(Map.of("answerGuard", Map.of(
+                        "answerStatus", "REFUSED",
+                        "refusalReason", "LOW_CONFIDENCE",
+                        "confidence", 0.21
+                )))
+                .progressEvents(List.of())
+                .build());
+
+        RagQueryVO result = ragService.query(dto, "7");
+
+        assertThat(result.getAnswerStatus()).isEqualTo("REFUSED");
+        verify(ragQueryHistoryMapper).insert(argThat(history ->
+                Integer.valueOf(0).equals(history.getEvidenceCount())
+                        && history.getDiagnosticsJson().contains("\"answerStatus\":\"REFUSED\"")
+                        && history.getDiagnosticsJson().contains("\"refusalReason\":\"LOW_CONFIDENCE\"")
+        ));
+        verify(logService).recordRagEvent(
+                eq("rag_query"),
+                eq("retrieve"),
+                eq("rag_query_refused"),
+                eq("RAG 查询完成"),
+                argThat(context -> "REFUSED".equals(context.get("answerStatus"))
+                        && "LOW_CONFIDENCE".equals(context.get("refusalReason"))
+                        && Integer.valueOf(0).equals(context.get("supportingEvidenceCount")))
+        );
+    }
+
+    @Test
+    void pythonRagClientReadsGuardFieldsAndKeepsLegacyCompatibility() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        PythonRagClient client = new PythonRagClient(new PythonRagProperties(), mapper);
+        JsonNode refusedRoot = mapper.readTree("""
+                {
+                  "answer": "证据不足，已拒答",
+                  "answerStatus": "REFUSED",
+                  "refusalReason": "LOW_CONFIDENCE",
+                  "refusalPolicy": "STRICT_EVIDENCE_GUARD_V1",
+                  "confidence": 0.21,
+                  "supportingEvidenceIds": [],
+                  "refusalMessage": "证据相关性不足",
+                  "expandedQueries": ["酸面包"],
+                  "evidences": [],
+                  "diagnostics": {
+                    "answerGuard": {
+                      "answerStatus": "REFUSED",
+                      "refusalReason": "LOW_CONFIDENCE",
+                      "confidence": 0.21
+                    }
+                  },
+                  "progressEvents": []
+                }
+                """);
+        JsonNode legacyRoot = mapper.readTree("""
+                {
+                  "answer": "旧响应回答",
+                  "expandedQueries": [],
+                  "evidences": [
+                    {
+                      "evidenceId": "chunk-1",
+                      "documentId": "doc-1",
+                      "title": "旧资料",
+                      "snippet": "旧响应 evidence",
+                      "source": "unit-test",
+                      "sectionName": "全文",
+                      "documentType": "markdown",
+                      "score": 0.8
+                    }
+                  ],
+                  "diagnostics": {},
+                  "progressEvents": []
+                }
+                """);
+
+        RagQueryVO refused = (RagQueryVO) ReflectionTestUtils.invokeMethod(client, "readQueryResult", refusedRoot);
+        RagQueryVO legacy = (RagQueryVO) ReflectionTestUtils.invokeMethod(client, "readQueryResult", legacyRoot);
+
+        assertThat(refused.getAnswerStatus()).isEqualTo("REFUSED");
+        assertThat(refused.getRefusalReason()).isEqualTo("LOW_CONFIDENCE");
+        assertThat(refused.getConfidence()).isEqualTo(0.21);
+        assertThat(refused.getSupportingEvidenceIds()).isEmpty();
+        assertThat(legacy.getAnswerStatus()).isEqualTo("ANSWERED");
+        assertThat(legacy.getSupportingEvidenceIds()).containsExactly("chunk-1");
+    }
+
+    @Test
+    void listQueryHistoryBackfillsGuardFieldsFromDiagnosticsJson() {
+        RagQueryHistory history = new RagQueryHistory();
+        history.setId(12L);
+        history.setTaskId("task-refused");
+        history.setUserId("7");
+        history.setQuestion("酸面包问题");
+        history.setAnswer("证据不足，已拒答");
+        history.setStatus("COMPLETED");
+        history.setTopK(5);
+        history.setEvidenceCount(0);
+        history.setExpandedQueriesJson("[]");
+        history.setEvidencesJson("[]");
+        history.setDiagnosticsJson("""
+                {
+                  "answerGuard": {
+                    "answerStatus": "REFUSED",
+                    "refusalReason": "LOW_CONFIDENCE",
+                    "refusalPolicy": "STRICT_EVIDENCE_GUARD_V1",
+                    "confidence": 0.21,
+                    "supportingEvidenceIds": [],
+                    "refusalMessage": "证据相关性不足"
+                  }
+                }
+                """);
+        history.setProgressEventsJson("[]");
+        when(ragQueryHistoryMapper.findRecentByUserIdBetween(eq("7"), any(LocalDateTime.class), any(LocalDateTime.class), eq(5)))
+                .thenReturn(List.of(history));
+
+        var result = ragService.listQueryHistory("7", LocalDate.now().minusDays(1), LocalDate.now(), 5);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getAnswerStatus()).isEqualTo("REFUSED");
+        assertThat(result.get(0).getRefusalReason()).isEqualTo("LOW_CONFIDENCE");
+        assertThat(result.get(0).getConfidence()).isEqualTo(0.21);
+        assertThat(result.get(0).getRefusalMessage()).isEqualTo("证据相关性不足");
+        assertThat(result.get(0).getSupportingEvidenceIds()).isEmpty();
     }
 
     @Test

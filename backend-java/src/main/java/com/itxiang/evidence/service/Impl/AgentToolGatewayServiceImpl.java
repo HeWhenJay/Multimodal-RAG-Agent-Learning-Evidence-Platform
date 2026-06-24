@@ -79,7 +79,12 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
             "resultCount",
             "memoryId",
             "memoryCount",
-            "candidateCount"
+            "candidateCount",
+            "answerStatus",
+            "refusalReason",
+            "confidence",
+            "supportingEvidenceIds",
+            "evidenceIds"
     );
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
     };
@@ -543,10 +548,16 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
                 .collect(Collectors.groupingBy(e -> defaultText(e.getDocumentType(), "unknown"), LinkedHashMap::new, Collectors.counting()));
         Map<String, Long> byRetrievalSource = evidences.stream()
                 .collect(Collectors.groupingBy(e -> defaultText(e.getRetrievalSource(), "unknown"), LinkedHashMap::new, Collectors.counting()));
+        List<String> supportingEvidenceIds = result.getSupportingEvidenceIds() == null ? List.of() : result.getSupportingEvidenceIds();
         Map<String, Object> coverage = new LinkedHashMap<>();
         coverage.put("answer", result.getAnswer());
+        coverage.put("answerStatus", result.getAnswerStatus());
+        coverage.put("refusalReason", result.getRefusalReason());
+        coverage.put("confidence", result.getConfidence());
         coverage.put("expandedQueries", result.getExpandedQueries());
         coverage.put("evidenceCount", evidences.size());
+        coverage.put("supportingEvidenceIds", supportingEvidenceIds);
+        coverage.put("evidenceIds", supportingEvidenceIds);
         coverage.put("documentTypeDistribution", byDocumentType);
         coverage.put("retrievalSourceDistribution", byRetrievalSource);
         coverage.put("diagnostics", result.getDiagnostics());

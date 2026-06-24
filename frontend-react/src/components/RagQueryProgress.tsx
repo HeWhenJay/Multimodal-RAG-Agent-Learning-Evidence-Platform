@@ -13,6 +13,7 @@ const QUERY_STEPS = [
   { code: 'query.vector', label: '向量召回', fallback: '语义向量召回候选证据' },
   { code: 'query.fusion', label: 'RAG-Fusion', fallback: 'RRF 融合多路召回结果' },
   { code: 'query.rerank', label: '重排', fallback: '对候选 evidence 重新排序' },
+  { code: 'query.guard', label: '回答准入', fallback: '判断 evidence 是否足以支撑回答' },
   { code: 'query.answer', label: '回答生成', fallback: '生成带引用的 RAG 回复' }
 ];
 

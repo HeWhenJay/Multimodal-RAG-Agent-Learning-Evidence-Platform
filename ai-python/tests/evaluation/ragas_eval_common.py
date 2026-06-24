@@ -349,10 +349,17 @@ def evaluate_boundary_case(
     max_score = max((float(item.get("score") or 0) for item in evidences), default=0.0)
     expected_ids = list(case.get("expected_document_ids") or [])
     answer = str(response.get("answer") or "")
+    answer_status = normalized_answer_status(response)
+    refusal_reason = normalized_refusal_reason(response)
+    expected_refusal_reasons = {str(item) for item in case.get("expected_refusal_reasons") or []}
     no_effective_evidence = not evidences or max_score < boundary_score_threshold
     no_unexpected_document = not expected_ids and not retrieved_ids if case["case_id"] == "B02" else True
     refusal_text = has_refusal_intent(answer)
-    if case["case_id"] == "B02":
+    structured_refusal = answer_status == "REFUSED"
+    refusal_reason_ok = not expected_refusal_reasons or refusal_reason in expected_refusal_reasons
+    if structured_refusal:
+        passed = not evidences and no_unexpected_document and refusal_reason_ok
+    elif case["case_id"] == "B02":
         passed = not evidences and no_unexpected_document
     else:
         passed = no_effective_evidence or refusal_text
@@ -362,8 +369,26 @@ def evaluate_boundary_case(
         "evidence_count": len(evidences),
         "max_score": round(max_score, 6),
         "retrieved_document_ids": retrieved_ids,
-        "reason": "边界样本通过" if passed else "边界样本返回了有效证据或未拒答",
+        "answer_status": answer_status,
+        "refusal_reason": refusal_reason,
+        "reason": "边界样本通过" if passed else "边界样本返回了有效证据、拒答原因不匹配或未拒答",
     }
+
+
+def normalized_answer_status(response: dict[str, Any]) -> str:
+    """优先读取结构化 answerStatus，缺失时返回空字符串供旧响应兼容。"""
+    value = str(response.get("answerStatus") or "").strip().upper()
+    return value if value in {"ANSWERED", "REFUSED"} else ""
+
+
+def normalized_refusal_reason(response: dict[str, Any]) -> str:
+    """优先读取顶层 refusalReason，再兼容 diagnostics.answerGuard。"""
+    value = response.get("refusalReason")
+    if value:
+        return str(value)
+    diagnostics = response.get("diagnostics") if isinstance(response.get("diagnostics"), dict) else {}
+    guard = diagnostics.get("answerGuard") if isinstance(diagnostics.get("answerGuard"), dict) else {}
+    return str(guard.get("refusalReason") or "")
 
 
 def has_refusal_intent(answer: str) -> bool:

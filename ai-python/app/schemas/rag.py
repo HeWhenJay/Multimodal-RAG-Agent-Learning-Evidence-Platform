@@ -146,6 +146,12 @@ class EvidenceListResponse(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
+    answerStatus: Literal["ANSWERED", "REFUSED"] = "ANSWERED"
+    refusalReason: str | None = None
+    refusalPolicy: str = "STRICT_EVIDENCE_GUARD_V1"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    supportingEvidenceIds: list[str] = Field(default_factory=list)
+    refusalMessage: str | None = None
     expandedQueries: list[str]
     evidences: list[Evidence]
     diagnostics: dict[str, Any] = Field(default_factory=dict)

@@ -1002,8 +1002,8 @@ public class RagServiceImpl implements RagService {
             RagQueryVO result = pythonRagClient.query(scopedDto);
             saveSynchronousQueryHistory(scopedDto, scopedUserId, result, System.currentTimeMillis() - start);
             Map<String, Object> context = queryContext(scopedDto, result, System.currentTimeMillis() - start);
-            String action = result.getEvidences() == null || result.getEvidences().isEmpty()
-                    ? "rag_query_no_evidence"
+            String action = "REFUSED".equals(result.getAnswerStatus())
+                    ? "rag_query_refused"
                     : "rag_query_success";
             logService.recordRagEvent(
                     "rag_query",
@@ -1263,7 +1263,7 @@ public class RagServiceImpl implements RagService {
         history.setEvidenceCount(result.getEvidences() == null ? 0 : result.getEvidences().size());
         history.setExpandedQueriesJson(toJson(result.getExpandedQueries(), "[]"));
         history.setEvidencesJson(toJson(result.getEvidences(), "[]"));
-        history.setDiagnosticsJson(toJson(result.getDiagnostics(), "{}"));
+        history.setDiagnosticsJson(toJson(diagnosticsWithAnswerGuard(result), "{}"));
         history.setProgressEventsJson(toJson(result.getProgressEvents(), "[]"));
         history.setDurationMs(safeDuration(durationMs));
         ragQueryHistoryMapper.insert(history);
@@ -1309,7 +1309,7 @@ public class RagServiceImpl implements RagService {
         history.setEvidenceCount(result == null || result.getEvidences() == null ? existing.getEvidenceCount() : result.getEvidences().size());
         history.setExpandedQueriesJson(result == null ? existing.getExpandedQueriesJson() : toJson(result.getExpandedQueries(), "[]"));
         history.setEvidencesJson(result == null ? existing.getEvidencesJson() : toJson(result.getEvidences(), "[]"));
-        history.setDiagnosticsJson(result == null ? existing.getDiagnosticsJson() : toJson(result.getDiagnostics(), "{}"));
+        history.setDiagnosticsJson(result == null ? existing.getDiagnosticsJson() : toJson(diagnosticsWithAnswerGuard(result), "{}"));
         history.setProgressEventsJson(toJson(task.getProgressEvents(), "[]"));
         history.setErrorMessage(task.getErrorMessage());
         history.setDurationMs(calculateDurationMs(existing, task));
@@ -1320,23 +1320,83 @@ public class RagServiceImpl implements RagService {
      * 将历史实体转换为前端可直接回填的 VO。
      */
     private RagQueryHistoryVO convertQueryHistoryToVO(RagQueryHistory history) {
+        Map<String, Object> diagnostics = fromJson(history.getDiagnosticsJson(), new TypeReference<Map<String, Object>>() {}, Map.of());
+        Map<String, Object> answerGuard = answerGuardFromDiagnostics(diagnostics);
         return RagQueryHistoryVO.builder()
                 .id(history.getId())
                 .taskId(history.getTaskId())
                 .question(history.getQuestion())
                 .answer(history.getAnswer())
+                .answerStatus(queryAnswerStatus(answerGuard, history.getEvidenceCount()))
+                .refusalReason(stringValue(answerGuard.get("refusalReason")))
+                .refusalPolicy(defaultText(stringValue(answerGuard.get("refusalPolicy")), "STRICT_EVIDENCE_GUARD_V1"))
+                .confidence(numberValue(answerGuard.get("confidence"), 0.0))
+                .supportingEvidenceIds(readStringList(answerGuard.get("supportingEvidenceIds")))
+                .refusalMessage(stringValue(answerGuard.get("refusalMessage")))
                 .status(history.getStatus())
                 .topK(history.getTopK())
                 .evidenceCount(history.getEvidenceCount())
                 .expandedQueries(fromJson(history.getExpandedQueriesJson(), new TypeReference<List<String>>() {}, List.of()))
                 .evidences(fromJson(history.getEvidencesJson(), new TypeReference<List<RagEvidenceVO>>() {}, List.of()))
-                .diagnostics(fromJson(history.getDiagnosticsJson(), new TypeReference<Map<String, Object>>() {}, Map.of()))
+                .diagnostics(diagnostics)
                 .progressEvents(fromJson(history.getProgressEventsJson(), new TypeReference<List<RagProgressVO>>() {}, List.of()))
                 .errorMessage(history.getErrorMessage())
                 .durationMs(history.getDurationMs())
                 .createdAt(toLocalDateTime(history.getCreatedAt()))
                 .updatedAt(toLocalDateTime(history.getUpdatedAt()))
                 .build();
+    }
+
+    /**
+     * 将查询结果中的 guard 顶层字段同步写入 diagnostics.answerGuard，兼容旧 Python 响应。
+     */
+    private Map<String, Object> diagnosticsWithAnswerGuard(RagQueryVO result) {
+        Map<String, Object> diagnostics = new LinkedHashMap<>();
+        if (result != null && result.getDiagnostics() != null) {
+            diagnostics.putAll(result.getDiagnostics());
+        }
+        Map<String, Object> answerGuard = answerGuardFromDiagnostics(diagnostics);
+        String answerStatus = defaultText(
+                result == null ? null : result.getAnswerStatus(),
+                result == null || result.getEvidences() == null || result.getEvidences().isEmpty() ? "REFUSED" : "ANSWERED"
+        );
+        List<String> supportingEvidenceIds = result == null || result.getSupportingEvidenceIds() == null
+                ? List.of()
+                : result.getSupportingEvidenceIds();
+        if (supportingEvidenceIds.isEmpty() && "ANSWERED".equals(answerStatus) && result != null && result.getEvidences() != null) {
+            supportingEvidenceIds = result.getEvidences().stream().map(RagEvidenceVO::getEvidenceId).toList();
+        }
+        answerGuard.put("answerStatus", answerStatus);
+        answerGuard.put("refusalReason", result == null ? null : result.getRefusalReason());
+        answerGuard.put("refusalPolicy", defaultText(result == null ? null : result.getRefusalPolicy(), "STRICT_EVIDENCE_GUARD_V1"));
+        answerGuard.put("confidence", result == null || result.getConfidence() == null ? 0.0 : result.getConfidence());
+        answerGuard.put("supportingEvidenceIds", supportingEvidenceIds);
+        answerGuard.put("refusalMessage", result == null ? null : result.getRefusalMessage());
+        diagnostics.put("answerGuard", answerGuard);
+        return diagnostics;
+    }
+
+    /**
+     * 从 diagnostics 中读取 answerGuard，字段名统一转为 String。
+     */
+    private Map<String, Object> answerGuardFromDiagnostics(Map<String, Object> diagnostics) {
+        Object value = diagnostics == null ? null : diagnostics.get("answerGuard");
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (value instanceof Map<?, ?> map) {
+            map.forEach((key, item) -> result.put(String.valueOf(key), item));
+        }
+        return result;
+    }
+
+    /**
+     * 历史缺少 answerStatus 时按 evidenceCount 兼容旧数据。
+     */
+    private String queryAnswerStatus(Map<String, Object> answerGuard, Integer evidenceCount) {
+        String status = stringValue(answerGuard.get("answerStatus"));
+        if (status != null && !status.isBlank()) {
+            return status;
+        }
+        return evidenceCount == null || evidenceCount == 0 ? "REFUSED" : "ANSWERED";
     }
 
     /**
@@ -1913,6 +1973,33 @@ public class RagServiceImpl implements RagService {
         } catch (NumberFormatException e) {
             return fallback;
         }
+    }
+
+    /**
+     * 读取 Map 中的小数字段，失败时返回默认值。
+     */
+    private Double numberValue(Object value, Double fallback) {
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 读取 Map 中的字符串数组字段。
+     */
+    private List<String> readStringList(Object value) {
+        if (!(value instanceof List<?> items)) {
+            return List.of();
+        }
+        return items.stream().map(String::valueOf).toList();
     }
 
     /**
@@ -2757,6 +2844,10 @@ public class RagServiceImpl implements RagService {
         if (result != null) {
             context.put("expandedQueryCount", result.getExpandedQueries() == null ? 0 : result.getExpandedQueries().size());
             context.put("evidenceCount", result.getEvidences() == null ? 0 : result.getEvidences().size());
+            context.put("answerStatus", result.getAnswerStatus());
+            context.put("refusalReason", result.getRefusalReason());
+            context.put("confidence", result.getConfidence());
+            context.put("supportingEvidenceCount", result.getSupportingEvidenceIds() == null ? 0 : result.getSupportingEvidenceIds().size());
             context.put("diagnosticKeys", result.getDiagnostics() == null ? List.of() : result.getDiagnostics().keySet().stream().toList());
         }
         if (elapsedMs != null) {

@@ -219,8 +219,48 @@ public class PythonRagClient {
                 evidences.add(readEvidence(item));
             }
         }
+        JsonNode guardNode = root.path("diagnostics").path("answerGuard");
+        String answerStatus = text(root, "answerStatus");
+        if (answerStatus == null) {
+            answerStatus = text(guardNode, "answerStatus");
+        }
+        if (answerStatus == null) {
+            answerStatus = evidences.isEmpty() ? "REFUSED" : "ANSWERED";
+        }
+        String refusalReason = text(root, "refusalReason");
+        if (refusalReason == null) {
+            refusalReason = text(guardNode, "refusalReason");
+        }
+        String refusalPolicy = text(root, "refusalPolicy");
+        if (refusalPolicy == null) {
+            refusalPolicy = text(guardNode, "refusalPolicy");
+        }
+        if (refusalPolicy == null) {
+            refusalPolicy = "STRICT_EVIDENCE_GUARD_V1";
+        }
+        Double confidence = nullableDouble(root, "confidence");
+        if (confidence == null) {
+            confidence = nullableDouble(guardNode, "confidence");
+        }
+        List<String> supportingEvidenceIds = readTextArray(root.get("supportingEvidenceIds"));
+        if (supportingEvidenceIds.isEmpty()) {
+            supportingEvidenceIds = readTextArray(guardNode.get("supportingEvidenceIds"));
+        }
+        if (supportingEvidenceIds.isEmpty() && "ANSWERED".equals(answerStatus)) {
+            supportingEvidenceIds = evidences.stream().map(RagEvidenceVO::getEvidenceId).toList();
+        }
+        String refusalMessage = text(root, "refusalMessage");
+        if (refusalMessage == null && "REFUSED".equals(answerStatus)) {
+            refusalMessage = refusalReason == null ? "证据不足，已拒答" : "证据不足，已拒答：" + refusalReason;
+        }
         return RagQueryVO.builder()
                 .answer(text(root, "answer"))
+                .answerStatus(answerStatus)
+                .refusalReason(refusalReason)
+                .refusalPolicy(refusalPolicy)
+                .confidence(confidence == null ? 0.0 : confidence)
+                .supportingEvidenceIds(supportingEvidenceIds)
+                .refusalMessage(refusalMessage)
                 .expandedQueries(readTextArray(root.get("expandedQueries")))
                 .evidences(evidences)
                 .diagnostics(readObjectMap(root.get("diagnostics")))
@@ -589,6 +629,14 @@ public class PythonRagClient {
     private Integer nullableInt(JsonNode node, String fieldName) {
         JsonNode value = node == null ? null : node.get(fieldName);
         return value == null || value.isNull() ? null : value.asInt();
+    }
+
+    /**
+     * 读取 JSON 小数字段，空值返回 null。
+     */
+    private Double nullableDouble(JsonNode node, String fieldName) {
+        JsonNode value = node == null ? null : node.get(fieldName);
+        return value == null || value.isNull() ? null : value.asDouble();
     }
 
     /**

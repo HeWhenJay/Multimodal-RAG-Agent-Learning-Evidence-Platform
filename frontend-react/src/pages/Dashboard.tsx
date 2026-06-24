@@ -55,6 +55,9 @@ export function Dashboard() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
+  const [answerStatus, setAnswerStatus] = useState<string>('ANSWERED');
+  const [refusalMessage, setRefusalMessage] = useState('');
+  const [answerConfidence, setAnswerConfidence] = useState<number | null>(null);
   const [evidences, setEvidences] = useState<RagEvidence[]>([]);
   const [querying, setQuerying] = useState(false);
   const [advancedSearchOpen, setAdvancedSearchOpen] = useState(false);
@@ -211,6 +214,9 @@ export function Dashboard() {
   function applyQueryHistory(item: RagQueryHistory) {
     setQuestion(item.question);
     setAnswer(item.answer || item.errorMessage || '该次询问暂未生成回答。');
+    setAnswerStatus(item.answerStatus || (item.evidences?.length ? 'ANSWERED' : 'REFUSED'));
+    setRefusalMessage(item.refusalMessage || '');
+    setAnswerConfidence(item.confidence ?? null);
     setEvidences(item.evidences || []);
     setQueryProgressEvents(item.progressEvents || []);
     setError(item.status === 'COMPLETED' ? '' : (item.errorMessage || '该次询问尚未完成'));
@@ -226,6 +232,9 @@ export function Dashboard() {
     try {
       setError('');
       setAnswer('');
+      setAnswerStatus('ANSWERED');
+      setRefusalMessage('');
+      setAnswerConfidence(null);
       setEvidences([]);
       setQuerying(true);
       setQueryProgressEvents([]);
@@ -245,6 +254,9 @@ export function Dashboard() {
         return;
       }
       setAnswer(result.answer);
+      setAnswerStatus(result.answerStatus || (result.evidences.length > 0 ? 'ANSWERED' : 'REFUSED'));
+      setRefusalMessage(result.refusalMessage || '');
+      setAnswerConfidence(result.confidence ?? null);
       setEvidences(result.evidences);
       setQueryProgressEvents(result.progressEvents || []);
       void loadQueryHistory();
@@ -336,7 +348,11 @@ export function Dashboard() {
             <div className="answer-label">
               <Bot size={17} />
               RAG 回复
+              <span className={`status-pill ${answerStatus === 'REFUSED' ? 'failed' : 'indexed'}`}>
+                {formatAnswerStatusLabel(answerStatus, answerConfidence, evidences.length)}
+              </span>
             </div>
+            {answerStatus === 'REFUSED' && refusalMessage ? <p className="form-message danger">{refusalMessage}</p> : null}
             <MarkdownText
               content={answer || '提交问题后展示基于数据库证据检索生成的回答。'}
               rewriteHref={buildPreviewHrefRewriter(evidences)}
@@ -349,7 +365,7 @@ export function Dashboard() {
                     [{item.title} / {item.sectionTitle || item.sectionName}]
                   </span>
                 ))
-              ) : <span><FileText size={15} />暂无证据引用</span>}
+              ) : <span><FileText size={15} />{answerStatus === 'REFUSED' ? '证据不足，已拒答' : '暂无证据引用'}</span>}
             </div>
           </div>
           <div className="query-history-panel">
@@ -418,7 +434,7 @@ export function Dashboard() {
                     <strong>{item.question}</strong>
                     <small>{formatQueryHistoryMeta(item)}</small>
                   </span>
-                  <em className={item.status === 'COMPLETED' ? 'done' : 'pending'}>{formatQueryHistoryStatus(item.status)}</em>
+                  <em className={item.status === 'COMPLETED' ? 'done' : 'pending'}>{formatQueryHistoryStatus(item)}</em>
                 </button>
               ))}
               {!queryHistoryLoading && queryHistory.length === 0 ? <div className="empty-state compact">暂无近期询问记录</div> : null}
@@ -748,17 +764,29 @@ function formatDateTime(value: string) {
 function formatQueryHistoryMeta(item: RagQueryHistory) {
   const createdAt = item.createdAt ? formatDateTime(item.createdAt) : '时间未知';
   const evidenceText = `${item.evidenceCount || item.evidences?.length || 0} 条证据`;
+  const guardText = item.answerStatus === 'REFUSED'
+    ? (item.refusalMessage || item.refusalReason || '证据不足')
+    : '';
   const durationText = item.durationMs ? `耗时 ${formatDuration(item.durationMs)}` : '';
-  return [createdAt, evidenceText, durationText].filter(Boolean).join(' · ');
+  return [createdAt, evidenceText, guardText, durationText].filter(Boolean).join(' · ');
 }
 
 // 将查询历史状态转换为中文展示。
-function formatQueryHistoryStatus(status: string) {
+function formatQueryHistoryStatus(item: RagQueryHistory) {
+  const status = item.status;
+  if (status === 'COMPLETED' && item.answerStatus === 'REFUSED') return '已拒答';
   if (status === 'COMPLETED') return '已完成';
   if (status === 'FAILED') return '失败';
   if (status === 'EXPIRED') return '已过期';
   if (status === 'RUNNING') return '检索中';
   return status || '未知';
+}
+
+// 展示回答准入状态，兼容旧响应缺少 answerStatus 的情况。
+function formatAnswerStatusLabel(status: string, confidence: number | null, evidenceCount: number) {
+  const resolved = status || (evidenceCount > 0 ? 'ANSWERED' : 'REFUSED');
+  const prefix = resolved === 'REFUSED' ? '已拒答' : '已回答';
+  return confidence == null ? prefix : `${prefix} · 置信度 ${confidence.toFixed(2)}`;
 }
 
 // 格式化查询耗时。

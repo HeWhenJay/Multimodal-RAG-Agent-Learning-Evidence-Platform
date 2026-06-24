@@ -1,6 +1,6 @@
 # Ragas 小样本 RAG 效果评估方案
 
-更新日期：2026-06-20
+更新日期：2026-06-24
 
 ## 目标
 
@@ -25,7 +25,7 @@
 | D09 | `llm-ragas-d09` | `33_rag_rerank.md` | Rerank 作用、落地和验证 |
 | D10 | `llm-ragas-d10` | `34_rag_store.md` | RAG 存储架构、权限隔离、多级索引 |
 
-其中 10 条 `case_type=ragas` 主样本进入自动评分，2 条 `case_type=manual_boundary` 只做人审契约检查。
+其中 10 条 `case_type=ragas` 主样本进入自动评分，5 条 `case_type=manual_boundary` 只做人审契约检查。边界样本优先使用结构化 `answerStatus/refusalReason` 判定，文案拒答匹配仅作为旧响应兼容。
 
 ## 依赖版本
 
@@ -97,7 +97,14 @@ Ragas 测评数据必须写入同一个 PostgreSQL 数据库中带 `Ragas_Test` 
 | 文档级 top1/top3 命中 | 用 `expected_document_ids` 对比返回 evidence 的 `documentId` |
 | 关键点覆盖率 | 用 `expected_answer_points` 与回答文本做粗粒度包含检查 |
 | evidence 引用结构 | 检查回答是否保留可追踪 evidence 引用，且 evidence 有标题、章节、来源和分数 |
-| 边界样本契约 | 检查无关问题和不存在 `documentType` 过滤不应返回有效证据 |
+| 边界样本契约 | 检查无关问题、不存在 `documentType` 过滤、低相关误召回、弱 snippet 和 summary child 候选不应返回顶层有效证据 |
+
+边界样本判定规则：
+
+- 新响应优先读取 `answerStatus/refusalReason`。`answerStatus=REFUSED` 且 `evidences=[]` 视为通过，再核对 `refusalReason` 是否落在样本期望范围。
+- 旧响应缺少 `answerStatus` 时，继续按 evidence 数量、最高分和拒答文案做兼容判断。
+- `REFUSED` 时弱候选只能出现在 `diagnostics.answerGuard.candidateEvidenceSummaries`，不得出现在顶层 `evidences`。
+- `B02` 仍额外校验 metadataFilter 不泄漏其它 `documentType` 文档。
 
 真实 Ragas 模式不运行离线命中率、关键点覆盖率或边界样本门槛，只使用生产同款 RAG 输出的回答与上下文执行 4 个 LLM 指标：
 
@@ -256,7 +263,7 @@ PyCharm 的 Parameters 可直接使用：
 | --- | --- |
 | 主样本文档级 top3 命中 | `>= 9 / 10` |
 | 主样本引用结构合格 | `10 / 10` |
-| 边界样本 | `2 / 2` |
+| 边界样本 | `5 / 5` |
 | 主样本 evidence 为空 | `<= 2` |
 
 真实 Ragas 模式建议门槛：

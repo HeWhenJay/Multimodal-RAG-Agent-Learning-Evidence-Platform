@@ -426,10 +426,7 @@ def query(request: QueryRequest) -> QueryResponse:
                     context={"topK": request.topK, "candidateMultiplier": request.candidateMultiplier, "metadataFilter": request.metadataFilter},
                 )
                 raise HTTPException(status_code=400, detail="question is empty")
-            response = store.query(request)
-            if not response.evidences:
-                response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
-            return response
+            return store.query(request)
 
 
 @router.post("/query/tasks", response_model=QueryTaskResponse)
@@ -506,8 +503,6 @@ def run_query_task(task_id: str, request: QueryRequest) -> None:
                 )
                 progress = RagProgressReporter(document_id="query", user_id=user_id, persist=False, on_emit=on_emit)
                 response = store.query(request, progress_reporter=progress)
-                if not response.evidences:
-                    response.answer = "当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。"
                 with query_tasks_lock:
                     task = query_tasks.get(task_id)
                     if task is None:

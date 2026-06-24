@@ -114,8 +114,14 @@ export function KnowledgeBase() {
           <article className="panel">
             <div className="panel-title">
               <h3>回答</h3>
+              <span className={`status-pill ${result.answerStatus === 'REFUSED' ? 'failed' : 'indexed'}`}>
+                {formatAnswerStatus(result)}
+              </span>
               <span className="status-pill">{result.evidences.length} 条证据</span>
             </div>
+            {result.answerStatus === 'REFUSED' && (
+              <p className="form-message danger">{result.refusalMessage || '证据不足，已拒答'}</p>
+            )}
             <MarkdownText className="answer-copy" content={result.answer} rewriteHref={buildPreviewHrefRewriter(result.evidences)} />
             <div className="query-tags">
               {result.expandedQueries.map((query) => <span key={query}>{query}</span>)}
@@ -134,6 +140,7 @@ export function KnowledgeBase() {
               <h3><FileText size={20} />证据引用</h3>
             </div>
             <div className="evidence-list">
+              {result.evidences.length === 0 ? <div className="empty-state compact">暂无可支持本次回答的证据</div> : null}
               {result.evidences.map((item) => {
                 const videoEvidenceLink = buildVideoEvidenceLink(item);
                 const location = formatEvidenceLocation(item);
@@ -168,6 +175,17 @@ export function KnowledgeBase() {
       )}
     </div>
   );
+}
+
+// 格式化回答准入状态，兼容旧响应缺少 answerStatus 的情况。
+function formatAnswerStatus(result: RagQueryResult) {
+  if (result.answerStatus === 'REFUSED') {
+    return result.confidence == null ? '已拒答' : `已拒答 · 置信度 ${result.confidence.toFixed(2)}`;
+  }
+  if (result.answerStatus === 'ANSWERED') {
+    return result.confidence == null ? '已回答' : `已回答 · 置信度 ${result.confidence.toFixed(2)}`;
+  }
+  return result.evidences.length > 0 ? '已回答' : '证据不足';
 }
 
 // 高级检索控件只生成结构化 metadataFilter，不展示用户权限字段。

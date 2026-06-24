@@ -44,6 +44,7 @@ STAGE_LABELS = {
     "query.vector": "向量召回",
     "query.fusion": "RAG-Fusion",
     "query.rerank": "重排",
+    "query.guard": "回答准入",
     "query.answer": "生成回答",
 }
 

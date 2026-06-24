@@ -19,6 +19,7 @@ from rag.metadata_filters import (
 )
 from rag.process_logger import logged_rag_method, process_event
 from rag.rerankers.reranking import rerank_evidences
+from rag.retrievers.answer_guard import evaluate_answer_guard, refusal_short_message
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
 from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_parent_evidences
 from rag.retrievers.query_expansion import expand_queries_with_diagnostics, format_query_expansion_detail
@@ -423,7 +424,7 @@ class PgVectorRagStore:
     def query(self, request: QueryRequest, progress_reporter: RagProgressReporter | None = None) -> QueryResponse:
         """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
         progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
-        progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=7, percent=8)
+        progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=8, percent=8)
         filter_plan = build_metadata_filter_plan(request.metadataFilter)
         query_expansion = expand_queries_with_diagnostics(request.question)
         expanded_queries = query_expansion.queries
@@ -432,11 +433,11 @@ class PgVectorRagStore:
             f"Multi-Query 已生成 {len(expanded_queries)} 个查询变体，生成方式：{query_expansion.provider}",
             status="COMPLETED",
             current_step=1,
-            total_steps=7,
+            total_steps=8,
             percent=14,
             detail=format_query_expansion_detail(query_expansion),
         )
-        progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=7, percent=18)
+        progress_reporter.emit("query.filter", "正在按元数据过滤候选切块", current_step=2, total_steps=8, percent=18)
         scoped_chunks = self._load_filtered_chunks(filter_plan.system_filter)
         filtered_chunks = self._load_filtered_chunks(filter_plan.effective_filter())
         progress_reporter.emit(
@@ -444,7 +445,7 @@ class PgVectorRagStore:
             f"元数据过滤完成：保留 {len(filtered_chunks)} 个候选切块",
             status="COMPLETED",
             current_step=2,
-            total_steps=7,
+            total_steps=8,
             percent=24,
             detail=format_metadata_filter_plan(filter_plan, total_count=len(scoped_chunks), filtered_count=len(filtered_chunks)),
         )
@@ -461,7 +462,7 @@ class PgVectorRagStore:
         candidate_budget = max(request.topK * request.candidateMultiplier, 20)
         for query_text in expanded_queries:
             limit = candidate_budget
-            progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=7, percent=30)
+            progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=8, percent=30)
             bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=limit)
             ranked_lists.append(bm25_hits)
             progress_reporter.emit(
@@ -469,7 +470,7 @@ class PgVectorRagStore:
                 f"BM25 召回完成：{query_text}，命中 {len(bm25_hits)} 条",
                 status="COMPLETED",
                 current_step=3,
-                total_steps=7,
+                total_steps=8,
                 percent=36,
                 detail=format_ranked_hits(
                     bm25_hits,
@@ -478,7 +479,7 @@ class PgVectorRagStore:
                     else None,
                 ),
             )
-            progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=7, percent=45)
+            progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=8, percent=45)
             vector_hits = self._vector_search(query_text, filter_plan.effective_filter(), limit=limit)
             ranked_lists.append(vector_hits)
             progress_reporter.emit(
@@ -486,7 +487,7 @@ class PgVectorRagStore:
                 f"向量召回完成：{query_text}，命中 {len(vector_hits)} 条",
                 status="COMPLETED",
                 current_step=4,
-                total_steps=7,
+                total_steps=8,
                 percent=52,
                 detail=format_ranked_hits(
                     vector_hits,
@@ -496,7 +497,7 @@ class PgVectorRagStore:
                 ),
             )
 
-        progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=7, percent=62)
+        progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=8, percent=62)
         fused = reciprocal_rank_fusion(ranked_lists)
         diagnostics["candidateBudget"] = candidate_budget
         candidates = [
@@ -528,7 +529,7 @@ class PgVectorRagStore:
             f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
             status="COMPLETED",
             current_step=5,
-            total_steps=7,
+            total_steps=8,
             percent=70,
             detail=format_evidence_titles(candidate_evidences),
         )
@@ -537,7 +538,7 @@ class PgVectorRagStore:
             "query.rerank",
             f"目前在使用 {rerank_model} 模型完成候选 evidence 重排事件",
             current_step=6,
-            total_steps=7,
+            total_steps=8,
             percent=78,
             detail=f"目前在使用 {rerank_model} 模型完成候选 evidence 重排事件",
         )
@@ -550,34 +551,90 @@ class PgVectorRagStore:
             f"重排完成：输入 {len(candidate_evidences)} 条，保留 {len(diversified.evidences)} 条最终 evidence",
             status="COMPLETED",
             current_step=6,
-            total_steps=7,
+            total_steps=8,
             percent=84,
             detail=format_evidence_titles(diversified.evidences),
         )
+        guard = evaluate_answer_guard(
+            question=request.question,
+            expanded_queries=expanded_queries,
+            evidences=diversified.evidences,
+            diagnostics=diagnostics,
+        )
+        diagnostics["answerGuard"] = guard.diagnostics()
+        supporting_evidence_ids = set(guard.supportingEvidenceIds)
+        supporting_evidences = [
+            item
+            for item in diversified.evidences
+            if item.evidenceId in supporting_evidence_ids
+        ]
+        progress_reporter.emit(
+            "query.guard",
+            guard.message if guard.answerStatus == "ANSWERED" else f"回答准入拒答：{guard.refusalReason}，可回答分 {guard.confidence:.4f}",
+            status="COMPLETED",
+            current_step=7,
+            total_steps=8,
+            percent=88,
+            detail=(
+                f"answerStatus={guard.answerStatus}；refusalReason={guard.refusalReason}；"
+                f"confidence={guard.confidence:.4f}；supportingEvidenceCount={len(guard.supportingEvidenceIds)}；"
+                f"candidateCount={len(diversified.evidences)}；thresholds={guard.thresholds}"
+            ),
+        )
+        if guard.answerStatus == "REFUSED":
+            progress_reporter.emit(
+                "query.answer",
+                "证据不足，已跳过 LLM 回答生成",
+                status="COMPLETED",
+                current_step=8,
+                total_steps=8,
+                percent=100,
+                detail=f"refusalReason={guard.refusalReason}；未调用回答模型",
+            )
+            return QueryResponse(
+                answer=guard.message,
+                answerStatus=guard.answerStatus,
+                refusalReason=guard.refusalReason,
+                refusalPolicy=guard.refusalPolicy,
+                confidence=guard.confidence,
+                supportingEvidenceIds=[],
+                refusalMessage=refusal_short_message(guard.refusalReason),
+                expandedQueries=expanded_queries,
+                evidences=[],
+                diagnostics=diagnostics,
+                progressEvents=progress_reporter.events,
+            )
+
         answer_model = os.getenv("RAG_LLM_MODEL") or "qwen-plus"
         progress_reporter.emit(
             "query.answer",
             f"目前在使用 {answer_model} 模型完成基于 evidence 生成回答事件",
-            current_step=7,
-            total_steps=7,
-            percent=90,
+            current_step=8,
+            total_steps=8,
+            percent=92,
             detail=f"目前在使用 {answer_model} 模型完成基于 evidence 生成回答事件",
         )
-        generated = generate_grounded_answer(request.question, diversified.evidences)
+        generated = generate_grounded_answer(request.question, supporting_evidences)
         diagnostics.update(generated.diagnostics())
         progress_reporter.emit(
             "query.answer",
             "RAG 检索问答完成",
             status="COMPLETED",
-            current_step=7,
-            total_steps=7,
+            current_step=8,
+            total_steps=8,
             percent=100,
-            detail=f"回答模型：{generated.diagnostics().get('answerModel') or answer_model}；引用 evidence 数：{len(diversified.evidences)}",
+            detail=f"回答模型：{generated.diagnostics().get('answerModel') or answer_model}；引用 evidence 数：{len(supporting_evidences)}",
         )
         return QueryResponse(
             answer=generated.answer,
+            answerStatus=guard.answerStatus,
+            refusalReason=guard.refusalReason,
+            refusalPolicy=guard.refusalPolicy,
+            confidence=guard.confidence,
+            supportingEvidenceIds=guard.supportingEvidenceIds,
+            refusalMessage=None,
             expandedQueries=expanded_queries,
-            evidences=diversified.evidences,
+            evidences=supporting_evidences,
             diagnostics=diagnostics,
             progressEvents=progress_reporter.events,
         )
