@@ -2,9 +2,9 @@ import os
 
 from fastapi import APIRouter, Header, HTTPException
 
-from agent.java_gateway import JavaAgentGatewayClient
-from agent.planning_graph import resume_planning_agent, start_planning_agent
-from agent.read_only_graph import run_read_only_agent
+from agents.gateway.java_gateway import JavaAgentGatewayClient
+from agents.jd_learning_plan.planning_graph import resume_planning_agent, start_planning_agent
+from agents.read_only.read_only_graph import run_read_only_agent
 from app.schemas.agent import AgentTaskResumeRequest, AgentTaskStartRequest, AgentTaskStartResponse
 
 

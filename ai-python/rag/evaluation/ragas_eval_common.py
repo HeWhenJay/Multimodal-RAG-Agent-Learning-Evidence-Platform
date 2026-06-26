@@ -711,7 +711,7 @@ def write_manual_review(
     if rerun_command:
         lines.extend(["```powershell", rerun_command, "```"])
     else:
-        lines.append("- 如需真实评分，请配置 `RAGAS_EVAL_*` 环境变量后运行 `python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas`。")
+        lines.append("- 如需真实评分，请配置 `RAGAS_EVAL_*` 环境变量后运行 `python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas`。")
     lines.extend(
         [
             "",

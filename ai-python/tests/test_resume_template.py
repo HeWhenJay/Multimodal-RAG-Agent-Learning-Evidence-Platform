@@ -2,7 +2,7 @@ from pathlib import Path
 
 from docx import Document
 
-from agent.resume_template_fill import fill_resume_template
+from agents.resume_adapter.resume_template_fill import fill_resume_template
 
 
 def test_fill_resume_template_replaces_paragraph_and_table_placeholders(tmp_path: Path):

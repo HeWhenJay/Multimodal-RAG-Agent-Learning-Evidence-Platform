@@ -2,7 +2,7 @@ import os
 
 from fastapi import APIRouter, Header, HTTPException
 
-from agent.memory_service import AgentMemoryService
+from agents.memory.memory_service import AgentMemoryService
 from app.schemas.agent_memory import (
     MemoryConflictRequest,
     MemoryConflictResponse,

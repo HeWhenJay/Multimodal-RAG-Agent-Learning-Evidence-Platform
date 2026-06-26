@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from evaluation import run_ragas_small_eval
-from evaluation.ragas_eval_common import (
+from rag.evaluation import run_ragas_small_eval
+from rag.evaluation.ragas_eval_common import (
     RagasEvalSettings,
     EvaluationRunResult,
     build_ragas_input_row,
@@ -127,7 +127,7 @@ def test_configure_current_rag_environment_reuses_project_components(monkeypatch
     monkeypatch.setenv("RAG_LLM_MODEL", "qwen-custom")
     monkeypatch.setenv("RAG_RERANK_PROVIDER", "auto")
     monkeypatch.setenv("RAG_RERANK_MODEL", "rerank-custom")
-    monkeypatch.setattr("evaluation.ragas_eval_common.load_current_project_rag_config", lambda: None)
+    monkeypatch.setattr("rag.evaluation.ragas_eval_common.load_current_project_rag_config", lambda: None)
 
     configure_current_rag_environment()
 
@@ -147,7 +147,7 @@ def test_configure_current_rag_environment_rejects_non_pgvector_backend(monkeypa
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
     monkeypatch.setenv("RAG_DATABASE_URL", "postgresql://postgres:123456@127.0.0.1:5433/postgres")
     monkeypatch.setenv("RAG_STORE_BACKEND", "memory")
-    monkeypatch.setattr("evaluation.ragas_eval_common.load_current_project_rag_config", lambda: None)
+    monkeypatch.setattr("rag.evaluation.ragas_eval_common.load_current_project_rag_config", lambda: None)
 
     with pytest.raises(RuntimeError, match="RAG_STORE_BACKEND 需要为 pgvector"):
         configure_current_rag_environment()
@@ -437,7 +437,7 @@ def test_require_ragas_dependencies_reports_core_group(monkeypatch):
             raise ImportError(name)
         return original_import_module(name, package)
 
-    monkeypatch.setattr("evaluation.ragas_eval_common.importlib.import_module", fake_import_module)
+    monkeypatch.setattr("rag.evaluation.ragas_eval_common.importlib.import_module", fake_import_module)
 
     with pytest.raises(RuntimeError) as exc_info:
         require_ragas_core_dependencies()

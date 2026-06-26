@@ -31,7 +31,7 @@
 
 已验证目标版本为 `ragas==0.4.0` 与 `ragas==0.4.3`。Python 依赖清单中保留 `ragas>=0.4,<0.5`，其它 0.4 小版本按兼容层尽力支持。
 
-真实 Ragas 模式的指标创建集中在 `ai-python/tests/evaluation/ragas_eval_common.py` 的兼容层中。现代主路径使用 `ragas.evaluate` 或 `ragas.aevaluate`、`ragas.llms.llm_factory`、`ragas.embeddings.OpenAIEmbeddings` 和 `ragas.metrics`，指标类为 `LLMContextPrecisionWithReference`、`LLMContextRecall`、`Faithfulness`、`AnswerRelevancy`。现代路径主要依赖 `ragas/openai/datasets`。
+真实 Ragas 模式的指标创建集中在 `ai-python/rag/evaluation/ragas_eval_common.py` 的兼容层中。现代主路径使用 `ragas.evaluate` 或 `ragas.aevaluate`、`ragas.llms.llm_factory`、`ragas.embeddings.OpenAIEmbeddings` 和 `ragas.metrics`，指标类为 `LLMContextPrecisionWithReference`、`LLMContextRecall`、`Faithfulness`、`AnswerRelevancy`。现代路径主要依赖 `ragas/openai/datasets`。
 
 仅当现代路径无法构造时，才回退到 `langchain_openai.ChatOpenAI`、`langchain_openai.OpenAIEmbeddings`、`LangchainLLMWrapper`、`LangchainEmbeddingsWrapper` 与 `ragas.metrics` 下的 legacy 指标。`langchain-openai` 只用于 legacy fallback，不与 `ragas.metrics.collections` 混用。
 
@@ -127,7 +127,7 @@ Ragas 测评数据必须写入同一个 PostgreSQL 数据库中带 `Ragas_Test` 
 
 ```powershell
 $env:PYTHONPATH='ai-python'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode offline
 ```
 
 当前项目 RAG 全流程离线验收：
@@ -136,7 +136,7 @@ conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_raga
 $env:PYTHONPATH='ai-python'
 $env:RAG_VECTOR_DIMENSIONS='1024'
 $env:RAGAS_TEST_TABLE_PREFIX='Ragas_Test_'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-offline
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode offline --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-offline
 ```
 
 真实 Ragas 评分：
@@ -154,7 +154,7 @@ $env:RAGAS_EVAL_MAX_WAIT_SECONDS='10'
 $env:RAGAS_EVAL_MAX_WORKERS='2'
 $env:RAGAS_EVAL_BATCH_SIZE='1'
 $env:RAGAS_EVAL_TEMPERATURE='0'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas
 ```
 
 当前项目 RAG 全流程加 Ragas 核验：
@@ -171,7 +171,7 @@ $env:RAGAS_EVAL_MAX_WORKERS='1'
 $env:RAGAS_EVAL_BATCH_SIZE='1'
 $env:RAGAS_EVAL_TEMPERATURE='0'
 $env:RAGAS_EVAL_METRICS='context_recall'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-ragas
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-ragas
 ```
 
 复用已存在 `Ragas_Test` 索引，只跑真实生产查询和 Ragas 指标：
@@ -188,7 +188,7 @@ $env:RAGAS_EVAL_MAX_WORKERS='1'
 $env:RAGAS_EVAL_BATCH_SIZE='1'
 $env:RAGAS_EVAL_TEMPERATURE='0'
 $env:RAGAS_EVAL_METRICS='answer_relevancy'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --skip-index --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-ragas-reuse-index
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas --skip-index --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-ragas-reuse-index
 ```
 
 逐条排查真实 Ragas 慢指标：
@@ -205,7 +205,7 @@ $env:RAGAS_EVAL_MAX_WORKERS='1'
 $env:RAGAS_EVAL_BATCH_SIZE='1'
 $env:RAGAS_EVAL_TEMPERATURE='0'
 $env:RAGAS_EVAL_METRICS='faithfulness'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --skip-index --rag-profile current --case-index 1 --output-dir tmp/ragas-single-case-faithfulness-r01
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas --skip-index --rag-profile current --case-index 1 --output-dir tmp/ragas-single-case-faithfulness-r01
 ```
 
 PyCharm 的 Parameters 可直接使用：
@@ -285,8 +285,8 @@ PyCharm 的 Parameters 可直接使用：
 $env:PYTHONPATH='ai-python'
 conda run -n learning-evidence-rag python -B -m pytest ai-python/tests/test_ragas_eval_common.py -q
 conda run -n learning-evidence-rag python -B -m pytest ai-python/tests/test_pgvector_store.py -q
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-offline
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --output-dir tmp/ragas-small-eval-missing-config
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode offline --rag-profile current --output-dir tmp/ragas-small-eval-current-rag-offline
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas --output-dir tmp/ragas-small-eval-missing-config
 ```
 
 最后一条在未配置真实评估 Key 时预期返回非 0，但必须已经写出 `ragas_input.jsonl`、`run_config.json` 和失败原因，不要求生成离线指标文件。

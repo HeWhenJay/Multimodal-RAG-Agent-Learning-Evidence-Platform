@@ -10,7 +10,7 @@ if str(AI_PYTHON_DIR) not in sys.path:
 
 os.environ["RAG_STORE_BACKEND"] = "memory"
 
-from agent.memory_service import IN_MEMORY_INDEX
+from agents.memory.memory_service import IN_MEMORY_INDEX
 from app.main import app
 
 

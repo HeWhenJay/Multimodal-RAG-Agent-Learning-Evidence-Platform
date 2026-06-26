@@ -183,7 +183,7 @@ def main() -> int:
             "$env:RAGAS_EVAL_BATCH_SIZE='1'",
             "$env:RAGAS_EVAL_TEMPERATURE='0'",
             "$env:RAGAS_EVAL_MAX_TOKENS='4096'",
-            f"python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode ragas --rag-profile {args.rag_profile} --output-dir {args.output_dir}",
+            f"python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode ragas --rag-profile {args.rag_profile} --output-dir {args.output_dir}",
         ]
     )
     write_run_config(

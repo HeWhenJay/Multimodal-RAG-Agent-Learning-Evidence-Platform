@@ -94,14 +94,25 @@ python run.py
 
 未配置 `RAG_DATABASE_URL` 时会退回内存后端，主要用于本地单元测试。正式运行使用 PostgreSQL/pgvector，建库和建表语句见 `docs/database/postgresql-pgvector.md` 与 `infra/sql/init.sql`。
 
+## 目录结构
+
+- `app/api/`：FastAPI 内部接口路由。
+- `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
+- `app/schemas/`：Java 与 Python 之间共享的 Pydantic 请求/响应模型。
+- `agents/`：按职责拆分的 Agent 编排实现，包括 `gateway/`、`read_only/`、`jd_learning_plan/`、`memory/` 和 `resume_adapter/`。
+- `agent/`：旧导入路径兼容层，新代码优先使用 `agents.*`。
+- `rag/`：文档解析、递归切块、索引、检索、重排、回答守卫和评估能力。
+- `video/`：视频 ASR、抽帧、OCR、去重和分片证据处理。
+- `tests/`：Python 单元测试和接口回归测试。
+
 ## RAG 评估
 
-小样本 Ragas 评估入口位于 `ai-python/tests/evaluation/run_ragas_small_eval.py`。评估脚本默认使用真实 PostgreSQL/pgvector 和百炼模型链路，并在同一个数据库中写入 `Ragas_Test_` 前缀表；`offline` 仅表示不额外运行 Ragas LLM 指标，不表示使用内存仓库或 hash embedding：
+小样本 Ragas 评估入口位于 `ai-python/rag/evaluation/run_ragas_small_eval.py`。评估脚本默认使用真实 PostgreSQL/pgvector 和百炼模型链路，并在同一个数据库中写入 `Ragas_Test_` 前缀表；`offline` 仅表示不额外运行 Ragas LLM 指标，不表示使用内存仓库或 hash embedding：
 
 ```powershell
 $env:PYTHONPATH='ai-python'
 $env:RAGAS_TEST_TABLE_PREFIX='Ragas_Test_'
-conda run -n learning-evidence-rag python -B ai-python/tests/evaluation/run_ragas_small_eval.py --mode offline
+conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode offline
 ```
 
 真实 Ragas 评分需要先按 `docs/testing/ragas-small-evaluation-plan.md` 配置 `RAGAS_EVAL_*` 环境变量。评估 Key 不会写入 `run_config.json` 或日志输出。
