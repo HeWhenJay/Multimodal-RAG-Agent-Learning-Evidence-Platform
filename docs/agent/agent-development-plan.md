@@ -295,17 +295,17 @@ flowchart TD
 
 ## 8. LangGraph 设计
 
-Python 新增 `ai-python/agent/`：
+Python Agent 统一放在 `ai-python/agents/`：
 
 ```text
-ai-python/agent/
+ai-python/agents/
   __init__.py
-  state.py              # AgentState、ReviewState、ToolCallResult
-  graph.py              # StateGraph 构建
-  nodes.py              # planner、tool_router、guard、finalizer
-  tools.py              # Java Tool Gateway client 和 utc_time_provider，不直连 Python RAG
-  prompts.py            # 中文 prompt，结构化输出约束
-  checkpoint.py         # SQLite checkpoint 配置
+  gateway/              # Java Tool Gateway client，不直连 Python RAG
+  read_only/            # pure_read_query 只读图
+  jd_learning_plan/     # planning_task 规划图
+  memory/               # Agent 记忆提炼、冲突判断和检索
+  resume_adapter/       # 简历模板兼容填充能力
+  note_writer/          # 后续笔记生成 Agent 预留目录
 ```
 
 状态字段：
@@ -418,7 +418,7 @@ frontend-react/src/pages/agent/AgentWorkspace.tsx
 目标：实现第一条可运行 Agent 路径。
 
 - 新增 `ai-python/app/api/agent.py` 和 schemas。
-- 新增 `ai-python/agent/*`。
+- 新增 `ai-python/agents/*`。
 - 实现 `utc_time_provider`。
 - Python 通过 Java Read Tool Gateway 调用只读工具。
 - Java `/api/agent/tasks` 调 Python `/internal/agent/tasks`。
