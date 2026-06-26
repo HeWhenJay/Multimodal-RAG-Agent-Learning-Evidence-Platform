@@ -174,7 +174,13 @@ def should_request_crud_review(task_input: dict[str, Any]) -> bool:
         return True
     tool_hints = task_input.get("toolHints")
     return isinstance(tool_hints, list) and any(
-        str(item) in {"jd_learning_plan_save", "resume_revision_save", "agent_task_cancel_request"} for item in tool_hints
+        str(item) in {
+            "jd_learning_plan_save",
+            "resume_revision_save",
+            "agent_task_cancel_request",
+            "agent_memory_candidate_save",
+        }
+        for item in tool_hints
     )
 
 
@@ -185,6 +191,7 @@ def build_crud_review_request(request: AgentTaskResumeRequest) -> dict[str, Any]
         "resume_revision_save": "RESUME_REVISION_SAVE",
         "jd_learning_plan_save": "JD_PLAN_SAVE",
         "agent_task_cancel_request": "TASK_CANCEL",
+        "agent_memory_candidate_save": "AGENT_MEMORY_CANDIDATE_SAVE",
     }[tool_name]
     idempotency_key = mutation_idempotency_key(request, tool_name)
     return {
@@ -194,7 +201,11 @@ def build_crud_review_request(request: AgentTaskResumeRequest) -> dict[str, Any]
             "title": "保存 Agent 草稿确认",
             "toolName": tool_name,
             "operationType": operation_type,
-            "resourceType": "agent_task" if tool_name == "agent_task_cancel_request" else "agent_task_draft",
+            "resourceType": "agent_memory"
+            if tool_name == "agent_memory_candidate_save"
+            else "agent_task"
+            if tool_name == "agent_task_cancel_request"
+            else "agent_task_draft",
             "resourceId": request.taskId,
             "idempotencyKey": idempotency_key,
             "riskLevel": "MEDIUM",
@@ -233,7 +244,12 @@ def mutation_tool_name(task_input: dict[str, Any]) -> str:
     tool_hints = task_input.get("toolHints")
     if isinstance(tool_hints, list):
         for item in tool_hints:
-            if str(item) in {"resume_revision_save", "jd_learning_plan_save", "agent_task_cancel_request"}:
+            if str(item) in {
+                "resume_revision_save",
+                "jd_learning_plan_save",
+                "agent_task_cancel_request",
+                "agent_memory_candidate_save",
+            }:
                 return str(item)
     return "jd_learning_plan_save"
 

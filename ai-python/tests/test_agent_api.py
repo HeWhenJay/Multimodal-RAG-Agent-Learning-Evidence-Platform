@@ -2,7 +2,6 @@ import os
 import sys
 from pathlib import Path
 
-from docx import Document
 from fastapi.testclient import TestClient
 
 AI_PYTHON_DIR = Path(__file__).resolve().parents[1]
@@ -103,6 +102,22 @@ class FakeJavaClient:
                     }
                 )
             if json["toolName"] == "web_search_probe":
+                if json["arguments"]["query"] == "__fail_tavily__":
+                    return FakeResponse(
+                        {
+                            "taskId": json["taskId"],
+                            "toolCallId": json["toolCallId"],
+                            "toolName": json["toolName"],
+                            "status": "FAILED",
+                            "ownershipVerified": True,
+                            "scope": "current_user_or_authorized",
+                            "data": {},
+                            "diagnostics": {},
+                            "retryable": False,
+                            "errorCode": "AGENT_TAVILY_NOT_CONFIGURED",
+                            "errorMessage": "未配置 Tavily API Key",
+                        }
+                    )
                 return FakeResponse(
                     {
                         "taskId": json["taskId"],
@@ -309,6 +324,7 @@ def test_planning_resume_uses_java_gateway_and_requests_output_review(monkeypatc
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     assert [call["json"]["toolName"] for call in tool_calls] == [
         "agent_memory_retriever",
+        "agent_memory_retriever",
         "rag_query_probe_non_persistent",
         "agent_memory_candidate_proposer",
     ]
@@ -358,6 +374,7 @@ def test_planning_resume_with_web_search_keeps_local_rag_flow(monkeypatch):
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     assert [call["json"]["toolName"] for call in tool_calls] == [
         "agent_memory_retriever",
+        "agent_memory_retriever",
         "web_search_probe",
         "rag_query_probe_non_persistent",
         "agent_memory_candidate_proposer",
@@ -371,15 +388,56 @@ def test_planning_resume_with_web_search_keeps_local_rag_flow(monkeypatch):
     assert event_calls[2]["json"]["draft"]["webReferences"][0]["sourceUrl"] == "https://example.com/trend"
 
 
-def test_planning_resume_can_fill_resume_template_draft(monkeypatch, tmp_path):
+def test_planning_resume_degrades_to_local_rag_when_web_search_unavailable(monkeypatch):
     import httpx
 
-    template_path = tmp_path / "resume-template.docx"
-    output_dir = tmp_path / "outputs"
-    document = Document()
-    document.add_paragraph("摘要：{{summary}}")
-    document.add_paragraph("技能：{{skills}}")
-    document.save(template_path)
+    FakeJavaClient.calls = []
+    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "agent-secret")
+    client = TestClient(app)
+    monkeypatch.setattr(httpx, "Client", FakeJavaClient)
+
+    response = client.post(
+        "/internal/agent/tasks/agent-task-plan/resume",
+        headers={"X-Agent-Internal-Token": "agent-secret"},
+        json={
+            "taskId": "agent-task-plan",
+            "taskType": "planning_task",
+            "threadId": "agent-task-plan",
+            "reviewType": "PLAN",
+            "decision": "APPROVED",
+            "decisionPayload": {"comment": "同意继续"},
+            "input": {
+                "goal": "分析后端实习 JD 适配度",
+                "jobDescription": "要求 Java、Spring Boot、Redis 和 RAG 项目经验",
+                "resumeText": "做过多模态 RAG 项目，熟悉 Java",
+                "enableWebSearch": True,
+                "webSearchQuery": "__fail_tavily__",
+            },
+            "callbackUrl": "http://java/api/internal/agent/tasks/agent-task-plan/events",
+            "javaToolGatewayBaseUrl": "http://java",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WAITING_OUTPUT_REVIEW"
+    tool_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/api/internal/agent/tools/read")]
+    event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
+    assert [call["json"]["toolName"] for call in tool_calls] == [
+        "agent_memory_retriever",
+        "agent_memory_retriever",
+        "web_search_probe",
+        "rag_query_probe_non_persistent",
+        "agent_memory_candidate_proposer",
+    ]
+    assert event_calls[0]["json"]["toolCall"]["status"] == "FAILED"
+    assert event_calls[0]["json"]["toolCall"]["errorCode"] == "AGENT_TAVILY_NOT_CONFIGURED"
+    assert event_calls[-1]["json"]["reviewRequest"]["reviewType"] == "OUTPUT"
+    assert event_calls[-1]["json"]["draft"]["webReferences"] == []
+    assert event_calls[-1]["json"]["draft"]["alignment"][0]["status"] == "supported"
+
+
+def test_planning_resume_builds_resume_template_fill_candidate(monkeypatch):
+    import httpx
 
     FakeJavaClient.calls = []
     monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "agent-secret")
@@ -401,8 +459,7 @@ def test_planning_resume_can_fill_resume_template_draft(monkeypatch, tmp_path):
                 "jobDescription": "要求 Java、Redis 和 RAG 项目经验",
                 "resumeText": "做过多模态 RAG 项目，熟悉 Java",
                 "toolHints": ["resume_template_fill"],
-                "resumeTemplatePath": str(template_path),
-                "resumeTemplateOutputDir": str(output_dir),
+                "resumeTemplateId": "resume-template-1",
             },
             "callbackUrl": "http://java/api/internal/agent/tasks/agent-task-plan/events",
             "javaToolGatewayBaseUrl": "http://java",
@@ -413,11 +470,11 @@ def test_planning_resume_can_fill_resume_template_draft(monkeypatch, tmp_path):
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     draft = event_calls[1]["json"]["draft"]
     fill_result = draft["resumeTemplateFill"]
-    assert fill_result["status"] == "SUCCEEDED"
-    assert Path(fill_result["outputPath"]).exists()
-    filled = Document(fill_result["outputPath"])
-    assert "具备" in filled.paragraphs[0].text or "做过多模态" in filled.paragraphs[0].text
-    assert "{{summary}}" not in filled.paragraphs[0].text
+    assert fill_result["status"] == "PENDING_REVIEW"
+    assert fill_result["requiresApproval"] is True
+    assert fill_result["approvalType"] == "OUTPUT"
+    assert "outputPath" not in fill_result
+    assert "Java" in fill_result["contentMap"]["skills"]
 
 
 def test_planning_output_approval_with_save_intent_requests_crud_review(monkeypatch):
@@ -456,6 +513,86 @@ def test_planning_output_approval_with_save_intent_requests_crud_review(monkeypa
     assert review["reviewType"] == "CRUD"
     assert review["proposal"]["toolName"] == "jd_learning_plan_save"
     assert review["proposal"]["idempotencyKey"] == "jd_learning_plan_save-agent-task-plan-v1"
+
+
+def test_planning_output_approval_with_memory_save_requests_crud_review(monkeypatch):
+    import httpx
+
+    FakeJavaClient.calls = []
+    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "agent-secret")
+    client = TestClient(app)
+    monkeypatch.setattr(httpx, "Client", FakeJavaClient)
+
+    response = client.post(
+        "/internal/agent/tasks/agent-task-plan/resume",
+        headers={"X-Agent-Internal-Token": "agent-secret"},
+        json={
+            "taskId": "agent-task-plan",
+            "taskType": "planning_task",
+            "threadId": "agent-task-plan",
+            "reviewType": "OUTPUT",
+            "decision": "APPROVED",
+            "decisionPayload": {"comment": "确认保存这条记忆"},
+            "input": {
+                "goal": "记住我偏好先看结论",
+                "toolHints": ["agent_memory_candidate_save"],
+            },
+            "callbackUrl": "http://java/api/internal/agent/tasks/agent-task-plan/events",
+            "javaToolGatewayBaseUrl": "http://java",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WAITING_CRUD_REVIEW"
+    event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
+    review = event_calls[0]["json"]["reviewRequest"]
+    assert review["reviewType"] == "CRUD"
+    assert review["proposal"]["toolName"] == "agent_memory_candidate_save"
+    assert review["proposal"]["operationType"] == "AGENT_MEMORY_CANDIDATE_SAVE"
+    assert review["proposal"]["resourceType"] == "agent_memory"
+
+
+def test_tool_adapter_rejects_unapproved_mutation_before_java_gateway():
+    from agents.orchestration.pae_react_graph import tool_adapter_node
+
+    class GuardedClient:
+        def __init__(self) -> None:
+            self.events = []
+            self.mutation_called = False
+
+        def execute_mutation_tool(self, payload: dict) -> dict:
+            self.mutation_called = True
+            raise AssertionError("未审批变更不应调用 Java mutation gateway")
+
+        def execute_read_tool(self, payload: dict) -> dict:
+            raise AssertionError("该用例不应调用只读工具")
+
+        def publish_event(self, event) -> None:
+            self.events.append(event.model_dump(by_alias=True, exclude_none=True))
+
+    client = GuardedClient()
+
+    state = tool_adapter_node(
+        {
+            "task_id": "agent-task-plan",
+            "thread_id": "agent-task-plan",
+            "current_action": {
+                "toolName": "jd_learning_plan_save",
+                "toolType": "MUTATION",
+                "arguments": {"source": "test"},
+            },
+            "tool_calls": [],
+            "observations": [],
+            "tool_results": [],
+            "react_trace": [],
+        },
+        client,
+    )
+
+    assert client.mutation_called is False
+    assert state["status"] == "TOOL_FAILED"
+    assert state["error_code"] == "AGENT_MUTATION_REQUIRES_APPROVAL"
+    assert client.events[0]["toolCall"]["errorCode"] == "AGENT_MUTATION_REQUIRES_APPROVAL"
 
 
 def test_planning_crud_approval_executes_java_mutation_gateway(monkeypatch):
