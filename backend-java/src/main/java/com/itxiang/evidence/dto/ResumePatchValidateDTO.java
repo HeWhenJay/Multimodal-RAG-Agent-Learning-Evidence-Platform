@@ -21,4 +21,6 @@ public class ResumePatchValidateDTO {
 
     @NotEmpty(message = "补丁列表不能为空")
     private List<Map<String, Object>> patches;
+
+    private Map<String, Object> layoutContract;
 }

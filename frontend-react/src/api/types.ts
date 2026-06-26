@@ -192,9 +192,8 @@ export interface ResumeTemplate {
   currentFilePath?: string | null;
   currentPublicUrl?: string | null;
   fileType: string;
-  fields: ResumeTemplateFieldBinding[];
-  unsupportedRegions: string[];
-  layoutFingerprint?: Record<string, unknown>;
+  fieldCount: number;
+  unsupportedRegionCount: number;
   createdAt?: string | null;
   updatedAt?: string | null;
 }
@@ -271,6 +270,25 @@ export interface ResumePatchDraft {
   annotationRevision?: number | null;
   createdAt?: string | null;
   updatedAt?: string | null;
+}
+
+export interface LayoutAllowedChange {
+  type: 'TEXT_REPLACE' | 'STYLE_RANGE' | 'INSERT_PARAGRAPH' | 'DELETE_PARAGRAPH' | string;
+  fieldId?: string | null;
+  sectionKey?: string | null;
+  textRange?: string | null;
+  stylePatch?: Record<string, unknown>;
+  maxParagraphs?: number;
+  styleSource?: 'current_run' | 'previous_paragraph' | 'section_default' | string;
+}
+
+export interface LayoutChangeContract {
+  mode: 'PRESERVE_LAYOUT' | 'CONTROLLED_EDIT' | 'RELAYOUT' | string;
+  allowedChanges?: LayoutAllowedChange[];
+  maxPageDelta?: number;
+  maxParagraphDelta?: number;
+  maxRunDelta?: number;
+  requireVisualCheck?: boolean;
 }
 
 export interface ResumeTemplateExport {

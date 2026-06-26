@@ -731,6 +731,9 @@ public class RagServiceImpl implements RagService {
         payload.put("fields", fields.stream().map(this::toFieldBindingMap).toList());
         payload.put("patches", dto.getPatches());
         payload.put("allowedEvidenceIds", evidenceCandidates.stream().map(item -> String.valueOf(item.get("evidenceId"))).toList());
+        if (dto.getLayoutContract() != null && !dto.getLayoutContract().isEmpty()) {
+            payload.put("layoutContract", dto.getLayoutContract());
+        }
         PythonRagClient.ResumePatchValidationResult result = pythonRagClient.validateResumePatches(payload);
         String nextStatus = result.validationErrors().isEmpty() ? resolvePatchDraftStatus(result.patches()) : "DRAFT";
         resumeTemplatePatchDraftMapper.updateValidation(
@@ -785,6 +788,9 @@ public class RagServiceImpl implements RagService {
         payload.put("fields", fields.stream().map(this::toFieldBindingMap).toList());
         payload.put("patches", fromJson(draft.getPatchesJson(), new TypeReference<List<Map<String, Object>>>() {}, List.of()));
         payload.put("allowedEvidenceIds", evidenceCandidates.stream().map(item -> String.valueOf(item.get("evidenceId"))).toList());
+        if (dto.getLayoutContract() != null && !dto.getLayoutContract().isEmpty()) {
+            payload.put("layoutContract", dto.getLayoutContract());
+        }
         PythonRagClient.ResumeTemplateExportResult result = pythonRagClient.exportResumeTemplate(payload);
         PythonRagClient.ResumeTemplateParseResult parsedExport = pythonRagClient.parseResumeTemplate(
                 template.getId(),
@@ -1720,9 +1726,8 @@ public class RagServiceImpl implements RagService {
                 .currentFilePath(template.getCurrentFilePath())
                 .currentPublicUrl(template.getCurrentPublicUrl())
                 .fileType(template.getFileType())
-                .fields(fields.stream().map(this::toFieldBindingMap).toList())
-                .unsupportedRegions(fromJson(template.getUnsupportedRegionsJson(), new TypeReference<List<String>>() {}, List.of()))
-                .layoutFingerprint(fromJson(template.getLayoutFingerprintJson(), new TypeReference<Map<String, Object>>() {}, Map.of()))
+                .fieldCount(fields.size())
+                .unsupportedRegionCount(fromJson(template.getUnsupportedRegionsJson(), new TypeReference<List<String>>() {}, List.of()).size())
                 .createdAt(template.getCreatedAt())
                 .updatedAt(template.getUpdatedAt())
                 .build();

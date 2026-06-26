@@ -7,10 +7,12 @@ import pytest
 from docx import Document
 from docx.shared import Inches
 
-from app.schemas.resume_template import ResumeContentPatch, ResumePatchGenerationRequest, ResumeTemplatePreviewRequest
+from app.schemas.resume_template import LayoutChangeContract, ResumeContentPatch, ResumePatchGenerationRequest, ResumeTemplatePreviewRequest
 from rag.resume_template.docx_patch import (
     apply_resume_patches_to_docx,
+    layout_fingerprint,
     parse_resume_template_docx,
+    validate_layout_change,
     validate_resume_patches,
 )
 from rag.resume_template.patch_generation import build_generation_prompt, generate_resume_patches, resume_patch_json_schema
@@ -184,6 +186,44 @@ def test_export_allows_static_picture_when_patch_targets_plain_field(tmp_path: P
 
     assert exported.layoutValidation["status"] == "PASSED"
     assert result_doc.paragraphs[0].text == "项目：多模态 RAG 学习证据平台，负责模板导出链路"
+
+
+def test_layout_guard_rejects_unapproved_structure_change():
+    """默认保排版模式下，段落或 run 指纹变化会被判定为未授权版式变化。"""
+    original = Document()
+    original.add_paragraph("项目：RAG 平台")
+    changed = Document()
+    changed.add_paragraph("项目：RAG 平台")
+    changed.add_paragraph("新增量化成果")
+
+    result = validate_layout_change(
+        layout_fingerprint(docx_bytes(original)),
+        layout_fingerprint(docx_bytes(changed)),
+        LayoutChangeContract(),
+    )
+
+    assert result["status"] == "FAILED"
+    assert "paragraphCount" in result["diff"]["changedKeys"]
+
+
+def test_controlled_layout_contract_allows_authorized_paragraph_delta():
+    """受控编辑模式允许用户授权范围内的段落变化，但仍保留差异审计。"""
+    original = Document()
+    original.add_paragraph("项目：RAG 平台")
+    changed = Document()
+    changed.add_paragraph("项目：RAG 平台")
+    changed.add_paragraph("新增量化成果")
+
+    contract = LayoutChangeContract.model_validate({
+        "mode": "CONTROLLED_EDIT",
+        "allowedChanges": [{"type": "INSERT_PARAGRAPH", "sectionKey": "project_experience", "maxParagraphs": 1}],
+        "maxParagraphDelta": 1,
+        "maxRunDelta": 1,
+    })
+    result = validate_layout_change(layout_fingerprint(docx_bytes(original)), layout_fingerprint(docx_bytes(changed)), contract)
+
+    assert result["status"] == "PASSED"
+    assert result["diff"]["paragraphDelta"] == 1
 
 
 def test_local_patch_generation_returns_strict_schema_and_safe_drafts():

@@ -14,7 +14,8 @@ import type {
   ResumeTemplate,
   ResumeTemplateExport,
   ResumeTemplatePreview,
-  ResumeTemplateRegionAnnotation
+  ResumeTemplateRegionAnnotation,
+  LayoutChangeContract
 } from './types';
 import { getStoredAuthToken } from './auth';
 
@@ -286,6 +287,7 @@ export function validateResumePatches(templateId: string, payload: {
   version: number;
   patchDraftId: string;
   patches: ResumeContentPatch[];
+  layoutContract?: LayoutChangeContract;
 }): Promise<ResumePatchDraft> {
   return request<ResumePatchDraft>(`/api/rag/resume-templates/${templateId}/patches/validate`, {
     method: 'POST',
@@ -299,6 +301,7 @@ export function exportResumeTemplate(templateId: string, payload: {
   version: number;
   patchDraftId: string;
   idempotencyKey: string;
+  layoutContract?: LayoutChangeContract;
 }): Promise<ResumeTemplateExport> {
   return request<ResumeTemplateExport>(`/api/rag/resume-templates/${templateId}/exports`, {
     method: 'POST',

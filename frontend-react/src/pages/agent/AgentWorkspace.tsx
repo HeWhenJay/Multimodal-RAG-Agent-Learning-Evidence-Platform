@@ -1083,7 +1083,6 @@ function ResumeTemplateSelector({
           templates.map((template) => {
             const active = template.templateId === selectedTemplateId;
             const canFill = templateCanFill(template);
-            const previewFields = template.fields.slice(0, 3);
             return (
               <div className="agent-template-history-item" key={template.templateId}>
                 <button
@@ -1101,13 +1100,8 @@ function ResumeTemplateSelector({
                     <span>{formatTemplateStatus(template.status)}</span>
                   </span>
                   <strong>{template.filename}</strong>
-                  <small>版本 {template.version} · {template.fields.length} 个字段 · {template.unsupportedRegions.length} 个不支持区域</small>
+                  <small>版本 {template.version} · {template.unsupportedRegionCount} 个复杂区域</small>
                   <span className="agent-template-card-time">{formatTime(template.updatedAt || template.createdAt)}</span>
-                  <span className="agent-template-field-tags">
-                    {previewFields.length ? previewFields.map((field) => (
-                      <em key={field.fieldId}>{field.displayName}</em>
-                    )) : <em>暂无字段绑定</em>}
-                  </span>
                 </button>
                 <button
                   className="agent-template-delete"
@@ -1218,13 +1212,12 @@ function ResumePatchPanel({
       {draft ? (
         <div className="resume-patch-list agent-resume-patch-list">
           {draft.patches.map((patch) => {
-            const field = selectedTemplate?.fields.find((item) => item.fieldId === patch.fieldId);
             return (
               <div className={`resume-patch-row ${patchRowClass(patch.status)}`} key={patch.fieldId}>
                 <div className="resume-patch-head">
                   <div>
-                    <strong>{field?.displayName || patch.fieldId}</strong>
-                    <span>{formatResumeSection(field?.sectionKey)} · {patch.confidence ? `${Math.round(patch.confidence * 100)}%` : '待评估'}</span>
+                    <strong>待确认改写项</strong>
+                    <span>{patch.confidence ? `${Math.round(patch.confidence * 100)}%` : '待评估'} · 字段内容由后端托管</span>
                   </div>
                   <span className={`evidence-status ${patchStatusClass(patch.status)}`}>
                     {patch.status === 'REJECTED' ? <XCircle size={15} /> : <CheckCircle2 size={15} />}
@@ -1232,10 +1225,6 @@ function ResumePatchPanel({
                   </span>
                 </div>
                 <div className="resume-patch-compare">
-                  <label>
-                    <span>原文</span>
-                    <p>{field?.sourceText || '字段原文不可用'}</p>
-                  </label>
                   <label>
                     <span>新文本</span>
                     <textarea
@@ -1260,7 +1249,7 @@ function ResumePatchPanel({
                       onClick={() => onUpdatePatch(
                         patch.fieldId,
                         (current) => ({ ...current, status: 'CONFIRMED' }),
-                        `${field?.displayName || patch.fieldId} 已确认，校验后会参与导出`
+                        '该改写项已确认，校验后会参与导出'
                       )}
                       type="button"
                     >
@@ -1272,7 +1261,7 @@ function ResumePatchPanel({
                       onClick={() => onUpdatePatch(
                         patch.fieldId,
                         (current) => ({ ...current, status: 'REJECTED' }),
-                        `${field?.displayName || patch.fieldId} 已拒绝，导出时不会应用`
+                        '该改写项已拒绝，导出时不会应用'
                       )}
                       type="button"
                     >
@@ -1557,22 +1546,6 @@ function formatTemplateStatus(status: string) {
   if (status === 'EXPORTED') return '已导出';
   if (status === 'FAILED') return '解析失败';
   return status || '未知状态';
-}
-
-function formatResumeSection(section?: string) {
-  const labels: Record<string, string> = {
-    personal_info: '个人信息',
-    summary: '个人总结',
-    education: '教育背景',
-    work_experience: '工作经历',
-    project_experience: '项目经历',
-    skills: '技能',
-    awards: '奖项',
-    certifications: '证书',
-    research: '科研',
-    other: '其他'
-  };
-  return labels[section || 'other'] || section || '其他';
 }
 
 function formatPatchStatus(status?: string) {

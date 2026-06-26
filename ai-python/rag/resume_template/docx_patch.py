@@ -19,6 +19,7 @@ from lxml import etree
 
 from app.schemas.resume_template import (
     EvidencePolicy,
+    LayoutChangeContract,
     ResumeContentPatch,
     ResumeTemplateBinding,
     ResumeTemplateExportResponse,
@@ -145,8 +146,10 @@ def validate_resume_patches(
     fields: list[ResumeTemplateBinding],
     patches: list[ResumeContentPatch],
     allowed_evidence_ids: list[str] | None = None,
+    layout_contract: LayoutChangeContract | None = None,
 ) -> ResumePatchValidationResponse:
     """校验字段补丁是否只包含可接受的内容变更。"""
+    contract = layout_contract or LayoutChangeContract()
     allowed_evidence = set(allowed_evidence_ids or [])
     fields_by_id = {field.fieldId: field for field in fields}
     errors: list[str] = []
@@ -182,11 +185,18 @@ def validate_resume_patches(
             errors.append(f"{path} riskFlags 中 NONE 不能和其他风险同时出现")
         if not any(error.startswith(path) for error in errors):
             valid_patches.append(patch)
+    errors.extend(validate_layout_contract_for_patches(contract, valid_patches, fields_by_id))
     return ResumePatchValidationResponse(
         templateId=template_id,
         version=version,
         patches=valid_patches,
         validationErrors=errors,
+        layoutValidation={
+            "status": "PASSED" if not errors else "FAILED",
+            "mode": contract.mode,
+            "allowedChanges": [change.model_dump() for change in contract.allowedChanges],
+            "message": "版式变更契约校验通过" if not errors else "版式变更契约校验失败",
+        },
     )
 
 
@@ -198,12 +208,14 @@ def apply_resume_patches_to_docx(
     fields: list[ResumeTemplateBinding],
     patches: list[ResumeContentPatch],
     allowed_evidence_ids: list[str] | None = None,
+    layout_contract: LayoutChangeContract | None = None,
 ) -> ResumeTemplateExportResponse:
     """把已确认补丁确定性应用到 DOCX，并校验版式 fingerprint 不变。"""
+    contract = layout_contract or LayoutChangeContract()
     blocking_regions = detect_export_blocking_regions(content)
     if blocking_regions:
         raise ValueError("简历包含暂不支持的复杂结构，拒绝自动导出：" + "；".join(blocking_regions))
-    validation = validate_resume_patches(template_id, version, fields, patches, allowed_evidence_ids)
+    validation = validate_resume_patches(template_id, version, fields, patches, allowed_evidence_ids, contract)
     if validation.validationErrors:
         raise ValueError("补丁校验失败: " + "；".join(validation.validationErrors))
     original_fingerprint = layout_fingerprint(content)
@@ -227,13 +239,8 @@ def apply_resume_patches_to_docx(
     document.save(output)
     output_bytes = output.getvalue()
     new_fingerprint = layout_fingerprint(output_bytes)
-    layout_validation = {
-        "status": "PASSED" if original_fingerprint == new_fingerprint else "FAILED",
-        "baseline": original_fingerprint,
-        "current": new_fingerprint,
-        "message": "XML 结构 fingerprint 未变化" if original_fingerprint == new_fingerprint else "RESUME_LAYOUT_CHANGED",
-    }
-    if original_fingerprint != new_fingerprint:
+    layout_validation = validate_layout_change(original_fingerprint, new_fingerprint, contract)
+    if layout_validation["status"] != "PASSED":
         raise ValueError("RESUME_LAYOUT_CHANGED")
     return ResumeTemplateExportResponse(
         templateId=template_id,
@@ -243,6 +250,99 @@ def apply_resume_patches_to_docx(
         layoutValidation=layout_validation,
         appliedPatchCount=applied,
     )
+
+
+def validate_layout_contract_for_patches(
+    contract: LayoutChangeContract,
+    patches: list[ResumeContentPatch],
+    fields_by_id: dict[str, ResumeTemplateBinding],
+) -> list[str]:
+    """校验补丁意图是否符合用户授权的版式变更契约。"""
+    errors: list[str] = []
+    if contract.mode == "PRESERVE_LAYOUT":
+        layout_risk_patches = [patch.fieldId for patch in patches if "LAYOUT_RISK" in patch.riskFlags]
+        if layout_risk_patches:
+            errors.append("PRESERVE_LAYOUT 模式不允许带 LAYOUT_RISK 的补丁: " + "、".join(layout_risk_patches))
+        return errors
+    if contract.mode == "CONTROLLED_EDIT":
+        allowed_field_ids = {change.fieldId for change in contract.allowedChanges if change.fieldId}
+        for change in contract.allowedChanges:
+            if change.fieldId and change.fieldId not in fields_by_id:
+                errors.append(f"LayoutChangeContract 指向未知字段: {change.fieldId}")
+            if change.type == "STYLE_RANGE" and not change.stylePatch:
+                errors.append(f"STYLE_RANGE 必须声明 stylePatch: {change.fieldId or change.sectionKey or '未指定字段'}")
+        for patch in patches:
+            if "LAYOUT_RISK" in patch.riskFlags and patch.fieldId not in allowed_field_ids:
+                errors.append(f"字段 {patch.fieldId} 标记 LAYOUT_RISK，但未在 LayoutChangeContract 中授权")
+        return errors
+    return errors
+
+
+def validate_layout_change(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    contract: LayoutChangeContract,
+) -> dict[str, Any]:
+    """根据版式变更契约审计 DOCX 结构 fingerprint 差异。"""
+    diff = layout_fingerprint_diff(baseline, current)
+    if contract.mode == "PRESERVE_LAYOUT":
+        passed = not diff["changedKeys"]
+        return {
+            "status": "PASSED" if passed else "FAILED",
+            "mode": contract.mode,
+            "baseline": baseline,
+            "current": current,
+            "diff": diff,
+            "message": "XML 结构 fingerprint 未变化" if passed else "RESUME_LAYOUT_CHANGED: 存在未授权版式变化",
+        }
+    if contract.mode == "CONTROLLED_EDIT":
+        blocking_keys = [
+            key for key in diff["changedKeys"]
+            if key not in {"paragraphCount", "runCount", "structureHash"}
+        ]
+        paragraph_delta = abs(int(current.get("paragraphCount", 0)) - int(baseline.get("paragraphCount", 0)))
+        run_delta = abs(int(current.get("runCount", 0)) - int(baseline.get("runCount", 0)))
+        errors: list[str] = []
+        if blocking_keys:
+            errors.append("存在未授权结构变化: " + "、".join(blocking_keys))
+        if paragraph_delta > contract.maxParagraphDelta:
+            errors.append(f"段落变化 {paragraph_delta} 超过授权上限 {contract.maxParagraphDelta}")
+        if run_delta > contract.maxRunDelta:
+            errors.append(f"run 变化 {run_delta} 超过授权上限 {contract.maxRunDelta}")
+        if diff["changedKeys"] and not contract.allowedChanges:
+            errors.append("检测到结构变化，但 LayoutChangeContract 未声明 allowedChanges")
+        return {
+            "status": "PASSED" if not errors else "FAILED",
+            "mode": contract.mode,
+            "baseline": baseline,
+            "current": current,
+            "diff": diff,
+            "allowedChanges": [change.model_dump() for change in contract.allowedChanges],
+            "message": "授权版式变化已通过结构审计" if not errors else "RESUME_LAYOUT_CHANGED: " + "；".join(errors),
+        }
+    return {
+        "status": "REVIEW_REQUIRED",
+        "mode": contract.mode,
+        "baseline": baseline,
+        "current": current,
+        "diff": diff,
+        "message": "RELAYOUT 模式需要人工预览确认后保存",
+    }
+
+
+def layout_fingerprint_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """生成两个版式指纹的可解释差异。"""
+    keys = sorted(set(baseline.keys()) | set(current.keys()))
+    changed = [key for key in keys if baseline.get(key) != current.get(key)]
+    return {
+        "changedKeys": changed,
+        "paragraphDelta": int(current.get("paragraphCount", 0)) - int(baseline.get("paragraphCount", 0)),
+        "tableDelta": int(current.get("tableCount", 0)) - int(baseline.get("tableCount", 0)),
+        "runDelta": int(current.get("runCount", 0)) - int(baseline.get("runCount", 0)),
+        "mediaChanged": baseline.get("mediaNames") != current.get("mediaNames"),
+        "relationshipsChanged": baseline.get("relationshipHashes") != current.get("relationshipHashes"),
+        "structureHashChanged": baseline.get("structureHash") != current.get("structureHash"),
+    }
 
 
 def validate_patch_text(new_text: str, max_chars: int, max_lines: int) -> list[str]:

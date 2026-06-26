@@ -1346,7 +1346,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 
 更新日期：2026-06-24
 
-本节描述 RAG 服务边界内的简历模板、字段补丁和 DOCX 确定性导出能力。用户填写岗位 JD、发起简历修改和审批修改建议由 Agent 工作台承载；`/resume-template` 前端页面只负责模板上传、历史模板选择、图片预览、区域确认和模板效果原型图。Structured Outputs / JSON Schema 只用于约束 LLM 输出字段级补丁；DOCX 排版不变由 Python 确定性应用、人工确认和 layout fingerprint 校验保证。
+本节描述 RAG 服务边界内的简历模板、字段补丁和 DOCX 确定性导出能力。用户填写岗位 JD、发起简历修改和审批修改建议由 Agent 工作台承载；`/resume-template` 前端页面只负责模板上传、历史模板选择、图片预览和区域确认，不展示 Agent/Python 提取出来的字段原文、定位、样式指纹或 layout fingerprint。Structured Outputs / JSON Schema 只用于约束 LLM 输出字段级补丁；DOCX 排版变化由 Python 确定性应用、人工确认、`LayoutChangeContract` 和 layout fingerprint 差异审计共同控制。
 
 ### 状态机和错误码
 
@@ -1377,8 +1377,31 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 | `RESUME_TEMPLATE_VERSION_CONFLICT` | `Result.error` | 前端提交版本不是当前版本 |
 | `RESUME_PATCH_VALIDATION_FAILED` | `Result.error` | `fieldId/hash/evidenceIds/长度/行数/注入风险` 校验失败 |
 | `RESUME_EXPORT_REQUIRES_CONFIRMATION` | `Result.error` | 存在未确认补丁时尝试导出 |
-| `RESUME_LAYOUT_CHANGED` | `Result.error` | Python 应用后 layout fingerprint 变化 |
+| `RESUME_LAYOUT_CHANGED` | `Result.error` | Python 应用后出现未被 `LayoutChangeContract` 授权的 layout fingerprint 变化 |
 | `RAG_PYTHON_4XX/RAG_PYTHON_5XX/RAG_PYTHON_TIMEOUT` | `Result.error` | Java 调 Python 内部接口失败 |
+
+### LayoutChangeContract
+
+简历改写不再把“结构变化”一律视为失败，而是区分是否经过用户授权。Java 调 Python 校验或导出时可携带 `layoutContract`：
+
+```json
+{
+  "mode": "PRESERVE_LAYOUT",
+  "allowedChanges": [],
+  "maxPageDelta": 0,
+  "maxParagraphDelta": 0,
+  "maxRunDelta": 0,
+  "requireVisualCheck": true
+}
+```
+
+| 模式 | 含义 | 检查规则 |
+| --- | --- | --- |
+| `PRESERVE_LAYOUT` | 默认保排版，只允许字段文本变化 | `paragraphCount/tableCount/runCount/mediaNames/relationshipHashes/structureHash` 必须完全一致 |
+| `CONTROLLED_EDIT` | 用户明确要求新增段落、删除段落、加粗关键词等受控变化 | 变化必须落在 `allowedChanges` 白名单内，且段落/run 变化不超过阈值 |
+| `RELAYOUT` | 用户要求大幅重排版或换结构 | Python 只返回需要人工预览确认的报告，Java 不应静默保存为正式版本 |
+
+`allowedChanges[]` 当前预留 `TEXT_REPLACE`、`STYLE_RANGE`、`INSERT_PARAGRAPH`、`DELETE_PARAGRAPH` 四类。Agent 只能根据用户明确要求生成契约候选，不能自行放宽 `mode` 或阈值。没有契约时一律按 `PRESERVE_LAYOUT` 处理。
 
 ### Java 对外 API
 
@@ -1391,7 +1414,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 | 鉴权 | 必须携带 `Authorization: Bearer <token>` |
 | 响应 | `Result<List<ResumeTemplateVO>>` |
 
-用途：模板页和 Agent 工作台都通过该接口展示当前用户已上传或导出的 DOCX 模板历史。前端选择历史模板后必须再调用 `GET /api/rag/resume-templates/{templateId}` 和预览接口刷新当前版本字段、图片和区域约束。
+用途：模板页和 Agent 工作台都通过该接口展示当前用户已上传或导出的 DOCX 模板历史。前端选择历史模板后必须再调用 `GET /api/rag/resume-templates/{templateId}` 和预览接口刷新当前版本摘要、图片和区域约束；接口不返回字段原文、字段 hash、内部定位或样式指纹。
 
 #### 上传并解析简历模板
 
@@ -1414,26 +1437,14 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
     "version": 1,
     "status": "READY",
     "filename": "后端实习简历.docx",
-    "fields": [
-      {
-        "fieldId": "p-7aa1c3d091",
-        "sectionKey": "project_experience",
-        "displayName": "多模态 RAG 学习证据平台",
-        "sourceText": "多模态 RAG 学习证据平台...",
-        "sourceTextHash": "sha256...",
-        "maxChars": 280,
-        "maxLines": 3,
-        "requiredEvidencePolicy": "REQUIRED",
-        "unsupportedRegions": []
-      }
-    ],
-    "unsupportedRegions": [],
+    "fieldCount": 8,
+    "unsupportedRegionCount": 0,
     "createdAt": "2026-06-22T10:00:00"
   }
 }
 ```
 
-#### 查看字段绑定
+#### 查看模板摘要
 
 | 项目 | 内容 |
 | --- | --- |
@@ -1441,7 +1452,7 @@ Python 对 `docx/pptx/xlsx` 等原生解析结果生成质量指标：
 | 路径 | `/api/rag/resume-templates/{templateId}` |
 | 响应 | `Result<ResumeTemplateVO>` |
 
-Java 必须按当前登录用户和 `templateId` 查询，不能返回其他用户模板。
+Java 必须按当前登录用户和 `templateId` 查询，不能返回其他用户模板。对外 `ResumeTemplateVO` 只返回 `fieldCount/unsupportedRegionCount` 等摘要，不返回字段原文、字段 hash、locationRefs、styleFingerprint 或 layoutFingerprint；前端页面不展示 `fieldCount`，只把模板作为可选择资源使用。Java 生成补丁、预览和导出时仍可在服务端读取字段绑定并转发给 Python 内部接口。
 
 #### 删除简历模板
 
@@ -1486,7 +1497,7 @@ Java 行为：
 6. 保存补丁草稿、生成时冻结的 `allowedFieldIds` 和最大 `annotationRevision`，状态为 `DRAFT` 或 `VALIDATED`。
 7. 不记录简历全文、JD 全文和模型原始补丁到日志。
 
-前端职责：岗位 JD 不在 `/resume-template` 页面输入；Agent 工作台先选择已上传简历资料读取摘要，再选择模板并提交 JD，之后触发字段补丁生成、人工确认和导出闭环。模板页保存的图片区域约束是 Agent 生成补丁时的字段范围约束。
+前端职责：岗位 JD 不在 `/resume-template` 页面输入；Agent 工作台先选择已上传简历资料读取摘要，再选择模板并提交 JD，之后触发字段补丁生成、人工确认和导出闭环。模板页保存的图片区域约束是 Agent 生成补丁时的字段范围约束，但前端不展示模板字段原文和内部定位信息。
 
 #### 图片预览与区域标注
 
@@ -1561,6 +1572,8 @@ Java 校验模板归属后读取当前受控 DOCX。若已有缓存且未指定 
 }
 ```
 
+可选 `layoutContract` 用于用户明确要求受控排版变化时授权；未传时按 `PRESERVE_LAYOUT`。
+
 Java 和 Python 都必须校验：
 
 - `templateId + version + fieldId + sourceTextHash` 匹配。
@@ -1569,6 +1582,7 @@ Java 和 Python 都必须校验：
 - `riskFlags/status` 为枚举值。
 - 不包含 `style/font/layout/xml/path/locationRefs/run/paragraph/table/cell` 等排版字段。
 - 不包含 Markdown 表格、HTML 或 DOCX XML。
+- 如用户要求加粗、增加段落或删除段落，不能把排版字段混进 `ResumeContentPatch`，必须通过独立 `layoutContract.allowedChanges` 授权并由 Python 差异审计。
 
 #### 导出确认后的新版本
 
@@ -1585,7 +1599,11 @@ Java 和 Python 都必须校验：
 {
   "version": 1,
   "patchDraftId": "draft-uuid",
-  "idempotencyKey": "resume-export-20260622-001"
+  "idempotencyKey": "resume-export-20260622-001",
+  "layoutContract": {
+    "mode": "PRESERVE_LAYOUT",
+    "allowedChanges": []
+  }
 }
 ```
 
@@ -1595,6 +1613,7 @@ Java 和 Python 都必须校验：
 - 所有将应用的补丁必须是 `CONFIRMED` 或 `VALIDATED`。
 - 幂等键重复时返回已有导出记录，不重复生成。
 - Python 返回 `RESUME_LAYOUT_CHANGED` 时，Java 不保存导出文件。
+- 未传 `layoutContract` 时按 `PRESERVE_LAYOUT`，任何段落数、run 数、关系、媒体或结构 hash 变化都会拒绝保存。
 - 导出保存为新对象，不覆盖原始模板。
 - 静态图片、头像和 Logo 等 `w:drawing/w:pict` 结构不再作为全局导出拒绝条件；它们仍保留在 layout fingerprint 的媒体文件和 relationship 校验中。若图片所在段落或文本框字段本身被识别为不可改写字段，字段级校验仍会拒绝自动修改。
 - 超链接、域代码、批注、修订痕迹、脚注尾注、文本框、内容控件等复杂结构仍会触发导出前拒绝，避免确定性替换误改结构化内容。

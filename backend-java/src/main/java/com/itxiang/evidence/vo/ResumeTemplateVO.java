@@ -4,8 +4,6 @@ import lombok.Builder;
 import lombok.Data;
 
 import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
 
 @Data
 @Builder
@@ -18,9 +16,8 @@ public class ResumeTemplateVO {
     private String currentFilePath;
     private String currentPublicUrl;
     private String fileType;
-    private List<Map<String, Object>> fields;
-    private List<String> unsupportedRegions;
-    private Map<String, Object> layoutFingerprint;
+    private Integer fieldCount;
+    private Integer unsupportedRegionCount;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

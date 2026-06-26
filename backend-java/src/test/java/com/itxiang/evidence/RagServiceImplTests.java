@@ -763,6 +763,8 @@ class RagServiceImplTests {
         assertThat(result.get(0).getTemplateId()).isEqualTo("tpl-history");
         assertThat(result.get(0).getFilename()).isEqualTo("resume-v2.docx");
         assertThat(result.get(0).getCurrentFilePath()).isEqualTo("uploads/resume-v2.docx");
+        assertThat(result.get(0).getFieldCount()).isZero();
+        assertThat(result.get(0).getUnsupportedRegionCount()).isZero();
         verify(resumeTemplateMapper).findRecentByUserId(eq("7"), eq(12));
     }
 

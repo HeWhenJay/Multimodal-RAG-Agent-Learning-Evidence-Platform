@@ -5,6 +5,8 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
+import java.util.Map;
+
 @Data
 public class ResumeTemplateExportDTO {
 
@@ -17,4 +19,6 @@ public class ResumeTemplateExportDTO {
 
     @NotBlank(message = "幂等键不能为空")
     private String idempotencyKey;
+
+    private Map<String, Object> layoutContract;
 }

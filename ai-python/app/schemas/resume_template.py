@@ -28,6 +28,8 @@ RiskFlag = Literal[
     "INJECTION_RISK",
 ]
 PatchStatus = Literal["DRAFT", "VALIDATED", "CONFIRMED", "REJECTED", "EXPORTED"]
+LayoutEditMode = Literal["PRESERVE_LAYOUT", "CONTROLLED_EDIT", "RELAYOUT"]
+LayoutOperationType = Literal["TEXT_REPLACE", "STYLE_RANGE", "INSERT_PARAGRAPH", "DELETE_PARAGRAPH"]
 
 
 class StrictModel(BaseModel):
@@ -85,6 +87,29 @@ class ResumeContentPatch(StrictModel):
     status: PatchStatus
 
 
+class LayoutAllowedChange(StrictModel):
+    """描述用户显式授权的版式变化范围。"""
+
+    type: LayoutOperationType
+    fieldId: str | None = None
+    sectionKey: SectionKey | None = None
+    textRange: str | None = Field(default=None, max_length=200)
+    stylePatch: dict[str, Any] = Field(default_factory=dict)
+    maxParagraphs: int = Field(default=0, ge=0, le=20)
+    styleSource: Literal["current_run", "previous_paragraph", "section_default"] = "current_run"
+
+
+class LayoutChangeContract(StrictModel):
+    """定义本次简历导出允许发生的版式差异。"""
+
+    mode: LayoutEditMode = "PRESERVE_LAYOUT"
+    allowedChanges: list[LayoutAllowedChange] = Field(default_factory=list)
+    maxPageDelta: int = Field(default=0, ge=0, le=5)
+    maxParagraphDelta: int = Field(default=0, ge=0, le=50)
+    maxRunDelta: int = Field(default=0, ge=0, le=200)
+    requireVisualCheck: bool = True
+
+
 class ResumePatchGenerationRequest(StrictModel):
     templateId: str = Field(..., min_length=1)
     version: int = Field(..., ge=1)
@@ -113,6 +138,7 @@ class ResumePatchValidationRequest(StrictModel):
     fields: list[ResumeTemplateBinding] = Field(..., min_length=1)
     patches: list[ResumeContentPatch] = Field(..., min_length=1)
     allowedEvidenceIds: list[str] = Field(default_factory=list)
+    layoutContract: LayoutChangeContract = Field(default_factory=LayoutChangeContract)
 
 
 class ResumePatchValidationResponse(StrictModel):
@@ -120,6 +146,7 @@ class ResumePatchValidationResponse(StrictModel):
     version: int
     patches: list[ResumeContentPatch]
     validationErrors: list[str] = Field(default_factory=list)
+    layoutValidation: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResumeTemplateParseResponse(StrictModel):
@@ -193,3 +220,4 @@ class ResumeTemplateExportRequest(StrictModel):
     fields: list[ResumeTemplateBinding] = Field(..., min_length=1)
     patches: list[ResumeContentPatch] = Field(..., min_length=1)
     allowedEvidenceIds: list[str] = Field(default_factory=list)
+    layoutContract: LayoutChangeContract = Field(default_factory=LayoutChangeContract)

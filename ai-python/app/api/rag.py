@@ -357,6 +357,7 @@ def validate_resume_template_patch_request(request: ResumePatchValidationRequest
         fields=request.fields,
         patches=request.patches,
         allowed_evidence_ids=request.allowedEvidenceIds,
+        layout_contract=request.layoutContract,
     )
 
 
@@ -373,6 +374,7 @@ def export_resume_template(request: ResumeTemplateExportRequest) -> ResumeTempla
             fields=request.fields,
             patches=request.patches,
             allowed_evidence_ids=request.allowedEvidenceIds,
+            layout_contract=request.layoutContract,
         )
     except ValueError as exc:
         detail = str(exc)

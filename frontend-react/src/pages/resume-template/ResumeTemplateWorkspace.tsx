@@ -1,7 +1,6 @@
 import {
   ExternalLink,
   FileText,
-  Highlighter,
   History,
   Image as ImageIcon,
   Loader2,
@@ -37,7 +36,7 @@ type DraftRegion = {
   currentY: number;
 };
 
-// 简历模板页只负责模板选择、字段识别、图片区域确认和模板效果原型预览。
+// 简历模板页只负责模板上传、历史选择、图片预览和可修改区域确认。
 export function ResumeTemplateWorkspace() {
   const [searchParams] = useSearchParams();
   const [templates, setTemplates] = useState<ResumeTemplate[]>([]);
@@ -54,7 +53,6 @@ export function ResumeTemplateWorkspace() {
   const [error, setError] = useState('');
   const preferredTemplateId = searchParams.get('templateId') || '';
 
-  const fieldsById = useMemo(() => new Map((template?.fields || []).map((field) => [field.fieldId, field])), [template]);
   const editableAnnotations = useMemo(
     () => (preview?.annotations || []).filter((item) => item.editable && item.status === 'ACTIVE' && item.fieldId),
     [preview]
@@ -156,7 +154,7 @@ export function ResumeTemplateWorkspace() {
       setImageUrls({});
       setDraftRegion(null);
       setAnnotationDirty(false);
-      setMessage('简历模板字段解析完成，正在生成图片预览');
+      setMessage('简历模板已解析，正在生成图片预览');
       await loadPreview(result.templateId, false, result);
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : '简历模板解析失败');
@@ -206,9 +204,9 @@ export function ResumeTemplateWorkspace() {
       setSelectedAnnotationId(result.annotations[0]?.annotationId || '');
       setAnnotationDirty(false);
       if (result.previewStatus === 'UNAVAILABLE') {
-        setMessage('图片预览暂不可用，模板字段列表仍可用于 Agent 简历修改');
+        setMessage('图片预览暂不可用，请稍后刷新或重新上传 DOCX');
       } else if (result.previewStatus === 'PARTIAL') {
-        setMessage(`字段草图预览已生成，可继续确认区域：${result.warnings[0] || sourceTemplate?.filename || '部分字段未精确映射'}`);
+        setMessage(`降级预览已生成，可继续确认区域：${result.warnings[0] || sourceTemplate?.filename || '部分区域未精确映射'}`);
       } else if (sourceTemplate) {
         setMessage(`模板效果预览已生成：${sourceTemplate.filename}`);
       }
@@ -352,7 +350,7 @@ export function ResumeTemplateWorkspace() {
           <label className="file-drop compact">
             <FileText size={28} />
             <strong>上传 DOCX 简历模板</strong>
-            <span>解析字段绑定、hash 和 layout fingerprint</span>
+            <span>解析版式边界并生成图片预览</span>
             <input
               type="file"
               accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -367,7 +365,7 @@ export function ResumeTemplateWorkspace() {
           {template ? (
             <div className="resume-template-meta">
               <strong>{template.filename}</strong>
-              <span>版本 {template.version} · {template.fields.length} 个字段 · {template.unsupportedRegions.length} 个不支持区域</span>
+              <span>版本 {template.version} · {template.unsupportedRegionCount} 个复杂区域</span>
               <span>更新时间 {formatTime(template.updatedAt || template.createdAt)}</span>
               <button className="chip-button danger" onClick={() => void removeTemplate(template.templateId)} disabled={busy} type="button">
                 <XCircle size={16} />删除当前模板
@@ -406,7 +404,7 @@ export function ResumeTemplateWorkspace() {
                         <em>{formatTemplateStatus(item.status)}</em>
                       </span>
                       <strong>{item.filename}</strong>
-                      <small>版本 {item.version} · {item.fields.length} 个字段 · {formatTime(item.updatedAt || item.createdAt)}</small>
+                      <small>版本 {item.version} · {formatTime(item.updatedAt || item.createdAt)}</small>
                     </button>
                     <button className="icon-button small danger" disabled={busy} onClick={() => void removeTemplate(item.templateId)} title="删除模板" type="button">
                       <XCircle size={15} />
@@ -429,14 +427,6 @@ export function ResumeTemplateWorkspace() {
         </p>
       ) : null}
 
-      <TemplatePrototype
-        template={template}
-        preview={preview}
-        imageUrls={imageUrls}
-        editableCount={editableAnnotations.length}
-        selectedAnnotationId={selectedAnnotationId}
-      />
-
       <section className="panel resume-preview-shell">
         <div className="panel-title">
           <h3><ImageIcon size={20} />图片预览确认</h3>
@@ -451,7 +441,7 @@ export function ResumeTemplateWorkspace() {
           </div>
         </div>
         <Legend />
-        <p className="resume-template-hint">在图片上选择字段区域，打开“允许 Agent 修改”，再保存区域约束。手动备注未绑定字段时只用于视觉说明，不会自动修改 DOCX。</p>
+        <p className="resume-template-hint">在图片预览上选择高亮区域，打开“允许 Agent 修改”，再保存区域约束。系统不会在前端展示或编辑 Agent 提取出的模板字段内容。</p>
         {preview?.warnings.length ? (
           <div className="resume-validation-errors">
             {preview.warnings.map((item) => <span key={item}><TriangleAlert size={15} />{item}</span>)}
@@ -477,7 +467,7 @@ export function ResumeTemplateWorkspace() {
                       style={rectStyle(annotation.rect)}
                       onPointerDown={(event) => event.stopPropagation()}
                       onClick={() => setSelectedAnnotationId(annotation.annotationId || '')}
-                      title={regionTitle(annotation, fieldsById)}
+                      title={regionTitle(annotation)}
                     />
                   ))}
                   {draftRegion?.pageIndex === page.pageIndex ? <span className="resume-region manual-unbound drafting" style={rectStyle(draftToRect(draftRegion))} /> : null}
@@ -486,13 +476,12 @@ export function ResumeTemplateWorkspace() {
             </div>
             <AnnotationPanel
               annotation={selectedAnnotation}
-              fields={template?.fields || []}
               onChange={updateAnnotation}
             />
           </div>
         ) : (
           <div className="empty-state">
-            {previewLoading ? '正在生成图片预览' : '图片预览不可用或尚未生成，模板字段仍可在 Agent 中作为修改边界'}
+            {previewLoading ? '正在生成图片预览' : '图片预览不可用或尚未生成'}
           </div>
         )}
         <div className="resume-template-actions">
@@ -509,94 +498,17 @@ export function ResumeTemplateWorkspace() {
   );
 }
 
-function TemplatePrototype({
-  template,
-  preview,
-  imageUrls,
-  editableCount,
-  selectedAnnotationId
-}: {
-  template: ResumeTemplate | null;
-  preview: ResumeTemplatePreview | null;
-  imageUrls: Record<number, string>;
-  editableCount: number;
-  selectedAnnotationId: string;
-}) {
-  const firstPage = preview?.pages[0];
-  const firstPageAnnotations = firstPage ? preview.annotations.filter((annotation) => annotation.pageIndex === firstPage.pageIndex) : [];
-  const firstPageImage = firstPage ? imageUrls[firstPage.pageIndex] : '';
-  return (
-    <section className="panel resume-template-prototype">
-      <div className="panel-title">
-        <h3><Highlighter size={20} />模板效果原型图</h3>
-        <span className="status-pill">{template ? `${template.fields.length} 个识别字段` : '等待模板'}</span>
-      </div>
-      {template ? (
-        <div className="resume-prototype-layout">
-          <div className="resume-prototype-canvas">
-            {firstPageImage ? (
-              <>
-                <img src={firstPageImage} alt="简历模板效果原型图" />
-                {firstPageAnnotations.map((annotation) => (
-                  <span
-                    key={annotation.annotationId}
-                    className={`resume-region prototype-region ${regionClass(annotation, selectedAnnotationId)}`}
-                    style={rectStyle(annotation.rect)}
-                  />
-                ))}
-              </>
-            ) : (
-              <div className="resume-prototype-paper">
-                {template.fields.slice(0, 8).map((field) => (
-                  <div className="resume-prototype-line" key={field.fieldId}>
-                    <strong>{field.displayName}</strong>
-                    <span>{field.sourceText.slice(0, 48)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="resume-prototype-summary">
-            <MetaBlock label="当前模板" value={template.filename} />
-            <MetaBlock label="版本" value={String(template.version)} />
-            <MetaBlock label="允许 Agent 修改" value={`${editableCount} 个区域`} />
-            <MetaBlock label="复杂结构" value={`${template.unsupportedRegions.length} 个`} />
-            <div className="resume-prototype-tags">
-              {template.fields.slice(0, 8).map((field) => <span key={field.fieldId}>{formatSection(field.sectionKey)}</span>)}
-            </div>
-            <p>这里展示的是 Agent 后续生成 DOCX 前可见的模板原型：图片来自真实 DOCX 渲染或字段草图降级预览，彩色区域代表已识别或人工确认的可修改字段。</p>
-          </div>
-        </div>
-      ) : (
-        <div className="empty-state">选择或上传模板后显示真实 DOCX 效果原型图</div>
-      )}
-    </section>
-  );
-}
-
-function MetaBlock({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="resume-prototype-meta">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
 function AnnotationPanel({
   annotation,
-  fields,
   onChange
 }: {
   annotation: ResumeTemplateRegionAnnotation | null;
-  fields: ResumeTemplate['fields'];
   onChange: (annotationId: string | undefined | null, updater: (annotation: ResumeTemplateRegionAnnotation) => ResumeTemplateRegionAnnotation) => void;
 }) {
-  const field = annotation?.fieldId ? fields.find((item) => item.fieldId === annotation.fieldId) : null;
   if (!annotation) {
     return (
       <aside className="resume-annotation-panel">
-        <div className="empty-state">选择一个高亮区域后编辑绑定字段、改写要求和证据要求</div>
+        <div className="empty-state">选择一个高亮区域后确认是否允许 Agent 修改</div>
       </aside>
     );
   }
@@ -604,25 +516,9 @@ function AnnotationPanel({
   return (
     <aside className="resume-annotation-panel">
       <div className="resume-annotation-head">
-        <strong>{field?.displayName || '未绑定区域'}</strong>
+        <strong>{annotation.fieldId ? '已绑定内部字段' : '未绑定区域'}</strong>
         <span>{annotation.sourceType} · {annotation.status}</span>
       </div>
-      <label>
-        <span>字段绑定</span>
-        <select
-          value={annotation.fieldId || ''}
-          onChange={(event) => onChange(annotation.annotationId, (current) => ({
-            ...current,
-            fieldId: event.target.value || null,
-            sourceType: event.target.value ? 'MANUAL_BOUND' : 'MANUAL_UNBOUND',
-            editable: event.target.value ? current.editable : false,
-            requiredEvidencePolicy: event.target.value ? (fields.find((item) => item.fieldId === event.target.value)?.requiredEvidencePolicy || current.requiredEvidencePolicy) : 'NONE'
-          }))}
-        >
-          <option value="">未绑定字段</option>
-          {fields.map((item) => <option key={item.fieldId} value={item.fieldId}>{item.displayName}</option>)}
-        </select>
-      </label>
       <label className={annotation.editable ? 'resume-toggle-row active' : 'resume-toggle-row'}>
         <input
           type="checkbox"
@@ -663,7 +559,7 @@ function AnnotationPanel({
         </select>
       </label>
       <div className="resume-annotation-facts">
-        <span>{field?.sourceText ? `原文：${field.sourceText.slice(0, 90)}` : '未绑定字段，仅作为视觉备注'}</span>
+        <span>{annotation.fieldId ? '该区域已由系统绑定到内部字段，字段内容不在前端展示。' : '未绑定字段，仅作为视觉备注'}</span>
         <span>{annotation.fieldId && annotation.editable && annotation.status === 'ACTIVE' ? '保存后会作为 Agent 可修改边界' : '不会参与 Agent 自动修改'}</span>
       </div>
     </aside>
@@ -718,9 +614,8 @@ function regionClass(annotation: ResumeTemplateRegionAnnotation, selectedId: str
   return classes.join(' ');
 }
 
-function regionTitle(annotation: ResumeTemplateRegionAnnotation, fieldsById: Map<string, ResumeTemplate['fields'][number]>) {
-  const field = annotation.fieldId ? fieldsById.get(annotation.fieldId) : null;
-  return field?.displayName || (annotation.sourceType === 'MANUAL_UNBOUND' ? '手动未绑定备注' : '未绑定区域');
+function regionTitle(annotation: ResumeTemplateRegionAnnotation) {
+  return annotation.sourceType === 'MANUAL_UNBOUND' ? '手动未绑定备注' : '系统识别区域';
 }
 
 function clamp01(value: number) {
@@ -758,10 +653,6 @@ const sectionLabels: Record<string, string> = {
   research: '科研',
   other: '其他'
 };
-
-function formatSection(section?: string) {
-  return sectionLabels[section || 'other'] || section || '其他';
-}
 
 function formatTime(value?: string | null) {
   if (!value) return '暂无时间';
