@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import math
@@ -9,19 +9,19 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 from typing import Any
 
-from rag.bailian_llm import generate_grounded_answer
+from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
-from rag.models import Chunk, utc_now_iso
+from rag.core.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
-from rag.metadata_filters import (
+from rag.core.metadata_filters import (
     MetadataFilterPlan,
     build_metadata_filter_plan,
     format_metadata_filter_plan,
     matches_metadata_filter,
 )
-from rag.model_logging import log_model_call
-from rag.process_logger import logged_rag_method, process_event
-from rag.progress import RagProgressReporter
+from rag.observability.model_logging import log_model_call
+from rag.observability.process_logger import logged_rag_method, process_event
+from rag.observability.progress import RagProgressReporter
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.answer_guard import evaluate_answer_guard, refusal_short_message
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
@@ -33,7 +33,7 @@ from rag.retrievers.query_expansion import (
     format_query_variants,
 )
 from rag.indexes.summary_index import SummaryIndex
-from rag.text_sanitizer import (
+from rag.core.text_sanitizer import (
     clean_postgres_text,
     sanitize_chunks,
     sanitize_document_blocks,

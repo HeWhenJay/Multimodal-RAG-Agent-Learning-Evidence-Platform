@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from rag.models import Chunk
-from rag.process_logger import logged_rag_method, process_event
+from rag.core.models import Chunk
+from rag.observability.process_logger import logged_rag_method, process_event
 
 
 class SummaryIndex:

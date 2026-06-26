@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import re
@@ -15,8 +15,8 @@ from urllib.parse import unquote, urlparse
 from video.asr.bailian_asr import BailianAsrClient
 from video.ocr.bailian_ocr import BailianOcrClient
 from app.schemas.rag import DocumentBlock
-from rag.process_logger import logged_rag_method, process_event
-from rag.progress import RagProgressReporter
+from rag.observability.process_logger import logged_rag_method, process_event
+from rag.observability.progress import RagProgressReporter
 
 
 VIDEO_FILE_TYPES = {"mp4", "mov", "m4v", "webm", "mkv", "avi"}

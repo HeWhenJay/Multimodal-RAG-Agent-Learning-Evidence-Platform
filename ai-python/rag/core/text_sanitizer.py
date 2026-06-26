@@ -4,7 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from app.schemas.rag import DocumentBlock, ParseQuality
-from rag.models import Chunk
+from rag.core.models import Chunk
 
 
 POSTGRES_NUL = "\x00"

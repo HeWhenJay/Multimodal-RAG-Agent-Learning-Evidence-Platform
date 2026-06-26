@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from rag.models import ParsedDocument
+from rag.core.models import ParsedDocument
 
 
 class MineruDocumentLoader:

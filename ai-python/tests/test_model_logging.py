@@ -1,5 +1,5 @@
-from rag.model_logging import log_model_call
-from rag.process_logger import RagProcessLogger, use_process_logger
+from rag.observability.model_logging import log_model_call
+from rag.observability.process_logger import RagProcessLogger, use_process_logger
 
 
 def test_model_call_logs_before_and_after(capsys):

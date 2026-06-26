@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import DocumentBlock
-from rag.process_logger import logged_rag_method, process_event
-from rag.progress import RagProgressReporter
+from rag.observability.process_logger import logged_rag_method, process_event
+from rag.observability.progress import RagProgressReporter
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")

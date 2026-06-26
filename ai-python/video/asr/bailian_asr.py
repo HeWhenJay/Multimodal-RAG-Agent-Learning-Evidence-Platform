@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from rag.model_logging import log_model_call
+from rag.observability.model_logging import log_model_call
 
 
 DEFAULT_ASR_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"

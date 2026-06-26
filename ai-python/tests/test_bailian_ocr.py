@@ -1,6 +1,6 @@
-﻿from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
+from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
 from rag.loaders.document_parsers import DocumentParserRouter
-from rag.process_logger import RagProcessLogger, use_process_logger
+from rag.observability.process_logger import RagProcessLogger, use_process_logger
 
 
 class FakeResponse:

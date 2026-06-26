@@ -100,7 +100,11 @@ python run.py
 - `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
 - `app/schemas/`：Java 与 Python 之间共享的 Pydantic 请求/响应模型。
 - `agents/`：按职责拆分的 Agent 编排实现，包括 `gateway/`、`read_only/`、`jd_learning_plan/`、`memory/` 和 `resume_adapter/`。
-- `rag/`：文档解析、递归切块、索引、检索、重排、回答守卫和评估能力。
+- `rag/core/`：RAG 通用模型、元数据过滤和文本清洗。
+- `rag/observability/`：RAG 进度上报、过程日志、模型调用日志和 Java 日志回调。
+- `rag/generation/`：百炼 LLM 回答生成和 evidence 引用摘要。
+- `rag/loaders/`、`rag/chunkers/`、`rag/indexes/`、`rag/retrievers/`、`rag/rerankers/`：解析、递归切块、索引、检索和重排主链路。
+- `rag/evaluation/`：Ragas 小样本评估脚本和兼容层。
 - `video/`：视频 ASR、抽帧、OCR、去重和分片证据处理。
 - `tests/`：Python 单元测试和接口回归测试。
 

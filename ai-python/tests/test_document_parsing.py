@@ -1,4 +1,4 @@
-﻿from rag.loaders.document_parsers import DocumentParserRouter
+from rag.loaders.document_parsers import DocumentParserRouter
 from rag.retrievers.retrieval import InMemoryRagStore
 from video.chunking.video_processing import FrameImage, build_video_segment_summary_blocks, select_ppt_slide_frames
 from app.schemas.rag import DocumentBlock
@@ -258,7 +258,7 @@ def test_public_video_without_subtitle_marker_keeps_filetrans_first(tmp_path, mo
 
 
 def test_video_ocr_retry_progress_reports_attempt_message():
-    from rag.progress import RagProgressReporter
+    from rag.observability.progress import RagProgressReporter
     from video.chunking.video_processing import emit_ocr_retry_progress
 
     reporter = RagProgressReporter(document_id="doc-video-retry", persist=False)

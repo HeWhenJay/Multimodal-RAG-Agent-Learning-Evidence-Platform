@@ -136,7 +136,7 @@ def test_stage_b_default_has_no_twenty_frame_limit(tmp_path, monkeypatch):
 
 
 def test_slide_detection_reports_frontend_progress(tmp_path, monkeypatch):
-    from rag.progress import RagProgressReporter
+    from rag.observability.progress import RagProgressReporter
 
     monkeypatch.setenv("RAG_VIDEO_FRAME_VISUAL_DEDUP_ENABLED", "false")
     monkeypatch.setenv("RAG_VIDEO_FRAME_MIN_INTERVAL_SECONDS", "0")

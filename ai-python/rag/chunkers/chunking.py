@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 import hashlib
@@ -6,9 +6,9 @@ import os
 from dataclasses import replace
 from typing import Any
 
-from rag.models import Chunk
-from rag.process_logger import logged_rag_method, process_event
-from rag.text_sanitizer import clean_postgres_text, sanitize_for_postgres
+from rag.core.models import Chunk
+from rag.observability.process_logger import logged_rag_method, process_event
+from rag.core.text_sanitizer import clean_postgres_text, sanitize_for_postgres
 from app.schemas.rag import DocumentBlock
 
 

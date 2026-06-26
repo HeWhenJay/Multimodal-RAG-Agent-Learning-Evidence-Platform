@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import html
 import os
@@ -15,12 +15,12 @@ from xml.etree import ElementTree
 
 from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
 from rag.loaders.mineru_loader import MineruDocumentLoader
-from rag.models import ParsedBlockDocument
+from rag.core.models import ParsedBlockDocument
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
 from rag.indexes.summary_index import SummaryIndex
-from rag.process_logger import logged_rag_method, process_event
-from rag.progress import RagProgressReporter
-from rag.text_sanitizer import clean_postgres_text
+from rag.observability.process_logger import logged_rag_method, process_event
+from rag.observability.progress import RagProgressReporter
+from rag.core.text_sanitizer import clean_postgres_text
 from video.chunking.video_processing import (
     VIDEO_FILE_TYPES,
     build_video_segment_summary_blocks,
@@ -2304,7 +2304,7 @@ def mark_video_evidence_quality(quality: ParseQuality, blocks: list[DocumentBloc
 
 
 def _summary_chunk(document_id: str, index: int, block: DocumentBlock):
-    from rag.models import Chunk
+    from rag.core.models import Chunk
 
     return Chunk(
         chunk_id=f"{document_id}-summary-{index}",

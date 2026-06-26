@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from rag.model_logging import log_model_call
-from rag.process_logger import process_event
+from rag.observability.model_logging import log_model_call
+from rag.observability.process_logger import process_event
 
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"

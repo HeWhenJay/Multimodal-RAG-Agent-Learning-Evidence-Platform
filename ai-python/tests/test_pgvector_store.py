@@ -3,7 +3,7 @@ import pytest
 from app.schemas.rag import DocumentBlock
 from rag.indexes.pgvector_store import PgVectorRagStore, normalize_table_prefix, quote_identifier
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
-from rag.models import Chunk
+from rag.core.models import Chunk
 
 
 class FakeChunker:

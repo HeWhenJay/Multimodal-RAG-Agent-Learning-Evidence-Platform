@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from time import perf_counter
 from typing import Iterator
 
-from rag.process_logger import process_event
+from rag.observability.process_logger import process_event
 
 
 # 记录百炼模型调用生命周期，同时同步到 Python 控制台和 Java 控制面板。

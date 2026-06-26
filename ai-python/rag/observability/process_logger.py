@@ -11,8 +11,8 @@ from functools import wraps
 from time import perf_counter
 from typing import Any
 
-from rag.log_callback import post_log_error, post_log_event
-from rag.progress import parse_material_id, truncate
+from rag.observability.log_callback import post_log_error, post_log_event
+from rag.observability.progress import parse_material_id, truncate
 
 
 logger = logging.getLogger(__name__)

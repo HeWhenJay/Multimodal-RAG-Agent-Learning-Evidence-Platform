@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.schemas.rag import ProgressEvent
-from rag.log_callback import post_log_event
+from rag.observability.log_callback import post_log_event
 
 
 logger = logging.getLogger(__name__)

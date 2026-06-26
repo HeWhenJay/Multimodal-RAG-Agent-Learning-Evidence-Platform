@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -7,17 +7,17 @@ import re
 from collections import Counter
 from typing import Any
 
-from rag.bailian_llm import generate_grounded_answer
+from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
-from rag.models import Chunk, utc_now_iso
+from rag.core.models import Chunk, utc_now_iso
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
-from rag.metadata_filters import (
+from rag.core.metadata_filters import (
     BUSINESS_METADATA_FILTER_KEYS,
     SYSTEM_METADATA_FILTER_KEYS,
     build_metadata_filter_plan,
     format_metadata_filter_plan,
 )
-from rag.process_logger import logged_rag_method, process_event
+from rag.observability.process_logger import logged_rag_method, process_event
 from rag.rerankers.reranking import rerank_evidences
 from rag.retrievers.answer_guard import evaluate_answer_guard, refusal_short_message
 from rag.retrievers.evidence_diversity import build_evidence_metadata_view, dedupe_evidences_for_context
@@ -35,7 +35,7 @@ from rag.retrievers.retrieval import (
     tokenize,
 )
 from rag.indexes.summary_index import SummaryIndex
-from rag.text_sanitizer import (
+from rag.core.text_sanitizer import (
     clean_postgres_text,
     sanitize_chunks,
     sanitize_document_blocks,
@@ -52,7 +52,7 @@ from app.schemas.rag import (
     QueryRequest,
     QueryResponse,
 )
-from rag.progress import RagProgressReporter
+from rag.observability.progress import RagProgressReporter
 
 
 FILTER_COLUMNS = {

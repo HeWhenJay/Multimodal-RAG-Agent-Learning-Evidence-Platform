@@ -6,9 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from rag.bailian_llm import DEFAULT_CHAT_BASE_URL, DEFAULT_CHAT_MODEL, extract_message_content
-from rag.model_logging import log_model_call
-from rag.process_logger import logged_rag_method, process_event
+from rag.generation.bailian_llm import DEFAULT_CHAT_BASE_URL, DEFAULT_CHAT_MODEL, extract_message_content
+from rag.observability.model_logging import log_model_call
+from rag.observability.process_logger import logged_rag_method, process_event
 
 
 DEFAULT_QUERY_EXPANSION_MODEL = DEFAULT_CHAT_MODEL

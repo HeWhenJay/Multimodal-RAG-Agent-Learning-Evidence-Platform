@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import re
@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
-from rag.model_logging import log_model_call
-from rag.process_logger import logged_rag_method, process_event
+from rag.observability.model_logging import log_model_call
+from rag.observability.process_logger import logged_rag_method, process_event
 
 
 DEFAULT_RERANK_BASE_URL = "https://dashscope.aliyuncs.com"
