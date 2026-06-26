@@ -243,15 +243,24 @@ flowchart TD
     PLAN_REVIEW -->|"拒绝或要求修改"| ANSWER["回答节点<br/>组织当前状态和可执行建议"]
 
     M1 --> EXEC["执行器 Executor<br/>ReAct：选择下一步行动"]
-    EXEC --> TOOL["工具节点 Tool Adapter<br/>Java Gateway / 后续 MCP"]
+    EXEC --> ACTION{"下一步行动类型"}
+    ACTION -->|"普通工具"| TOOL["工具节点 Tool Adapter<br/>Java Gateway / 后续 MCP"]
+    ACTION -->|"简历改写步骤"| RESUME_SUB["简历改写子图 resume_rewrite_graph<br/>模板抽取、补丁、Layout Guard、预览候选"]
     TOOL --> TOOL_RESULT{"工具结果"}
+    RESUME_SUB --> RESUME_RESULT{"子图结果"}
 
     TOOL_RESULT -->|"失败"| REPAIR["修补节点<br/>重试、跳过、重规划或汇报无法完成"]
-    REPAIR -->|"重试"| TOOL
+    RESUME_RESULT -->|"失败"| REPAIR
+    REPAIR -->|"重试当前行动"| ACTION
     REPAIR -->|"重规划"| PL
     REPAIR -->|"无法完成"| ACCEPT["验收器<br/>检查计划完成度和失败原因"]
 
     TOOL_RESULT -->|"成功"| ACCEPT
+    RESUME_RESULT -->|"草稿或校验通过"| ACCEPT
+    RESUME_RESULT -->|"需要预览、导出或保存确认"| RESUME_REVIEW["HITL：OUTPUT / CRUD 审批<br/>确认改写结果、导出与保存"]
+    RESUME_REVIEW -->|"批准"| ACCEPT
+    RESUME_REVIEW -->|"要求修改"| EXEC
+    RESUME_REVIEW -->|"拒绝"| ANSWER
     ACCEPT -->|"计划未完成"| EXEC
     ACCEPT -->|"需补救"| REPAIR
     ACCEPT -->|"验收通过"| ANSWER
@@ -266,15 +275,7 @@ flowchart TD
 
 当前 LangGraph 按 `docs/api/agent.md` 契约落地：`pae_react_graph` 已统一纯只读和规划类路径，固定节点为 `memory_prefetch_before_planner -> planner -> plan_review? -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口当前通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
-PAE 主图不直接改写 DOCX，也不直接写对象存储。若 Planner 发现计划中包含“基于模板改写简历、保留原版式、导出简历”等步骤，执行器只把该步骤路由到专门的 `resume_rewrite_graph` 子图；子图完成后把补丁草稿、版式审计、预览状态和待审批动作作为 Observation 回到主图，再由主图继续验收、输出或等待用户确认。下图只表达主图与子图的调用关系，子图内部流程见后续图解。
-
-```mermaid
-flowchart TD
-    PL["PAE Planner<br/>计划包含简历改写步骤"] --> EXEC["ReAct Executor<br/>执行到该计划步骤"]
-    EXEC --> SUB["resume_rewrite_graph 子图<br/>独立处理简历改写"]
-    SUB --> OBS["Observation 回到 pae_react_graph<br/>补丁草稿、版式审计、预览状态"]
-    OBS --> ACCEPT["主图验收/回答/审批<br/>继续后续计划或等待用户确认"]
-```
+PAE 主图不直接改写 DOCX，也不直接写对象存储。若 Planner 生成的计划包含“基于模板改写简历、保留原版式、导出简历”等步骤，`human_plan_review` 只确认这条计划路线和工具范围；计划通过后，执行器执行到该步骤时才从“下一步行动类型”分支进入 `resume_rewrite_graph` 子图。子图完成后把补丁草稿、版式审计、预览状态和待审批动作作为 Observation 回到主图：只产出草稿或校验结果时直接进入验收；涉及用户预览、导出、保存或版本写入时进入 `OUTPUT / CRUD` 审批，审批通过后再回到验收节点，要求修改则回到执行循环。
 
 简历改写子图的职责是把“内容改写”和“版式保护”拆开：LLM 只生成字段级内容补丁和显式授权的版式变化请求，确定性 DOCX 应用器负责写入，Layout Guard 负责判断是否发生未授权的样式/结构变化。用户主动要求新增段落、删减内容、加粗字段或做局部重排时，不会因为版式发生变化就直接打回；这些变化必须进入 `LayoutChangeContract`，只有超出授权范围的变化才回到模板抽取/补丁生成环节重新处理。
 
