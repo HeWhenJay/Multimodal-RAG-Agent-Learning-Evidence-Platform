@@ -198,10 +198,10 @@ flowchart TD
     AGSVC -->|"只读工具和变更工具复用业务能力"| RAGSVC
     AGSVC --> FE
 
-    FE -->|"简历模板上传、字段绑定、预览标注、补丁和导出"| TPLAPI["Java 简历模板接口<br/>/api/rag/resume/templates/*"]
+    FE -->|"简历模板上传、预览确认、区域约束、补丁和导出"| TPLAPI["Java 简历模板接口<br/>/api/rag/resume/templates/*"]
     TPLAPI --> TPLSVC["RagService 模板子流程<br/>DOCX 校验、用户归属、文件资源和版本"]
     TPLSVC --> STORE
-    TPLSVC -->|"内部 token"| PYTPL["Python 简历模板接口<br/>字段解析 / 图片预览 / JSON Patch / DOCX 导出"]
+    TPLSVC -->|"内部 token"| PYTPL["Python 简历模板接口<br/>内部模板抽取 / 图片预览 / JSON Patch / Layout Guard / DOCX 导出"]
     PYTPL --> TPLSVC
     TPLSVC --> TPLDB["resume_template / resume_template_field<br/>preview_page / region_annotation / patch_draft / export"]
     TPLSVC --> FE
@@ -224,7 +224,7 @@ flowchart TD
 
 ### 第二阶段 Agent 能力现状与后续边界（阶段 0-7 已实现）
 
-本节记录当前已经落地的 Agent 能力和仍保留的后续边界。阶段 0 已新增 [Agent 接口契约](docs/api/agent.md) 和 `agent_*` 表结构；阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、严格内部 token 校验和 `RagService.queryNonPersistent()`；阶段 2 已实现 Python LangGraph 纯只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 页面；阶段 3 已实现规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批；阶段 4 已实现 Agent 自身范围内的 `resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 变更网关、CRUD 审批、before/after snapshot、幂等键、撤销窗口和前端撤销入口；阶段 5 已实现 `web_search_probe` 联网参考工具，用于补充公司背景、技能趋势和外部学习资源，外部结果不写入 RAG evidence 库；阶段 6 已补齐简历模板上传、字段绑定、图片预览、区域标注、补丁草稿、校验和导出链路，旧 `resume_template_fill` 仅保留为兼容型确定性填充能力；阶段 7 已实现 Agent 记忆最小闭环，包括当前用户记忆 CRUD、待审确认/拒绝、归档/删除、版本和审计、Python 记忆候选提炼、索引/检索、Agent 任务 `memoryContext` 预取和前端记忆管理。
+本节记录当前已经落地的 Agent 能力和仍保留的后续边界。阶段 0 已新增 [Agent 接口契约](docs/api/agent.md) 和 `agent_*` 表结构；阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、严格内部 token 校验和 `RagService.queryNonPersistent()`；阶段 2 已实现 Python LangGraph 纯只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 页面；阶段 3 已实现规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批；阶段 4 已实现 Agent 自身范围内的 `resume_revision_save`、`jd_learning_plan_save`、`agent_task_cancel_request` 变更网关、CRUD 审批、before/after snapshot、幂等键、撤销窗口和前端撤销入口；阶段 5 已实现 `web_search_probe` 联网参考工具，用于补充公司背景、技能趋势和外部学习资源，外部结果不写入 RAG evidence 库；阶段 6 已补齐简历模板上传、服务端内部模板抽取、图片预览、区域标注、补丁草稿、校验和导出链路，前端不展示 Agent/Python 提取出的模板字段明细，旧 `resume_template_fill` 仅保留为兼容型确定性填充能力；阶段 7 已实现 Agent 记忆最小闭环，包括当前用户记忆 CRUD、待审确认/拒绝、归档/删除、版本和审计、Python 记忆候选提炼、索引/检索、Agent 任务 `memoryContext` 预取和前端记忆管理。
 
 当前仍未实现 MCP、`web_page_fetcher`、自主长任务调度、多 Agent 协作，也未把资料重建索引、普通上传、分片上传或确定性 RAG 入库纳入 Agent 工具。已落地的 Agent 编排继续遵守边界：React 只调用 Java；Java 负责登录用户、权限、业务状态、资料记录、统一响应和日志；Python 负责 Agent 图执行、RAG 计算、解析、索引、检索、重排、回答和 evidence 引用。Agent 不直接绕过 Java 调用 Python 内部接口、数据库或对象存储。
 
@@ -265,6 +265,60 @@ flowchart TD
 ```
 
 当前 LangGraph 按 `docs/api/agent.md` 契约落地：`pae_react_graph` 已统一纯只读和规划类路径，固定节点为 `memory_prefetch_before_planner -> planner -> plan_review? -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口当前通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+
+PAE 主图不直接改写 DOCX，也不直接写对象存储。若 Planner 发现计划中包含“基于模板改写简历、保留原版式、导出简历”等步骤，执行器只把该步骤路由到专门的 `resume_rewrite_graph` 子图；子图完成后把补丁草稿、版式审计、预览状态和待审批动作作为 Observation 回到主图，再由主图继续验收、输出或等待用户确认。
+
+```mermaid
+flowchart TD
+    START["用户发起 Agent 任务<br/>JD、简历目标、模板选择"] --> PAE["pae_react_graph 主图"]
+    PAE --> M0["记忆预取<br/>偏好、历史约束、近期任务"]
+    M0 --> PL["PAE Planner<br/>识别计划步骤和工具范围"]
+    PL --> GATE{"计划是否包含<br/>简历改写步骤"}
+
+    GATE -->|"否"| EXEC["ReAct Executor<br/>普通工具执行循环"]
+    GATE -->|"是"| SUBROUTE["Tool Adapter<br/>路由到简历改写子图"]
+    SUBROUTE --> SUB["resume_rewrite_graph 子图<br/>模板抽取、补丁、Layout Guard、预览"]
+    SUB --> OBS["子图 Observation<br/>补丁草稿、版式审计、导出候选、审批需求"]
+
+    EXEC --> READ["Java Read Tool Gateway<br/>RAG、资料、evidence、记忆"]
+    EXEC --> MUTATION["human_crud_review<br/>Java Mutation Gateway"]
+    READ --> ACCEPT["主图验收节点<br/>检查计划完成度"]
+    MUTATION --> ACCEPT
+    OBS --> ACCEPT
+    ACCEPT -->|"计划未完成"| EXEC
+    ACCEPT -->|"需要用户确认"| REVIEW["PLAN / OUTPUT / CRUD 审批"]
+    ACCEPT -->|"通过"| ANSWER["回答节点<br/>返回状态、预览和下一步"]
+    REVIEW -->|"批准后继续"| EXEC
+    REVIEW -->|"拒绝或修改"| ANSWER
+```
+
+简历改写子图的职责是把“内容改写”和“版式保护”拆开：LLM 只生成字段级内容补丁和显式授权的版式变化请求，确定性 DOCX 应用器负责写入，Layout Guard 负责判断是否发生未授权的样式/结构变化。用户主动要求新增段落、删减内容、加粗字段或做局部重排时，不会因为版式发生变化就直接打回；这些变化必须进入 `LayoutChangeContract`，只有超出授权范围的变化才回到模板抽取/补丁生成环节重新处理。
+
+```mermaid
+flowchart TD
+    A["Start: resume_rewrite_graph<br/>PAE 主图传入简历改写步骤"] --> B["输入归一化<br/>JD、目标岗位、模板ID、用户指令、版式契约"]
+    B --> C{"原始文件类型"}
+    C -->|"DOCX"| D["读取受控 DOCX<br/>保留原文件和版本"]
+    C -->|"PDF"| E["PDF 转 DOCX 候选<br/>生成转换质量报告"]
+    E --> EQ{"转换质量是否可接受"}
+    EQ -->|"否"| ESTOP["等待用户上传 DOCX<br/>或确认转换结果"]
+    EQ -->|"是"| D
+
+    D --> F["模板抽取节点<br/>内部字段、样式指纹、结构指纹、可编辑区域"]
+    F --> R["证据检索节点<br/>JD 要求、简历摘要、RAG evidence"]
+    R --> H["补丁生成节点<br/>严格 JSON 字段级内容补丁"]
+    H --> LC["LayoutChangeContract 合并<br/>PRESERVE_LAYOUT / CONTROLLED_EDIT / RELAYOUT"]
+    LC --> I["确定性应用节点<br/>只按契约修改 DOCX"]
+    I --> J["Layout Guard 检查节点<br/>结构指纹、样式差异、文本容量、渲染预览"]
+    J -->|"发现未授权变化"| F
+    J -->|"授权变化通过"| K["验收节点<br/>JD 覆盖、证据引用、风险标记"]
+    K -->|"不通过"| R
+    K -->|"通过"| L["预览与用户确认<br/>前端只展示预览和确认信息"]
+    L -->|"确认导出"| M["Java 保存 OSS/对象存储<br/>返回下载链接"]
+    L -->|"要求调整"| R
+```
+
+Layout Guard 的检查目标不是“完全没有任何变化”，而是“没有未授权变化”。`PRESERVE_LAYOUT` 模式下重点检查页数、段落/表格/列表结构、字体、字号、加粗、颜色、间距、页边距、图片和渲染像素差异；`CONTROLLED_EDIT` 模式允许 `allowedChanges` 中声明的段落增删、字段加粗、局部文本容量变化；`RELAYOUT` 模式必须把风险提示和预览交给用户确认后再导出。模板抽取结果、字段原文、定位和样式指纹只在服务端内部流转，React 页面不展示这些细节。
 
 固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤；`utc_time_provider` 为纯系统工具，不访问用户数据。当前网关只允许服务端计算 `ownerUserId == currentUserId`，`explicitGrant` 是预留能力，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；如果未来要保存查询历史，则必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
 
