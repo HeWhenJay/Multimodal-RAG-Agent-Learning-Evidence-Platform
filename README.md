@@ -266,30 +266,14 @@ flowchart TD
 
 当前 LangGraph 按 `docs/api/agent.md` 契约落地：`pae_react_graph` 已统一纯只读和规划类路径，固定节点为 `memory_prefetch_before_planner -> planner -> plan_review? -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口当前通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
-PAE 主图不直接改写 DOCX，也不直接写对象存储。若 Planner 发现计划中包含“基于模板改写简历、保留原版式、导出简历”等步骤，执行器只把该步骤路由到专门的 `resume_rewrite_graph` 子图；子图完成后把补丁草稿、版式审计、预览状态和待审批动作作为 Observation 回到主图，再由主图继续验收、输出或等待用户确认。
+PAE 主图不直接改写 DOCX，也不直接写对象存储。若 Planner 发现计划中包含“基于模板改写简历、保留原版式、导出简历”等步骤，执行器只把该步骤路由到专门的 `resume_rewrite_graph` 子图；子图完成后把补丁草稿、版式审计、预览状态和待审批动作作为 Observation 回到主图，再由主图继续验收、输出或等待用户确认。下图只表达主图与子图的调用关系，子图内部流程见后续图解。
 
 ```mermaid
 flowchart TD
-    START["用户发起 Agent 任务<br/>JD、简历目标、模板选择"] --> PAE["pae_react_graph 主图"]
-    PAE --> M0["记忆预取<br/>偏好、历史约束、近期任务"]
-    M0 --> PL["PAE Planner<br/>识别计划步骤和工具范围"]
-    PL --> GATE{"计划是否包含<br/>简历改写步骤"}
-
-    GATE -->|"否"| EXEC["ReAct Executor<br/>普通工具执行循环"]
-    GATE -->|"是"| SUBROUTE["Tool Adapter<br/>路由到简历改写子图"]
-    SUBROUTE --> SUB["resume_rewrite_graph 子图<br/>模板抽取、补丁、Layout Guard、预览"]
-    SUB --> OBS["子图 Observation<br/>补丁草稿、版式审计、导出候选、审批需求"]
-
-    EXEC --> READ["Java Read Tool Gateway<br/>RAG、资料、evidence、记忆"]
-    EXEC --> MUTATION["human_crud_review<br/>Java Mutation Gateway"]
-    READ --> ACCEPT["主图验收节点<br/>检查计划完成度"]
-    MUTATION --> ACCEPT
-    OBS --> ACCEPT
-    ACCEPT -->|"计划未完成"| EXEC
-    ACCEPT -->|"需要用户确认"| REVIEW["PLAN / OUTPUT / CRUD 审批"]
-    ACCEPT -->|"通过"| ANSWER["回答节点<br/>返回状态、预览和下一步"]
-    REVIEW -->|"批准后继续"| EXEC
-    REVIEW -->|"拒绝或修改"| ANSWER
+    PL["PAE Planner<br/>计划包含简历改写步骤"] --> EXEC["ReAct Executor<br/>执行到该计划步骤"]
+    EXEC --> SUB["resume_rewrite_graph 子图<br/>独立处理简历改写"]
+    SUB --> OBS["Observation 回到 pae_react_graph<br/>补丁草稿、版式审计、预览状态"]
+    OBS --> ACCEPT["主图验收/回答/审批<br/>继续后续计划或等待用户确认"]
 ```
 
 简历改写子图的职责是把“内容改写”和“版式保护”拆开：LLM 只生成字段级内容补丁和显式授权的版式变化请求，确定性 DOCX 应用器负责写入，Layout Guard 负责判断是否发生未授权的样式/结构变化。用户主动要求新增段落、删减内容、加粗字段或做局部重排时，不会因为版式发生变化就直接打回；这些变化必须进入 `LayoutChangeContract`，只有超出授权范围的变化才回到模板抽取/补丁生成环节重新处理。
