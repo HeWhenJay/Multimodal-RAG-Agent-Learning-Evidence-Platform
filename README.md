@@ -1,60 +1,40 @@
 # 学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
 
-## 启动前环境变量
-
-### 必须补填且不能暴露
-
-这些值不要写进 Git，也不要直接提交到 `application.yml`。推荐配置为 Windows 系统环境变量；如果用 PyCharm 启动 Python AI 服务，新增或修改系统环境变量后需要重启 PyCharm。
-
-| 环境变量 | 必填场景 | 用途 | 配置写法 |
-| --- | --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 真实 RAG 联调必填 | Python AI 调用百炼 embedding、rerank、LLM、OCR 和 ASR | `ai-python/config/application.yml` 中为 `${DASHSCOPE_API_KEY:}` |
-| `MINERU_TOKEN` / `MINERU_API_TOKEN` / `MINERU_API_KEY` | 使用 MinerU 云端能力时必填 | MinerU 命令或第三方封装读取鉴权 | `ai-python/config/application.yml` 中默认留空 |
-| `ALIYUN_OSS_ACCESS_KEY_ID` / `ALIYUN_OSS_ACCESS_KEY_SECRET` | Java 存储切到 `oss` 时必填 | Java 后端上传原始资料到阿里云 OSS | `backend-java/src/main/resources/application.yml` 中默认读取环境变量 |
-| `EVIDENCE_INTERNAL_LOG_TOKEN` | 需要保护内部日志上报接口时填写 | Java 内部日志接口鉴权 token | `backend-java/src/main/resources/application.yml` 中默认读取环境变量 |
-
-本地开发如果继续使用 `local` 文件存储，只需要先确认 `DASHSCOPE_API_KEY` 已在系统环境变量中配置。数据库密码默认使用本地值 `123456`，只适合本机开发；部署或共享环境应改为环境变量。
-
-### 选填变量与可暴露默认值
-
-Python AI 服务使用类似 Java 的配置格式，默认读取 `ai-python/config/application.yml`，可复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 做本机覆盖。`application.local.yml` 已被 `.gitignore` 忽略。
-
-已在 Python 默认配置中填好的可暴露联调值：
-
-| 配置项 | 默认值 | 修改方式 |
-| --- | --- | --- |
-| `server.port` / `AI_SERVICE_PORT` | `8090` | 修改 `ai-python/config/application.yml`，或设置环境变量 `AI_SERVICE_PORT` |
-| `rag.store.backend` / `RAG_STORE_BACKEND` | `pgvector` | 离线演示可改为 `memory` |
-| `rag.database.url` / `RAG_DATABASE_URL` | `postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic` | 本机 PostgreSQL 端口、账号或 schema 不同时修改 |
-| `rag.database.schema` / `RAG_DATABASE_SCHEMA` | `learning_evidence` | 与数据库 schema 保持一致 |
-| `rag.vector.dimensions` / `RAG_VECTOR_DIMENSIONS` | `1024` | 必须与 pgvector 表中 `VECTOR(1024)` 一致 |
-| `rag.embedding.model` / `RAG_EMBEDDING_MODEL` | `text-embedding-v4` | 更换百炼 embedding 模型时修改 |
-| `rag.rerank.model` / `RAG_RERANK_MODEL` | `qwen3-rerank` | 更换百炼 rerank 模型时修改 |
-| `rag.llm.model` / `RAG_LLM_MODEL` | `qwen-plus` | 更换回答生成模型时修改 |
-
-常用选填项：
-
-| 配置项 | 默认值 | 何时修改 |
-| --- | --- | --- |
-| `mineru.command` / `MINERU_COMMAND` | 空 | 安装 MinerU 并希望优先用 MinerU 解析 PDF 时填写，例如 `mineru -p {input} -o {output}` |
-| `video.ffmpeg-command` / `FFMPEG_COMMAND` | 空 | conda 环境默认通过 `ffmpeg` 包提供；环境外运行且不在 PATH 时填写完整路径 |
-| `video.ffprobe-command` / `FFPROBE_COMMAND` | 空 | conda 环境默认随 `ffmpeg` 包提供；环境外运行且不在 PATH 时填写完整路径 |
-| `document.convert.libreoffice-command` / `LIBREOFFICE_COMMAND` | 空 | LibreOffice 不在 PATH 且需要 DOC/PPT 转 PDF 补充解析时填写 |
-| `ocr.lang` / `OCR_LANG` | `chi_sim+eng` | 本地 OCR 语言包不同时修改 |
-
-配置占位符格式与 Java 保持一致，例如：
-
-```yaml
-rag:
-  database:
-    url: ${RAG_DATABASE_URL:postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic}
-dashscope:
-  api-key: ${DASHSCOPE_API_KEY:}
-```
-
 英文标识：Multimodal RAG Agent Learning Evidence Platform
 
 技术栈：React + Java Spring Boot + Python FastAPI + RAG。系统覆盖 RAG、视频证据、JD 适配、Agent 编排、记忆管理和简历模板改写链路；MCP、自主长任务调度和多 Agent 协作不纳入项目能力范围。
+
+## 项目速览
+
+学迹智配 Agent 面向大学生和求职准备人群，把课程资料、项目文档、视频片段、岗位 JD、简历模板和历史偏好整理为可检索、可引用、可审批、可撤销的个人学习证据库。系统的核心原则是：React 只调用 Java；Java 负责登录、权限、业务状态、审计、审批、幂等和撤销；Python 负责 RAG 计算、Agent 编排、检索、重排、回答生成和 evidence 引用。
+
+核心能力：
+
+- 多模态资料入库：PDF、DOCX、PPTX、XLSX、Markdown、图片、字幕和原始视频。
+- RAG 证据库：递归切块、摘要索引、BM25、PostgreSQL/pgvector、Multi-Query、RRF/RAG-Fusion 和 rerank。
+- 视频证据：FFmpeg 抽音频、重叠 ASR 分段、PPT 翻页检测、关键帧 OCR、片段摘要和时间戳播放定位。
+- 岗位适配：基于当前用户知识库对齐 JD 技能要求，输出已掌握、半掌握、缺口和学习计划。
+- Codex 式 Agent 工作台：任务会话、计划、执行说明、思考摘要、工具调用、RAG evidence、审批卡片、变更快照和撤销窗口。
+- 简历模板协作：模板抽取、字段补丁、Layout Guard、预览确认和导出。
+
+默认入口：
+
+| 服务 | 默认地址 | 说明 |
+| --- | --- | --- |
+| React 前端 | `http://127.0.0.1:5178` | Vite 开发服务 |
+| Java 后端 | `http://127.0.0.1:7080` | 登录、权限、业务状态和统一 API |
+| Python AI/RAG | `http://127.0.0.1:8090` | 内部 RAG、Agent、解析和检索服务 |
+| PostgreSQL/pgvector | `127.0.0.1:5433` | RAG 与业务权威数据 |
+| Redis | `127.0.0.1:6379` | Agent 短期运行态，可降级 |
+
+默认本地管理员账号是 `admin / 123456`，仅用于本机开发和演示。
+
+## 阅读导航
+
+1. 先看“项目定位”“RAG 业务流程”和下方几张说明图，快速理解系统大致内容。
+2. 再看“Agent 能力与边界”，确认哪些事情交给 Agent，哪些必须走 Java 审批和撤销。
+3. 本地运行时再跳到“本地启动”“本地 Redis”和“需要补全的环境变量”。
+4. API 细节见 [Agent 接口契约](docs/api/agent.md)、[RAG 接口契约](docs/api/rag.md) 和 [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)。
 
 ## 项目定位
 
@@ -452,6 +432,23 @@ samples/          示例 JD、简历和学习资料
 
 ## 本地启动
 
+### 运行前置条件
+
+- JDK 17+、Maven 3.9+。
+- Node.js 18+、npm。
+- Conda 或 Miniforge，用于创建 `learning-evidence-rag` Python 环境。
+- PostgreSQL + pgvector，默认连接 `127.0.0.1:5433/postgres`，schema 为 `learning_evidence`。
+- Docker Desktop 可选，用于本地 Redis。
+- 可选外部能力：DashScope/百炼、MinerU、LibreOffice、Tavily、阿里云 OSS。
+
+Python AI 服务使用类似 Java 的配置格式，默认读取 `ai-python/config/application.yml`，可复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 做本机覆盖。`application.local.yml` 已被 `.gitignore` 忽略。
+
+首次启动建议顺序：
+
+1. 准备 PostgreSQL/pgvector，空库直接执行 [infra/sql/init.sql](infra/sql/init.sql)；已有库按 `infra/sql/alter-database/` 下的时间顺序执行增量脚本。
+2. 需要实时 Agent 事件流时启动本地 Redis；未启动 Redis 时 Java 会走数据库轮询降级。
+3. 先启动 Python AI/RAG 服务，再启动 Java 后端，最后启动 React 前端。
+
 Python RAG 服务：
 
 ```powershell
@@ -471,7 +468,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8090
 
 `environment.yml` 会安装视频解析需要的 `ffmpeg/ffprobe`、本地 OCR 降级需要的 `tesseract`、以及 Python 侧解析依赖。`OCR_LANG=chi_sim+eng` 还要求 Tesseract 环境中存在对应语言数据；如果本机没有中文语言包，可以先改成 `eng` 验证链路，或安装中文 traineddata 后再恢复。MinerU 和 LibreOffice 仍按外部可选命令接入：需要高精度 PDF 识别时配置 `MINERU_COMMAND`，需要 `.doc/.ppt` 或 DOCX/PPTX 转 PDF 补充解析时配置 `LIBREOFFICE_COMMAND` / `SOFFICE_COMMAND`。
 
-PostgreSQL/pgvector 建库和向量仓库创建语句见 [docs/database/postgresql-pgvector.md](docs/database/postgresql-pgvector.md)。完整初始化 SQL 在 [infra/sql/init.sql](infra/sql/init.sql)，生产 RAG 表增量迁移 SQL 在 [infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql](infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql)，Ragas 同库评估表增量迁移 SQL 在 [infra/sql/alter-database/20260621_0100_create_ragas_test_pgvector_store.sql](infra/sql/alter-database/20260621_0100_create_ragas_test_pgvector_store.sql)，Agent 表结构迁移 SQL 在 [infra/sql/alter-database/20260621_0200_create_agent_tables.sql](infra/sql/alter-database/20260621_0200_create_agent_tables.sql)。
+PostgreSQL/pgvector 建库和向量仓库创建语句见 [docs/database/postgresql-pgvector.md](docs/database/postgresql-pgvector.md)。完整初始化 SQL 在 [infra/sql/init.sql](infra/sql/init.sql)。已有数据库需要按顺序补跑增量迁移：生产 RAG 表 [20260616_0200_create_pgvector_rag_store.sql](infra/sql/alter-database/20260616_0200_create_pgvector_rag_store.sql)、Ragas 同库评估表 [20260621_0100_create_ragas_test_pgvector_store.sql](infra/sql/alter-database/20260621_0100_create_ragas_test_pgvector_store.sql)、Agent 权威状态表 [20260621_0200_create_agent_tables.sql](infra/sql/alter-database/20260621_0200_create_agent_tables.sql)、Agent 消息与运行事件表 [20260627_0100_create_agent_message_event_tables.sql](infra/sql/alter-database/20260627_0100_create_agent_message_event_tables.sql)。
 
 Java 后端：
 
@@ -502,45 +499,131 @@ npm run dev
 
 访问：`http://127.0.0.1:5178`
 
+## 本地 Redis
+
+Agent 对话工作台使用 Redis 做短期运行态、SSE 低延迟事件流、纠偏摘要、取消标记和后续队列预留；PostgreSQL/H2 仍是任务、消息、审批、操作和运行事件的权威状态库。Redis 不可用时，Java 会降级到数据库事件轮询，任务查询和历史查看不应失效。
+
+Docker Desktop 本地开发建议使用官方镜像：
+
+```powershell
+docker run -d --name learning-evidence-redis `
+  -p 6379:6379 `
+  -v C:\Users\WhenJayHe\docker-data\learning-evidence-redis:/data `
+  redis:8-alpine redis-server --appendonly yes
+```
+
+本机直接运行的 Java、Python、Node/Vite 服务连接 `127.0.0.1:6379`。如果服务也运行在 Docker 容器内，容器内的 `127.0.0.1` 指向服务容器自身，不是宿主机 Redis；应使用同一 Docker network 下的 `learning-evidence-redis:6379`，或使用 `host.docker.internal:6379` 访问宿主机映射端口。
+
+当前本地开发建议先不设置密码。后续启用密码时，官方 Redis 镜像不能只靠 `REDIS_PASSWORD` 环境变量，需要启动命令加 `redis-server --requirepass <密码>`，并同步配置 `SPRING_DATA_REDIS_PASSWORD` 和 `REDIS_URL=redis://:<密码>@<host>:6379/0`。
+
 ## 需要补全的环境变量
 
-本项目不提交 `.env`、密钥或本地上传数据。使用者需要在系统环境变量、用户环境变量或本地未提交的 `.env` 中补全下列配置。
+本项目不提交 `.env`、密钥或本地上传数据。使用者需要在系统环境变量、用户环境变量或本地未提交的配置文件中补全下列配置。敏感值不要写进 Git，也不要直接提交到 `application.yml`。推荐配置为 Windows 系统环境变量；如果用 PyCharm 启动 Python AI 服务，新增或修改系统环境变量后需要重启 PyCharm。
+
+### 必填或常用敏感变量
+
+| 变量 | 必填场景 | 用途 | 示例或默认值 |
+| --- | --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 真实 RAG 联调必填 | 百炼 embedding、rerank、LLM、OCR 和 ASR | `<your-dashscope-api-key>` |
+| `MINERU_TOKEN` / `MINERU_API_TOKEN` / `MINERU_API_KEY` | 使用 MinerU 云端能力时必填 | MinerU 命令或第三方封装鉴权 | `<your-mineru-token>` |
+| `TAVILY_API_KEY` | Agent 联网搜索时必填 | Tavily Search API Key | `<your-tavily-api-key>` |
+| `ALIYUN_OSS_ACCESS_KEY_ID` / `ALIYUN_OSS_ACCESS_KEY_SECRET` | Java 存储切到 `oss` 时必填 | Java 上传原始资料到阿里云 OSS | `<your-access-key>` |
+| `EVIDENCE_INTERNAL_LOG_TOKEN` | 需要保护内部日志上报接口时填写 | Java 内部日志接口鉴权 token | 自定义随机字符串 |
+| `EVIDENCE_AGENT_INTERNAL_TOKEN` | Java 启动 Python Agent 或 Python 回写事件时填写 | Java/Python Agent 内部调用鉴权 | 自定义随机字符串 |
+
+本地开发如果继续使用 `local` 文件存储，只需要先确认 `DASHSCOPE_API_KEY` 已在系统环境变量中配置。数据库密码默认使用本地值 `123456`，只适合本机开发；部署或共享环境应改为环境变量。
+
+### 服务地址与数据源
 
 | 变量 | 是否必填 | 用途 | 示例或默认值 |
 | --- | --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 使用百炼模型时必填 | 阿里云百炼 / DashScope 统一 API Key，用于百炼 Qwen-OCR 和 `text-embedding-v4` embedding | `<your-dashscope-api-key>` |
-| `MINERU_TOKEN` | 使用 MinerU 云端能力时必填 | MinerU / OpenXLab API Token，供 MinerU 命令或第三方封装读取 | `<your-mineru-token>` |
-| `MINERU_API_TOKEN` | 推荐同 `MINERU_TOKEN` | 兼容部分 MinerU 工具或 MCP 封装 | 与 `MINERU_TOKEN` 相同 |
-| `MINERU_API_KEY` | 推荐同 `MINERU_TOKEN` | 兼容部分 MinerU 工具或 MCP 封装 | 与 `MINERU_TOKEN` 相同 |
-| `MINERU_COMMAND` | 使用 MinerU 解析 PDF 时必填 | Python 通过该命令模板调用 MinerU，必须支持 `{input}` 和 `{output}` 占位 | `mineru -p {input} -o {output}` |
-| `RAG_STORE_BACKEND` | 生产/联调推荐 | RAG 存储后端；未配置时 Python 单测和本地演示回退内存存储 | `pgvector` |
+| `AI_SERVICE_HOST` / `AI_SERVICE_PORT` | 可选 | Python FastAPI 监听地址和端口 | `127.0.0.1` / `8090` |
+| `AI_SERVICE_RELOAD` | 可选 | Python 本地开发是否启用热重载 | `true` |
+| `SPRING_DATASOURCE_URL` | 使用本机默认 PostgreSQL 以外配置时必填 | Java 业务库连接串 | `jdbc:postgresql://127.0.0.1:5433/postgres?currentSchema=learning_evidence,public` |
+| `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD` | 可选 | Java 数据库账号密码 | `postgres` / `123456` |
+| `RAG_STORE_BACKEND` | 生产/联调推荐 | Python RAG 存储后端；离线演示可改为 `memory` | `pgvector` |
 | `RAG_DATABASE_URL` | 使用 pgvector 时必填 | PostgreSQL/pgvector 连接串 | `postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic` |
 | `RAG_DATABASE_SCHEMA` | 可选 | PostgreSQL schema 名，Python 启动时会确保该 schema 存在并设置 search_path | `learning_evidence` |
+| `RAG_EVENT_CALLBACK_URL` / `RAG_ERROR_CALLBACK_URL` | 可选 | Python RAG 处理日志回写 Java 内部日志接口 | `http://127.0.0.1:7080/api/logs/internal/events` / `.../errors` |
+| `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:7080` |
+| `EVIDENCE_AGENT_JAVA_BASE_URL` | Python 调 Java 内部 Agent API 时可选 | Java Agent API 基础地址 | `http://127.0.0.1:7080` |
+
+### RAG、模型与解析能力
+
+| 变量 | 是否必填 | 用途 | 示例或默认值 |
+| --- | --- | --- | --- |
 | `RAG_VECTOR_DIMENSIONS` | 可选 | pgvector 向量维度，需与数据库列一致 | `1024` |
 | `RAG_EMBEDDING_MODEL` | 可选 | 百炼 embedding 模型名 | `text-embedding-v4` |
 | `RAG_EMBEDDING_PROVIDER` | 可选 | embedding 提供方；生产默认 `dashscope`，单测或离线演示才显式设置 `hash` | `dashscope` |
 | `RAG_EMBEDDING_BASE_URL` | 可选 | 百炼 OpenAI 兼容 embedding 接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `RAG_EMBEDDING_TIMEOUT_SECONDS` | 可选 | 单次 embedding 请求超时 | `30` |
-| `SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE` | 可选 | Java 单个 multipart 文件上限；长视频仍推荐走分片上传 | `512MB` |
-| `SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE` | 可选 | Java 单个 multipart 请求上限 | `512MB` |
-| `SERVER_TOMCAT_MAX_SWALLOW_SIZE` | 可选 | Tomcat 处理超大请求体的吞吐上限 | `512MB` |
-| `EVIDENCE_AI_INDEX_TIMEOUT_SECONDS` | 可选 | Java 等待 Python 索引结果的超时时间，长视频建议保留较大值 | `1800` |
-| `EVIDENCE_UPLOAD_CHUNK_ROOT` | 可选 | Java 分片上传临时目录 | `uploads/chunks` |
+| `RAG_RERANK_PROVIDER` / `RAG_RERANK_MODEL` | 可选 | 检索后重排提供方和模型 | `auto` / `qwen3-rerank` |
+| `RAG_RERANK_BASE_URL` / `RAG_RERANK_TIMEOUT_SECONDS` | 可选 | rerank 接口地址和超时时间 | `https://dashscope.aliyuncs.com` / `30` |
+| `RAG_ANSWER_PROVIDER` / `RAG_LLM_MODEL` | 可选 | 回答生成提供方和模型 | `auto` / `qwen-plus` |
+| `RAG_LLM_BASE_URL` / `RAG_LLM_TIMEOUT_SECONDS` | 可选 | LLM OpenAI 兼容接口地址和超时时间 | `https://dashscope.aliyuncs.com/compatible-mode/v1` / `45` |
+| `RAG_LLM_TEMPERATURE` | 可选 | RAG 回答生成温度 | `0.2` |
+| `MINERU_COMMAND` | 使用 MinerU 解析 PDF 时必填 | Python 调用 MinerU 的命令模板，必须支持 `{input}` 和 `{output}` 占位 | `mineru -p {input} -o {output}` |
 | `BAILIAN_OCR_MODEL` | 可选 | 百炼 OCR 模型名 | `qwen3.5-ocr` |
 | `BAILIAN_OCR_BASE_URL` | 可选 | 百炼 OpenAI 兼容接口地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | `BAILIAN_OCR_ENABLED` | 可选 | 是否启用百炼 OCR；`auto` 表示存在 `DASHSCOPE_API_KEY` 时启用 | `auto` |
 | `BAILIAN_OCR_TIMEOUT_SECONDS` | 可选 | 单次百炼 OCR 请求超时 | `60` |
 | `BAILIAN_OCR_MAX_IMAGE_BYTES` | 可选 | 送入百炼 OCR 前允许的最大图片字节数 | `10485760` |
+| `BAILIAN_OCR_MAX_ATTEMPTS` / `BAILIAN_OCR_RETRY_DELAY_SECONDS` | 可选 | OCR 失败重试次数和间隔 | `3` / `2` |
 | `LIBREOFFICE_COMMAND` / `SOFFICE_COMMAND` | 可选 | DOC/PPT 转 PDF 或结构化格式时指定 LibreOffice 命令 | `soffice` |
 | `OCR_LANG` | 可选 | 本地 `pytesseract` OCR 语言 | `chi_sim+eng` |
+
+### 视频、文件上传与存储
+
+| 变量 | 是否必填 | 用途 | 示例或默认值 |
+| --- | --- | --- | --- |
+| `SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE` | 可选 | Java 单个 multipart 文件上限；长视频仍推荐走分片上传 | `512MB` |
+| `SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE` | 可选 | Java 单个 multipart 请求上限 | `512MB` |
+| `SERVER_TOMCAT_MAX_SWALLOW_SIZE` | 可选 | Tomcat 处理超大请求体的吞吐上限 | `512MB` |
+| `EVIDENCE_AI_INDEX_TIMEOUT_SECONDS` | 可选 | Java 等待 Python 索引结果的超时时间，长视频建议保留较大值 | `1800` |
+| `EVIDENCE_UPLOAD_CHUNK_ROOT` | 可选 | Java 分片上传临时目录 | `uploads/chunks` |
+| `EVIDENCE_STORAGE_PROVIDER` | 可选 | Java 文件存储后端 | `local` |
+| `EVIDENCE_UPLOAD_ROOT` | 可选 | Java 本地上传目录 | `uploads/rag` |
+| `ALIYUN_OSS_BUCKET` / `ALIYUN_OSS_ENDPOINT` | OSS 场景必填 | 阿里云 OSS bucket 和 endpoint | `<your-bucket>` |
+| `ALIYUN_OSS_OBJECT_PREFIX` / `ALIYUN_OSS_PUBLIC_BASE_URL` | OSS 场景可选 | OSS 对象前缀和公开访问基础地址 | `learning-evidence` |
+| `FFMPEG_COMMAND` / `FFPROBE_COMMAND` | 可选 | 环境外运行且不在 PATH 时填写完整路径 | 空 |
+| `RAG_ASR_PROVIDER` / `RAG_ASR_MODEL` | 可选 | 视频 ASR 提供方和同步识别模型 | `auto` / `qwen3-asr-flash` |
+| `RAG_ASR_FILETRANS_MODEL` / `RAG_ASR_FILETRANS_ENABLED` | 可选 | 公开视频 URL 异步转写模型和开关 | `qwen3-asr-flash-filetrans` / `auto` |
+| `RAG_ASR_TIMEOUT_SECONDS` / `RAG_ASR_MAX_AUDIO_BYTES` | 可选 | 单次 ASR 请求超时和音频字节上限 | `120` / `10485760` |
 | `RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS` | 可选 | FFmpeg 抽音频、分段和抽帧超时时间 | `1800` |
 | `RAG_VIDEO_AUDIO_SEGMENT_SECONDS` | 可选 | 本地/私有长视频音频分段长度 | `300` |
 | `RAG_VIDEO_AUDIO_OVERLAP_SECONDS` | 可选 | 音频分段前后重叠秒数，用于防止切断连续讲解 | `10` |
-| `TAVILY_API_KEY` | Agent 联网搜索时必填 | Tavily Search API Key，用于 Agent 查询公司背景、技能趋势等外部信息 | `<your-tavily-api-key>` |
+| `RAG_VIDEO_FRAME_SCAN_MODE` / `RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS` | 可选 | 视频候选帧扫描策略和采样间隔 | `auto` / `5` |
+| `RAG_VIDEO_FRAME_TARGET_CANDIDATES` / `RAG_VIDEO_FRAME_MAX_CANDIDATES` | 可选 | 关键帧候选目标数和最大候选数 | `360` / `720` |
+| `RAG_VIDEO_PPT_FLIP_DIFF_THRESHOLD` | 可选 | PPT 翻页检测差异阈值 | `0.08` |
+| `RAG_VIDEO_SEGMENT_SECONDS` / `RAG_VIDEO_SEGMENT_MAX_CUES` | 可选 | 视频片段摘要窗口和最大字幕条数 | `120` / `6` |
+
+### Agent、Redis 与联网工具
+
+| 变量 | 是否必填 | 用途 | 示例或默认值 |
+| --- | --- | --- | --- |
+| `SPRING_DATA_REDIS_HOST` / `SPRING_DATA_REDIS_PORT` | 可选 | Java Agent SSE/运行时层连接 Redis | `127.0.0.1` / `6379` |
+| `SPRING_DATA_REDIS_PASSWORD` / `SPRING_DATA_REDIS_DATABASE` | Redis 启用密码或多库时填写 | Java Redis 鉴权和库编号 | 空 / `0` |
+| `SPRING_DATA_REDIS_TIMEOUT` | 可选 | Java Redis 连接超时 | `2s` |
+| `REDIS_URL` | 可选 | Python Agent 读取短期纠偏和取消标记 | `redis://127.0.0.1:6379/0` |
+| `EVIDENCE_AGENT_START_TIMEOUT_SECONDS` | 可选 | Java 启动 Python Agent 任务的等待超时 | `10` |
+| `EVIDENCE_AGENT_REDIS_ENABLED` | 可选 | Java 是否启用 Redis 运行态；关闭后走数据库轮询降级 | `true` |
+| `EVIDENCE_AGENT_REDIS_STREAM_TTL_HOURS` | 可选 | Redis Stream 保留时间 | `24` |
+| `EVIDENCE_AGENT_REDIS_CONTEXT_TTL_MINUTES` | 可选 | Redis 纠偏、取消、短期上下文 TTL | `120` |
+| `EVIDENCE_AGENT_SSE_POLL_INTERVAL_MILLIS` | 可选 | SSE 数据库轮询间隔 | `2000` |
 | `EVIDENCE_TAVILY_BASE_URL` | 可选 | Tavily API 基础地址 | `https://api.tavily.com` |
 | `EVIDENCE_TAVILY_TIMEOUT_SECONDS` | 可选 | Tavily Search API 超时时间 | `15` |
-| `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:7080` |
 
+配置占位符格式与 Java 保持一致，例如：
+
+```yaml
+rag:
+  database:
+    url: ${RAG_DATABASE_URL:postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic}
+dashscope:
+  api-key: ${DASHSCOPE_API_KEY:}
+```
+
+上表覆盖本地启动、联调和常见排障需要的配置。更细的评估、召回阈值、视频画面去重、Ragas 评测和简历模板生成参数，以 [backend-java/src/main/resources/application.yml](backend-java/src/main/resources/application.yml)、[ai-python/config/application.yml](ai-python/config/application.yml) 和 [ai-python/config/application.local.example.yml](ai-python/config/application.local.example.yml) 中的默认值为准。
 
 ## MinerU 接入
 
