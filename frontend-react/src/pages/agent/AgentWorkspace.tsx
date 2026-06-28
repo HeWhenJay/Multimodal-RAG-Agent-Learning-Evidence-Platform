@@ -39,11 +39,11 @@ const MODE_OPTIONS: Array<AgentOption<AgentWorkspaceMode> & { features: string[]
   },
   {
     value: 'general',
-    label: '通用探索',
-    description: '用于闲聊式提问、整理松散学习资料、生成资料入库建议；真正写入 RAG 库仍走资料上传入口。',
+    label: '自由探索',
+    description: '用于自然语言探索知识库、视频 evidence 和松散学习资料；真正写入 RAG 库仍走资料上传入口。',
     badge: '探索模式',
     icon: <MessageCircle size={18} />,
-    features: ['松散问题整理', '学习资料建议', '入库路径提示']
+    features: ['自由提问', '视频证据自然检索', '入库路径提示']
   }
 ];
 
@@ -66,7 +66,6 @@ const DOCUMENT_TYPE_OPTIONS: Array<AgentOption<string>> = [
   { value: '', label: '全部资料', description: '不限制资料类型，按当前用户知识库统一检索。' },
   { value: 'markdown', label: 'Markdown', description: '优先检索 Markdown 笔记、课程整理和技术文档。' },
   { value: 'pdf', label: 'PDF', description: '优先检索 PDF 课件、论文、书籍和报告。' },
-  { value: 'video', label: '视频', description: '优先检索视频切片、字幕、OCR 和摘要证据。' },
   { value: 'text', label: '文本', description: '优先检索纯文本资料和粘贴内容。' }
 ];
 
@@ -1354,6 +1353,7 @@ function ReviewProposal({ review }: { review: AgentHumanReview }) {
       ) : null}
       <div className="query-tags agent-tags">
         {normalizeStringList(proposal.tools).map((tool) => <span key={tool}>{tool}</span>)}
+        {normalizeStringList(proposal.internalSubgraphs).map((subgraph) => <span key={subgraph}>子图 {subgraph}</span>)}
         {proposal.toolName ? <span>{String(proposal.toolName)}</span> : null}
         {proposal.riskLevel ? <span>风险 {String(proposal.riskLevel)}</span> : null}
         {proposal.evidenceCount !== undefined ? <span>证据 {String(proposal.evidenceCount)}</span> : null}
@@ -1787,7 +1787,7 @@ function buildGoalForMode(mode: AgentWorkspaceMode, goal: string) {
   return [
     goal,
     '',
-    '请按通用探索模式处理：可以闲聊式解释、整理松散学习资料、给出推荐的资料标题、标签、摘要和入库步骤。',
+    '请按自由探索模式处理：可以自然语言解释知识库内容、检索视频 evidence、整理松散学习资料、给出推荐的资料标题、标签、摘要和入库步骤。',
     '如果用户想把内容写入 RAG 数据库，只给出资料库上传/粘贴入库建议，不执行任何写入或状态变更。'
   ].join('\n');
 }

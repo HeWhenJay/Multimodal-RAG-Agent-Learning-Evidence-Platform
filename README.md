@@ -193,10 +193,13 @@ flowchart TD
       P0 --> PL["规划器 Planner<br/>先生成 PAE 计划、完成标准、工具范围"]
       PL --> HPLAN{"是否需要 PLAN 审批"}
       HPLAN -->|"是"| PLAN_REVIEW["HITL: PLAN 审批"]
-      HPLAN -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
-      PLAN_REVIEW -->|"批准"| PM1
+      HPLAN -->|"否"| RWD{"Planner 是否检测到需要修改简历"}
+      PLAN_REVIEW -->|"批准"| RWD
       PLAN_REVIEW -->|"修改"| PL
       PLAN_REVIEW -->|"拒绝"| PAW["回答节点"]
+      RWD -->|"是"| RWS["简历修改子图<br/>生成改写计划与待确认候选"]
+      RWD -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
+      RWS --> PM1
       PM1 --> EXEC["执行器 Executor<br/>ReAct 行动选择"]
       EXEC --> TOOL["Tool Adapter<br/>Java Gateway / 后续 MCP 适配"]
       TOOL --> TR{"工具结果"}
@@ -219,7 +222,26 @@ flowchart TD
     SAVE --> END
 ```
 
-LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后先进入 `resume_rewrite_decision`，需要改简历时执行 `resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance`，再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+
+Planning 子图在 `PLAN` 审批通过后会先进入 `resume_rewrite_decision`。如果 Planner 在计划中标记 `resumeRewriteIntent=true`，或前端传入 `resume_rewrite_subgraph` / `resume_revision_save` / `resume_template_fill` 工具意图，统一图会进入简历修改子图；否则直接进入规划后记忆预取和常规 ReAct 执行链。简历修改子图只生成 `PENDING_REVIEW` 改写候选，不直接写 DOCX、不直接保存业务数据，后续仍由 `OUTPUT` 审批和可选 `CRUD` 审批决定是否保存。
+
+### 简历修改子图
+
+```mermaid
+flowchart TD
+    RS["进入条件<br/>PLAN 已批准 + Planner 检测到简历修改意图"] --> RD["resume_rewrite_decision<br/>读取计划、toolHints、目标和 JD/简历上下文"]
+    RD -->|"不需要修改"| PM1["返回 Planning 主链<br/>memory_prefetch_after_planner"]
+    RD -->|"需要修改"| RP["resume_rewrite_planner<br/>抽取 JD 要求、确定改写范围和护栏"]
+    RP --> RG["resume_rewrite_generator<br/>生成摘要、技能、项目经历、补强建议候选"]
+    RG --> RA{"resume_rewrite_acceptance<br/>候选是否可审批"}
+    RA -->|"候选为空 / 失败"| AW["answer_writer<br/>汇报无法生成改写候选"]
+    RA -->|"通过"| MERGE["并入 planning draft<br/>resumeRewrite.status=PENDING_REVIEW"]
+    MERGE --> OUT["OUTPUT 审批<br/>用户确认或要求修改"]
+    OUT -->|"批准且需要保存"| CRUD["CRUD 审批<br/>resume_revision_save"]
+    OUT -->|"仅确认输出"| DONE["完成任务<br/>不写业务数据"]
+    CRUD --> SAVE["Java Mutation Gateway<br/>幂等、快照、撤销窗口"]
+```
 
 固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤；`utc_time_provider` 为纯系统工具，不访问用户数据。网关只允许服务端计算 `ownerUserId == currentUserId`，`explicitGrant` 是预留能力，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；保存查询历史必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
 

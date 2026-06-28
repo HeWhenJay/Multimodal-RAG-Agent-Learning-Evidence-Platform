@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-阶段 0 新增 Agent 第二阶段契约和表结构说明。阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、`RagService.queryNonPersistent()` 和严格 `X-Agent-Internal-Token` 校验。阶段 2 已实现 Python LangGraph 只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 最小页面。阶段 3 新增规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批闭环。阶段 4 新增 Agent 自身范围内的 CRUD 审批、before/after snapshot、幂等键和撤销窗口。阶段 5 新增 `web_search_probe` 联网参考工具。阶段 7 新增 Agent 记忆最小闭环，详细接口见 `docs/api/agent-memory.md`。2026-06-28 统一为 `pae_react_graph` 任务路由器：所有 Agent 工作台任务先进入统一 LangGraph，再路由到 ReadOnly 子图或 Planning 子图；旧 `read_only_graph` / `planning_graph` 不再作为运行主图或 helper 容器；当前仍未实现 MCP、`web_page_fetcher` 或简历改写子图。
+阶段 0 新增 Agent 第二阶段契约和表结构说明。阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、`RagService.queryNonPersistent()` 和严格 `X-Agent-Internal-Token` 校验。阶段 2 已实现 Python LangGraph 只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 最小页面。阶段 3 新增规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批闭环。阶段 4 新增 Agent 自身范围内的 CRUD 审批、before/after snapshot、幂等键和撤销窗口。阶段 5 新增 `web_search_probe` 联网参考工具。阶段 7 新增 Agent 记忆最小闭环，详细接口见 `docs/api/agent-memory.md`。2026-06-28 统一为 `pae_react_graph` 任务路由器：所有 Agent 工作台任务先进入统一 LangGraph，再路由到 ReadOnly 子图或 Planning 子图；旧 `read_only_graph` / `planning_graph` 不再作为运行主图或 helper 容器；当前仍未实现 MCP 或 `web_page_fetcher`，简历修改已在统一图内建模为 Planning 子图下的 `resume_rewrite_*` 节点族。
 
 核心边界：
 
@@ -44,10 +44,13 @@ flowchart TD
       P0 --> PL["规划器 Planner<br/>先生成 PAE 计划、完成标准、工具范围"]
       PL --> HPLAN{"是否需要 PLAN 审批"}
       HPLAN -->|"是"| PLAN_REVIEW["HITL: PLAN 审批"]
-      HPLAN -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
-      PLAN_REVIEW -->|"批准"| PM1
+      HPLAN -->|"否"| RWD{"Planner 是否检测到需要修改简历"}
+      PLAN_REVIEW -->|"批准"| RWD
       PLAN_REVIEW -->|"修改"| PL
       PLAN_REVIEW -->|"拒绝"| PAW["回答节点"]
+      RWD -->|"是"| RWS["简历修改子图<br/>生成改写计划与待确认候选"]
+      RWD -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
+      RWS --> PM1
       PM1 --> EXEC["执行器 Executor<br/>ReAct 行动选择"]
       EXEC --> TOOL["Tool Adapter<br/>Java Gateway / 后续 MCP 适配"]
       TOOL --> TR{"工具结果"}
@@ -77,6 +80,7 @@ flowchart TD
 3. 只读问答、检索覆盖诊断、资料读取和联网参考都只能通过 `Tool Adapter -> Java Read Gateway`；写操作和保存草稿只能通过 `HITL -> Java Mutation Gateway`。回答后的记忆整理当前只生成 `PENDING_REVIEW` 候选，真正记忆保存由前端/Java 审批流程触发。
 4. 旧 `read_only_graph.py` / `planning_graph.py` 的运行入口删除；仍需复用的文本处理、工具参数、草稿生成、mutation payload 等纯函数迁入 `agents/orchestration/read_only_helpers.py` 和 `agents/orchestration/planning_helpers.py`。
 5. Agent 工作台入口统一走新图；独立非 Agent 的普通资料上传、确定性视频索引、传统 `/jd-analysis` 页面继续走 RAG/JD 服务，不强行改造成 Agent。
+6. Planner 检测到简历改写意图时进入 `resume_rewrite_decision -> resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance` 节点族；该节点族只生成待确认候选，不直接写 DOCX、不保存草稿、不绕过 Java 变更审批。
 
 节点职责：
 
@@ -86,6 +90,8 @@ flowchart TD
 | 只读预取 | `memory_prefetch_before_planner` | 仅 ReadOnly 子图在轻量规划前调用 `agent_memory_retriever`，读取偏好、历史约束和近期任务上下文 |
 | 规划器 | `planner` | PAE 生成计划、工具范围、完成标准和风险等级 |
 | 计划审批 | `plan_review` | `planning_task` 首轮规划完成后立即进入 `PLAN` 审批；审批只确认路线，不授权写操作 |
+| 简历修改判定 | `resume_rewrite_decision` | 读取 Planner 的 `resumeRewriteIntent`、`toolHints`、目标和 JD/简历上下文，判断是否进入简历修改子图 |
+| 简历修改子图 | `resume_rewrite_planner` / `resume_rewrite_generator` / `resume_rewrite_acceptance` | 生成简历改写范围、候选改写片段、模板填充值和验收结果；只产出 `PENDING_REVIEW` 草稿，不直接写文件或数据库 |
 | 规划后记忆预取 | `memory_prefetch_after_planner` | Planning 子图在计划通过后按步骤检索任务相关记忆；未批准计划前不调用工具 |
 | 执行器 | `executor` | ReAct 行动选择器，只决定下一步工具与参数，不直接调用外部系统 |
 | 工具节点 | `tool_adapter` | 唯一工具调用出口，只能访问 Java Read/Mutation Tool Gateway；后续 MCP 也在此适配 |
@@ -101,6 +107,7 @@ flowchart TD
 - `web_search_probe` 返回 `AGENT_TAVILY_NOT_CONFIGURED` 或 `AGENT_TAVILY_DOWNSTREAM_FAILED` 时跳过联网参考，继续使用本地 RAG evidence 对齐。
 - 未知工具进入重规划；重规划后的计划仍受 `PLAN` 审批约束。
 - 变更工具不在普通执行循环里盲目重试；只有 `OUTPUT` 审批通过且输入包含保存意图后，才生成 `CRUD` 审批，再由 Java mutation gateway 按幂等键执行。
+- 简历修改子图不调用 mutation gateway，也不直接写 DOCX；它只把改写候选并入规划草稿，后续仍由 `OUTPUT` 审批和可选 `CRUD` 审批处理。
 
 长期记忆规则：
 
@@ -963,6 +970,6 @@ Python 侧工具节点在调用 mutation gateway 前也会做硬门禁：缺少 
 
 ## 阶段 6 验收清单
 
-- 当前阶段不在 Agent 工作台提供简历模板或 `resume_template_fill` 能力。
-- 当前运行图没有 `resume_rewrite_graph` 或简历改写子图。
-- 如后续恢复简历模板能力，必须另行更新接口文档、前端入口和 Java/Python 边界说明。
+- Agent 工作台不再提供独立“JD 视频”或视频资料类型筛选；视频 evidence 作为普通知识库证据参与自由探索和 RAG 召回。
+- 当前运行图已在统一 `pae_react_graph` 中加入简历修改子图语义，节点为 `resume_rewrite_decision`、`resume_rewrite_planner`、`resume_rewrite_generator` 和 `resume_rewrite_acceptance`。
+- `resume_template_fill` 和 `resume_revision_save` 仍然只生成待确认候选或审批请求；Python Agent 不直接写 DOCX、不直接保存业务数据。

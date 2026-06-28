@@ -374,6 +374,54 @@ def test_planning_resume_uses_java_gateway_and_requests_output_review(monkeypatc
     assert event_calls[-1]["json"]["reviewRequest"]["reviewType"] == "OUTPUT"
     assert event_calls[-1]["json"]["draft"]["alignment"][0]["status"] == "supported"
     assert event_calls[-1]["json"]["draft"]["pendingMemoryCandidates"][0]["summary"] == "后端实习 JD 适配关注 Java 和 RAG。"
+    assert event_calls[-1]["json"]["draft"]["resumeRewrite"] == {}
+
+
+def test_planning_resume_enters_resume_rewrite_subgraph_when_planner_detects_intent(monkeypatch):
+    import httpx
+
+    FakeJavaClient.calls = []
+    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "agent-secret")
+    client = TestClient(app)
+    monkeypatch.setattr(httpx, "Client", FakeJavaClient)
+
+    response = client.post(
+        "/internal/agent/tasks/agent-task-resume-rewrite/resume",
+        headers={"X-Agent-Internal-Token": "agent-secret"},
+        json={
+            "taskId": "agent-task-resume-rewrite",
+            "taskType": "planning_task",
+            "threadId": "agent-task-resume-rewrite",
+            "reviewType": "PLAN",
+            "decision": "APPROVED",
+            "decisionPayload": {"comment": "同意继续"},
+            "input": {
+                "goal": "根据这个后端实习 JD 优化简历",
+                "jobDescription": "要求 Java、Spring Boot、Redis 和 RAG 项目经验",
+                "resumeText": "做过多模态 RAG 项目，熟悉 Java",
+                "topK": 3,
+            },
+            "callbackUrl": "http://java/api/internal/agent/tasks/agent-task-resume-rewrite/events",
+            "javaToolGatewayBaseUrl": "http://java",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WAITING_OUTPUT_REVIEW"
+    tool_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/api/internal/agent/tools/read")]
+    event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
+    assert [call["json"]["toolName"] for call in tool_calls] == [
+        "agent_memory_retriever",
+        "rag_query_probe_non_persistent",
+        "agent_memory_candidate_proposer",
+    ]
+    draft = event_calls[-1]["json"]["draft"]
+    resume_rewrite = draft["resumeRewrite"]
+    assert resume_rewrite["status"] == "PENDING_REVIEW"
+    assert resume_rewrite["toolName"] == "resume_rewrite_subgraph"
+    assert resume_rewrite["requiresApproval"] is True
+    assert resume_rewrite["subgraphResult"]["accepted"] is True
+    assert resume_rewrite["patches"][0]["status"] == "PENDING_REVIEW"
 
 
 def test_planning_resume_with_web_search_keeps_local_rag_flow(monkeypatch):

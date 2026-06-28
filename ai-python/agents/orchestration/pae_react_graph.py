@@ -47,6 +47,10 @@ class UnifiedAgentState(TypedDict, total=False):
     plan_version: int
     plan_approved: bool
     completion_criteria: list[str]
+    resume_rewrite_required: bool
+    resume_rewrite_plan: dict[str, Any]
+    resume_rewrite_draft: dict[str, Any]
+    resume_rewrite_result: dict[str, Any]
 
     memory_context_pre: list[dict[str, Any]]
     memory_context_task: list[dict[str, Any]]
@@ -229,6 +233,10 @@ def build_unified_graph(client: JavaAgentGatewayClient):
     workflow.add_node("memory_prefetch_before_planner", lambda state: memory_prefetch_before_planner(state, client))
     workflow.add_node("planner", planner_node)
     workflow.add_node("plan_review", lambda state: plan_review_node(state, client))
+    workflow.add_node("resume_rewrite_decision", resume_rewrite_decision_node)
+    workflow.add_node("resume_rewrite_planner", resume_rewrite_planner_node)
+    workflow.add_node("resume_rewrite_generator", resume_rewrite_generator_node)
+    workflow.add_node("resume_rewrite_acceptance", resume_rewrite_acceptance_node)
     workflow.add_node("memory_prefetch_after_planner", lambda state: memory_prefetch_after_planner(state, client))
     workflow.add_node("executor", executor_node)
     workflow.add_node("tool_adapter", lambda state: tool_adapter_node(state, client))
@@ -252,10 +260,29 @@ def build_unified_graph(client: JavaAgentGatewayClient):
         route_after_planner,
         {
             "plan_review": "plan_review",
+            "resume_rewrite_decision": "resume_rewrite_decision",
             "memory_prefetch_after_planner": "memory_prefetch_after_planner",
         },
     )
     workflow.add_edge("plan_review", END)
+    workflow.add_conditional_edges(
+        "resume_rewrite_decision",
+        route_after_resume_rewrite_decision,
+        {
+            "resume_rewrite_planner": "resume_rewrite_planner",
+            "memory_prefetch_after_planner": "memory_prefetch_after_planner",
+        },
+    )
+    workflow.add_edge("resume_rewrite_planner", "resume_rewrite_generator")
+    workflow.add_edge("resume_rewrite_generator", "resume_rewrite_acceptance")
+    workflow.add_conditional_edges(
+        "resume_rewrite_acceptance",
+        route_after_resume_rewrite_acceptance,
+        {
+            "memory_prefetch_after_planner": "memory_prefetch_after_planner",
+            "answer_writer": "answer_writer",
+        },
+    )
     workflow.add_edge("memory_prefetch_after_planner", "executor")
     workflow.add_conditional_edges(
         "executor",
@@ -371,6 +398,85 @@ def plan_review_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -
         )
     )
     return {**state, "status": "WAITING_PLAN_REVIEW"}
+
+
+def resume_rewrite_decision_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """根据 Planner 输出判断是否进入简历修改子图。"""
+    if state.get("status") == "FAILED" or state.get("subgraph") != "planning":
+        return state
+    required = should_enter_resume_rewrite_subgraph(state)
+    return {**state, "resume_rewrite_required": required}
+
+
+def resume_rewrite_planner_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """生成简历修改子图的局部计划。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    task_input = state.get("task_input") or {}
+    jd_text = text_value(task_input.get("jobDescription"))
+    resume_text = text_value(task_input.get("resumeText"))
+    requirements = extract_requirements(jd_text or state.get("user_goal") or "")
+    rewrite_plan = {
+        "title": "简历修改子图计划",
+        "scope": "PENDING_REVIEW_RESUME_DRAFT",
+        "steps": [
+            {"name": "定位岗位要求", "description": "从 JD 中抽取需要在简历中回应的能力要求"},
+            {"name": "比对现有简历", "description": "判断哪些要求已有表达、哪些需要改写或补充"},
+            {"name": "生成候选片段", "description": "输出摘要、技能、项目经历和缺口说明候选，不直接写 DOCX"},
+        ],
+        "targetRequirements": requirements,
+        "hasResumeText": bool(resume_text),
+        "guardrails": [
+            "不直接写 DOCX",
+            "不直接保存业务数据",
+            "候选片段必须进入 OUTPUT 审批",
+        ],
+    }
+    return {**state, "resume_rewrite_plan": rewrite_plan}
+
+
+def resume_rewrite_generator_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """生成简历修改候选片段，供最终 OUTPUT 审批展示。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    task_input = state.get("task_input") or {}
+    requirements = list((state.get("resume_rewrite_plan") or {}).get("targetRequirements") or [])
+    resume_text = text_value(task_input.get("resumeText"))
+    provisional_alignment = build_alignment(requirements, resume_text, [])
+    provisional_gaps = build_gaps(provisional_alignment)
+    content_map = build_resume_content_map(task_input, provisional_alignment, provisional_gaps, [])
+    draft = {
+        "status": "PENDING_REVIEW",
+        "toolName": "resume_rewrite_subgraph",
+        "requiresApproval": True,
+        "approvalType": "OUTPUT",
+        "message": "Planner 检测到需要修改简历，已进入简历修改子图并生成待确认候选。",
+        "contentMap": content_map,
+        "rewriteTargets": requirements,
+        "patches": build_resume_rewrite_patches(content_map, provisional_gaps),
+    }
+    return {**state, "resume_rewrite_draft": draft}
+
+
+def resume_rewrite_acceptance_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """验收简历修改子图候选是否可并入规划草稿。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    draft = state.get("resume_rewrite_draft") or {}
+    if not draft.get("contentMap"):
+        return {
+            **state,
+            "status": "FAILED",
+            "error_code": "AGENT_RESUME_REWRITE_EMPTY",
+            "error_message": "简历修改子图没有生成可审批候选",
+            "resume_rewrite_result": {"accepted": False},
+        }
+    result = {
+        "accepted": True,
+        "requiresOutputReview": True,
+        "candidateCount": len(draft.get("patches") or []),
+    }
+    return {**state, "resume_rewrite_result": result}
 
 
 def memory_prefetch_after_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
@@ -671,13 +777,25 @@ def route_after_task_router(state: UnifiedAgentState) -> Literal["planner", "mem
     return "memory_prefetch_before_planner"
 
 
-def route_after_planner(state: UnifiedAgentState) -> Literal["plan_review", "memory_prefetch_after_planner"]:
+def route_after_planner(state: UnifiedAgentState) -> Literal["plan_review", "resume_rewrite_decision", "memory_prefetch_after_planner"]:
     """规划器之后判断是否需要计划审批。"""
     if state.get("status") == "FAILED":
         return "memory_prefetch_after_planner"
     if state.get("subgraph") == "planning" and not state.get("plan_approved"):
         return "plan_review"
+    if state.get("subgraph") == "planning":
+        return "resume_rewrite_decision"
     return "memory_prefetch_after_planner"
+
+
+def route_after_resume_rewrite_decision(state: UnifiedAgentState) -> Literal["resume_rewrite_planner", "memory_prefetch_after_planner"]:
+    """简历修改判定后决定是否进入简历修改子图。"""
+    return "resume_rewrite_planner" if state.get("resume_rewrite_required") else "memory_prefetch_after_planner"
+
+
+def route_after_resume_rewrite_acceptance(state: UnifiedAgentState) -> Literal["memory_prefetch_after_planner", "answer_writer"]:
+    """简历修改子图验收后回到 Planning 主执行链或直接汇报失败。"""
+    return "answer_writer" if state.get("status") == "FAILED" else "memory_prefetch_after_planner"
 
 
 def route_after_executor(state: UnifiedAgentState) -> Literal["tool_adapter", "acceptance"]:
@@ -734,6 +852,7 @@ def build_read_plan(task_input: dict[str, Any]) -> dict[str, Any]:
 def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
     """为规划类任务生成需要用户确认的 PAE 计划。"""
     goal = text_value(task_input.get("goal")) or "JD/简历适配分析"
+    resume_rewrite_intent = detect_resume_rewrite_intent(task_input)
     steps: list[dict[str, Any]] = []
     if web_search_enabled(task_input):
         steps.append(
@@ -756,6 +875,8 @@ def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
         "title": f"{goal[:40]} 计划",
         "steps": steps,
         "tools": [step["toolName"] for step in steps] + ["resume_evidence_aligner", "gap_analyzer", "evidence_quality_auditor"],
+        "internalSubgraphs": ["resume_rewrite_subgraph"] if resume_rewrite_intent else [],
+        "resumeRewriteIntent": resume_rewrite_intent,
         "requiresPlanReview": True,
         "requiresOutputReview": True,
         "riskLevel": "MEDIUM" if web_search_enabled(task_input) else "LOW",
@@ -778,6 +899,8 @@ def build_action_for_step(state: UnifiedAgentState, step: dict[str, Any]) -> dic
     """根据计划步骤构造工具调用参数。"""
     task_input = state.get("task_input") or {}
     tool_name = text_value(step.get("toolName"))
+    if text_value(step.get("toolType")) == "INTERNAL_SUBGRAPH" or tool_name == "resume_rewrite_subgraph":
+        return {}
     if tool_name == "web_search_probe":
         goal = state.get("user_goal") or ""
         jd_text = text_value(task_input.get("jobDescription"))
@@ -871,6 +994,7 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: JavaAgentGateway
     gaps = build_gaps(alignment)
     risk_level = "LOW" if evidence_ids and not any(item["status"] == "missing" for item in alignment) else "MEDIUM"
     resume_template_fill = build_resume_template_fill_candidate(state, alignment, gaps, evidence_ids)
+    resume_rewrite = build_resume_rewrite_output(state, alignment, gaps, evidence_ids)
     draft = {
         "matchSummary": build_match_summary(alignment, evidence_ids),
         "alignment": alignment,
@@ -878,6 +1002,7 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: JavaAgentGateway
         "evidenceIds": evidence_ids,
         "memoryContext": merge_memory_contexts(state),
         "webReferences": web_references_from_state(state),
+        "resumeRewrite": resume_rewrite,
         "resumeTemplateFill": resume_template_fill,
         "answer": text_value(rag_data.get("answer")),
         "expandedQueries": rag_data.get("expandedQueries") if isinstance(rag_data.get("expandedQueries"), list) else [],
@@ -900,6 +1025,79 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: JavaAgentGateway
         draft["memoryCandidateCount"] = len(candidates)
         draft["memoryWritePolicy"] = "候选默认不激活，需用户确认后才可写入长期记忆。"
     return draft
+
+
+def detect_resume_rewrite_intent(task_input: dict[str, Any]) -> bool:
+    """检测用户目标或工具意图中是否包含简历修改需求。"""
+    tool_hints = task_input.get("toolHints")
+    if isinstance(tool_hints, list) and any(str(item) in {"resume_rewrite_subgraph", "resume_template_fill", "resume_revision_save"} for item in tool_hints):
+        return True
+    if bool(task_input.get("resumeRewriteRequested")):
+        return True
+    goal = text_value(task_input.get("goal"))
+    keywords = ["修改简历", "优化简历", "改简历", "简历改写", "简历润色", "生成简历", "投递简历"]
+    return any(keyword in goal for keyword in keywords)
+
+
+def should_enter_resume_rewrite_subgraph(state: UnifiedAgentState) -> bool:
+    """按 Planner 输出和任务输入决定是否进入简历修改子图。"""
+    plan = state.get("plan") or {}
+    if bool(plan.get("resumeRewriteIntent")):
+        return True
+    task_input = state.get("task_input") or {}
+    return detect_resume_rewrite_intent(task_input)
+
+
+def build_resume_rewrite_patches(content_map: dict[str, str], gaps: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """把简历内容候选转换成前端可展示的修改片段。"""
+    labels = {
+        "summary": "个人摘要",
+        "skills": "技能关键词",
+        "project_experience": "项目经历",
+        "learning_plan": "补强建议",
+        "gap_summary": "差距摘要",
+    }
+    patches = []
+    for field, value in content_map.items():
+        patches.append(
+            {
+                "field": field,
+                "label": labels.get(field, field),
+                "suggestedText": value,
+                "reason": "根据 JD 要求、简历摘要和当前 evidence 自动生成，需用户确认后才可保存。",
+                "status": "PENDING_REVIEW",
+            }
+        )
+    if gaps:
+        patches.append(
+            {
+                "field": "priority_gaps",
+                "label": "优先补强项",
+                "suggestedText": "；".join(item["suggestion"] for item in gaps[:3]),
+                "reason": "这些要求在当前简历或 evidence 中支撑较弱。",
+                "status": "PENDING_REVIEW",
+            }
+        )
+    return patches
+
+
+def build_resume_rewrite_output(
+    state: UnifiedAgentState,
+    alignment: list[dict[str, Any]],
+    gaps: list[dict[str, str]],
+    evidence_ids: list[str],
+) -> dict[str, Any]:
+    """合并简历修改子图结果和工具 evidence，形成最终可审批输出。"""
+    draft = state.get("resume_rewrite_draft") or {}
+    if not draft:
+        return {}
+    content_map = build_resume_content_map(state.get("task_input") or {}, alignment, gaps, evidence_ids)
+    merged = dict(draft)
+    merged["contentMap"] = {**content_map, **(draft.get("contentMap") if isinstance(draft.get("contentMap"), dict) else {})}
+    merged["evidenceIds"] = evidence_ids
+    merged["subgraphPlan"] = state.get("resume_rewrite_plan") or {}
+    merged["subgraphResult"] = state.get("resume_rewrite_result") or {}
+    return merged
 
 
 def build_resume_template_fill_candidate(
