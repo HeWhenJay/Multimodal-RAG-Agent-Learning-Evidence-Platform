@@ -87,7 +87,6 @@ export function AgentWorkspace() {
   const [saveDraft, setSaveDraft] = useState(false);
   const [enableWebSearch, setEnableWebSearch] = useState(false);
   const [webSearchQuery, setWebSearchQuery] = useState('');
-  const [resumeTemplatePath, setResumeTemplatePath] = useState('');
   const [selectedResumeTemplateId, setSelectedResumeTemplateId] = useState('');
   const [resumeTemplates, setResumeTemplates] = useState<ResumeTemplate[]>([]);
   const [templateLoading, setTemplateLoading] = useState(false);
@@ -178,7 +177,6 @@ export function AgentWorkspace() {
       setResumeTemplates(templates);
       if (selectedResumeTemplateId && !templates.some((item) => item.templateId === selectedResumeTemplateId)) {
         setSelectedResumeTemplateId('');
-        setResumeTemplatePath('');
       }
     } catch (loadError) {
       setTemplateError(loadError instanceof Error ? loadError.message : '简历模板历史加载失败');
@@ -239,7 +237,6 @@ export function AgentWorkspace() {
     }
     setTemplateError('');
     setSelectedResumeTemplateId(template.templateId);
-    setResumeTemplatePath(template.currentFilePath || '');
     clearResumePatchState();
   }
 
@@ -255,7 +252,6 @@ export function AgentWorkspace() {
         ...previous.filter((item) => item.templateId !== uploaded.templateId)
       ]);
       setSelectedResumeTemplateId(uploaded.templateId);
-      setResumeTemplatePath(uploaded.currentFilePath || '');
       clearResumePatchState();
     } catch (uploadError) {
       setTemplateError(uploadError instanceof Error ? uploadError.message : '简历模板上传解析失败');
@@ -477,7 +473,6 @@ export function AgentWorkspace() {
       setResumeTemplates((previous) => previous.filter((item) => item.templateId !== templateId));
       if (selectedResumeTemplateId === templateId) {
         setSelectedResumeTemplateId('');
-        setResumeTemplatePath('');
         clearResumePatchState();
       }
     } catch (deleteError) {
@@ -645,7 +640,6 @@ export function AgentWorkspace() {
               onDelete={(templateId) => void removeResumeTemplate(templateId)}
               onSelect={selectResumeTemplate}
               onUpload={(file) => void submitResumeTemplate(file)}
-              selectedPath={resumeTemplatePath}
               selectedTemplate={selectedResumeTemplate}
               selectedTemplateId={selectedResumeTemplateId}
               deletingTemplateId={templateDeleting}
@@ -1038,7 +1032,6 @@ function ResumeTemplateSelector({
   templates,
   selectedTemplateId,
   selectedTemplate,
-  selectedPath,
   loading,
   uploading,
   deletingTemplateId,
@@ -1050,7 +1043,6 @@ function ResumeTemplateSelector({
   templates: ResumeTemplate[];
   selectedTemplateId: string;
   selectedTemplate: ResumeTemplate | null;
-  selectedPath: string;
   loading: boolean;
   uploading: boolean;
   deletingTemplateId: string;
@@ -1124,7 +1116,7 @@ function ResumeTemplateSelector({
         <div className="agent-template-selected">
           <span>当前模板</span>
           <strong>{selectedTemplate.filename}</strong>
-          <small>{selectedPath || '模板文件路径已由后端托管，前端不再直连本地文件。'}</small>
+          <small>{selectedTemplate.currentFilePath || '模板文件路径已由后端托管，前端不再直连本地文件。'}</small>
           <div className="agent-template-selected-actions">
             <Link className="chip-button" to="/resume-template">
               <ExternalLink size={15} />确认可修改区域

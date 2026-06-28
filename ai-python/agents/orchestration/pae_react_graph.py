@@ -6,7 +6,7 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 
 from agents.gateway.java_gateway import JavaAgentGatewayClient
-from agents.jd_learning_plan.planning_graph import (
+from agents.orchestration.planning_helpers import (
     build_alignment,
     build_evidence_question,
     build_gaps,
@@ -19,7 +19,7 @@ from agents.jd_learning_plan.planning_graph import (
     mutation_tool_name,
     should_request_crud_review,
 )
-from agents.read_only.read_only_graph import (
+from agents.orchestration.read_only_helpers import (
     int_value,
     prefetch_memory_context,
     task_query,
@@ -41,6 +41,7 @@ class UnifiedAgentState(TypedDict, total=False):
     status: str
     error_code: str | None
     error_message: str | None
+    subgraph: str
 
     plan: dict[str, Any]
     plan_version: int
@@ -206,6 +207,7 @@ def initial_state(
         "task_input": task_input,
         "user_goal": text_value(task_input.get("question")) or text_value(task_input.get("goal")) or "执行 Agent 任务",
         "status": "RUNNING",
+        "subgraph": "",
         "plan_version": 1,
         "plan_approved": plan_approved,
         "current_step_index": 0,
@@ -223,6 +225,7 @@ def initial_state(
 def build_unified_graph(client: JavaAgentGatewayClient):
     """构建统一 PAE + ReAct LangGraph。"""
     workflow = StateGraph(UnifiedAgentState)
+    workflow.add_node("task_router", task_router_node)
     workflow.add_node("memory_prefetch_before_planner", lambda state: memory_prefetch_before_planner(state, client))
     workflow.add_node("planner", planner_node)
     workflow.add_node("plan_review", lambda state: plan_review_node(state, client))
@@ -234,7 +237,8 @@ def build_unified_graph(client: JavaAgentGatewayClient):
     workflow.add_node("answer_writer", lambda state: answer_node(state, client))
     workflow.add_node("post_answer_memory", lambda state: post_answer_memory_node(state, client))
 
-    workflow.set_entry_point("memory_prefetch_before_planner")
+    workflow.set_entry_point("task_router")
+    workflow.add_edge("task_router", "memory_prefetch_before_planner")
     workflow.add_edge("memory_prefetch_before_planner", "planner")
     workflow.add_conditional_edges(
         "planner",
@@ -285,8 +289,28 @@ def build_unified_graph(client: JavaAgentGatewayClient):
     return workflow.compile()
 
 
+def task_router_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """统一任务路由器，只标记子图语义，不分流到旧图入口。"""
+    task_type = state.get("task_type")
+    task_input = state.get("task_input") or {}
+    workspace_mode = text_value(task_input.get("workspaceMode"))
+    if task_type == "planning_task":
+        return {**state, "subgraph": "planning"}
+    if task_type == "pure_read_query" or workspace_mode in {"read", "general"}:
+        return {**state, "subgraph": "read_only"}
+    return {
+        **state,
+        "subgraph": "planning",
+        "status": "FAILED",
+        "error_code": "AGENT_VALIDATION_FAILED",
+        "error_message": "当前 Agent 任务类型暂不支持统一图执行",
+    }
+
+
 def memory_prefetch_before_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
     """规划前读取偏好、历史约束和近期任务记忆。"""
+    if state.get("status") == "FAILED":
+        return state
     query = task_query(state.get("task_input") or {}, state.get("task_type"))
     memory_context = prefetch_memory_context(
         task_id=state["task_id"],
@@ -303,12 +327,12 @@ def planner_node(state: UnifiedAgentState) -> UnifiedAgentState:
     if state.get("status") == "FAILED":
         return state
     task_input = state.get("task_input") or {}
-    task_type = state.get("task_type")
-    if task_type == "planning_task":
+    subgraph = state.get("subgraph")
+    if subgraph == "planning":
         plan = build_planning_plan(task_input)
     else:
         plan = build_read_plan(task_input)
-    criteria = build_completion_criteria(task_type, plan)
+    criteria = build_completion_criteria(subgraph, plan)
     return {
         **state,
         "plan": plan,
@@ -342,7 +366,9 @@ def plan_review_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -
 
 def memory_prefetch_after_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
     """规划后基于计划步骤重新读取任务相关记忆。"""
-    if state.get("task_type") != "planning_task":
+    if state.get("status") == "FAILED":
+        return state
+    if state.get("subgraph") != "planning":
         return state
     task_input = state.get("task_input") or {}
     plan = state.get("plan") or {}
@@ -517,7 +543,7 @@ def acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) ->
         current_index += 1
     if current_index < len(steps):
         return {**state, "current_step_index": current_index, "current_action": {}, "verifier_result": {"complete": False}}
-    if state.get("task_type") == "planning_task":
+    if state.get("subgraph") == "planning":
         draft = synthesize_planning_draft(state, client)
         return {
             **state,
@@ -631,7 +657,9 @@ def post_answer_memory_node(state: UnifiedAgentState, client: JavaAgentGatewayCl
 
 def route_after_planner(state: UnifiedAgentState) -> Literal["plan_review", "memory_prefetch_after_planner"]:
     """规划器之后判断是否需要计划审批。"""
-    if state.get("task_type") == "planning_task" and not state.get("plan_approved"):
+    if state.get("status") == "FAILED":
+        return "memory_prefetch_after_planner"
+    if state.get("subgraph") == "planning" and not state.get("plan_approved"):
         return "plan_review"
     return "memory_prefetch_after_planner"
 
@@ -723,9 +751,9 @@ def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_completion_criteria(task_type: str | None, plan: dict[str, Any]) -> list[str]:
+def build_completion_criteria(subgraph: str | None, plan: dict[str, Any]) -> list[str]:
     """生成验收标准。"""
-    if task_type == "planning_task":
+    if subgraph == "planning":
         return ["已完成计划内只读工具", "生成 supported/weak/missing 对齐", "输出 evidenceIds 或明确缺证据", "未执行未审批写操作"]
     return ["已完成只读工具", "返回回答或明确失败原因", "保留 evidence 引用结构"]
 
@@ -751,7 +779,7 @@ def build_action_for_step(state: UnifiedAgentState, step: dict[str, Any]) -> dic
         question = build_question_for_state(state)
         arguments: dict[str, Any] = {
             "question": question,
-            "topK": int_value(task_input.get("topK"), 6 if state.get("task_type") == "planning_task" else 5),
+            "topK": int_value(task_input.get("topK"), 6 if state.get("subgraph") == "planning" else 5),
             "candidateMultiplier": int_value(task_input.get("candidateMultiplier"), 4),
         }
         metadata_filter = task_input.get("metadataFilter")
@@ -787,7 +815,7 @@ def mutation_fields_from_action(action: dict[str, Any]) -> dict[str, Any]:
 def build_question_for_state(state: UnifiedAgentState) -> str:
     """为 RAG 工具组合当前任务问题。"""
     task_input = state.get("task_input") or {}
-    if state.get("task_type") == "planning_task":
+    if state.get("subgraph") == "planning":
         return build_evidence_question(
             state.get("user_goal") or "分析 JD 与简历证据差距",
             text_value(task_input.get("jobDescription")),

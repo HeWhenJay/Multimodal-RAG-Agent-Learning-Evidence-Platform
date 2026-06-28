@@ -3,8 +3,9 @@
 PAE + ReAct LangGraph 节点与边设计方案（面向当前项目落地）
 ================================================================================
 
-基于当前项目代码现状（read_only_graph.py / planning_graph.py / java_gateway.py /
-memory_service.py / AgentToolGatewayServiceImpl.java）设计。
+基于当前项目统一图改造目标设计。历史 `read_only_graph.py` / `planning_graph.py`
+仅作为旧阶段背景，不再作为运行主图或 helper 容器；统一入口为
+`agents.orchestration.pae_react_graph`。
 
 核心思路：
   - PAE 层（Supervisor）：Planner 生成步骤计划 → Executor 逐步执行 → Reviewer 把关 → Finalize 收尾
@@ -354,8 +355,8 @@ def _local_fallback_reasoning(messages: list[dict[str, str]]) -> str:
 # ── 4.2 PAE 层节点 ───────────────────────────────────────────────────────────
 
 def _memory_prefetch(state: PaeAgentState, client: JavaAgentGatewayClient) -> PaeAgentState:
-    """预取用户长期记忆，复用现有 prefetch_memory_context 逻辑。"""
-    from agents.read_only.read_only_graph import prefetch_memory_context, task_query
+    """预取用户长期记忆，复用统一编排 helper。"""
+    from agents.orchestration.read_only_helpers import prefetch_memory_context, task_query
 
     query = task_query(state.get("task_input") or {}, state.get("task_type"))
     memory = prefetch_memory_context(
@@ -967,13 +968,11 @@ def _make_event(
 1. 入口改造（app/api/agent.py）：
 
    POST /internal/agent/tasks
-   ├── taskType == "pure_read_query" → 继续走 read_only_graph（不变）
-   ├── taskType == "planning_task"   → 走新 PAE Graph
-   └── taskType == "mutation_task"   → 预留
+   └── 所有 taskType 统一进入 pae_react_graph，由 task_router 选择 ReadOnly 子图或 Planning 子图。
 
    resume 接口同样改造，CRUD 审批通过后走 PAE 图的 mutation 分支。
 
-2. 图选择（替换 run_read_only_agent / start_planning_agent）：
+2. 图选择（替换旧阶段按任务类型分流的入口）：
 
    def run_pae_agent(request, client):
        graph = build_pae_graph(client)

@@ -399,8 +399,6 @@ export interface AgentTaskInput {
   resumeMaterialId?: number;
   resumeMaterialTitle?: string;
   resumeTemplateId?: string;
-  resumeTemplatePath?: string;
-  resumeTemplateOutputDir?: string;
   toolHints?: string[];
   metadataFilter?: Record<string, unknown>;
 }

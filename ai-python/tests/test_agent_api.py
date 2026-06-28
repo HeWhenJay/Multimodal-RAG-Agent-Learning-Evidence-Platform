@@ -212,6 +212,16 @@ def test_agent_task_requires_internal_token(monkeypatch):
     assert response.json()["detail"] == "AGENT_INTERNAL_TOKEN_INVALID"
 
 
+def test_unified_graph_task_router_selects_subgraphs_without_old_entrypoints():
+    from agents.orchestration.pae_react_graph import task_router_node
+
+    read_state = task_router_node({"task_type": "pure_read_query", "task_input": {"workspaceMode": "general"}})
+    planning_state = task_router_node({"task_type": "planning_task", "task_input": {"workspaceMode": "planning"}})
+
+    assert read_state["subgraph"] == "read_only"
+    assert planning_state["subgraph"] == "planning"
+
+
 def test_agent_task_uses_java_gateway_and_callbacks(monkeypatch):
     import httpx
 
@@ -436,7 +446,7 @@ def test_planning_resume_degrades_to_local_rag_when_web_search_unavailable(monke
     assert event_calls[-1]["json"]["draft"]["alignment"][0]["status"] == "supported"
 
 
-def test_planning_resume_builds_resume_template_fill_candidate(monkeypatch):
+def test_planning_resume_builds_template_content_candidate_without_docx_write(monkeypatch):
     import httpx
 
     FakeJavaClient.calls = []
