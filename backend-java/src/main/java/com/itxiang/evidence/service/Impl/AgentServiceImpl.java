@@ -377,6 +377,11 @@ public class AgentServiceImpl implements AgentService {
      * 在任务事务提交后启动 Python Agent，避免 Python 回调读到未提交任务。
      */
     private void schedulePythonAgentStart(AgentTask task) {
+        String skipReason = pythonStartSkipReason(task);
+        if (skipReason != null) {
+            markPythonStartSkipped(task, skipReason);
+            return;
+        }
         if (!shouldStartPythonAgent(task)) {
             return;
         }
@@ -403,10 +408,36 @@ public class AgentServiceImpl implements AgentService {
     }
 
     /**
+     * 返回阻止启动 Python Agent 的配置原因；不需要 Python 的任务返回 null。
+     */
+    private String pythonStartSkipReason(AgentTask task) {
+        if (!Set.of("pure_read_query", "planning_task").contains(task.getTaskType())) {
+            return null;
+        }
+        if (agentProperties.getInternalToken() == null || agentProperties.getInternalToken().isBlank()) {
+            return "内部 Agent 令牌未配置，Java 已创建任务但不会调用 Python Agent。请同时为 Java 和 Python 设置 EVIDENCE_AGENT_INTERNAL_TOKEN。";
+        }
+        return null;
+    }
+
+    /**
+     * 将无法启动 Python 的配置问题回写到任务，避免前端长期等待。
+     */
+    private void markPythonStartSkipped(AgentTask task, String reason) {
+        log.warn("跳过 Python Agent 启动: taskId={}, taskType={}, reason={}", task.getId(), task.getTaskType(), reason);
+        task.setStatus("FAILED");
+        task.setPythonThreadId(task.getId());
+        task.setErrorCode("AGENT_INTERNAL_TOKEN_INVALID");
+        task.setErrorMessage(reason);
+        agentTaskMapper.updateFromEvent(task);
+    }
+
+    /**
      * 调用 Python Agent 接收任务；启动失败时只记录脱敏错误摘要。
      */
     private void startPythonAgent(AgentTask task) {
         try {
+            log.info("准备请求 Python Agent 启动任务: taskId={}, taskType={}", task.getId(), task.getTaskType());
             pythonAgentClient.startTask(task, readMap(task.getInputJson()));
             log.info("已请求 Python Agent 启动任务: taskId={}", task.getId());
         } catch (PythonAgentClient.PythonAgentClientException e) {

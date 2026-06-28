@@ -28,6 +28,8 @@ document:
     soffice-command: ${SOFFICE_COMMAND:}
 
 environment:
+  # Agent 工作台联调时必须与 Java 后端的 EVIDENCE_AGENT_INTERNAL_TOKEN 保持一致。
+  # EVIDENCE_AGENT_INTERNAL_TOKEN: ${EVIDENCE_AGENT_INTERNAL_TOKEN:dev-agent-secret}
   # 离线演示时可取消下面三项注释；真实联调建议使用默认的 pgvector + 百炼。
   # RAG_EMBEDDING_PROVIDER: ${RAG_EMBEDDING_PROVIDER:hash}
   # RAG_RERANK_PROVIDER: ${RAG_RERANK_PROVIDER:local}

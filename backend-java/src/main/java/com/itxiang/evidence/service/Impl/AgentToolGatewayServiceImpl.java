@@ -130,14 +130,20 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
                     .retryable(false)
                     .build();
             completeToolCall(toolCall, result);
+            log.info("Agent 只读工具执行完成: taskId={}, toolCallId={}, toolName={}, status={}",
+                    taskId, toolCallId, toolName, result.getStatus());
             return result;
         } catch (AgentToolFailureException e) {
             AgentToolResultVO result = failureResult(taskId, toolCallId, toolName, e.errorCode, e.getMessage(), e.retryable, e.diagnostics);
             completeToolCall(toolCall, result);
+            log.warn("Agent 只读工具执行失败: taskId={}, toolCallId={}, toolName={}, errorCode={}, retryable={}",
+                    taskId, toolCallId, toolName, e.errorCode, e.retryable);
             return result;
         } catch (Exception e) {
             AgentToolResultVO result = mapUnexpectedFailure(taskId, toolCallId, toolName, e);
             completeToolCall(toolCall, result);
+            log.warn("Agent 只读工具执行异常: taskId={}, toolCallId={}, toolName={}, errorCode={}, message={}",
+                    taskId, toolCallId, toolName, result.getErrorCode(), e.getMessage());
             return result;
         }
     }
@@ -166,6 +172,8 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
                 AgentMemoryVO memory = agentMemoryService.saveCandidateFromTool(task, arguments, boolArg(arguments, "explicitRemember", false));
                 AgentToolResultVO result = memorySaveSuccess(taskId, toolCallId, toolName, review, memory);
                 completeToolCall(toolCall, result);
+                log.info("Agent 变更工具执行完成: taskId={}, toolCallId={}, toolName={}, status={}",
+                        taskId, toolCallId, toolName, result.getStatus());
                 return result;
             }
             MutationSpec spec = mutationSpec(toolName, task);
@@ -174,6 +182,8 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
             if (existing != null) {
                 AgentToolResultVO result = mutationSuccess(taskId, toolCallId, toolName, existing);
                 completeToolCall(toolCall, result);
+                log.info("Agent 变更工具命中幂等结果: taskId={}, toolCallId={}, toolName={}, operationId={}",
+                        taskId, toolCallId, toolName, existing.getId());
                 return result;
             }
             AgentOperation operation = createPendingOperation(task, review, request, spec);
@@ -193,15 +203,21 @@ public class AgentToolGatewayServiceImpl implements AgentToolGatewayService {
             agentOperationMapper.updateResult(operation);
             AgentToolResultVO result = mutationSuccess(taskId, toolCallId, toolName, operation);
             completeToolCall(toolCall, result);
+            log.info("Agent 变更工具执行完成: taskId={}, toolCallId={}, toolName={}, operationId={}",
+                    taskId, toolCallId, toolName, operation.getId());
             return result;
         } catch (AgentToolFailureException e) {
             AgentToolResultVO result = failureResult(taskId, toolCallId, toolName, e.errorCode, e.getMessage(), e.retryable, e.diagnostics);
             completeToolCall(toolCall, result);
+            log.warn("Agent 变更工具执行失败: taskId={}, toolCallId={}, toolName={}, errorCode={}, retryable={}",
+                    taskId, toolCallId, toolName, e.errorCode, e.retryable);
             return result;
         } catch (Exception e) {
             AgentToolResultVO result = failureResult(taskId, toolCallId, toolName, "AGENT_VALIDATION_FAILED",
                     e.getMessage() == null ? "变更工具执行失败" : e.getMessage(), false, Map.of());
             completeToolCall(toolCall, result);
+            log.warn("Agent 变更工具执行异常: taskId={}, toolCallId={}, toolName={}, message={}",
+                    taskId, toolCallId, toolName, e.getMessage());
             return result;
         }
     }

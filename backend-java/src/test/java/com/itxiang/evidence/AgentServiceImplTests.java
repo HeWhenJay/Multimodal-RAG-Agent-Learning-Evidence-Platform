@@ -14,6 +14,7 @@ import com.itxiang.evidence.entity.AgentOperationSnapshot;
 import com.itxiang.evidence.entity.AgentTask;
 import com.itxiang.evidence.entity.AgentToolCall;
 import com.itxiang.evidence.vo.AgentOperationVO;
+import com.itxiang.evidence.vo.AgentTaskVO;
 import com.itxiang.evidence.mapper.AgentHumanReviewMapper;
 import com.itxiang.evidence.mapper.AgentOperationMapper;
 import com.itxiang.evidence.mapper.AgentOperationSnapshotMapper;
@@ -39,6 +40,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -126,6 +128,29 @@ class AgentServiceImplTests {
         ArgumentCaptor<AgentTask> taskCaptor = ArgumentCaptor.forClass(AgentTask.class);
         verify(pythonAgentClient).startTask(taskCaptor.capture(), any());
         assertThat(taskCaptor.getValue().getTaskType()).isEqualTo("planning_task");
+    }
+
+    @Test
+    void createAgentTaskFailsFastWhenInternalTokenMissing() {
+        agentProperties.setInternalToken("");
+        AtomicReference<AgentTask> savedTask = new AtomicReference<>();
+        doAnswer(invocation -> {
+            savedTask.set(invocation.getArgument(0));
+            return null;
+        }).when(agentTaskMapper).insert(any(AgentTask.class));
+        when(agentTaskMapper.findById(anyString())).thenAnswer(invocation -> savedTask.get());
+        AgentTaskCreateDTO dto = new AgentTaskCreateDTO();
+        dto.setTaskType("pure_read_query");
+        dto.setTitle("查询 Redis 学习证据");
+        dto.setInput(new LinkedHashMap<>(Map.of("goal", "Redis 学到了什么")));
+
+        AgentTaskVO result = service.createTask(dto, "7");
+
+        assertThat(result.getStatus()).isEqualTo("FAILED");
+        assertThat(result.getErrorCode()).isEqualTo("AGENT_INTERNAL_TOKEN_INVALID");
+        assertThat(result.getErrorMessage()).contains("EVIDENCE_AGENT_INTERNAL_TOKEN");
+        verify(pythonAgentClient, never()).startTask(any(), any());
+        verify(agentTaskMapper).updateFromEvent(savedTask.get());
     }
 
     @Test

@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.BindException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -88,6 +89,21 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 处理请求方法不匹配，并打印具体路径方便定位前端误调用。
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public Result<Void> handleMethodNotSupported(HttpRequestMethodNotSupportedException e,
+                                                 HttpServletRequest request) {
+        log.warn("请求方法不支持: method={}, path={}, supportedMethods={}, message={}",
+                request == null ? null : request.getMethod(),
+                request == null ? null : request.getRequestURI(),
+                e.getSupportedHttpMethods(),
+                e.getMessage());
+        RagOperationContext.clear();
+        return Result.error("请求方法不支持：" + (request == null ? "" : request.getMethod() + " " + request.getRequestURI()));
+    }
+
+    /**
      * 处理未被业务代码捕获的异常。
      */
     @ExceptionHandler(Exception.class)
@@ -99,7 +115,11 @@ public class GlobalExceptionHandler {
             RagOperationContext.clear();
             return Result.error(RagOperationContext.failureMessage(operation, e));
         }
-        log.error("请求处理失败: {}", e.getMessage(), e);
+        log.error("请求处理失败: method={}, path={}, message={}",
+                request == null ? null : request.getMethod(),
+                request == null ? null : request.getRequestURI(),
+                e.getMessage(),
+                e);
         RagOperationContext.clear();
         return Result.error(RagOperationContext.safeThrowableMessage(e));
     }

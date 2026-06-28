@@ -56,6 +56,8 @@ public class AgentInternalController {
                             false
                     ));
         }
+        log.info("接收 Agent 内部只读工具调用: taskId={}, toolCallId={}, toolName={}",
+                request.getTaskId(), request.getToolCallId(), request.getToolName());
         return ResponseEntity.ok(agentToolGatewayService.executeReadTool(request));
     }
 
@@ -81,6 +83,8 @@ public class AgentInternalController {
                             false
                     ));
         }
+        log.info("接收 Agent 内部变更工具调用: taskId={}, toolCallId={}, toolName={}",
+                request.getTaskId(), request.getToolCallId(), request.getToolName());
         return ResponseEntity.ok(agentToolGatewayService.executeMutationTool(request));
     }
 
@@ -103,6 +107,10 @@ public class AgentInternalController {
                             "errorMessage", "内部 Agent 令牌无效"
                     ));
         }
+        log.info("接收 Agent 内部任务事件: taskId={}, eventType={}, status={}",
+                taskId,
+                event == null ? null : event.getEventType(),
+                event == null ? null : event.getStatus());
         return ResponseEntity.ok(agentService.handleEvent(taskId, event));
     }
 

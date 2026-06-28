@@ -573,11 +573,13 @@ docker run -d --name learning-evidence-redis `
 | `SPRING_DATA_REDIS_PASSWORD` / `SPRING_DATA_REDIS_DATABASE` | Redis 启用密码或多库时填写 | Java Redis 鉴权和库编号 | 空 / `0` |
 | `SPRING_DATA_REDIS_TIMEOUT` | 可选 | Java Redis 连接超时 | `2s` |
 | `REDIS_URL` | 可选 | Python Agent 读取短期纠偏和取消标记 | `redis://127.0.0.1:6379/0` |
+| `EVIDENCE_AGENT_INTERNAL_TOKEN` | Agent 工作台联调必填 | Java 与 Python Agent 内部接口共享令牌；未配置时 Agent 任务会进入 `FAILED / AGENT_INTERNAL_TOKEN_INVALID`，Python 控制台不会收到启动请求 | 自定义随机字符串 |
 | `EVIDENCE_AGENT_START_TIMEOUT_SECONDS` | 可选 | Java 启动 Python Agent 任务的等待超时 | `10` |
 | `EVIDENCE_AGENT_REDIS_ENABLED` | 可选 | Java 是否启用 Redis 运行态；关闭后走数据库轮询降级 | `true` |
 | `EVIDENCE_AGENT_REDIS_STREAM_TTL_HOURS` | 可选 | Redis Stream 保留时间 | `24` |
 | `EVIDENCE_AGENT_REDIS_CONTEXT_TTL_MINUTES` | 可选 | Redis 纠偏、取消、短期上下文 TTL | `120` |
 | `EVIDENCE_AGENT_SSE_POLL_INTERVAL_MILLIS` | 可选 | SSE 数据库轮询间隔 | `2000` |
+| `TAVILY_API_KEY` | Agent 联网搜索时必填 | Tavily Search API Key，用于 Agent 查询公司背景、技能趋势等外部信息 | `<your-tavily-api-key>` |
 | `EVIDENCE_TAVILY_BASE_URL` | 可选 | Tavily API 基础地址 | `https://api.tavily.com` |
 | `EVIDENCE_TAVILY_TIMEOUT_SECONDS` | 可选 | Tavily Search API 超时时间 | `15` |
 

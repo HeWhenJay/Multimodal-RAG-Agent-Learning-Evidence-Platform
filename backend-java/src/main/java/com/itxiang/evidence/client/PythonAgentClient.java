@@ -51,14 +51,22 @@ public class PythonAgentClient {
         payload.put("javaToolGatewayBaseUrl", agentProperties.getJavaBaseUrl().replaceAll("/+$", ""));
         payload.put("threadId", task.getId());
         try {
-            return restClient.post()
-                    .uri(resolve("/internal/agent/tasks"))
+            URI endpoint = resolve("/internal/agent/tasks");
+            log.info("请求 Python Agent 接收任务: taskId={}, taskType={}, endpoint={}, timeoutSeconds={}",
+                    task.getId(), task.getTaskType(), endpoint, agentProperties.getStartTimeoutSeconds());
+            JsonNode response = restClient.post()
+                    .uri(endpoint)
                     .header("X-Agent-Internal-Token", agentProperties.getInternalToken())
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(payload)
                     .retrieve()
                     .body(JsonNode.class);
+            log.info("Python Agent 接收任务响应: taskId={}, accepted={}, status={}",
+                    task.getId(), response == null ? null : response.path("accepted").asText(null), response == null ? null : response.path("status").asText(null));
+            return response;
         } catch (RestClientResponseException e) {
+            log.warn("Python Agent 接收任务 HTTP 失败: taskId={}, statusCode={}, responseBody={}",
+                    task.getId(), e.getStatusCode().value(), truncate(e.getResponseBodyAsString(), 500));
             throw new PythonAgentClientException(e.getStatusCode().value(), e.getResponseBodyAsString(), "Python Agent 启动失败", e);
         } catch (Exception e) {
             throw new PythonAgentClientException(null, null, "Python Agent 启动失败：" + e.getMessage(), e);
@@ -85,14 +93,22 @@ public class PythonAgentClient {
                 + "/api/internal/agent/tasks/" + task.getId() + "/events");
         payload.put("javaToolGatewayBaseUrl", agentProperties.getJavaBaseUrl().replaceAll("/+$", ""));
         try {
-            return restClient.post()
-                    .uri(resolve("/internal/agent/tasks/" + task.getId() + "/resume"))
+            URI endpoint = resolve("/internal/agent/tasks/" + task.getId() + "/resume");
+            log.info("请求 Python Agent 恢复任务: taskId={}, reviewType={}, decision={}, endpoint={}",
+                    task.getId(), reviewType, decision, endpoint);
+            JsonNode response = restClient.post()
+                    .uri(endpoint)
                     .header("X-Agent-Internal-Token", agentProperties.getInternalToken())
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(payload)
                     .retrieve()
                     .body(JsonNode.class);
+            log.info("Python Agent 恢复任务响应: taskId={}, accepted={}, status={}",
+                    task.getId(), response == null ? null : response.path("accepted").asText(null), response == null ? null : response.path("status").asText(null));
+            return response;
         } catch (RestClientResponseException e) {
+            log.warn("Python Agent 恢复任务 HTTP 失败: taskId={}, statusCode={}, responseBody={}",
+                    task.getId(), e.getStatusCode().value(), truncate(e.getResponseBodyAsString(), 500));
             throw new PythonAgentClientException(e.getStatusCode().value(), e.getResponseBodyAsString(), "Python Agent 恢复失败", e);
         } catch (Exception e) {
             throw new PythonAgentClientException(null, null, "Python Agent 恢复失败：" + e.getMessage(), e);
@@ -105,6 +121,16 @@ public class PythonAgentClient {
     private URI resolve(String endpoint) {
         String base = pythonRagProperties.getPythonBaseUrl();
         return URI.create(base.replaceAll("/+$", "") + endpoint);
+    }
+
+    /**
+     * 截断下游响应，避免控制台被长错误体刷屏。
+     */
+    private String truncate(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, maxLength);
     }
 
     @Getter

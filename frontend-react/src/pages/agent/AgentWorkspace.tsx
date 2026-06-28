@@ -867,7 +867,7 @@ export function AgentWorkspace() {
               <PlanningResult task={task} />
             </>
           ) : (
-            <p className="agent-empty">{task.status === 'CREATED' ? '任务已创建，等待 Python Agent 接收。' : '等待最终结果回写。'}</p>
+            <p className="agent-empty">{task.status === 'CREATED' ? '任务已创建，等待 Java 启动 Python Agent。' : '等待最终结果回写。'}</p>
           )}
           <div className="query-tags agent-tags">
             {[...evidenceIds, ...draftEvidenceIds].map((id) => <span key={id}>{id}</span>)}
