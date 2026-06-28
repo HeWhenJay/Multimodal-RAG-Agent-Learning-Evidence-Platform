@@ -238,7 +238,14 @@ def build_unified_graph(client: JavaAgentGatewayClient):
     workflow.add_node("post_answer_memory", lambda state: post_answer_memory_node(state, client))
 
     workflow.set_entry_point("task_router")
-    workflow.add_edge("task_router", "memory_prefetch_before_planner")
+    workflow.add_conditional_edges(
+        "task_router",
+        route_after_task_router,
+        {
+            "planner": "planner",
+            "memory_prefetch_before_planner": "memory_prefetch_before_planner",
+        },
+    )
     workflow.add_edge("memory_prefetch_before_planner", "planner")
     workflow.add_conditional_edges(
         "planner",
@@ -308,7 +315,7 @@ def task_router_node(state: UnifiedAgentState) -> UnifiedAgentState:
 
 
 def memory_prefetch_before_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
-    """规划前读取偏好、历史约束和近期任务记忆。"""
+    """只读子图规划前读取偏好、历史约束和近期任务记忆。"""
     if state.get("status") == "FAILED":
         return state
     query = task_query(state.get("task_input") or {}, state.get("task_type"))
@@ -347,17 +354,19 @@ def planner_node(state: UnifiedAgentState) -> UnifiedAgentState:
 def plan_review_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
     """发布计划审批请求，等待 Java 和前端恢复同一任务。"""
     plan = state.get("plan") or {}
-    memory_count = len(state.get("memory_context_pre") or [])
     client.publish_event(
         AgentTaskEvent(
             eventType="REVIEW_REQUESTED",
             status="WAITING_PLAN_REVIEW",
             pythonThreadId=state["thread_id"],
-            draft={"planSummary": plan.get("title"), "memoryContext": state.get("memory_context_pre") or []},
+            draft={
+                "planSummary": plan.get("title"),
+                "message": "规划器已生成执行路线，等待用户批准或要求修改。",
+            },
             reviewRequest={
                 "id": f"review-plan-{state['task_id']}",
                 "reviewType": "PLAN",
-                "proposal": {**plan, "memoryCount": memory_count},
+                "proposal": plan,
             },
         )
     )
@@ -653,6 +662,13 @@ def post_answer_memory_node(state: UnifiedAgentState, client: JavaAgentGatewayCl
             )
         )
     return {**state, "pending_memory_candidates": candidates}
+
+
+def route_after_task_router(state: UnifiedAgentState) -> Literal["planner", "memory_prefetch_before_planner"]:
+    """任务路由后决定首个业务节点，规划类任务先生成计划再中断审批。"""
+    if state.get("subgraph") == "planning":
+        return "planner"
+    return "memory_prefetch_before_planner"
 
 
 def route_after_planner(state: UnifiedAgentState) -> Literal["plan_review", "memory_prefetch_after_planner"]:

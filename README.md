@@ -190,11 +190,10 @@ flowchart TD
     end
 
     subgraph PLAN["Planning 子图：PAE + ReAct"]
-      P0 --> PM0["记忆预取 1<br/>用户偏好、历史约束、近期任务"]
-      PM0 --> PL["规划器 Planner<br/>PAE 计划、完成标准、工具范围"]
+      P0 --> PL["规划器 Planner<br/>先生成 PAE 计划、完成标准、工具范围"]
       PL --> HPLAN{"是否需要 PLAN 审批"}
       HPLAN -->|"是"| PLAN_REVIEW["HITL: PLAN 审批"]
-      HPLAN -->|"否"| PM1["记忆预取 2<br/>按计划和工具意图检索"]
+      HPLAN -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
       PLAN_REVIEW -->|"批准"| PM1
       PLAN_REVIEW -->|"修改"| PL
       PLAN_REVIEW -->|"拒绝"| PAW["回答节点"]
@@ -220,7 +219,7 @@ flowchart TD
     SAVE --> END
 ```
 
-LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径，固定节点为 `task_router -> memory_prefetch_before_planner -> planner -> plan_review? -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
 固定图节点与 guardrail 不作为 Planner 可选工具，包括 `auth_context_resolver`、`scope_ownership_guard`、`intent_router`、Java/API 输入校验、受权限控制的上下文加载、`tool_router`、`java_read_tool_gateway`、`human_plan_review`、`human_crud_review`、`privacy_guard`、`citation_guard`、`undo_window_manager` 和 `audit_logging`。只读工具不需要人工审批，但必须通过 `java_read_tool_gateway` 强制当前用户归属过滤；`utc_time_provider` 为纯系统工具，不访问用户数据。网关只允许服务端计算 `ownerUserId == currentUserId`，`explicitGrant` 是预留能力，禁止 Agent 自行传入跨用户过滤条件。`rag_query_probe_non_persistent` 不写 `rag_query_history`，只允许写脱敏审计日志；保存查询历史必须按变更工具审批。`retrieval_coverage_probe` 只读取 Java 查询诊断里的 `expandedQueries`、候选数量、evidence 分布和覆盖率，不重新实现 Multi-Query、BM25、向量召回或 RAG-Fusion。
 

@@ -41,11 +41,10 @@ flowchart TD
     end
 
     subgraph PLAN["Planning 子图：PAE + ReAct"]
-      P0 --> PM0["记忆预取 1<br/>用户偏好、历史约束、近期任务"]
-      PM0 --> PL["规划器 Planner<br/>PAE 计划、完成标准、工具范围"]
+      P0 --> PL["规划器 Planner<br/>先生成 PAE 计划、完成标准、工具范围"]
       PL --> HPLAN{"是否需要 PLAN 审批"}
       HPLAN -->|"是"| PLAN_REVIEW["HITL: PLAN 审批"]
-      HPLAN -->|"否"| PM1["记忆预取 2<br/>按计划和工具意图检索"]
+      HPLAN -->|"否"| PM1["记忆预取<br/>按已批准计划和工具意图检索"]
       PLAN_REVIEW -->|"批准"| PM1
       PLAN_REVIEW -->|"修改"| PL
       PLAN_REVIEW -->|"拒绝"| PAW["回答节点"]
@@ -84,10 +83,10 @@ flowchart TD
 | 节点 | 代码节点 | 职责 |
 | --- | --- | --- |
 | 任务路由器 | `task_router` | 根据 `taskType/workspaceMode/toolHints` 标记 ReadOnly 或 Planning 子图，避免 FastAPI 入口分流到旧图 |
-| 记忆预取 1 | `memory_prefetch_before_planner` | 在规划前调用 `agent_memory_retriever`，读取偏好、历史约束和近期任务上下文 |
+| 只读预取 | `memory_prefetch_before_planner` | 仅 ReadOnly 子图在轻量规划前调用 `agent_memory_retriever`，读取偏好、历史约束和近期任务上下文 |
 | 规划器 | `planner` | PAE 生成计划、工具范围、完成标准和风险等级 |
-| 计划审批 | `plan_review` | 仅 `planning_task` 默认进入 `PLAN` 审批；审批只确认路线，不授权写操作 |
-| 记忆预取 2 | `memory_prefetch_after_planner` | Planning 子图在计划通过后按步骤再次检索任务相关记忆；ReadOnly 子图不做第二阶段预取 |
+| 计划审批 | `plan_review` | `planning_task` 首轮规划完成后立即进入 `PLAN` 审批；审批只确认路线，不授权写操作 |
+| 规划后记忆预取 | `memory_prefetch_after_planner` | Planning 子图在计划通过后按步骤检索任务相关记忆；未批准计划前不调用工具 |
 | 执行器 | `executor` | ReAct 行动选择器，只决定下一步工具与参数，不直接调用外部系统 |
 | 工具节点 | `tool_adapter` | 唯一工具调用出口，只能访问 Java Read/Mutation Tool Gateway；后续 MCP 也在此适配 |
 | 修补节点 | `repair` | 判断失败原因，决定重试、跳过可降级工具、重规划或汇报无法完成 |
@@ -105,7 +104,7 @@ flowchart TD
 
 长期记忆规则：
 
-- 规划前记忆用于约束计划，规划后记忆用于补充具体任务上下文，二者只读且均通过 Java Tool Gateway。
+- ReadOnly 子图可在轻量规划前读取记忆；Planning 子图必须先由 Planner 生成计划并等待 `PLAN` 审批，批准后才按计划读取记忆和调用只读工具。
 - 回答后的 `agent_memory_candidate_proposer` 只产出待确认候选和冲突信息，不写库、不激活；当前 `post_answer_memory` 图内不执行显式记忆写入分支。
 - `agent_memory_candidate_save` 属于数据库变更工具，必须由前端/Java 记忆确认或 `human_crud_review` 流程触发；前端可展示为 `MEMORY_WRITE` 语义，但底层审批、归属、版本和审计仍由 Java 流程处理。
 - 记忆合并、冲突覆盖和版本建议参考 `docs/api/agent-memory.md`，Python 不直接修改 `agent_memory_item`、`agent_memory_version` 或索引表。

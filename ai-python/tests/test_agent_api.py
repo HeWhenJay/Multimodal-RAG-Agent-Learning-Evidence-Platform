@@ -293,7 +293,7 @@ def test_agent_task_uses_java_gateway_and_callbacks(monkeypatch):
     assert "正文片段" not in str(observation)
 
 
-def test_planning_task_requests_plan_review_after_memory_prefetch(monkeypatch):
+def test_planning_task_requests_plan_review_before_tool_calls(monkeypatch):
     import httpx
 
     FakeJavaClient.calls = []
@@ -322,10 +322,10 @@ def test_planning_task_requests_plan_review_after_memory_prefetch(monkeypatch):
     assert response.json()["status"] == "WAITING_PLAN_REVIEW"
     tool_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/api/internal/agent/tools/read")]
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
-    assert [call["json"]["toolName"] for call in tool_calls] == ["agent_memory_retriever"]
+    assert tool_calls == []
     assert [event["json"]["eventType"] for event in event_calls] == ["TASK_STARTED", "REVIEW_REQUESTED"]
     assert event_calls[-1]["json"]["reviewRequest"]["reviewType"] == "PLAN"
-    assert event_calls[-1]["json"]["draft"]["memoryContext"][0]["memoryId"] == "agent-memory-1"
+    assert event_calls[-1]["json"]["draft"]["message"] == "规划器已生成执行路线，等待用户批准或要求修改。"
 
 
 def test_planning_resume_uses_java_gateway_and_requests_output_review(monkeypatch):
@@ -362,7 +362,6 @@ def test_planning_resume_uses_java_gateway_and_requests_output_review(monkeypatc
     tool_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/api/internal/agent/tools/read")]
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     assert [call["json"]["toolName"] for call in tool_calls] == [
-        "agent_memory_retriever",
         "agent_memory_retriever",
         "rag_query_probe_non_persistent",
         "agent_memory_candidate_proposer",
@@ -413,7 +412,6 @@ def test_planning_resume_with_web_search_keeps_local_rag_flow(monkeypatch):
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     assert [call["json"]["toolName"] for call in tool_calls] == [
         "agent_memory_retriever",
-        "agent_memory_retriever",
         "web_search_probe",
         "rag_query_probe_non_persistent",
         "agent_memory_candidate_proposer",
@@ -462,7 +460,6 @@ def test_planning_resume_degrades_to_local_rag_when_web_search_unavailable(monke
     tool_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/api/internal/agent/tools/read")]
     event_calls = [call for call in FakeJavaClient.calls if call["url"].endswith("/events")]
     assert [call["json"]["toolName"] for call in tool_calls] == [
-        "agent_memory_retriever",
         "agent_memory_retriever",
         "web_search_probe",
         "rag_query_probe_non_persistent",

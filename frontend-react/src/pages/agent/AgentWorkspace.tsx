@@ -712,6 +712,8 @@ export function AgentWorkspace() {
         </article>
       </section>
 
+      {task ? <AgentConversation task={task} /> : null}
+
       {task ? (
         <section className="agent-result-grid">
           <article className="panel">
@@ -935,6 +937,43 @@ function AgentListbox<T extends string>({
         </div>
       </Listbox>
     </div>
+  );
+}
+
+// 展示任务创建后的对话流摘要，用户目标固定在右侧。
+function AgentConversation({ task }: { task: AgentTask }) {
+  const input = task.input || {};
+  const userGoal = displayUserGoal(input.goal || input.question || task.title);
+  const planTitle = stringValue(task.plan?.title) || stringValue(task.draft?.planSummary);
+  const pendingReview = (task.reviews || []).find((review) => review.status === 'PENDING');
+  const botStatus = pendingReview?.reviewType === 'PLAN'
+    ? '规划器已完成初始路线，等待你批准、要求修改或拒绝。'
+    : statusLabel(task.status);
+  return (
+    <section className="agent-conversation-stream" aria-label="Agent 任务对话">
+      <div className="agent-chat-row user">
+        <div className="agent-chat-bubble user">
+          <strong>用户目标</strong>
+          <p>{userGoal}</p>
+          <div className="query-tags agent-tags">
+            {input.workspaceMode ? <span>{String(input.workspaceMode)}</span> : null}
+            {normalizeStringList(input.toolHints).map((tool) => <span key={tool}>{tool}</span>)}
+          </div>
+        </div>
+        <span className="agent-chat-avatar user">我</span>
+      </div>
+      <div className="agent-chat-row assistant">
+        <span className="agent-chat-avatar assistant"><Bot size={16} /></span>
+        <div className="agent-chat-bubble assistant">
+          <strong>执行说明</strong>
+          <p>{planTitle || botStatus}</p>
+          <div className="query-tags agent-tags">
+            <span>{statusLabel(task.status)}</span>
+            <span>{(task.toolCalls || []).length} 次工具观察</span>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1305,9 +1344,13 @@ function ReviewProposal({ review }: { review: AgentHumanReview }) {
         </div>
       ) : null}
       {Array.isArray(proposal.steps) ? (
-        <ul>
-          {proposal.steps.map((step) => <li key={String(step)}>{String(step)}</li>)}
-        </ul>
+        <ol className="agent-plan-step-list">
+          {proposal.steps.map((step, index) => (
+            <li key={`${index}-${planStepKey(step)}`}>
+              <PlanStepItem step={step} />
+            </li>
+          ))}
+        </ol>
       ) : null}
       <div className="query-tags agent-tags">
         {normalizeStringList(proposal.tools).map((tool) => <span key={tool}>{tool}</span>)}
@@ -1317,6 +1360,24 @@ function ReviewProposal({ review }: { review: AgentHumanReview }) {
         {proposal.undoable ? <span>可撤销</span> : null}
       </div>
       {proposal.summary ? <p>{String(proposal.summary)}</p> : null}
+    </div>
+  );
+}
+
+// 将后端返回的计划步骤对象拆成可读字段，避免渲染成 [object Object]。
+function PlanStepItem({ step }: { step: unknown }) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) {
+    return <span>{String(step || '未命名步骤')}</span>;
+  }
+  const item = step as Record<string, unknown>;
+  return (
+    <div className="agent-plan-step">
+      <strong>{stringValue(item.description) || stringValue(item.title) || '未命名步骤'}</strong>
+      <div className="query-tags agent-tags">
+        {item.toolName ? <span>工具 {String(item.toolName)}</span> : null}
+        {item.toolType ? <span>{String(item.toolType)}</span> : null}
+      </div>
+      {item.expectedOutput ? <p>{String(item.expectedOutput)}</p> : null}
     </div>
   );
 }
@@ -1709,6 +1770,16 @@ function normalizeStringList(value: unknown): string[] {
 
 function normalizeRecordList(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
+}
+
+function displayUserGoal(value: unknown) {
+  return stringValue(value).split('\n\n')[0] || '未返回用户目标';
+}
+
+function planStepKey(step: unknown) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return String(step || 'step');
+  const item = step as Record<string, unknown>;
+  return [item.description, item.toolName, item.expectedOutput].map((value) => String(value || '')).join('-') || 'step';
 }
 
 function buildGoalForMode(mode: AgentWorkspaceMode, goal: string) {
