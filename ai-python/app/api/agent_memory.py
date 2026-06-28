@@ -1,8 +1,7 @@
-import os
-
 from fastapi import APIRouter, Header, HTTPException
 
 from agents.memory.memory_service import AgentMemoryService
+from app.core.agent_internal_token import resolve_agent_internal_token
 from app.schemas.agent_memory import (
     MemoryConflictRequest,
     MemoryConflictResponse,
@@ -72,7 +71,7 @@ def delete_memory_index(
 
 def require_internal_token(token: str | None) -> str:
     """校验 Java 调 Python Memory Service 的内部令牌。"""
-    configured = os.getenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "").strip()
+    configured = resolve_agent_internal_token()
     if not configured or token != configured:
         raise HTTPException(status_code=401, detail="AGENT_INTERNAL_TOKEN_INVALID")
     return configured

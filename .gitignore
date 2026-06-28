@@ -41,6 +41,7 @@ conda-meta/
 ai-python/config/application.local.yml
 
 # Local storage
+.local/
 uploads/
 data/
 tmp/

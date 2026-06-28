@@ -28,8 +28,10 @@ document:
     soffice-command: ${SOFFICE_COMMAND:}
 
 environment:
-  # Agent 工作台联调时必须与 Java 后端的 EVIDENCE_AGENT_INTERNAL_TOKEN 保持一致。
+  # Agent 工作台本地联调默认会自动使用仓库根目录 .local/agent-internal-token。
+  # 如需手工指定共享令牌或共享文件路径，可取消下面配置并确保 Java/Python 一致。
   # EVIDENCE_AGENT_INTERNAL_TOKEN: ${EVIDENCE_AGENT_INTERNAL_TOKEN:dev-agent-secret}
+  # EVIDENCE_AGENT_INTERNAL_TOKEN_FILE: ${EVIDENCE_AGENT_INTERNAL_TOKEN_FILE:../.local/agent-internal-token}
   # 离线演示时可取消下面三项注释；真实联调建议使用默认的 pgvector + 百炼。
   # RAG_EMBEDDING_PROVIDER: ${RAG_EMBEDDING_PROVIDER:hash}
   # RAG_RERANK_PROVIDER: ${RAG_RERANK_PROVIDER:local}

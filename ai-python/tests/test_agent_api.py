@@ -212,6 +212,35 @@ def test_agent_task_requires_internal_token(monkeypatch):
     assert response.json()["detail"] == "AGENT_INTERNAL_TOKEN_INVALID"
 
 
+def test_agent_task_accepts_local_shared_token_without_env(monkeypatch, tmp_path):
+    """未配置环境变量时，Python 内部接口可使用本地共享文件令牌。"""
+    import httpx
+
+    FakeJavaClient.calls = []
+    monkeypatch.delenv("EVIDENCE_AGENT_INTERNAL_TOKEN", raising=False)
+    token_file = tmp_path / "agent-internal-token"
+    token_file.write_text("agent-secret\n", encoding="utf-8")
+    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN_FILE", str(token_file))
+    client = TestClient(app)
+    monkeypatch.setattr(httpx, "Client", FakeJavaClient)
+
+    response = client.post(
+        "/internal/agent/tasks",
+        headers={"X-Agent-Internal-Token": "agent-secret"},
+        json={
+            "taskId": "agent-task-local-token",
+            "taskType": "pure_read_query",
+            "input": {"goal": "Redis 学到了什么"},
+            "callbackUrl": "http://java/api/internal/agent/tasks/agent-task-local-token/events",
+            "javaToolGatewayBaseUrl": "http://java",
+            "threadId": "agent-task-local-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "COMPLETED"
+
+
 def test_unified_graph_task_router_selects_subgraphs_without_old_entrypoints():
     from agents.orchestration.pae_react_graph import task_router_node
 

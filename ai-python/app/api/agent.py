@@ -1,10 +1,10 @@
-import os
 import logging
 
 from fastapi import APIRouter, Header, HTTPException
 
 from agents.gateway.java_gateway import JavaAgentGatewayClient
 from agents.orchestration.pae_react_graph import resume_unified_agent, start_unified_agent
+from app.core.agent_internal_token import resolve_agent_internal_token
 from app.schemas.agent import AgentTaskResumeRequest, AgentTaskStartRequest, AgentTaskStartResponse
 
 
@@ -64,8 +64,8 @@ def resume_task(
 
 
 def require_internal_token(token: str | None) -> str:
-    """校验 Java 调 Python Agent 的内部令牌，未配置时拒绝处理。"""
-    configured = os.getenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "").strip()
+    """校验 Java 调 Python Agent 的内部令牌，本地未显式配置时使用共享文件兜底。"""
+    configured = resolve_agent_internal_token()
     if not configured or token != configured:
         agent_log("拒绝内部令牌", configured=bool(configured), provided=bool(token))
         raise HTTPException(status_code=401, detail="AGENT_INTERNAL_TOKEN_INVALID")

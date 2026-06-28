@@ -152,8 +152,8 @@ flowchart TD
 
 - 外部接口必须携带 `Authorization: Bearer <token>`。
 - Java 从登录 token 解析当前用户，并写入 `agent_task.user_id`。
-- 内部接口必须校验 `X-Agent-Internal-Token: ${EVIDENCE_AGENT_INTERNAL_TOKEN}`。
-- `EVIDENCE_AGENT_INTERNAL_TOKEN` 为空时，Java 内部 Agent Tool Gateway 和 Python Agent API 应拒绝启动或拒绝处理内部调用，避免误开无鉴权接口。
+- 内部接口必须校验 `X-Agent-Internal-Token`，令牌来源优先级为 `EVIDENCE_AGENT_INTERNAL_TOKEN`、`EVIDENCE_AGENT_INTERNAL_TOKEN_FILE` 指向文件、仓库根目录 `.local/agent-internal-token`。
+- 本地开发未显式配置 `EVIDENCE_AGENT_INTERNAL_TOKEN` 时，Java 和 Python 会自动读取或创建同一个 `.local/agent-internal-token`，避免两个服务分别手工配置；生产或多机部署应显式配置环境变量或共享密钥文件。
 - Java Tool Gateway 根据 `taskId` 查询 `agent_task.user_id`，不信任 Python 传入的 `userId`。
 - 只读工具无需 HITL，但任何 `resourceId/documentId/materialId/operationId` 必须由 Java 做 owner 校验。
 - 当前版本 `scope=current_user_or_authorized` 的实际含义是“当前用户本人资源”；`explicitGrant` 未落表前非 owner 一律返回 `AGENT_RESOURCE_FORBIDDEN`。
@@ -311,7 +311,7 @@ VO：
 ```
 
 阶段 2 开始，Java 创建任务后调用 Python `/internal/agent/tasks`；Python 通过 Java events 回写状态，Java 不轮询 Python。
-如果 `EVIDENCE_AGENT_INTERNAL_TOKEN` 为空，Java 会创建任务后立即回写 `FAILED / AGENT_INTERNAL_TOKEN_INVALID`，并在任务错误信息中提示需要同时为 Java 和 Python 配置该环境变量，避免前端长期停在 `CREATED` 且 Python 控制台无日志。
+如果显式环境变量和本地共享令牌文件都不可用，Java 会创建任务后立即回写 `FAILED / AGENT_INTERNAL_TOKEN_INVALID`，并在任务错误信息中提示检查 `EVIDENCE_AGENT_INTERNAL_TOKEN` 或 `.local/agent-internal-token`，避免前端长期停在 `CREATED` 且 Python 控制台无日志。
 Agent 链路排障日志要求：Java 全局异常日志必须打印 `method/path`，Java 创建任务、请求 Python、接收内部事件、执行 Tool Gateway 都要打印 `taskId/toolCallId/toolName/status` 摘要；Python `/internal/agent/tasks`、`/resume`、回调 Java events 和调用 Java tools 都要打印 `Agent链路` 控制台日志，不记录完整问题、回答、简历正文、资料正文或密钥。
 阶段 3 的 `planning_task` 创建后先由 Python 回写 `REVIEW_REQUESTED`，任务进入 `WAITING_PLAN_REVIEW`；用户确认计划后，Java 调用 Python `/internal/agent/tasks/{taskId}/resume` 继续执行只读证据对齐，随后 Python 回写 `WAITING_OUTPUT_REVIEW`；用户确认输出后任务进入 `COMPLETED`。
 
@@ -924,7 +924,7 @@ Python 侧工具节点在调用 mutation gateway 前也会做硬门禁：缺少 
 ## 阶段 1 验收清单
 
 - Java 已提供 `POST /api/agent/tasks`、`GET /api/agent/tasks/{taskId}`、`GET /api/agent/tools`。
-- Java 已提供 HTTP 级 `POST /api/internal/agent/tools/read`，内部 token 未配置、缺失或错误时返回 `AGENT_INTERNAL_TOKEN_INVALID`。
+- Java 已提供 HTTP 级 `POST /api/internal/agent/tools/read`，内部 token 缺失、错误或本地共享令牌无法解析时返回 `AGENT_INTERNAL_TOKEN_INVALID`。
 - 只读 Tool Gateway 从 `taskId` 反查 `agent_task.user_id`，不信任 Python 传入用户范围。
 - `rag_query_probe_non_persistent` 和 `retrieval_coverage_probe` 只走 `RagService.queryNonPersistent()`，不写 `rag_query_history`。
 - `agent_tool_call.response_json` 只保存脱敏摘要，不保存资料正文、完整回答或 evidence snippet。
@@ -934,7 +934,7 @@ Python 侧工具节点在调用 mutation gateway 前也会做硬门禁：缺少 
 
 - Python 已提供 `POST /internal/agent/tasks`，仅在 `X-Agent-Internal-Token` 匹配时启动 `pure_read_query`。
 - Python 只读图仅调用 Java `/api/internal/agent/tools/read` 和 Java events 回调，不直连数据库、对象存储或 Python RAG `/internal/*`。
-- Java 创建 `pure_read_query` 后在内部 token 已配置时调用 Python Agent；未配置 token 时任务进入 `FAILED / AGENT_INTERNAL_TOKEN_INVALID` 并在前端展示配置提示。
+- Java 创建 `pure_read_query` 后使用显式环境变量或本地共享令牌调用 Python Agent；令牌无法解析时任务进入 `FAILED / AGENT_INTERNAL_TOKEN_INVALID` 并在前端展示配置提示。
 - Java 已提供 `POST /api/internal/agent/tasks/{taskId}/events`，同样严格校验内部 token，并按事件更新 `agent_task` 和 `agent_tool_call`。
 - 前端 `/agent` 可创建只读任务、轮询任务详情、展示工具观察、最终回答和 evidence ID。
 - 阶段 2 验证命令：Python `conda run -n learning-evidence-rag python -B -m pytest ai-python/tests/test_agent_api.py -q`；Java Agent 窄测试覆盖 16 个测试。

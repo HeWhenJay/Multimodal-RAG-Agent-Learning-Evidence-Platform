@@ -10,6 +10,8 @@ from typing import Any
 
 import uvicorn
 
+from app.core.agent_internal_token import resolve_agent_internal_token
+
 
 AI_PYTHON_DIR = Path(__file__).resolve().parents[2]
 if str(AI_PYTHON_DIR) not in sys.path:
@@ -111,6 +113,8 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("video", "segment-max-cues"): "RAG_VIDEO_SEGMENT_MAX_CUES",
     ("document", "convert", "libreoffice-command"): "LIBREOFFICE_COMMAND",
     ("document", "convert", "soffice-command"): "SOFFICE_COMMAND",
+    ("agent", "internal-token"): "EVIDENCE_AGENT_INTERNAL_TOKEN",
+    ("agent", "internal-token-file"): "EVIDENCE_AGENT_INTERNAL_TOKEN_FILE",
 }
 
 
@@ -146,6 +150,7 @@ def load_runtime_config(args: argparse.Namespace) -> None:
     env_defaults = build_env_defaults(merged_config)
     for name, value in env_defaults.items():
         os.environ.setdefault(name, value)
+    os.environ.setdefault("EVIDENCE_AGENT_INTERNAL_TOKEN", resolve_agent_internal_token())
 
     if loaded_paths:
         joined_paths = ", ".join(str(path) for path in loaded_paths)

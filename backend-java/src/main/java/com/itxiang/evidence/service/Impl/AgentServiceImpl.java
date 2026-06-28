@@ -304,7 +304,7 @@ public class AgentServiceImpl implements AgentService {
         if (agentProperties.getInternalToken() == null || agentProperties.getInternalToken().isBlank()) {
             task.setStatus("WAITING_PLAN_REVIEW");
             task.setErrorCode("AGENT_INTERNAL_TOKEN_INVALID");
-            task.setErrorMessage("内部 Agent 令牌未配置，无法恢复 Python Agent");
+            task.setErrorMessage("内部 Agent 令牌不可用，无法恢复 Python Agent，请检查 EVIDENCE_AGENT_INTERNAL_TOKEN 或 .local/agent-internal-token");
             agentTaskMapper.updateFromEvent(task);
             return;
         }
@@ -415,7 +415,7 @@ public class AgentServiceImpl implements AgentService {
             return null;
         }
         if (agentProperties.getInternalToken() == null || agentProperties.getInternalToken().isBlank()) {
-            return "内部 Agent 令牌未配置，Java 已创建任务但不会调用 Python Agent。请同时为 Java 和 Python 设置 EVIDENCE_AGENT_INTERNAL_TOKEN。";
+            return "内部 Agent 令牌不可用，Java 已创建任务但不会调用 Python Agent。请检查 EVIDENCE_AGENT_INTERNAL_TOKEN 或 .local/agent-internal-token。";
         }
         return null;
     }

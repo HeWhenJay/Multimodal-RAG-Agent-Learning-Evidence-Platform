@@ -497,9 +497,11 @@ docker run -d --name learning-evidence-redis `
 | `TAVILY_API_KEY` | Agent 联网搜索时必填 | Tavily Search API Key | `<your-tavily-api-key>` |
 | `ALIYUN_OSS_ACCESS_KEY_ID` / `ALIYUN_OSS_ACCESS_KEY_SECRET` | Java 存储切到 `oss` 时必填 | Java 上传原始资料到阿里云 OSS | `<your-access-key>` |
 | `EVIDENCE_INTERNAL_LOG_TOKEN` | 需要保护内部日志上报接口时填写 | Java 内部日志接口鉴权 token | 自定义随机字符串 |
-| `EVIDENCE_AGENT_INTERNAL_TOKEN` | Java 启动 Python Agent 或 Python 回写事件时填写 | Java/Python Agent 内部调用鉴权 | 自定义随机字符串 |
+| `EVIDENCE_AGENT_INTERNAL_TOKEN` | 生产或多机部署建议显式填写 | Java/Python Agent 内部调用鉴权；本地未配置时自动使用 `.local/agent-internal-token` | 自定义随机字符串 |
 
 本地开发如果继续使用 `local` 文件存储，只需要先确认 `DASHSCOPE_API_KEY` 已在系统环境变量中配置。数据库密码默认使用本地值 `123456`，只适合本机开发；部署或共享环境应改为环境变量。
+
+Agent 工作台本地联调不需要分别为 Java 和 Python 手工设置内部令牌。两个服务在未读取到 `EVIDENCE_AGENT_INTERNAL_TOKEN` 时，会自动读取或创建仓库根目录 `.local/agent-internal-token`；该目录已被 `.gitignore` 忽略，不要提交。生产、多机或容器部署时，建议显式配置 `EVIDENCE_AGENT_INTERNAL_TOKEN` 或用 `EVIDENCE_AGENT_INTERNAL_TOKEN_FILE` 指向统一密钥文件。
 
 ### 服务地址与数据源
 
@@ -573,7 +575,8 @@ docker run -d --name learning-evidence-redis `
 | `SPRING_DATA_REDIS_PASSWORD` / `SPRING_DATA_REDIS_DATABASE` | Redis 启用密码或多库时填写 | Java Redis 鉴权和库编号 | 空 / `0` |
 | `SPRING_DATA_REDIS_TIMEOUT` | 可选 | Java Redis 连接超时 | `2s` |
 | `REDIS_URL` | 可选 | Python Agent 读取短期纠偏和取消标记 | `redis://127.0.0.1:6379/0` |
-| `EVIDENCE_AGENT_INTERNAL_TOKEN` | Agent 工作台联调必填 | Java 与 Python Agent 内部接口共享令牌；未配置时 Agent 任务会进入 `FAILED / AGENT_INTERNAL_TOKEN_INVALID`，Python 控制台不会收到启动请求 | 自定义随机字符串 |
+| `EVIDENCE_AGENT_INTERNAL_TOKEN` | 可选，生产建议配置 | Java 与 Python Agent 内部接口共享令牌；本地未配置时自动读取或创建仓库根目录 `.local/agent-internal-token` | 自定义随机字符串 |
+| `EVIDENCE_AGENT_INTERNAL_TOKEN_FILE` | 可选 | 指定 Java/Python 共用的内部令牌文件路径，便于容器或多进程复用同一密钥文件 | `.local/agent-internal-token` |
 | `EVIDENCE_AGENT_START_TIMEOUT_SECONDS` | 可选 | Java 启动 Python Agent 任务的等待超时 | `10` |
 | `EVIDENCE_AGENT_REDIS_ENABLED` | 可选 | Java 是否启用 Redis 运行态；关闭后走数据库轮询降级 | `true` |
 | `EVIDENCE_AGENT_REDIS_STREAM_TTL_HOURS` | 可选 | Redis Stream 保留时间 | `24` |

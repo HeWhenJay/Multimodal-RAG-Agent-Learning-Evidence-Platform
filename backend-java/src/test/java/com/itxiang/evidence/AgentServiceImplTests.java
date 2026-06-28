@@ -25,6 +25,7 @@ import com.itxiang.evidence.service.Impl.AgentServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -32,6 +33,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -67,6 +69,9 @@ class AgentServiceImplTests {
 
     @Mock
     private PythonAgentClient pythonAgentClient;
+
+    @TempDir
+    private Path tempDir;
 
     private AgentProperties agentProperties;
     private AgentServiceImpl service;
@@ -131,26 +136,30 @@ class AgentServiceImplTests {
     }
 
     @Test
-    void createAgentTaskFailsFastWhenInternalTokenMissing() {
+    void createAgentTaskUsesLocalSharedTokenWhenInternalTokenMissing() {
         agentProperties.setInternalToken("");
-        AtomicReference<AgentTask> savedTask = new AtomicReference<>();
-        doAnswer(invocation -> {
-            savedTask.set(invocation.getArgument(0));
-            return null;
-        }).when(agentTaskMapper).insert(any(AgentTask.class));
-        when(agentTaskMapper.findById(anyString())).thenAnswer(invocation -> savedTask.get());
-        AgentTaskCreateDTO dto = new AgentTaskCreateDTO();
-        dto.setTaskType("pure_read_query");
-        dto.setTitle("查询 Redis 学习证据");
-        dto.setInput(new LinkedHashMap<>(Map.of("goal", "Redis 学到了什么")));
+        System.setProperty("evidence.agent.internal-token-file", tempDir.resolve("agent-internal-token").toString());
+        try {
+            AtomicReference<AgentTask> savedTask = new AtomicReference<>();
+            doAnswer(invocation -> {
+                savedTask.set(invocation.getArgument(0));
+                return null;
+            }).when(agentTaskMapper).insert(any(AgentTask.class));
+            when(agentTaskMapper.findById(anyString())).thenAnswer(invocation -> savedTask.get());
+            AgentTaskCreateDTO dto = new AgentTaskCreateDTO();
+            dto.setTaskType("pure_read_query");
+            dto.setTitle("查询 Redis 学习证据");
+            dto.setInput(new LinkedHashMap<>(Map.of("goal", "Redis 学到了什么")));
 
-        AgentTaskVO result = service.createTask(dto, "7");
+            AgentTaskVO result = service.createTask(dto, "7");
 
-        assertThat(result.getStatus()).isEqualTo("FAILED");
-        assertThat(result.getErrorCode()).isEqualTo("AGENT_INTERNAL_TOKEN_INVALID");
-        assertThat(result.getErrorMessage()).contains("EVIDENCE_AGENT_INTERNAL_TOKEN");
-        verify(pythonAgentClient, never()).startTask(any(), any());
-        verify(agentTaskMapper).updateFromEvent(savedTask.get());
+            assertThat(result.getStatus()).isEqualTo("CREATED");
+            assertThat(agentProperties.getInternalToken()).isNotBlank();
+            verify(pythonAgentClient).startTask(any(), any());
+            verify(agentTaskMapper, never()).updateFromEvent(any(AgentTask.class));
+        } finally {
+            System.clearProperty("evidence.agent.internal-token-file");
+        }
     }
 
     @Test

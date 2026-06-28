@@ -103,7 +103,14 @@ document:
     libreoffice-command: ${LIBREOFFICE_COMMAND:}
     soffice-command: ${SOFFICE_COMMAND:}
 
+agent:
+  # 本地未显式配置时，Java 和 Python 会自动共用仓库根目录 .local/agent-internal-token。
+  internal-token: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
+  internal-token-file: ${EVIDENCE_AGENT_INTERNAL_TOKEN_FILE:}
+
 environment:
+  EVIDENCE_AGENT_INTERNAL_TOKEN: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
+  EVIDENCE_AGENT_INTERNAL_TOKEN_FILE: ${EVIDENCE_AGENT_INTERNAL_TOKEN_FILE:}
   DATABASE_URL: ${DATABASE_URL:}
   DASHSCOPE_EMBEDDING_MODEL: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
   DASHSCOPE_EMBEDDING_BASE_URL: ${DASHSCOPE_EMBEDDING_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}

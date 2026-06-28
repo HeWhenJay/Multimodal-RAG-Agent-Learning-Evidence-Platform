@@ -1,4 +1,5 @@
 from run import build_env_defaults
+from app.core.agent_internal_token import resolve_agent_internal_token
 
 
 def test_video_v6_config_env_mapping_is_effective():
@@ -38,3 +39,18 @@ def test_video_v6_config_env_mapping_is_effective():
     assert env_defaults["RAG_VIDEO_FRAME_VISUAL_REVISIT_VERIFY_SECONDS"] == "1800"
     assert env_defaults["RAG_VIDEO_FRAME_VISUAL_VERIFICATION_RATIO"] == "0.25"
     assert env_defaults["RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP"] == "2"
+
+
+def test_agent_internal_token_falls_back_to_local_shared_file(monkeypatch, tmp_path):
+    """未显式配置内部令牌时，Python 使用本地共享文件自动生成并复用令牌。"""
+    token_file = tmp_path / "agent-internal-token"
+    monkeypatch.delenv("EVIDENCE_AGENT_INTERNAL_TOKEN", raising=False)
+    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN_FILE", str(token_file))
+
+    first = resolve_agent_internal_token()
+    monkeypatch.delenv("EVIDENCE_AGENT_INTERNAL_TOKEN", raising=False)
+    second = resolve_agent_internal_token()
+
+    assert first
+    assert second == first
+    assert token_file.read_text(encoding="utf-8").strip() == first
