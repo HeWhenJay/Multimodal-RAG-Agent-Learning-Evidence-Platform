@@ -192,6 +192,27 @@ class FakeJavaClient:
         return FakeResponse({"accepted": True})
 
 
+class FakeQwenResult:
+    """测试用千问结构化返回。"""
+
+    def __init__(self, data: dict, model: str) -> None:
+        self.data = data
+        self.provider = "dashscope"
+        self.model = model
+
+
+class FakeQwenClient:
+    """按节点返回预设 JSON 的测试客户端。"""
+
+    def __init__(self, outputs: dict[str, dict]) -> None:
+        self.outputs = outputs
+
+    def complete_json(self, *, node: str, model: str, system_prompt: str, user_prompt: str) -> FakeQwenResult:
+        if node not in self.outputs:
+            raise RuntimeError(f"未配置 fake qwen 节点：{node}")
+        return FakeQwenResult(self.outputs[node], model)
+
+
 def test_agent_task_requires_internal_token(monkeypatch):
     monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN", "agent-secret")
     client = TestClient(app)
@@ -249,6 +270,126 @@ def test_unified_graph_task_router_selects_subgraphs_without_old_entrypoints():
 
     assert read_state["subgraph"] == "read_only"
     assert planning_state["subgraph"] == "planning"
+
+
+def test_planner_uses_qwen_json_for_resume_rewrite_intent(monkeypatch):
+    """Planner 可接收千问结构化计划并进入简历修改子图。"""
+    import agents.orchestration.pae_react_graph as graph
+
+    monkeypatch.setattr(
+        graph,
+        "get_agent_qwen_client",
+        lambda: FakeQwenClient(
+            {
+                "planner": {
+                    "title": "后端实习简历优化计划",
+                    "steps": [
+                        {
+                            "description": "检索当前用户 evidence 支撑简历优化",
+                            "toolName": "rag_query_probe_non_persistent",
+                            "toolType": "READ",
+                            "expectedOutput": "带 evidence 的适配观察",
+                        }
+                    ],
+                    "tools": ["rag_query_probe_non_persistent"],
+                    "internalSubgraphs": ["resume_rewrite_subgraph"],
+                    "resumeRewriteIntent": True,
+                    "requiresPlanReview": True,
+                    "requiresOutputReview": True,
+                    "riskLevel": "MEDIUM",
+                    "guardrails": ["计划审批不授权写操作"],
+                }
+            }
+        ),
+    )
+    state = graph.planner_node(
+        {
+            "task_type": "planning_task",
+            "subgraph": "planning",
+            "task_input": {"goal": "帮我优化简历匹配后端实习", "jobDescription": "Java 后端"},
+            "status": "RUNNING",
+        }
+    )
+
+    assert state["plan"]["resumeRewriteIntent"] is True
+    assert state["plan"]["internalSubgraphs"] == ["resume_rewrite_subgraph"]
+    assert state["llm_diagnostics"][0]["status"] == "used"
+
+
+def test_planner_rejects_illegal_llm_tool_and_falls_back(monkeypatch):
+    """Planner 输出非法工具名时走确定性 fallback。"""
+    import agents.orchestration.pae_react_graph as graph
+
+    monkeypatch.setattr(
+        graph,
+        "get_agent_qwen_client",
+        lambda: FakeQwenClient(
+            {
+                "planner": {
+                    "title": "非法计划",
+                    "steps": [{"description": "绕过网关", "toolName": "direct_database_writer", "toolType": "READ"}],
+                }
+            }
+        ),
+    )
+    state = graph.planner_node(
+        {
+            "task_type": "pure_read_query",
+            "subgraph": "read_only",
+            "task_input": {"question": "Redis 学到了什么"},
+            "status": "RUNNING",
+        }
+    )
+
+    assert state["plan"]["steps"][0]["toolName"] == "rag_query_probe_non_persistent"
+    assert state["llm_diagnostics"][0]["status"].startswith("fallback:")
+
+
+def test_executor_rejects_llm_mutation_tool(monkeypatch):
+    """Executor 不能让千问选择 mutation 工具。"""
+    import agents.orchestration.pae_react_graph as graph
+
+    monkeypatch.setattr(
+        graph,
+        "get_agent_qwen_client",
+        lambda: FakeQwenClient(
+            {
+                "executor": {
+                    "toolName": "jd_learning_plan_save",
+                    "toolType": "MUTATION",
+                    "arguments": {},
+                    "reason": "尝试保存",
+                }
+            }
+        ),
+    )
+    state = graph.executor_node(
+        {
+            "task_id": "agent-task-llm-executor",
+            "thread_id": "agent-task-llm-executor",
+            "task_type": "planning_task",
+            "subgraph": "planning",
+            "task_input": {"goal": "生成学习计划"},
+            "user_goal": "生成学习计划",
+            "status": "RUNNING",
+            "plan": {
+                "steps": [
+                    {
+                        "description": "检索 evidence",
+                        "toolName": "rag_query_probe_non_persistent",
+                        "toolType": "READ",
+                    }
+                ]
+            },
+            "current_step_index": 0,
+            "observations": [],
+            "react_trace": [],
+        }
+    )
+
+    assert state["current_action"]["toolName"] == "rag_query_probe_non_persistent"
+    assert state["current_action"]["toolType"] == "READ"
+    assert state["llm_diagnostics"][0]["status"].startswith("fallback:")
 
 
 def test_agent_task_uses_java_gateway_and_callbacks(monkeypatch):

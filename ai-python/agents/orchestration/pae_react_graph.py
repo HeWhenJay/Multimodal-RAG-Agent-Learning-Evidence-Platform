@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 from agents.gateway.java_gateway import JavaAgentGatewayClient
+from agents.llm.qwen_client import agent_qwen_model, get_agent_qwen_client
 from agents.orchestration.planning_helpers import (
     build_alignment,
     build_evidence_question,
@@ -28,6 +30,30 @@ from agents.orchestration.read_only_helpers import (
     utc_time_provider,
 )
 from app.schemas.agent import AgentTaskEvent, AgentTaskResumeRequest, AgentTaskStartRequest, AgentTaskStartResponse, AgentToolCallEvent
+
+
+READ_EXECUTION_TOOLS = {
+    "material_status_reader",
+    "material_evidence_reader",
+    "material_preview_reader",
+    "rag_query_probe_non_persistent",
+    "retrieval_coverage_probe",
+    "evidence_quality_auditor",
+    "resume_evidence_aligner",
+    "gap_analyzer",
+    "utc_time_provider",
+    "web_search_probe",
+    "agent_memory_retriever",
+    "agent_memory_candidate_proposer",
+}
+PLAN_ALLOWED_TOOLS = READ_EXECUTION_TOOLS | {"resume_rewrite_subgraph"}
+MUTATION_TOOLS = {
+    "jd_learning_plan_save",
+    "resume_revision_save",
+    "agent_task_cancel_request",
+    "agent_memory_candidate_save",
+}
+ALLOWED_INTERNAL_SUBGRAPHS = {"resume_rewrite_subgraph"}
 
 
 class UnifiedAgentState(TypedDict, total=False):
@@ -66,6 +92,7 @@ class UnifiedAgentState(TypedDict, total=False):
     max_retries: int
     failure_reason: dict[str, Any]
     repair_decision: str
+    llm_diagnostics: list[dict[str, Any]]
 
     verifier_result: dict[str, Any]
     completion_score: float
@@ -221,6 +248,7 @@ def initial_state(
         "react_trace": [],
         "retry_count": 0,
         "max_retries": int_value(task_input.get("maxToolRetries"), 1),
+        "llm_diagnostics": [],
         "approved_operation_ids": [],
         "idempotency_keys": [],
     }
@@ -362,10 +390,8 @@ def planner_node(state: UnifiedAgentState) -> UnifiedAgentState:
         return state
     task_input = state.get("task_input") or {}
     subgraph = state.get("subgraph")
-    if subgraph == "planning":
-        plan = build_planning_plan(task_input)
-    else:
-        plan = build_read_plan(task_input)
+    fallback_plan = build_planning_plan(task_input) if subgraph == "planning" else build_read_plan(task_input)
+    plan = build_llm_planning_plan(state, fallback_plan)
     criteria = build_completion_criteria(subgraph, plan)
     return {
         **state,
@@ -432,6 +458,7 @@ def resume_rewrite_planner_node(state: UnifiedAgentState) -> UnifiedAgentState:
             "候选片段必须进入 OUTPUT 审批",
         ],
     }
+    rewrite_plan = build_llm_resume_rewrite_plan(state, rewrite_plan)
     return {**state, "resume_rewrite_plan": rewrite_plan}
 
 
@@ -455,6 +482,7 @@ def resume_rewrite_generator_node(state: UnifiedAgentState) -> UnifiedAgentState
         "rewriteTargets": requirements,
         "patches": build_resume_rewrite_patches(content_map, provisional_gaps),
     }
+    draft = build_llm_resume_rewrite_draft(state, draft)
     return {**state, "resume_rewrite_draft": draft}
 
 
@@ -471,11 +499,12 @@ def resume_rewrite_acceptance_node(state: UnifiedAgentState) -> UnifiedAgentStat
             "error_message": "简历修改子图没有生成可审批候选",
             "resume_rewrite_result": {"accepted": False},
         }
-    result = {
+    fallback_result = {
         "accepted": True,
         "requiresOutputReview": True,
         "candidateCount": len(draft.get("patches") or []),
     }
+    result = build_llm_resume_rewrite_acceptance(state, fallback_result)
     return {**state, "resume_rewrite_result": result}
 
 
@@ -508,7 +537,8 @@ def executor_node(state: UnifiedAgentState) -> UnifiedAgentState:
     if index >= len(steps):
         return {**state, "current_action": {}}
     step = steps[index] if isinstance(steps[index], dict) else {}
-    action = build_action_for_step(state, step)
+    fallback_action = build_action_for_step(state, step)
+    action = build_llm_action_for_step(state, step, fallback_action)
     trace = list(state.get("react_trace") or [])
     trace.append(
         {
@@ -620,6 +650,9 @@ def tool_adapter_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) 
 
 def repair_node(state: UnifiedAgentState) -> UnifiedAgentState:
     """修补节点，判断重试、跳过、重规划或汇报无法完成。"""
+    llm_state = apply_llm_repair_decision(state)
+    if llm_state is not state:
+        return llm_state
     failure = state.get("failure_reason") or {}
     tool_name = text_value(failure.get("toolName"))
     error_code = text_value(failure.get("errorCode"))
@@ -644,6 +677,7 @@ def repair_node(state: UnifiedAgentState) -> UnifiedAgentState:
 
 def acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
     """验收器，判断计划是否完成、是否回到执行器或进入回答节点。"""
+    state = apply_llm_acceptance_result(state)
     if state.get("status") == "FAILED":
         verifier_result = {
             "complete": False,
@@ -682,6 +716,7 @@ def acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) ->
 
 def answer_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
     """回答节点，组织中文结果并回写 Java。"""
+    state = apply_llm_answer_writer(state)
     if state.get("status") == "WAITING_OUTPUT_REVIEW":
         draft = state.get("draft_result") or {}
         client.publish_event(
@@ -849,6 +884,45 @@ def build_read_plan(task_input: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_llm_planning_plan(state: UnifiedAgentState, fallback_plan: dict[str, Any]) -> dict[str, Any]:
+    """调用千问辅助生成计划，失败或越权时回退确定性计划。"""
+    task_input = state.get("task_input") or {}
+    prompt = {
+        "node": "planner",
+        "taskType": state.get("task_type"),
+        "subgraph": state.get("subgraph"),
+        "goal": state.get("user_goal"),
+        "allowedTools": sorted(PLAN_ALLOWED_TOOLS),
+        "allowedSubgraphs": sorted(ALLOWED_INTERNAL_SUBGRAPHS),
+        "taskInputSummary": summarize_task_input(task_input),
+        "fallbackPlan": fallback_plan,
+        "expectedJson": {
+            "title": "字符串",
+            "steps": [{"description": "字符串", "toolName": "allowedTools 中的工具", "toolType": "READ 或 INTERNAL_SUBGRAPH", "expectedOutput": "字符串"}],
+            "tools": ["allowedTools 中的工具"],
+            "internalSubgraphs": ["resume_rewrite_subgraph"],
+            "resumeRewriteIntent": False,
+            "requiresPlanReview": True,
+            "requiresOutputReview": True,
+            "riskLevel": "LOW/MEDIUM/HIGH",
+            "guardrails": ["字符串"],
+        },
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="planner",
+            model=agent_qwen_model("planner"),
+            system_prompt=planner_system_prompt(),
+            user_prompt=planner_user_prompt(prompt),
+        )
+        plan = sanitize_plan(result.data, state, fallback_plan)
+        record_llm_diagnostic(state, "planner", result.model, "used")
+        return plan
+    except Exception as exc:
+        record_llm_diagnostic(state, "planner", agent_qwen_model("planner"), f"fallback: {exc}")
+        return fallback_plan
+
+
 def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
     """为规划类任务生成需要用户确认的 PAE 计划。"""
     goal = text_value(task_input.get("goal")) or "JD/简历适配分析"
@@ -928,6 +1002,40 @@ def build_action_for_step(state: UnifiedAgentState, step: dict[str, Any]) -> dic
     return {"toolName": tool_name, "toolType": text_value(step.get("toolType")) or "READ", "arguments": {}}
 
 
+def build_llm_action_for_step(state: UnifiedAgentState, step: dict[str, Any], fallback_action: dict[str, Any]) -> dict[str, Any]:
+    """调用千问辅助选择下一步只读行动，非法工具或 mutation 自动回退。"""
+    if not fallback_action:
+        return fallback_action
+    prompt = {
+        "node": "executor",
+        "goal": state.get("user_goal"),
+        "step": step,
+        "allowedTools": sorted(READ_EXECUTION_TOOLS),
+        "forbiddenMutationTools": sorted(MUTATION_TOOLS),
+        "observations": summarize_observations(state.get("observations") or []),
+        "fallbackAction": fallback_action,
+        "expectedJson": {
+            "toolName": "allowedTools 中的只读工具，或空字符串表示无需工具",
+            "toolType": "READ",
+            "arguments": {},
+            "reason": "简短中文理由",
+        },
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="executor",
+            model=agent_qwen_model("executor"),
+            system_prompt=executor_system_prompt(),
+            user_prompt=executor_user_prompt(prompt),
+        )
+        action = sanitize_action(result.data, fallback_action)
+        record_llm_diagnostic(state, "executor", result.model, "used")
+        return action
+    except Exception as exc:
+        record_llm_diagnostic(state, "executor", agent_qwen_model("executor"), f"fallback: {exc}")
+        return fallback_action
+
+
 def build_react_thought(state: UnifiedAgentState, step: dict[str, Any]) -> str:
     """生成可审计的 ReAct 思考摘要，不记录资料正文或模型密钥。"""
     description = text_value(step.get("description")) or "执行计划步骤"
@@ -963,6 +1071,129 @@ def build_question_for_state(state: UnifiedAgentState) -> str:
     return text_value(task_input.get("question")) or text_value(task_input.get("goal")) or "查询学习证据"
 
 
+def apply_llm_repair_decision(state: UnifiedAgentState) -> UnifiedAgentState:
+    """调用千问辅助修补决策；权限类错误仍由确定性规则硬停止。"""
+    if state.get("status") != "TOOL_FAILED":
+        return state
+    failure = state.get("failure_reason") or {}
+    hard_stop_codes = {
+        "AGENT_RESOURCE_FORBIDDEN",
+        "AGENT_MEMORY_FORBIDDEN",
+        "AGENT_MEMORY_SCOPE_ESCALATION",
+        "AGENT_INTERNAL_TOKEN_INVALID",
+    }
+    if text_value(failure.get("errorCode")) in hard_stop_codes:
+        return state
+    prompt = {
+        "node": "repair",
+        "goal": state.get("user_goal"),
+        "failure": failure,
+        "retryCount": int_value(state.get("retry_count"), 0),
+        "maxRetries": int_value(state.get("max_retries"), 1),
+        "allowedDecisions": ["RETRY", "SKIP_TOOL", "REPLAN", "REPORT_UNABLE"],
+        "currentAction": state.get("current_action") or {},
+        "expectedJson": {"decision": "RETRY/SKIP_TOOL/REPLAN/REPORT_UNABLE", "reason": "中文原因"},
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="repair",
+            model=agent_qwen_model("repair"),
+            system_prompt=repair_system_prompt(),
+            user_prompt=repair_user_prompt(prompt),
+        )
+        decision = text_value(result.data.get("decision"))
+        record_llm_diagnostic(state, "repair", result.model, "used")
+        if decision == "SKIP_TOOL":
+            return skip_current_tool(state, text_value(result.data.get("reason")) or "LLM 判断该工具可降级跳过")
+        if decision == "RETRY" and bool(failure.get("retryable")) and int_value(state.get("retry_count"), 0) < int_value(state.get("max_retries"), 1):
+            return {**state, "repair_decision": "RETRY", "retry_count": int_value(state.get("retry_count"), 0) + 1, "status": "RUNNING"}
+        if decision == "REPLAN" and text_value(failure.get("errorCode")) == "AGENT_TOOL_UNKNOWN":
+            return {**state, "repair_decision": "REPLAN", "plan_approved": False, "status": "RUNNING"}
+        if decision == "REPORT_UNABLE":
+            return {**state, "repair_decision": "REPORT_UNABLE", "status": "FAILED"}
+    except Exception as exc:
+        record_llm_diagnostic(state, "repair", agent_qwen_model("repair"), f"fallback: {exc}")
+    return state
+
+
+def apply_llm_acceptance_result(state: UnifiedAgentState) -> UnifiedAgentState:
+    """调用千问辅助验收；只接受继续、修补或完成三类安全决策。"""
+    if state.get("status") not in {"RUNNING", "FAILED"}:
+        return state
+    steps = list((state.get("plan") or {}).get("steps") or [])
+    current_index = int_value(state.get("current_step_index"), 0)
+    prompt = {
+        "node": "acceptance",
+        "goal": state.get("user_goal"),
+        "status": state.get("status"),
+        "completionCriteria": state.get("completion_criteria") or [],
+        "stepCount": len(steps),
+        "currentStepIndex": current_index,
+        "toolCalls": state.get("tool_calls") or [],
+        "observations": summarize_observations(state.get("observations") or []),
+        "expectedJson": {
+            "decision": "CONTINUE/REPAIR/COMPLETE",
+            "complete": False,
+            "requiresOutputReview": False,
+            "missingRequirements": ["字符串"],
+            "reason": "中文原因",
+        },
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="acceptance",
+            model=agent_qwen_model("acceptance"),
+            system_prompt=acceptance_system_prompt(),
+            user_prompt=acceptance_user_prompt(prompt),
+        )
+        decision = text_value(result.data.get("decision"))
+        record_llm_diagnostic(state, "acceptance", result.model, "used")
+        if decision == "REPAIR" and state.get("status") == "RUNNING":
+            return {**state, "status": "TOOL_FAILED", "repair_decision": "REPLAN"}
+        if decision == "CONTINUE" and current_index < len(steps):
+            return state
+        if decision == "COMPLETE" and current_index >= len(steps):
+            return state
+    except Exception as exc:
+        record_llm_diagnostic(state, "acceptance", agent_qwen_model("acceptance"), f"fallback: {exc}")
+    return state
+
+
+def apply_llm_answer_writer(state: UnifiedAgentState) -> UnifiedAgentState:
+    """调用千问辅助输出摘要，只允许改写已有 summary/answer，不新增事实。"""
+    if state.get("status") not in {"WAITING_OUTPUT_REVIEW", "COMPLETED", "FAILED"}:
+        return state
+    source = state.get("draft_result") or state.get("final_result") or {}
+    prompt = {
+        "node": "answer_writer",
+        "status": state.get("status"),
+        "source": summarize_result(source),
+        "evidenceIds": source.get("evidenceIds") if isinstance(source, dict) else [],
+        "expectedJson": {"answer": "中文输出摘要", "reviewMessage": "等待审批时的说明", "riskLevel": "LOW/MEDIUM/HIGH"},
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="answer_writer",
+            model=agent_qwen_model("answer"),
+            system_prompt=answer_writer_system_prompt(),
+            user_prompt=answer_writer_user_prompt(prompt),
+        )
+        record_llm_diagnostic(state, "answer_writer", result.model, "used")
+        answer = text_value(result.data.get("answer"))
+        review_message = text_value(result.data.get("reviewMessage"))
+        if state.get("status") == "WAITING_OUTPUT_REVIEW" and review_message and isinstance(state.get("draft_result"), dict):
+            draft = dict(state.get("draft_result") or {})
+            draft["message"] = review_message
+            return {**state, "draft_result": draft}
+        if answer and isinstance(state.get("final_result"), dict):
+            final = dict(state.get("final_result") or {})
+            final["answer"] = answer
+            return {**state, "final_result": final}
+    except Exception as exc:
+        record_llm_diagnostic(state, "answer_writer", agent_qwen_model("answer"), f"fallback: {exc}")
+    return state
+
+
 def synthesize_read_final(state: UnifiedAgentState) -> dict[str, Any]:
     """从只读工具结果生成最终回答。"""
     result = latest_successful_tool_result(state)
@@ -977,6 +1208,7 @@ def synthesize_read_final(state: UnifiedAgentState) -> dict[str, Any]:
         "memoryContext": state.get("memory_context_pre") or [],
         "observedAt": utc_time_provider()["utcTime"],
         "riskLevel": "LOW",
+        "diagnostics": {"llm": state.get("llm_diagnostics") or []},
     }
 
 
@@ -1007,6 +1239,7 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: JavaAgentGateway
         "answer": text_value(rag_data.get("answer")),
         "expandedQueries": rag_data.get("expandedQueries") if isinstance(rag_data.get("expandedQueries"), list) else [],
         "riskLevel": risk_level,
+        "diagnostics": {"llm": state.get("llm_diagnostics") or []},
         "verifier": {
             "completionCriteria": state.get("completion_criteria") or [],
             "toolCallCount": len(state.get("tool_calls") or []),
@@ -1079,6 +1312,103 @@ def build_resume_rewrite_patches(content_map: dict[str, str], gaps: list[dict[st
             }
         )
     return patches
+
+
+def build_llm_resume_rewrite_plan(state: UnifiedAgentState, fallback_plan: dict[str, Any]) -> dict[str, Any]:
+    """调用千问辅助生成简历改写局部计划。"""
+    task_input = state.get("task_input") or {}
+    prompt = {
+        "node": "resume_rewrite_planner",
+        "goal": state.get("user_goal"),
+        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 900),
+        "resumeText": truncate_text(text_value(task_input.get("resumeText")), 700),
+        "fallbackPlan": fallback_plan,
+        "expectedJson": {
+            "title": "简历修改子图计划",
+            "scope": "PENDING_REVIEW_RESUME_DRAFT",
+            "steps": [{"name": "字符串", "description": "字符串"}],
+            "targetRequirements": ["字符串"],
+            "hasResumeText": True,
+            "guardrails": ["不直接写 DOCX", "不直接保存业务数据", "候选片段必须进入 OUTPUT 审批"],
+        },
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="resume_rewrite_planner",
+            model=agent_qwen_model("resume"),
+            system_prompt=resume_rewrite_planner_system_prompt(),
+            user_prompt=resume_rewrite_planner_user_prompt(prompt),
+        )
+        plan = sanitize_resume_rewrite_plan(result.data, fallback_plan)
+        record_llm_diagnostic(state, "resume_rewrite_planner", result.model, "used")
+        return plan
+    except Exception as exc:
+        record_llm_diagnostic(state, "resume_rewrite_planner", agent_qwen_model("resume"), f"fallback: {exc}")
+        return fallback_plan
+
+
+def build_llm_resume_rewrite_draft(state: UnifiedAgentState, fallback_draft: dict[str, Any]) -> dict[str, Any]:
+    """调用千问辅助生成简历改写候选，仍保持 PENDING_REVIEW。"""
+    task_input = state.get("task_input") or {}
+    prompt = {
+        "node": "resume_rewrite_generator",
+        "goal": state.get("user_goal"),
+        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 900),
+        "resumeText": truncate_text(text_value(task_input.get("resumeText")), 700),
+        "rewritePlan": state.get("resume_rewrite_plan") or {},
+        "fallbackDraft": fallback_draft,
+        "expectedJson": {
+            "contentMap": {
+                "summary": "个人摘要候选",
+                "skills": "技能关键词候选",
+                "project_experience": "项目经历候选",
+                "learning_plan": "补强建议候选",
+                "gap_summary": "差距摘要候选",
+            },
+            "rewriteTargets": ["字符串"],
+            "message": "中文说明",
+        },
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="resume_rewrite_generator",
+            model=agent_qwen_model("resume"),
+            system_prompt=resume_rewrite_generator_system_prompt(),
+            user_prompt=resume_rewrite_generator_user_prompt(prompt),
+        )
+        draft = sanitize_resume_rewrite_draft(result.data, fallback_draft)
+        record_llm_diagnostic(state, "resume_rewrite_generator", result.model, "used")
+        return draft
+    except Exception as exc:
+        record_llm_diagnostic(state, "resume_rewrite_generator", agent_qwen_model("resume"), f"fallback: {exc}")
+        return fallback_draft
+
+
+def build_llm_resume_rewrite_acceptance(state: UnifiedAgentState, fallback_result: dict[str, Any]) -> dict[str, Any]:
+    """调用千问辅助验收简历候选，只接受结构化布尔结果。"""
+    prompt = {
+        "node": "resume_rewrite_acceptance",
+        "draftSummary": summarize_result(state.get("resume_rewrite_draft") or {}),
+        "expectedJson": {"accepted": True, "requiresOutputReview": True, "reason": "中文原因"},
+    }
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="resume_rewrite_acceptance",
+            model=agent_qwen_model("acceptance"),
+            system_prompt=resume_rewrite_acceptance_system_prompt(),
+            user_prompt=resume_rewrite_acceptance_user_prompt(prompt),
+        )
+        if isinstance(result.data.get("accepted"), bool):
+            record_llm_diagnostic(state, "resume_rewrite_acceptance", result.model, "used")
+            return {
+                **fallback_result,
+                "accepted": bool(result.data.get("accepted")),
+                "requiresOutputReview": True,
+                "reason": text_value(result.data.get("reason")),
+            }
+    except Exception as exc:
+        record_llm_diagnostic(state, "resume_rewrite_acceptance", agent_qwen_model("acceptance"), f"fallback: {exc}")
+    return fallback_result
 
 
 def build_resume_rewrite_output(
@@ -1286,3 +1616,296 @@ def build_memory_aware_crud_review_request(request: AgentTaskResumeRequest) -> d
             "summary": "该操作属于数据库变更，需用户确认后由 Java Tool Gateway 校验并执行。",
         },
     }
+
+
+def sanitize_plan(candidate: dict[str, Any], state: UnifiedAgentState, fallback_plan: dict[str, Any]) -> dict[str, Any]:
+    """校验 LLM 计划，非法工具、子图或审批边界不合格则回退。"""
+    steps_raw = candidate.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        raise ValueError("计划缺少 steps")
+    steps: list[dict[str, Any]] = []
+    for item in steps_raw[:6]:
+        if not isinstance(item, dict):
+            continue
+        tool_name = text_value(item.get("toolName"))
+        tool_type = text_value(item.get("toolType")) or "READ"
+        if tool_name not in PLAN_ALLOWED_TOOLS:
+            raise ValueError(f"计划包含未授权工具 {tool_name}")
+        if tool_name in MUTATION_TOOLS or tool_type == "MUTATION":
+            raise ValueError("PLAN 审批不能授权写操作")
+        if tool_type == "INTERNAL_SUBGRAPH" and tool_name not in ALLOWED_INTERNAL_SUBGRAPHS:
+            raise ValueError("计划包含未授权内部子图")
+        steps.append(
+            {
+                "description": text_value(item.get("description")) or text_value(item.get("name")) or "执行计划步骤",
+                "toolName": tool_name,
+                "toolType": "INTERNAL_SUBGRAPH" if tool_name in ALLOWED_INTERNAL_SUBGRAPHS else "READ",
+                "expectedOutput": text_value(item.get("expectedOutput")) or "结构化观察结果",
+            }
+        )
+    if not steps:
+        raise ValueError("计划没有可执行步骤")
+    internal_subgraphs = [str(item) for item in candidate.get("internalSubgraphs") or [] if str(item) in ALLOWED_INTERNAL_SUBGRAPHS]
+    if candidate.get("resumeRewriteIntent") and "resume_rewrite_subgraph" not in internal_subgraphs:
+        internal_subgraphs.append("resume_rewrite_subgraph")
+    task_input = state.get("task_input") or {}
+    if detect_resume_rewrite_intent(task_input) and "resume_rewrite_subgraph" not in internal_subgraphs:
+        internal_subgraphs.append("resume_rewrite_subgraph")
+    plan = {
+        **fallback_plan,
+        "title": text_value(candidate.get("title")) or fallback_plan.get("title"),
+        "steps": [step for step in steps if step["toolName"] != "resume_rewrite_subgraph"] or fallback_plan.get("steps", []),
+        "tools": sorted({step["toolName"] for step in steps if step["toolName"] != "resume_rewrite_subgraph"}),
+        "internalSubgraphs": internal_subgraphs,
+        "resumeRewriteIntent": bool(candidate.get("resumeRewriteIntent")) or bool(internal_subgraphs),
+        "requiresPlanReview": bool(fallback_plan.get("requiresPlanReview")),
+        "requiresOutputReview": bool(fallback_plan.get("requiresOutputReview")),
+        "riskLevel": sanitize_risk_level(candidate.get("riskLevel"), fallback_plan.get("riskLevel")),
+        "guardrails": sanitize_string_list(candidate.get("guardrails")) or fallback_plan.get("guardrails", []),
+    }
+    if state.get("subgraph") != "planning":
+        plan["requiresPlanReview"] = False
+        plan["requiresOutputReview"] = False
+        plan["resumeRewriteIntent"] = False
+        plan["internalSubgraphs"] = []
+    return plan
+
+
+def sanitize_action(candidate: dict[str, Any], fallback_action: dict[str, Any]) -> dict[str, Any]:
+    """校验 LLM action，只允许只读工具。"""
+    tool_name = text_value(candidate.get("toolName"))
+    if not tool_name:
+        return {}
+    tool_type = text_value(candidate.get("toolType")) or "READ"
+    if tool_name not in READ_EXECUTION_TOOLS:
+        raise ValueError(f"执行器选择未授权工具 {tool_name}")
+    if tool_name in MUTATION_TOOLS or tool_type == "MUTATION":
+        raise ValueError("执行器不允许选择 mutation 工具")
+    arguments = candidate.get("arguments") if isinstance(candidate.get("arguments"), dict) else fallback_action.get("arguments") or {}
+    return {"toolName": tool_name, "toolType": "READ", "arguments": arguments}
+
+
+def sanitize_resume_rewrite_plan(candidate: dict[str, Any], fallback_plan: dict[str, Any]) -> dict[str, Any]:
+    """校验简历改写计划，防止模型输出文件路径或保存动作。"""
+    forbidden_keys = {"locationRefs", "docxPath", "xml", "styleXml", "savePath"}
+    if forbidden_keys.intersection(candidate.keys()):
+        raise ValueError("简历改写计划包含禁止字段")
+    plan = dict(fallback_plan)
+    plan["title"] = text_value(candidate.get("title")) or plan.get("title")
+    plan["scope"] = "PENDING_REVIEW_RESUME_DRAFT"
+    requirements = sanitize_string_list(candidate.get("targetRequirements"))
+    if requirements:
+        plan["targetRequirements"] = requirements[:8]
+    steps = candidate.get("steps")
+    if isinstance(steps, list) and steps:
+        plan["steps"] = [
+            {"name": text_value(item.get("name")) or f"步骤 {index}", "description": text_value(item.get("description")) or "生成待确认候选"}
+            for index, item in enumerate(steps[:5], start=1)
+            if isinstance(item, dict)
+        ] or plan.get("steps", [])
+    plan["guardrails"] = ["不直接写 DOCX", "不直接保存业务数据", "候选片段必须进入 OUTPUT 审批"]
+    return plan
+
+
+def sanitize_resume_rewrite_draft(candidate: dict[str, Any], fallback_draft: dict[str, Any]) -> dict[str, Any]:
+    """校验简历改写候选，固定为待审批草稿。"""
+    content_map = candidate.get("contentMap")
+    if not isinstance(content_map, dict):
+        raise ValueError("简历候选缺少 contentMap")
+    allowed_fields = {"summary", "skills", "project_experience", "learning_plan", "gap_summary"}
+    cleaned = {key: text_value(value) for key, value in content_map.items() if key in allowed_fields and text_value(value)}
+    if not cleaned:
+        raise ValueError("简历候选 contentMap 为空")
+    draft = dict(fallback_draft)
+    draft["status"] = "PENDING_REVIEW"
+    draft["toolName"] = "resume_rewrite_subgraph"
+    draft["requiresApproval"] = True
+    draft["approvalType"] = "OUTPUT"
+    draft["message"] = text_value(candidate.get("message")) or fallback_draft.get("message")
+    draft["contentMap"] = {**(fallback_draft.get("contentMap") if isinstance(fallback_draft.get("contentMap"), dict) else {}), **cleaned}
+    targets = sanitize_string_list(candidate.get("rewriteTargets"))
+    if targets:
+        draft["rewriteTargets"] = targets[:8]
+    draft["patches"] = build_resume_rewrite_patches(draft["contentMap"], [])
+    return draft
+
+
+def sanitize_risk_level(value: Any, fallback: Any) -> str:
+    """读取风险等级。"""
+    risk = text_value(value).upper()
+    if risk in {"LOW", "MEDIUM", "HIGH"}:
+        return risk
+    return text_value(fallback).upper() if text_value(fallback).upper() in {"LOW", "MEDIUM", "HIGH"} else "MEDIUM"
+
+
+def sanitize_string_list(value: Any) -> list[str]:
+    """清洗模型返回的字符串列表。"""
+    if not isinstance(value, list):
+        return []
+    return [text_value(item) for item in value if text_value(item)]
+
+
+def summarize_task_input(task_input: dict[str, Any]) -> dict[str, Any]:
+    """构造不含敏感长正文的任务输入摘要。"""
+    return {
+        "goal": truncate_text(text_value(task_input.get("goal") or task_input.get("question")), 240),
+        "hasJobDescription": bool(text_value(task_input.get("jobDescription"))),
+        "hasResumeText": bool(text_value(task_input.get("resumeText"))),
+        "toolHints": task_input.get("toolHints") if isinstance(task_input.get("toolHints"), list) else [],
+        "enableWebSearch": bool(task_input.get("enableWebSearch")),
+        "saveDraft": bool(task_input.get("saveDraft")),
+    }
+
+
+def summarize_observations(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """压缩工具观察，避免把正文送入修补和验收提示。"""
+    compact = []
+    for item in observations[-5:]:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                "toolName": item.get("toolName"),
+                "status": item.get("status"),
+                "evidenceCount": item.get("evidenceCount"),
+                "errorCode": item.get("errorCode"),
+                "diagnosticKeys": item.get("diagnosticKeys"),
+            }
+        )
+    return compact
+
+
+def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
+    """压缩草稿或最终输出，供 answer_writer 使用。"""
+    return {
+        "matchSummary": truncate_text(text_value(result.get("matchSummary")), 300),
+        "answer": truncate_text(text_value(result.get("answer")), 300),
+        "evidenceIds": result.get("evidenceIds") if isinstance(result.get("evidenceIds"), list) else [],
+        "riskLevel": result.get("riskLevel"),
+        "hasResumeRewrite": bool(result.get("resumeRewrite")),
+        "alignmentCount": len(result.get("alignment")) if isinstance(result.get("alignment"), list) else 0,
+        "gapCount": len(result.get("gaps")) if isinstance(result.get("gaps"), list) else 0,
+    }
+
+
+def truncate_text(value: str, limit: int) -> str:
+    """截断提示词中的长文本。"""
+    return value[:limit] if len(value) > limit else value
+
+
+def json_prompt(payload: dict[str, Any]) -> str:
+    """把提示词输入序列化为中文 JSON。"""
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def record_llm_diagnostic(state: UnifiedAgentState, node: str, model: str, status: str) -> None:
+    """记录非敏感 LLM 诊断信息到状态对象。"""
+    diagnostics = state.setdefault("llm_diagnostics", [])
+    diagnostics.append({"node": node, "provider": "dashscope", "model": model, "status": status})
+
+
+def planner_system_prompt() -> str:
+    """Planner 节点专用提示词。"""
+    return (
+        "你是学迹智配 Agent 的 LangGraph 规划节点。你只生成可审批计划，不执行工具、不保存数据、不生成最终答案。"
+        "所有工具必须通过 Java Tool Gateway。PLAN 审批只确认路线，不授权写操作。任何保存、修改、删除、写入记忆或导出文件"
+        "都必须在 OUTPUT 审批后再进入 CRUD 审批。只允许从 allowedTools 和 allowedSubgraphs 选择。"
+        "若目标涉及优化简历、修改简历、生成投递简历、简历改写，必须设置 resumeRewriteIntent=true 并加入 internalSubgraphs=[\"resume_rewrite_subgraph\"]。"
+        "只输出合法 JSON。"
+    )
+
+
+def planner_user_prompt(payload: dict[str, Any]) -> str:
+    """Planner 节点用户提示词。"""
+    return "请根据以下任务上下文生成可审批计划 JSON，不要输出解释文字：\n" + json_prompt(payload)
+
+
+def executor_system_prompt() -> str:
+    """Executor 节点专用提示词。"""
+    return (
+        "你是学迹智配 Agent 的 ReAct 执行节点。你只能根据已批准计划选择下一步只读工具或判断无需工具。"
+        "不能发明工具名，不能选择 mutation 工具，不能绕过 Java Tool Gateway。只输出 JSON action。"
+    )
+
+
+def executor_user_prompt(payload: dict[str, Any]) -> str:
+    """Executor 节点用户提示词。"""
+    return "请根据当前计划步骤和工具观察选择下一步只读 action JSON；如无需工具，toolName 置空：\n" + json_prompt(payload)
+
+
+def repair_system_prompt() -> str:
+    """Repair 节点专用提示词。"""
+    return (
+        "你是学迹智配 Agent 的修补节点。你根据工具错误码、retryable、重试次数和任务目标决定 RETRY、SKIP_TOOL、REPLAN 或 REPORT_UNABLE。"
+        "权限、内部令牌、跨用户资源错误必须硬停止。web_search_probe 不可用时优先降级到本地 RAG。只输出 JSON。"
+    )
+
+
+def repair_user_prompt(payload: dict[str, Any]) -> str:
+    """Repair 节点用户提示词。"""
+    return "请根据失败摘要输出修补决策 JSON，只能使用 allowedDecisions 中的值：\n" + json_prompt(payload)
+
+
+def acceptance_system_prompt() -> str:
+    """Acceptance 节点专用提示词。"""
+    return (
+        "你是学迹智配 Agent 的验收节点。你检查计划步骤、工具观察、completion criteria、evidenceIds、riskLevel 和审批要求，"
+        "判断继续执行、修补、输出审批或完成。不能虚构 evidence。只输出 JSON。"
+    )
+
+
+def acceptance_user_prompt(payload: dict[str, Any]) -> str:
+    """Acceptance 节点用户提示词。"""
+    return "请检查任务是否满足完成标准并输出验收 JSON，不得新增 evidence：\n" + json_prompt(payload)
+
+
+def resume_rewrite_planner_system_prompt() -> str:
+    """简历修改规划节点专用提示词。"""
+    return (
+        "你是简历修改子图的规划节点。你根据 JD、简历摘要、用户目标和证据状态确定简历改写范围。"
+        "你不能写 DOCX、不能输出 XML/样式/路径/locationRefs、不能保存数据。只生成待确认候选的计划。只输出 JSON。"
+    )
+
+
+def resume_rewrite_planner_user_prompt(payload: dict[str, Any]) -> str:
+    """简历修改规划节点用户提示词。"""
+    return "请基于 JD、简历摘要和目标生成简历改写局部计划 JSON：\n" + json_prompt(payload)
+
+
+def resume_rewrite_generator_system_prompt() -> str:
+    """简历修改候选生成节点专用提示词。"""
+    return (
+        "你是简历修改子图的候选生成节点。你生成个人摘要、技能关键词、项目经历、补强建议和差距摘要候选。"
+        "所有内容必须基于简历摘要、JD 和 evidence 状态；证据不足时明确标记缺口。不能写 DOCX，不能保存数据。只输出 JSON。"
+    )
+
+
+def resume_rewrite_generator_user_prompt(payload: dict[str, Any]) -> str:
+    """简历修改候选生成节点用户提示词。"""
+    return "请生成待审批的简历候选 JSON，只能填写 contentMap 和 rewriteTargets 等允许字段：\n" + json_prompt(payload)
+
+
+def resume_rewrite_acceptance_system_prompt() -> str:
+    """简历修改验收节点专用提示词。"""
+    return (
+        "你是简历修改子图的验收节点。你只检查候选是否包含可审批的个人摘要、技能、项目经历、补强建议或差距摘要。"
+        "你不能批准保存、不能写 DOCX、不能新增 evidence。只输出 JSON。"
+    )
+
+
+def resume_rewrite_acceptance_user_prompt(payload: dict[str, Any]) -> str:
+    """简历修改验收节点用户提示词。"""
+    return "请检查简历候选是否可进入 OUTPUT 审批，并输出验收 JSON：\n" + json_prompt(payload)
+
+
+def answer_writer_system_prompt() -> str:
+    """回答节点专用提示词。"""
+    return (
+        "你是学迹智配 Agent 的输出节点。你根据已验证 draft/final 和审批状态生成中文输出摘要。"
+        "必须保留 evidence 引用，不得新增事实。等待审批时只生成审批说明，不伪装任务完成。只输出 JSON。"
+    )
+
+
+def answer_writer_user_prompt(payload: dict[str, Any]) -> str:
+    """回答节点用户提示词。"""
+    return "请基于已验证结果生成中文输出 JSON；等待审批时只写审批说明：\n" + json_prompt(payload)

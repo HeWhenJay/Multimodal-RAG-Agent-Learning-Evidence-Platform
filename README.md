@@ -222,7 +222,7 @@ flowchart TD
     SAVE --> END
 ```
 
-LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后先进入 `resume_rewrite_decision`，需要改简历时执行 `resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance`，再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后先进入 `resume_rewrite_decision`，需要改简历时执行 `resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance`，再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。Planner、Executor、Repair、Acceptance、Answer Writer 和简历修改子图节点会优先调用阿里千问/Qwen 生成 JSON 决策，再由 Python 做 schema、工具白名单、内部子图白名单和 mutation guardrail 校验；未配置 `DASHSCOPE_API_KEY` 或模型输出不合格时回退到确定性逻辑。`task_router`、`plan_review`、`tool_adapter`、记忆预取和记忆候选发布属于安全、审批或网关固定节点，不让 LLM 控制权限、审批结果或外部调用。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
 Planning 子图在 `PLAN` 审批通过后会先进入 `resume_rewrite_decision`。如果 Planner 在计划中标记 `resumeRewriteIntent=true`，或前端传入 `resume_rewrite_subgraph` / `resume_revision_save` / `resume_template_fill` 工具意图，统一图会进入简历修改子图；否则直接进入规划后记忆预取和常规 ReAct 执行链。简历修改子图只生成 `PENDING_REVIEW` 改写候选，不直接写 DOCX、不直接保存业务数据，后续仍由 `OUTPUT` 审批和可选 `CRUD` 审批决定是否保存。
 
@@ -603,6 +603,11 @@ Agent 工作台本地联调不需要分别为 Java 和 Python 手工设置内部
 | `EVIDENCE_AGENT_REDIS_STREAM_TTL_HOURS` | 可选 | Redis Stream 保留时间 | `24` |
 | `EVIDENCE_AGENT_REDIS_CONTEXT_TTL_MINUTES` | 可选 | Redis 纠偏、取消、短期上下文 TTL | `120` |
 | `EVIDENCE_AGENT_SSE_POLL_INTERVAL_MILLIS` | 可选 | SSE 数据库轮询间隔 | `2000` |
+| `AGENT_LLM_ENABLED` | 可选 | 是否启用 LangGraph 节点 Qwen JSON 决策；关闭或无 Key 时回退确定性逻辑 | `true` |
+| `AGENT_QWEN_BASE_URL` | 可选 | Agent Qwen OpenAI 兼容 Chat Completions 地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `AGENT_QWEN_PLANNER_MODEL` / `AGENT_QWEN_RESUME_MODEL` / `AGENT_QWEN_ANSWER_MODEL` | 可选 | Planner、简历修改和回答节点模型 | `qwen-plus` |
+| `AGENT_QWEN_EXECUTOR_MODEL` / `AGENT_QWEN_REPAIR_MODEL` / `AGENT_QWEN_ACCEPTANCE_MODEL` | 可选 | Executor、Repair 和 Acceptance 节点模型 | `qwen-turbo` |
+| `AGENT_QWEN_TEMPERATURE` / `AGENT_QWEN_TIMEOUT_SECONDS` | 可选 | Agent Qwen 结构化决策温度和超时 | `0.2` / `30` |
 | `TAVILY_API_KEY` | Agent 联网搜索时必填 | Tavily Search API Key，用于 Agent 查询公司背景、技能趋势等外部信息 | `<your-tavily-api-key>` |
 | `EVIDENCE_TAVILY_BASE_URL` | 可选 | Tavily API 基础地址 | `https://api.tavily.com` |
 | `EVIDENCE_TAVILY_TIMEOUT_SECONDS` | 可选 | Tavily Search API 超时时间 | `15` |

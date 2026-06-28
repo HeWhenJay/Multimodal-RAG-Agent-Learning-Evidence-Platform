@@ -16,6 +16,39 @@
 - 普通上传、分片上传和确定性 RAG 入库不纳入 Agent 工具。
 - 当前版本未实现授权表，`explicitGrant` 只是预留语义；除 `ownerUserId == currentUserId` 外全部拒绝。
 
+## LangGraph Qwen 决策策略
+
+统一图从 2026-06-28 起采用“Qwen 结构化决策 + schema 校验 + 确定性 fallback”的执行方式。LLM 只负责给 LangGraph 业务节点提供 JSON 决策建议，不能直接执行工具、授权写操作、绕过 Java Tool Gateway 或改变审批边界。未配置 `DASHSCOPE_API_KEY`、`AGENT_LLM_ENABLED=false`、调用超时、JSON 解析失败、字段不符合 schema、工具名不在白名单、子图名不在白名单或出现 mutation 工具时，Python 会回退到原确定性逻辑，保证本地测试和离线开发不被模型配置阻断。
+
+模型分配：
+
+| 节点 | 默认模型 | 职责 |
+| --- | --- | --- |
+| `planner` | `qwen-plus` | 生成 PAE 计划、工具范围、风险等级、`resumeRewriteIntent` 和 `internalSubgraphs` |
+| `executor` | `qwen-turbo` | 基于已批准计划和观察结果选择下一步只读工具 |
+| `repair` | `qwen-turbo` | 在工具失败后建议 `RETRY`、`SKIP_TOOL`、`REPLAN` 或 `REPORT_UNABLE` |
+| `acceptance` / `resume_rewrite_acceptance` | `qwen-turbo` | 辅助检查完成标准、审批要求和缺口，不虚构 evidence |
+| `resume_rewrite_planner` / `resume_rewrite_generator` | `qwen-plus` | 生成简历改写范围和待审批候选片段 |
+| `answer_writer` | `qwen-plus` | 基于已验证 draft/final 生成中文输出摘要，等待审批时只写审批说明 |
+
+安全固定节点不让 LLM 控制最终行为：`task_router` 只做任务类型路由，避免模型改变入口权限；`plan_review` 只发布 Java/前端审批请求，不能由模型批准；`tool_adapter` 是 Java Gateway 唯一出口，必须用确定性代码校验工具名、`approvalId`、`operationId` 和 `idempotencyKey`；`memory_prefetch_before_planner` / `memory_prefetch_after_planner` 只能通过 Java 记忆只读工具读取当前用户记忆；`post_answer_memory` 只请求待确认记忆候选，不自动写库。这些节点可记录上游 LLM 诊断，但不能把模型输出作为权限、审批或网关调用依据。
+
+Agent LLM 环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 空 | 阿里云百炼 / DashScope API Key；为空时 Agent LLM 自动 fallback |
+| `AGENT_LLM_ENABLED` | `true` | 是否启用 Agent 节点 Qwen 调用 |
+| `AGENT_QWEN_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI Chat Completions 兼容地址 |
+| `AGENT_QWEN_PLANNER_MODEL` | `qwen-plus` | Planner 模型 |
+| `AGENT_QWEN_EXECUTOR_MODEL` | `qwen-turbo` | Executor 模型 |
+| `AGENT_QWEN_REPAIR_MODEL` | `qwen-turbo` | Repair 模型 |
+| `AGENT_QWEN_ACCEPTANCE_MODEL` | `qwen-turbo` | Acceptance 模型 |
+| `AGENT_QWEN_RESUME_MODEL` | `qwen-plus` | 简历修改子图模型 |
+| `AGENT_QWEN_ANSWER_MODEL` | `qwen-plus` | Answer Writer 模型 |
+| `AGENT_QWEN_TEMPERATURE` | `0.2` | Agent 结构化决策温度 |
+| `AGENT_QWEN_TIMEOUT_SECONDS` | `30` | 单次 Agent LLM 调用超时 |
+
 ## 统一 LangGraph 编排
 
 Python 内部入口统一为 `agents.orchestration.pae_react_graph`，FastAPI `/internal/agent/tasks` 调用 `start_unified_agent()`，`/internal/agent/tasks/{taskId}/resume` 调用 `resume_unified_agent()`。所有 Agent 工作台任务先进入统一任务路由器，再进入 ReadOnly 子图或 Planning 子图；旧 `read_only_graph` 和 `planning_graph` 不再作为运行主图，也不再被统一图导入复用。若需要确定性纯函数，必须放在 `agents.orchestration.*_helpers` 这类共享模块中。
