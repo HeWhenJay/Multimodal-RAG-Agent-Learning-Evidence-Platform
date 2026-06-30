@@ -3,7 +3,6 @@ package com.itxiang.evidence.client;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.config.PythonRagProperties;
-import com.itxiang.evidence.dto.JdAnalysisRequestDTO;
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
@@ -27,7 +26,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -286,29 +284,6 @@ public class PythonRagClient {
     }
 
     /**
-     * 调用 Python JD 分析接口，基于当前用户知识库生成岗位匹配结果。
-     */
-    public JdAnalysisResult analyzeJd(String userId, JdAnalysisRequestDTO dto) {
-        Map<String, Object> payload = new HashMap<>();
-        payload.put("userId", userId);
-        payload.put("jobDescription", dto.getJobDescription());
-        payload.put("resumeText", dto.getResumeText());
-        payload.put("topK", 3);
-
-        JsonNode root = postJson("/internal/rag/jd-analysis", payload);
-        return new JdAnalysisResult(
-                text(root, "jobDescription"),
-                root.path("matchScore").asInt(0),
-                root.path("masteredPercent").asInt(0),
-                root.path("partialPercent").asInt(0),
-                root.path("gapPercent").asInt(0),
-                readSkillResults(root.get("skills")),
-                readPlanResults(root.get("learningPlan")),
-                readAlignmentResults(root.get("resumeAlignments"))
-        );
-    }
-
-    /**
      * 查询指定文档的 evidence 列表。
      */
     public List<RagEvidenceVO> listDocumentEvidences(String documentId, Integer limit) {
@@ -333,102 +308,6 @@ public class PythonRagClient {
         } catch (Exception e) {
             throw pythonException("list-evidences", "/internal/rag/documents/{document_id}/evidences", e);
         }
-    }
-
-    /**
-     * 调用 Python 简历模板解析接口，生成字段绑定和版式指纹。
-     */
-    public ResumeTemplateParseResult parseResumeTemplate(String templateId, Integer version, byte[] content, String filename) {
-        try {
-            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-            body.add("template_id", templateId);
-            body.add("version", version == null ? 1 : version);
-            body.add("file", new NamedByteArrayResource(content, filename));
-            byte[] response = restClient.post()
-                    .uri(resolve("/internal/rag/resume/templates/parse"))
-                    .contentType(MediaType.MULTIPART_FORM_DATA)
-                    .body(body)
-                    .retrieve()
-                    .body(byte[].class);
-            JsonNode root = readJsonResponse("resume-template-parse", "/internal/rag/resume/templates/parse", response);
-            return new ResumeTemplateParseResult(
-                    text(root, "templateId"),
-                    root.path("version").asInt(1),
-                    text(root, "filename"),
-                    readObjectList(root.get("fields")),
-                    readTextArray(root.get("unsupportedRegions")),
-                    readObjectMap(root.get("layoutFingerprint"))
-            );
-        } catch (RestClientResponseException e) {
-            throw pythonException("resume-template-parse", "/internal/rag/resume/templates/parse", e);
-        } catch (PythonRagClientException e) {
-            throw e;
-        } catch (Exception e) {
-            throw pythonException("resume-template-parse", "/internal/rag/resume/templates/parse", e);
-        }
-    }
-
-    /**
-     * 调用 Python 简历模板预览接口。
-     */
-    public ResumeTemplatePreviewResult previewResumeTemplate(Map<String, Object> payload) {
-        JsonNode root = postJson("/internal/rag/resume/templates/preview", payload);
-        return new ResumeTemplatePreviewResult(
-                text(root, "templateId"),
-                root.path("version").asInt(1),
-                text(root, "previewStatus"),
-                readObjectList(root.get("pages")),
-                readObjectList(root.get("regions")),
-                readObjectList(root.get("unmappedFields")),
-                readTextArray(root.get("warnings")),
-                text(root, "generatedAt")
-        );
-    }
-
-    /**
-     * 调用 Python 简历字段补丁生成接口。
-     */
-    public ResumePatchGenerationResult generateResumePatches(Map<String, Object> payload) {
-        JsonNode root = postJson("/internal/rag/resume/templates/patches/generate", payload);
-        return new ResumePatchGenerationResult(
-                text(root, "templateId"),
-                root.path("version").asInt(1),
-                text(root, "provider"),
-                text(root, "schemaName"),
-                readObjectMap(root.get("strictSchema")),
-                readObjectList(root.get("patches")),
-                readTextArray(root.get("validationErrors"))
-        );
-    }
-
-    /**
-     * 调用 Python 简历字段补丁校验接口。
-     */
-    public ResumePatchValidationResult validateResumePatches(Map<String, Object> payload) {
-        JsonNode root = postJson("/internal/rag/resume/templates/patches/validate", payload);
-        return new ResumePatchValidationResult(
-                text(root, "templateId"),
-                root.path("version").asInt(1),
-                readObjectList(root.get("patches")),
-                readTextArray(root.get("validationErrors"))
-        );
-    }
-
-    /**
-     * 调用 Python DOCX 确定性应用接口。
-     */
-    public ResumeTemplateExportResult exportResumeTemplate(Map<String, Object> payload) {
-        JsonNode root = postJson("/internal/rag/resume/templates/exports", payload);
-        String fileBase64 = text(root, "fileBase64");
-        byte[] fileBytes = fileBase64 == null || fileBase64.isBlank() ? new byte[0] : Base64.getDecoder().decode(fileBase64);
-        return new ResumeTemplateExportResult(
-                text(root, "templateId"),
-                root.path("version").asInt(1),
-                text(root, "filename"),
-                fileBytes,
-                readObjectMap(root.get("layoutValidation")),
-                root.path("appliedPatchCount").asInt(0)
-        );
     }
 
     /**
@@ -697,56 +576,6 @@ public class PythonRagClient {
     }
 
     /**
-     * 读取 Python JD 技能分析数组。
-     */
-    private List<JdSkillResult> readSkillResults(JsonNode node) {
-        List<JdSkillResult> result = new ArrayList<>();
-        if (node == null || !node.isArray()) {
-            return result;
-        }
-        for (JsonNode item : node) {
-            result.add(new JdSkillResult(text(item, "skillName"), text(item, "status")));
-        }
-        return result;
-    }
-
-    /**
-     * 读取 Python JD 学习计划数组。
-     */
-    private List<JdPlanResult> readPlanResults(JsonNode node) {
-        List<JdPlanResult> result = new ArrayList<>();
-        if (node == null || !node.isArray()) {
-            return result;
-        }
-        for (JsonNode item : node) {
-            result.add(new JdPlanResult(
-                    item.path("stepNo").asInt(result.size() + 1),
-                    text(item, "title"),
-                    text(item, "description")
-            ));
-        }
-        return result;
-    }
-
-    /**
-     * 读取 Python 简历证据对齐数组。
-     */
-    private List<ResumeAlignmentResult> readAlignmentResults(JsonNode node) {
-        List<ResumeAlignmentResult> result = new ArrayList<>();
-        if (node == null || !node.isArray()) {
-            return result;
-        }
-        for (JsonNode item : node) {
-            result.add(new ResumeAlignmentResult(
-                    text(item, "requirement"),
-                    text(item, "evidence"),
-                    text(item, "status")
-            ));
-        }
-        return result;
-    }
-
-    /**
      * 将 Python HTTP 错误转换为统一客户端异常。
      */
     private PythonRagClientException pythonException(String operation, String endpoint, RestClientResponseException e) {
@@ -853,105 +682,6 @@ public class PythonRagClient {
             Integer chunkCount,
             Integer evidenceCount,
             String lastIndexedTitle
-    ) {
-    }
-
-    /**
-     * Python JD 分析响应。
-     */
-    public record JdAnalysisResult(
-            String jobDescription,
-            Integer matchScore,
-            Integer masteredPercent,
-            Integer partialPercent,
-            Integer gapPercent,
-            List<JdSkillResult> skills,
-            List<JdPlanResult> learningPlan,
-            List<ResumeAlignmentResult> resumeAlignments
-    ) {
-    }
-
-    /**
-     * Python JD 技能匹配结果。
-     */
-    public record JdSkillResult(String skillName, String status) {
-    }
-
-    /**
-     * Python JD 学习计划结果。
-     */
-    public record JdPlanResult(Integer stepNo, String title, String description) {
-    }
-
-    /**
-     * Python 简历证据对齐结果。
-     */
-    public record ResumeAlignmentResult(String requirement, String evidence, String status) {
-    }
-
-    /**
-     * Python 简历模板解析结果。
-     */
-    public record ResumeTemplateParseResult(
-            String templateId,
-            Integer version,
-            String filename,
-            List<Map<String, Object>> fields,
-            List<String> unsupportedRegions,
-            Map<String, Object> layoutFingerprint
-    ) {
-    }
-
-    /**
-     * Python 简历模板图片预览结果。
-     */
-    public record ResumeTemplatePreviewResult(
-            String templateId,
-            Integer version,
-            String previewStatus,
-            List<Map<String, Object>> pages,
-            List<Map<String, Object>> regions,
-            List<Map<String, Object>> unmappedFields,
-            List<String> warnings,
-            String generatedAt
-    ) {
-    }
-
-    /**
-     * Python 简历补丁生成结果。
-     */
-    public record ResumePatchGenerationResult(
-            String templateId,
-            Integer version,
-            String provider,
-            String schemaName,
-            Map<String, Object> strictSchema,
-            List<Map<String, Object>> patches,
-            List<String> validationErrors
-    ) {
-    }
-
-    /**
-     * Python 简历补丁校验结果。
-     */
-    public record ResumePatchValidationResult(
-            String templateId,
-            Integer version,
-            List<Map<String, Object>> patches,
-            List<String> validationErrors
-    ) {
-    }
-
-    /**
-     * Python 简历模板导出结果。
-     */
-    public record ResumeTemplateExportResult(
-            String templateId,
-            Integer version,
-            String filename,
-            byte[] fileBytes,
-            Map<String, Object> layoutValidation,
-            Integer appliedPatchCount
     ) {
     }
 

@@ -1,0 +1,380 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AgentChatMessageMapper">
+
+    <resultMap id="AgentChatMessageResultMap" type="com.itxiang.evidence.entity.AgentChatMessage">
+        <id property="id" column="id"/>
+        <result property="taskId" column="task_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="sequenceNo" column="sequence_no"/>
+        <result property="role" column="role"/>
+        <result property="messageType" column="message_type"/>
+        <result property="content" column="content"/>
+        <result property="payloadJson" column="payload_json"/>
+        <result property="sourceEventType" column="source_event_type"/>
+        <result property="sourceId" column="source_id"/>
+        <result property="dedupeKey" column="dedupe_key"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.AgentChatMessage">
+        INSERT INTO agent_chat_message (
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key
+        )
+        VALUES (
+            #{id},
+            #{taskId},
+            #{userId},
+            #{sequenceNo},
+            #{role},
+            #{messageType},
+            #{content},
+            #{payloadJson},
+            #{sourceEventType},
+            #{sourceId},
+            #{dedupeKey}
+        )
+    </insert>
+
+    <select id="nextSequenceNo" resultType="long">
+        SELECT COALESCE(MAX(sequence_no), 0) + 1
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+    </select>
+
+    <select id="findByTaskIdAndDedupeKey" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND dedupe_key = #{dedupeKey}
+    </select>
+
+    <select id="findByIdAndTaskId" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE id = #{id}
+          AND task_id = #{taskId}
+    </select>
+
+    <update id="updateByDedupeKey" parameterType="com.itxiang.evidence.entity.AgentChatMessage">
+        UPDATE agent_chat_message
+        SET role = #{role},
+            message_type = #{messageType},
+            content = #{content},
+            payload_json = #{payloadJson},
+            source_event_type = #{sourceEventType},
+            source_id = #{sourceId},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE task_id = #{taskId}
+          AND dedupe_key = #{dedupeKey}
+    </update>
+
+    <select id="findByTaskId" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+        ORDER BY sequence_no ASC
+    </select>
+
+    <select id="findPageBySequence" resultMap="AgentChatMessageResultMap">
+        SELECT *
+        FROM (
+            SELECT
+                id,
+                task_id,
+                user_id,
+                sequence_no,
+                role,
+                message_type,
+                content,
+                payload_json,
+                source_event_type,
+                source_id,
+                dedupe_key,
+                created_at,
+                updated_at
+            FROM agent_chat_message
+            WHERE task_id = #{taskId}
+              <if test="beforeSequenceNo != null">
+              AND sequence_no &lt; #{beforeSequenceNo}
+              </if>
+              <if test="afterSequenceNo != null">
+              AND sequence_no &gt; #{afterSequenceNo}
+              </if>
+            ORDER BY
+              <choose>
+                <when test="(beforeSequenceNo != null and afterSequenceNo == null) or (beforeSequenceNo == null and afterSequenceNo == null)">sequence_no DESC</when>
+                <otherwise>sequence_no ASC</otherwise>
+              </choose>
+            LIMIT #{limit}
+        ) page_messages
+        ORDER BY sequence_no ASC
+    </select>
+
+    <select id="countBeforeSequence" resultType="int">
+        SELECT COUNT(*)
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND sequence_no &lt; #{sequenceNo}
+    </select>
+
+    <select id="countAfterSequence" resultType="int">
+        SELECT COUNT(*)
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND sequence_no &gt; #{sequenceNo}
+    </select>
+
+    <select id="findRecentByTaskId" resultMap="AgentChatMessageResultMap">
+        SELECT *
+        FROM (
+            SELECT
+                id,
+                task_id,
+                user_id,
+                sequence_no,
+                role,
+                message_type,
+                content,
+                payload_json,
+                source_event_type,
+                source_id,
+                dedupe_key,
+                created_at,
+                updated_at
+            FROM agent_chat_message
+            WHERE task_id = #{taskId}
+            ORDER BY sequence_no DESC
+            LIMIT #{limit}
+        ) recent_messages
+        ORDER BY sequence_no ASC
+    </select>
+
+    <select id="findCompressionCandidates" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND id NOT IN (
+            SELECT id
+            FROM (
+                SELECT id
+                FROM agent_chat_message
+                WHERE task_id = #{taskId}
+                ORDER BY sequence_no DESC
+                LIMIT #{recentLimit}
+            ) recent_message_ids
+          )
+          <if test="latestCoveredMessageEndId != null and latestCoveredMessageEndId != ''">
+          AND sequence_no &gt; (
+              SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{latestCoveredMessageEndId}
+          )
+          </if>
+        ORDER BY sequence_no ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countCompressionCandidates" resultType="int">
+        SELECT COUNT(*)
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND id NOT IN (
+            SELECT id
+            FROM (
+                SELECT id
+                FROM agent_chat_message
+                WHERE task_id = #{taskId}
+                ORDER BY sequence_no DESC
+                LIMIT #{recentLimit}
+            ) recent_message_ids
+          )
+          <if test="latestCoveredMessageEndId != null and latestCoveredMessageEndId != ''">
+          AND sequence_no &gt; (
+              SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{latestCoveredMessageEndId}
+          )
+          </if>
+    </select>
+
+    <select id="findBeforeContext" resultMap="AgentChatMessageResultMap">
+        SELECT *
+        FROM (
+            SELECT
+                id,
+                task_id,
+                user_id,
+                sequence_no,
+                role,
+                message_type,
+                content,
+                payload_json,
+                source_event_type,
+                source_id,
+                dedupe_key,
+                created_at,
+                updated_at
+            FROM agent_chat_message
+            WHERE task_id = #{taskId}
+              AND (
+                <choose>
+                    <when test="anchorMessageId != null and anchorMessageId != ''">
+                        sequence_no &lt; (
+                            SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{anchorMessageId}
+                        )
+                    </when>
+                    <when test="coveredMessageStartId != null and coveredMessageStartId != ''">
+                        sequence_no &lt; (
+                            SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{coveredMessageStartId}
+                        )
+                    </when>
+                    <otherwise>
+                        1 = 0
+                    </otherwise>
+                </choose>
+              )
+            ORDER BY sequence_no DESC
+            LIMIT #{limit}
+        ) before_messages
+        ORDER BY sequence_no ASC
+    </select>
+
+    <select id="findCoreContext" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND (
+            <choose>
+                <when test="anchorMessageId != null and anchorMessageId != ''">
+                    id = #{anchorMessageId}
+                </when>
+                <when test="coveredMessageStartId != null and coveredMessageStartId != '' and coveredMessageEndId != null and coveredMessageEndId != ''">
+                    sequence_no &gt;= (
+                        SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{coveredMessageStartId}
+                    )
+                    AND sequence_no &lt;= (
+                        SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{coveredMessageEndId}
+                    )
+                </when>
+                <otherwise>
+                    1 = 0
+                </otherwise>
+            </choose>
+          )
+        ORDER BY sequence_no ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="findAfterContext" resultMap="AgentChatMessageResultMap">
+        SELECT
+            id,
+            task_id,
+            user_id,
+            sequence_no,
+            role,
+            message_type,
+            content,
+            payload_json,
+            source_event_type,
+            source_id,
+            dedupe_key,
+            created_at,
+            updated_at
+        FROM agent_chat_message
+        WHERE task_id = #{taskId}
+          AND (
+            <choose>
+                <when test="anchorMessageId != null and anchorMessageId != ''">
+                    sequence_no &gt; (
+                        SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{anchorMessageId}
+                    )
+                </when>
+                <when test="coveredMessageEndId != null and coveredMessageEndId != ''">
+                    sequence_no &gt; (
+                        SELECT sequence_no FROM agent_chat_message WHERE task_id = #{taskId} AND id = #{coveredMessageEndId}
+                    )
+                </when>
+                <otherwise>
+                    1 = 0
+                </otherwise>
+            </choose>
+          )
+        ORDER BY sequence_no ASC
+        LIMIT #{limit}
+    </select>
+</mapper>

@@ -23,10 +23,49 @@ public class AgentProperties {
     private Integer startTimeoutSeconds = 10;
 
     /**
+     * Agent Redis 运行态配置；关闭或连接异常时自动降级到 PostgreSQL。
+     */
+    private Redis redis = new Redis();
+
+    /**
      * 获取最终可用的内部令牌，避免本地联调时 Java/Python 需要分别手工配置。
      */
     public String getInternalToken() {
         internalToken = AgentInternalTokenResolver.resolve(internalToken);
         return internalToken;
+    }
+
+    @Data
+    public static class Redis {
+
+        /**
+         * 是否启用 Agent Redis 热态缓存和 SSE 事件缓冲。
+         */
+        private Boolean enabled = true;
+
+        /**
+         * 任务运行中上下文热态 TTL，默认 24 小时。
+         */
+        private Integer runningContextTtlHours = 24;
+
+        /**
+         * 任务完成后上下文热态 TTL，默认 7 天。
+         */
+        private Integer completedContextTtlDays = 7;
+
+        /**
+         * 最近消息热态 TTL，默认 7 天。
+         */
+        private Integer messageTtlDays = 7;
+
+        /**
+         * SSE 重连事件缓冲 TTL，默认 2 小时。
+         */
+        private Integer sseTtlHours = 2;
+
+        /**
+         * Redis 中每个任务最多保留的 SSE 事件数。
+         */
+        private Integer sseMaxEvents = 120;
     }
 }

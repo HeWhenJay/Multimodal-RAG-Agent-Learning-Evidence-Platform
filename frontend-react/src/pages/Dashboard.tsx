@@ -1,22 +1,16 @@
 import {
   CalendarDays,
   Anchor,
-  BarChart3,
   Bot,
   ChevronDown,
-  CheckCircle2,
   CloudUpload,
   Database,
   FileText,
-  Flag,
   LibraryBig,
   Loader2,
-  PlayCircle,
   Search,
   Send,
   SlidersHorizontal,
-  TriangleAlert,
-  Video
 } from 'lucide-react';
 import { DayPicker, type DateRange } from '@daypicker/react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
@@ -276,7 +270,6 @@ export function Dashboard() {
 
   const stats = [
     { label: '已入库材料', value: dashboard?.materialCount ?? 0, delta: dashboard?.materialDelta7Days ?? 0, note: '本周新增', icon: LibraryBig },
-    { label: '视频片段', value: dashboard?.videoSliceCount ?? 0, delta: dashboard?.videoSliceDelta7Days ?? 0, note: '本周新增', icon: Video },
     { label: 'RAG 证据锚点', value: dashboard?.evidenceCount ?? 0, delta: dashboard?.evidenceCount ?? 0, note: '当前切块', icon: Anchor },
     { label: '待处理错误', value: dashboard?.openErrorCount ?? 0, delta: dashboard?.errorCount30Days ?? 0, note: '近 30 天错误', icon: Bot }
   ];
@@ -549,80 +542,8 @@ export function Dashboard() {
           {(dashboard?.recentMaterials || []).length === 0 ? <div className="empty-state">暂无资料处理任务</div> : null}
         </article>
 
-        <article className="panel">
-          <div className="panel-title">
-            <h3>
-              <BarChart3 size={20} />
-              岗位适配分析
-            </h3>
-          </div>
-          <label className="field-label">目标岗位描述 (JD) 输入</label>
-          <textarea className="compact-textarea" value={dashboard?.latestJdAnalysis?.jobDescription || ''} readOnly placeholder="暂无 JD 分析记录" />
-          <button className="full-action">
-            <BarChart3 size={17} />
-            查看适配分析
-          </button>
-          <h4>能力雷达匹配度</h4>
-          <div className="stacked-bar" aria-label="能力匹配度">
-            <span className="mastered" style={{ width: `${dashboard?.latestJdAnalysis?.masteredPercent || 0}%` }}>已掌握</span>
-            <span className="partial" style={{ width: `${dashboard?.latestJdAnalysis?.partialPercent || 0}%` }}>待强化</span>
-            <span className="gaps" style={{ width: `${dashboard?.latestJdAnalysis?.gapPercent || 0}%` }}>缺口</span>
-          </div>
-          <div className="plan-note">
-            <Flag size={17} />
-            <span>下一步学习计划：{dashboard?.latestJdAnalysis?.learningPlan?.[0]?.title || '暂无学习计划'}</span>
-          </div>
-        </article>
 
-        <article className="panel">
-          <div className="panel-title">
-            <h3>
-              <Video size={20} />
-              视频知识切片回顾
-            </h3>
-          </div>
-          {(dashboard?.recentVideoSlices || []).map((item) => (
-            <div className="video-slice" key={item.id}>
-              <div className="play-badge"><PlayCircle size={18} /></div>
-              <div>
-                <h4>{item.title}</h4>
-                <span>知识命中</span>
-                <p>知识片段：{item.topic}</p>
-                <p>时间范围：{item.startTime} - {item.endTime}</p>
-              </div>
-            </div>
-          ))}
-          {(dashboard?.recentVideoSlices || []).length === 0 ? <div className="empty-state">暂无视频切片</div> : null}
-        </article>
 
-        <article className="panel wide">
-          <div className="panel-title">
-            <h3>
-              <FileText size={20} />
-              简历证据对齐 (JD 与简历)
-            </h3>
-            <span className="status-pill">复核模式</span>
-          </div>
-          <div className="evidence-stack">
-            {(dashboard?.resumeAlignments || []).map((item) => (
-              <div className="evidence-item" key={item.id}>
-                <div className="evidence-field">
-                  <span className="evidence-field-label">JD 要求</span>
-                  <strong>{item.requirement}</strong>
-                </div>
-                <div className="evidence-field">
-                  <span className="evidence-field-label">简历证据</span>
-                  <p>{item.evidence}</p>
-                </div>
-                <div className="evidence-field">
-                  <span className="evidence-field-label">状态</span>
-                  <StatusIcon status={item.status} />
-                </div>
-              </div>
-            ))}
-            {(dashboard?.resumeAlignments || []).length === 0 ? <div className="empty-state">暂无简历证据对齐记录</div> : null}
-          </div>
-        </article>
       </section>
     </div>
   );
@@ -933,13 +854,3 @@ function formatTaskProgress(item: LearningMaterial) {
   return parts.join(' · ');
 }
 
-// 根据适配状态展示对应的中文状态标记。
-function StatusIcon({ status }: { status: string }) {
-  if (status === 'supported') {
-    return <span className="evidence-status supported"><CheckCircle2 size={16} />证据充分</span>;
-  }
-  if (status === 'weak') {
-    return <span className="evidence-status weak"><TriangleAlert size={16} />证据不足</span>;
-  }
-  return <span className="evidence-status missing">不建议写入</span>;
-}

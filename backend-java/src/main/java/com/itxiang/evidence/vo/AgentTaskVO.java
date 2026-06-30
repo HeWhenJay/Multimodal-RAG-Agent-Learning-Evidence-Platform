@@ -12,6 +12,7 @@ import java.util.Map;
 public class AgentTaskVO {
 
     private String id;
+    private String folderId;
     private String taskType;
     private String status;
     private String title;
@@ -23,6 +24,7 @@ public class AgentTaskVO {
     private String pythonThreadId;
     private String errorCode;
     private String errorMessage;
+    private Integer summaryCount;
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;
 }

@@ -2,10 +2,6 @@ package com.itxiang.evidence.service;
 
 import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.dto.RagQueryDTO;
-import com.itxiang.evidence.dto.ResumePatchGenerateDTO;
-import com.itxiang.evidence.dto.ResumePatchValidateDTO;
-import com.itxiang.evidence.dto.ResumeTemplateAnnotationSaveDTO;
-import com.itxiang.evidence.dto.ResumeTemplateExportDTO;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.MaterialPreviewVO;
@@ -14,10 +10,6 @@ import com.itxiang.evidence.vo.RagOverviewVO;
 import com.itxiang.evidence.vo.RagQueryHistoryVO;
 import com.itxiang.evidence.vo.RagQueryTaskVO;
 import com.itxiang.evidence.vo.RagQueryVO;
-import com.itxiang.evidence.vo.ResumePatchDraftVO;
-import com.itxiang.evidence.vo.ResumeTemplateExportVO;
-import com.itxiang.evidence.vo.ResumeTemplatePreviewVO;
-import com.itxiang.evidence.vo.ResumeTemplateVO;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDate;
@@ -107,53 +99,4 @@ public interface RagService {
      */
     RagQueryTaskVO getQueryTask(String taskId, String userId);
 
-    /**
-     * 上传并解析简历模板字段绑定。
-     */
-    ResumeTemplateVO uploadResumeTemplate(MultipartFile file, String userId);
-
-    /**
-     * 查询当前用户最近的简历模板历史。
-     */
-    List<ResumeTemplateVO> listResumeTemplates(String userId, Integer limit);
-
-    /**
-     * 查询简历模板字段绑定。
-     */
-    ResumeTemplateVO getResumeTemplate(String templateId, String userId);
-
-    /**
-     * 删除当前用户上传的简历模板及其派生记录。
-     */
-    void deleteResumeTemplate(String templateId, String userId);
-
-    /**
-     * 查询或生成简历模板图片预览。
-     */
-    ResumeTemplatePreviewVO previewResumeTemplate(String templateId, Boolean refresh, String userId);
-
-    /**
-     * 读取简历模板预览页图片字节。
-     */
-    byte[] loadResumeTemplatePreviewImage(String templateId, Integer pageIndex, String userId);
-
-    /**
-     * 保存用户对图片区域的可改写约束。
-     */
-    ResumeTemplatePreviewVO saveResumeTemplateAnnotations(String templateId, ResumeTemplateAnnotationSaveDTO dto, String userId);
-
-    /**
-     * 基于 JD 和当前用户 evidence 生成字段级补丁草稿。
-     */
-    ResumePatchDraftVO generateResumeTemplatePatches(String templateId, ResumePatchGenerateDTO dto, String userId);
-
-    /**
-     * 校验用户确认的字段级补丁。
-     */
-    ResumePatchDraftVO validateResumeTemplatePatches(String templateId, ResumePatchValidateDTO dto, String userId);
-
-    /**
-     * 应用已确认补丁并导出新的 DOCX 版本。
-     */
-    ResumeTemplateExportVO exportResumeTemplate(String templateId, ResumeTemplateExportDTO dto, String userId);
 }

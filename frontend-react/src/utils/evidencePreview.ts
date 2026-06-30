@@ -1,21 +1,15 @@
 import type { RagEvidence } from '../api/types';
-import { buildVideoEvidenceLink } from './videoEvidence';
 
 const PREVIEWABLE_TYPES = new Set(['markdown', 'md', 'txt', 'text', 'srt', 'vtt']);
 
 interface PreviewLinkEntry {
   evidence: RagEvidence;
-  kind: 'text' | 'video';
   preview: string;
   sources: string[];
 }
 
 // 根据 evidence 构造应用内资料预览链接，避免直接访问 OSS 触发下载。
 export function buildMaterialPreviewLink(evidence: RagEvidence) {
-  const videoLink = buildVideoEvidenceLink(evidence);
-  if (videoLink) {
-    return videoLink;
-  }
   if (!isPreviewableEvidence(evidence)) {
     return '';
   }
@@ -51,9 +45,6 @@ export function buildPreviewHrefRewriter(evidences: RagEvidence[]) {
     if (!matched) {
       return '';
     }
-    if (matched.kind === 'video') {
-      return matched.preview;
-    }
     const hrefHash = extractSourceHash(href);
     if (!hrefHash) {
       return matched.preview;
@@ -64,7 +55,7 @@ export function buildPreviewHrefRewriter(evidences: RagEvidence[]) {
   };
 }
 
-// 生成用于链接改写的候选来源，视频 evidence 允许同一个视频源按时间段跳转。
+// 生成用于链接改写的候选来源。
 function buildPreviewLinkEntry(evidence: RagEvidence): PreviewLinkEntry | null {
   const preview = buildMaterialPreviewLink(evidence);
   if (!preview) {
@@ -73,7 +64,6 @@ function buildPreviewLinkEntry(evidence: RagEvidence): PreviewLinkEntry | null {
   return {
     evidence,
     preview,
-    kind: preview.startsWith('/videos') ? 'video' : 'text',
     sources: collectComparableSources(evidence)
   };
 }

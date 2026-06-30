@@ -1,23 +1,16 @@
 package com.itxiang.evidence.controller;
 
 import com.itxiang.evidence.common.Result;
-import com.itxiang.evidence.dto.JdAnalysisRequestDTO;
 import com.itxiang.evidence.service.AuthService;
 import com.itxiang.evidence.service.PageDataService;
 import com.itxiang.evidence.vo.DashboardVO;
-import com.itxiang.evidence.vo.JdAnalysisVO;
-import com.itxiang.evidence.vo.ResumeEvidenceAlignmentVO;
 import com.itxiang.evidence.vo.SystemSettingVO;
-import com.itxiang.evidence.vo.VideoSliceVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
-import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -51,47 +44,6 @@ public class PageDataController {
         log.info("获取工作台页面数据: startDate={}, endDate={}, recentDays={}, recentLimit={}",
                 startDate, endDate, recentDays, recentLimit);
         return Result.success(pageDataService.dashboard(currentUserId(authorization), startDate, endDate, recentDays, recentLimit));
-    }
-
-    /**
-     * 获取最近一次 JD 分析页面数据。
-     */
-    @GetMapping("/jd-analysis")
-    @Operation(summary = "获取 JD 分析页面数据")
-    public Result<JdAnalysisVO> jdAnalysis(@RequestHeader(value = "Authorization", required = false) String authorization) {
-        log.info("获取 JD 分析页面数据");
-        return Result.success(pageDataService.latestJdAnalysis(currentUserId(authorization)));
-    }
-
-    /**
-     * 提交 JD 和简历文本，运行 RAG 证据适配分析。
-     */
-    @PostMapping("/jd-analysis/analyze")
-    @Operation(summary = "运行 JD 适配分析")
-    public Result<JdAnalysisVO> analyzeJd(@Valid @RequestBody JdAnalysisRequestDTO dto,
-                                          @RequestHeader(value = "Authorization", required = false) String authorization) {
-        log.info("运行 JD 适配分析: jdLength={}", dto.getJobDescription() == null ? 0 : dto.getJobDescription().length());
-        return Result.success(pageDataService.analyzeJd(dto, currentUserId(authorization)));
-    }
-
-    /**
-     * 获取简历适配页面数据。
-     */
-    @GetMapping("/resume-adaptation")
-    @Operation(summary = "获取简历适配页面数据")
-    public Result<List<ResumeEvidenceAlignmentVO>> resumeAdaptation(@RequestHeader(value = "Authorization", required = false) String authorization) {
-        log.info("获取简历适配页面数据");
-        return Result.success(pageDataService.resumeAlignments(currentUserId(authorization)));
-    }
-
-    /**
-     * 获取视频复习页面数据。
-     */
-    @GetMapping("/video-review")
-    @Operation(summary = "获取视频复习页面数据")
-    public Result<List<VideoSliceVO>> videoReview() {
-        log.info("获取视频复习页面数据");
-        return Result.success(pageDataService.videoSlices());
     }
 
     /**

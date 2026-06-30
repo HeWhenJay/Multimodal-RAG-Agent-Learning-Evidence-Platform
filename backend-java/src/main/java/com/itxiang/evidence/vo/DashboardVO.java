@@ -11,8 +11,6 @@ public class DashboardVO {
 
     private Long materialCount;
     private Long materialDelta7Days;
-    private Long videoSliceCount;
-    private Long videoSliceDelta7Days;
     private Integer evidenceCount;
     private Long openErrorCount;
     private Long errorCount30Days;
@@ -20,7 +18,4 @@ public class DashboardVO {
     private String recentTaskEndDate;
     private Integer recentTaskLimit;
     private List<LearningMaterialVO> recentMaterials;
-    private List<VideoSliceVO> recentVideoSlices;
-    private JdAnalysisVO latestJdAnalysis;
-    private List<ResumeEvidenceAlignmentVO> resumeAlignments;
 }

@@ -165,7 +165,7 @@ Agent 能力由 [Agent 接口契约](docs/api/agent.md)、`agent_*` 表结构、
 
 MCP、`web_page_fetcher`、自主长任务调度、多 Agent 协作不纳入项目能力范围；资料重建索引、普通上传、分片上传或确定性 RAG 入库也不纳入 Agent 工具。Agent 编排继续遵守边界：React 只调用 Java；Java 负责登录用户、权限、业务状态、资料记录、统一响应和日志；Python 负责 Agent 图执行、工具观察整合、草稿生成、回答和 evidence 引用。Agent 不直接绕过 Java 调用 Python RAG 内部接口、数据库或对象存储。独立非 Agent 的普通资料上传、确定性视频索引、传统 `/jd-analysis` 页面继续走 RAG/JD 服务路径，不强行改成 Agent。
 
-Agent 编排统一收敛到 Python `pae_react_graph`：任务路由器先选择 ReadOnly 子图或 Planning 子图；ReadOnly 子图覆盖只读问答、资料读取和检索覆盖诊断；Planning 子图采用 PAE（Plan-and-Execute）生成计划、完成标准和工具范围，再由 ReAct 式执行器按观察结果继续行动或修补。工具节点只负责适配 Java Tool Gateway。普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、联网参考、evidence 对齐、JD/简历匹配、草稿生成、记忆提炼或人工审批的场景介入。工具注册面以 Java 业务能力为准；Agent 执行器只能通过 Java Tool Gateway 触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。
+Agent 编排统一收敛到 Python `pae_react_graph`：任务路由器先选择 ReadOnly 子图或 Planning 子图；ReadOnly 子图覆盖只读问答、资料读取和检索覆盖诊断；Planning 子图采用 PAE（Plan-and-Execute）生成计划、完成标准和工具范围，再由 ReAct 式执行器按观察结果继续行动或修补。工具节点只负责适配 Java Tool Gateway。Agent 工作台的只读问答以 RAG 检索为主；自由探索 `workspaceMode=free_explore` 默认优先使用 `web_search_probe` 联网获取外部资料，再用 `rag_query_probe_non_persistent` 做本地 evidence 补充或联网失败降级。普通文件上传、分片上传和确定性入库不纳入 Agent 工具链，仍由 React 调用 Java 的现有资料接口完成。Agent 只在需要规划、观察、联网参考、evidence 对齐、JD/简历匹配、草稿生成、记忆提炼或人工审批的场景介入。工具注册面以 Java 业务能力为准；Agent 执行器只能通过 Java Tool Gateway 触发业务动作，由 Java 负责用户隔离、权限、状态机、日志、幂等和错误映射。
 
 查询和只读工具不需要 Human-in-the-Loop，但必须由 Java 从登录 token 解析当前用户，并在 Tool Gateway 或业务服务层强制资源归属过滤：只能查询当前用户自己上传的数据，不能读取其他用户上传的资料。`explicitGrant(currentUserId, resourceId)` 是授权表扩展语义，未落表前非 owner 资源一律拒绝；Agent 不接收、也不自行构造跨用户资源过滤条件。Create/Update/Delete 以及任何业务状态变更必须进入 `human_crud_review` 做具体操作审批。计划确认只批准任务目标和工具路线，不等于批准任何写操作。自动写入 `log_event/log_error` 属于平台审计和故障观测副作用，不作为 Agent 可选工具，也不因工具审批而阻断；但日志必须由服务端补齐当前 `userId`、`traceId`，脱敏后写入，不能记录简历正文、资料正文或模型密钥。
 
@@ -222,7 +222,7 @@ flowchart TD
     SAVE --> END
 ```
 
-LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后先进入 `resume_rewrite_decision`，需要改简历时执行 `resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance`，再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。Planner、Executor、Repair、Acceptance、Answer Writer 和简历修改子图节点会优先调用阿里千问/Qwen 生成 JSON 决策，再由 Python 做 schema、工具白名单、内部子图白名单和 mutation guardrail 校验；未配置 `DASHSCOPE_API_KEY` 或模型输出不合格时回退到确定性逻辑。`task_router`、`plan_review`、`tool_adapter`、记忆预取和记忆候选发布属于安全、审批或网关固定节点，不让 LLM 控制权限、审批结果或外部调用。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
+LangGraph 按 `docs/api/agent.md` 契约组织：`pae_react_graph` 统一纯只读和规划类路径。ReadOnly 路径为 `task_router -> memory_prefetch_before_planner -> planner -> memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`；Planning 路径首轮为 `task_router -> planner -> plan_review`，用户批准计划后先进入 `resume_rewrite_decision`，需要改简历时执行 `resume_rewrite_planner -> resume_rewrite_generator -> resume_rewrite_acceptance`，再进入 `memory_prefetch_after_planner -> executor -> tool_adapter -> repair/acceptance -> answer_writer -> post_answer_memory`。Planner、Executor、Repair、Acceptance、Answer Writer 和简历修改子图节点会优先调用阿里千问/Qwen 生成 JSON 决策，再由 Python 做 schema、工具白名单、内部子图白名单和 mutation guardrail 校验；未配置 `DASHSCOPE_API_KEY` 或模型输出不合格时回退到确定性逻辑。`task_router`、`plan_review`、`tool_adapter`、记忆预取和记忆候选发布属于安全、审批或网关固定节点，不让 LLM 控制权限、审批结果或外部调用。`post_answer_memory` 当前只生成 `PENDING_REVIEW` 记忆候选，不在图内直接写入记忆；真正保存由前端/Java 的记忆确认或 CRUD 审批流程触发。统一图调用 LangGraph 时限制最大深度为 24；如果超过深度，Python 会回写 `AGENT_GRAPH_RECURSION_LIMIT` 失败事件，前端显示 Java 返回的错误信息并提示缩小目标或重新规划。Agent 工作台不会在提交后写死机器人回答、默认计划或最终结果占位，只根据 `GET /api/agent/tasks/:id` 返回的 `draft`、`final`、`reviews`、`toolCalls`、`errorCode/errorMessage` 增量展示。`human_plan_review` 只确认复杂任务目标和工具路线，普通 RAG 查询、资料状态读取、evidence 读取和检索覆盖诊断不经过计划审批；`human_crud_review` 才批准具体保存类变更。撤销窗口通过 Java `POST /api/agent/operations/:id/undo` 暴露给前端，不作为 Python 可直接调用的 Tool Gateway 工具。
 
 Planning 子图在 `PLAN` 审批通过后会先进入 `resume_rewrite_decision`。如果 Planner 在计划中标记 `resumeRewriteIntent=true`，或前端传入 `resume_rewrite_subgraph` / `resume_revision_save` / `resume_template_fill` 工具意图，统一图会进入简历修改子图；否则直接进入规划后记忆预取和常规 ReAct 执行链。简历修改子图只生成 `PENDING_REVIEW` 改写候选，不直接写 DOCX、不直接保存业务数据，后续仍由 `OUTPUT` 审批和可选 `CRUD` 审批决定是否保存。
 
@@ -256,7 +256,7 @@ flowchart TD
 | `resume_evidence_aligner` | 只读生成 | JD/简历适配时对齐 supported / weak / missing 证据 | 否 | 只走 `java_read_tool_gateway`，只读取当前用户简历、资料和授权 JD/资料 | 无，产出草稿 Observation |
 | `gap_analyzer` | 只读生成 | 根据 evidence 缺口生成能力差距和学习建议时 | 否 | 只走 `java_read_tool_gateway`，只处理已授权 evidence 和 JD 要求 | 无，产出草稿 Observation |
 | `utc_time_provider` | 只读 | Agent 需要获取当前 UTC 时间以判断技能、资料、证书时效性时 | 否 | 纯系统时间读取，不涉及用户数据 | 无 |
-| `web_search_probe` | 只读 | 需要联网参考公司背景、技能趋势或外部学习资源时 | 否 | 只走 Java Tool Gateway，由 Java 调 Tavily，未配置密钥时返回可重试错误 | 无，外部结果不写入 RAG evidence |
+| `web_search_probe` | 只读 | 自由探索默认第一步，或需要联网参考公司背景、技能趋势、外部学习资源时 | 否 | 只走 Java Tool Gateway，由 Java 调 Tavily，未配置密钥时返回可重试错误；失败后降级到本地 RAG | 无，外部结果不写入 RAG evidence |
 | `agent_memory_retriever` | 只读 | Agent 任务启动或执行前需要读取当前用户可注入记忆时 | 否 | 只走 Java Tool Gateway，Java 负责用户归属和 ACTIVE 状态二次过滤 | 无，只返回 `memoryContext` |
 | `agent_memory_candidate_proposer` | 只读生成 | 任务完成后需要提炼待确认记忆候选时 | 否 | Python 只做候选和冲突判断，Java 保存前做用户归属、去重和脱敏审计 | 无，候选默认不激活 |
 | `jd_learning_plan_save` | 变更 | 用户确认保存学习路线或计划后 | 是，`human_crud_review` | 只走 Java Tool Gateway，校验当前用户计划归属 | 保存计划，可撤销 |
@@ -599,9 +599,12 @@ Agent 工作台本地联调不需要分别为 Java 和 Python 手工设置内部
 | `EVIDENCE_AGENT_INTERNAL_TOKEN` | 可选，生产建议配置 | Java 与 Python Agent 内部接口共享令牌；本地未配置时自动读取或创建仓库根目录 `.local/agent-internal-token` | 自定义随机字符串 |
 | `EVIDENCE_AGENT_INTERNAL_TOKEN_FILE` | 可选 | 指定 Java/Python 共用的内部令牌文件路径，便于容器或多进程复用同一密钥文件 | `.local/agent-internal-token` |
 | `EVIDENCE_AGENT_START_TIMEOUT_SECONDS` | 可选 | Java 启动 Python Agent 任务的等待超时 | `10` |
-| `EVIDENCE_AGENT_REDIS_ENABLED` | 可选 | Java 是否启用 Redis 运行态；关闭后走数据库轮询降级 | `true` |
-| `EVIDENCE_AGENT_REDIS_STREAM_TTL_HOURS` | 可选 | Redis Stream 保留时间 | `24` |
-| `EVIDENCE_AGENT_REDIS_CONTEXT_TTL_MINUTES` | 可选 | Redis 纠偏、取消、短期上下文 TTL | `120` |
+| `EVIDENCE_AGENT_REDIS_ENABLED` | 可选 | Java 是否启用 Redis L2 热态上下文和 SSE 重连缓冲；关闭后走 PostgreSQL/快照轮询降级 | `true` |
+| `EVIDENCE_AGENT_REDIS_RUNNING_CONTEXT_TTL_HOURS` | 可选 | `agent:ctx:{userId}:{taskId}` 运行中 TTL | `24` |
+| `EVIDENCE_AGENT_REDIS_COMPLETED_CONTEXT_TTL_DAYS` | 可选 | `agent:ctx:{userId}:{taskId}` 终态 TTL | `7` |
+| `EVIDENCE_AGENT_REDIS_MESSAGE_TTL_DAYS` | 可选 | `agent:ctx:messages:{userId}:{taskId}` 最近消息热态 TTL | `7` |
+| `EVIDENCE_AGENT_REDIS_SSE_TTL_HOURS` | 可选 | `agent:sse:{taskId}` SSE 重连缓冲 TTL | `2` |
+| `EVIDENCE_AGENT_REDIS_SSE_MAX_EVENTS` | 可选 | 每个任务 Redis SSE 缓冲最多保留事件数 | `120` |
 | `EVIDENCE_AGENT_SSE_POLL_INTERVAL_MILLIS` | 可选 | SSE 数据库轮询间隔 | `2000` |
 | `AGENT_LLM_ENABLED` | 可选 | 是否启用 LangGraph 节点 Qwen JSON 决策；关闭或无 Key 时回退确定性逻辑 | `true` |
 | `AGENT_QWEN_BASE_URL` | 可选 | Agent Qwen OpenAI 兼容 Chat Completions 地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |

@@ -14,5 +14,7 @@ public class AgentTaskCreateDTO {
 
     private String title;
 
+    private String folderId;
+
     private Map<String, Object> input = new LinkedHashMap<>();
 }

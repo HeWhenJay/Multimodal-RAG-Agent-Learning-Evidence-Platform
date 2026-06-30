@@ -84,20 +84,24 @@ def get_agent_qwen_client() -> AgentQwenClient:
 def agent_qwen_model(role: str) -> str:
     """按节点角色读取模型配置。"""
     env_map = {
+        "title": "AGENT_QWEN_TITLE_MODEL",
         "planner": "AGENT_QWEN_PLANNER_MODEL",
         "executor": "AGENT_QWEN_EXECUTOR_MODEL",
         "repair": "AGENT_QWEN_REPAIR_MODEL",
         "acceptance": "AGENT_QWEN_ACCEPTANCE_MODEL",
         "resume": "AGENT_QWEN_RESUME_MODEL",
         "answer": "AGENT_QWEN_ANSWER_MODEL",
+        "compression": "AGENT_QWEN_COMPRESSION_MODEL",
     }
     default_map = {
+        "title": "qwen-turbo",
         "planner": "qwen-plus",
         "executor": "qwen-turbo",
         "repair": "qwen-turbo",
         "acceptance": "qwen-turbo",
         "resume": "qwen-plus",
         "answer": "qwen-plus",
+        "compression": "qwen-plus",
     }
     return os.getenv(env_map[role], default_map[role])
 

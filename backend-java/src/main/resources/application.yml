@@ -6,6 +6,13 @@ server:
 spring:
   application:
     name: learning-evidence-backend
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:127.0.0.1}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD:}
+      database: ${SPRING_DATA_REDIS_DATABASE:0}
+      timeout: ${SPRING_DATA_REDIS_TIMEOUT:2s}
   servlet:
     multipart:
       max-file-size: ${SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE:512MB}
@@ -44,6 +51,13 @@ evidence:
     internal-token: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
     java-base-url: ${EVIDENCE_AGENT_JAVA_BASE_URL:http://127.0.0.1:7080}
     start-timeout-seconds: ${EVIDENCE_AGENT_START_TIMEOUT_SECONDS:10}
+    redis:
+      enabled: ${EVIDENCE_AGENT_REDIS_ENABLED:true}
+      running-context-ttl-hours: ${EVIDENCE_AGENT_REDIS_RUNNING_CONTEXT_TTL_HOURS:24}
+      completed-context-ttl-days: ${EVIDENCE_AGENT_REDIS_COMPLETED_CONTEXT_TTL_DAYS:7}
+      message-ttl-days: ${EVIDENCE_AGENT_REDIS_MESSAGE_TTL_DAYS:7}
+      sse-ttl-hours: ${EVIDENCE_AGENT_REDIS_SSE_TTL_HOURS:2}
+      sse-max-events: ${EVIDENCE_AGENT_REDIS_SSE_MAX_EVENTS:120}
   tools:
     tavily:
       api-key: ${TAVILY_API_KEY:}

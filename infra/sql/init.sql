@@ -9,17 +9,6 @@ DROP TABLE IF EXISTS learning_evidence."Ragas_Test_rag_chunk";
 DROP TABLE IF EXISTS learning_evidence."Ragas_Test_rag_document";
 DROP TABLE IF EXISTS learning_evidence.rag_chunk;
 DROP TABLE IF EXISTS learning_evidence.rag_document;
-DROP TABLE IF EXISTS learning_evidence.jd_learning_plan_item;
-DROP TABLE IF EXISTS learning_evidence.jd_analysis_skill;
-DROP TABLE IF EXISTS learning_evidence.jd_analysis_report;
-DROP TABLE IF EXISTS learning_evidence.resume_evidence_alignment;
-DROP TABLE IF EXISTS learning_evidence.resume_template_export;
-DROP TABLE IF EXISTS learning_evidence.resume_template_patch_draft;
-DROP TABLE IF EXISTS learning_evidence.resume_template_region_annotation;
-DROP TABLE IF EXISTS learning_evidence.resume_template_preview_page;
-DROP TABLE IF EXISTS learning_evidence.resume_template_field;
-DROP TABLE IF EXISTS learning_evidence.resume_template;
-DROP TABLE IF EXISTS learning_evidence.video_slice;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_audit;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_version;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_embedding;
@@ -28,7 +17,10 @@ DROP TABLE IF EXISTS learning_evidence.agent_operation_snapshot;
 DROP TABLE IF EXISTS learning_evidence.agent_operation;
 DROP TABLE IF EXISTS learning_evidence.agent_human_review;
 DROP TABLE IF EXISTS learning_evidence.agent_tool_call;
+DROP TABLE IF EXISTS learning_evidence.agent_conversation_summary;
+DROP TABLE IF EXISTS learning_evidence.agent_chat_message;
 DROP TABLE IF EXISTS learning_evidence.agent_task;
+DROP TABLE IF EXISTS learning_evidence.agent_conversation_folder;
 DROP TABLE IF EXISTS learning_evidence.rag_query_history;
 DROP TABLE IF EXISTS learning_evidence.log_error;
 DROP TABLE IF EXISTS learning_evidence.log_event;
@@ -153,149 +145,6 @@ CREATE INDEX idx_learning_material_document_type
 
 CREATE INDEX idx_learning_material_user_updated
     ON learning_evidence.learning_material(user_id, updated_at DESC);
-
-CREATE TABLE learning_evidence.resume_template (
-    id VARCHAR(120) PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    template_name VARCHAR(255) NOT NULL,
-    original_filename VARCHAR(255) NOT NULL,
-    original_file_path VARCHAR(700) NOT NULL,
-    storage_type VARCHAR(30) NOT NULL DEFAULT 'local',
-    object_key VARCHAR(700),
-    public_url VARCHAR(700),
-    current_filename VARCHAR(255),
-    current_file_path VARCHAR(700),
-    current_storage_type VARCHAR(30),
-    current_object_key VARCHAR(700),
-    current_public_url VARCHAR(700),
-    file_type VARCHAR(20) NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    status VARCHAR(30) NOT NULL DEFAULT 'PARSING',
-    layout_fingerprint_json TEXT NOT NULL DEFAULT '{}',
-    unsupported_regions_json TEXT NOT NULL DEFAULT '[]',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_resume_template_user_updated
-    ON learning_evidence.resume_template(user_id, updated_at DESC);
-
-CREATE INDEX idx_resume_template_status
-    ON learning_evidence.resume_template(status);
-
-CREATE TABLE learning_evidence.resume_template_field (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template(id) ON DELETE CASCADE,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    field_id VARCHAR(120) NOT NULL,
-    section_key VARCHAR(60) NOT NULL,
-    display_name VARCHAR(255) NOT NULL,
-    source_text TEXT NOT NULL,
-    source_text_hash VARCHAR(128) NOT NULL,
-    location_refs_json TEXT NOT NULL DEFAULT '[]',
-    style_fingerprint_json TEXT NOT NULL DEFAULT '{}',
-    max_chars INTEGER NOT NULL,
-    max_lines INTEGER NOT NULL,
-    required_evidence_policy VARCHAR(30) NOT NULL,
-    unsupported_regions_json TEXT NOT NULL DEFAULT '[]',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_resume_template_field UNIQUE (template_id, template_version, field_id)
-);
-
-CREATE INDEX idx_resume_template_field_template
-    ON learning_evidence.resume_template_field(template_id, template_version);
-
-CREATE TABLE learning_evidence.resume_template_preview_page (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template(id) ON DELETE CASCADE,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    page_index INTEGER NOT NULL,
-    storage_type VARCHAR(30) NOT NULL,
-    file_path VARCHAR(700),
-    object_key VARCHAR(700),
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_resume_template_preview_page UNIQUE (template_id, template_version, page_index)
-);
-
-CREATE INDEX idx_resume_template_preview_page_user
-    ON learning_evidence.resume_template_preview_page(user_id, template_id, template_version);
-
-CREATE TABLE learning_evidence.resume_template_region_annotation (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template(id) ON DELETE CASCADE,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    field_id VARCHAR(120),
-    page_index INTEGER NOT NULL,
-    rect_json TEXT NOT NULL,
-    source_type VARCHAR(30) NOT NULL CHECK (source_type IN ('AUTO','MANUAL_BOUND','MANUAL_UNBOUND')),
-    editable BOOLEAN NOT NULL DEFAULT FALSE,
-    section_key VARCHAR(60) NOT NULL,
-    user_instruction VARCHAR(500),
-    required_evidence_policy VARCHAR(30) NOT NULL CHECK (required_evidence_policy IN ('NONE','OPTIONAL','REQUIRED')),
-    status VARCHAR(30) NOT NULL CHECK (status IN ('ACTIVE','IGNORED')),
-    annotation_revision INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_resume_template_region_annotation_status
-    ON learning_evidence.resume_template_region_annotation(user_id, template_id, template_version, status);
-
-CREATE INDEX idx_resume_template_region_annotation_field
-    ON learning_evidence.resume_template_region_annotation(template_id, template_version, field_id);
-
-CREATE TABLE learning_evidence.resume_template_patch_draft (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template(id) ON DELETE CASCADE,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'DRAFT',
-    job_description_hash VARCHAR(128) NOT NULL,
-    patches_json TEXT NOT NULL DEFAULT '[]',
-    evidence_candidates_json TEXT NOT NULL DEFAULT '[]',
-    validation_errors_json TEXT NOT NULL DEFAULT '[]',
-    allowed_field_ids_json TEXT NOT NULL DEFAULT '[]',
-    annotation_revision INTEGER,
-    provider VARCHAR(40),
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_resume_patch_draft_template
-    ON learning_evidence.resume_template_patch_draft(template_id, template_version, updated_at DESC);
-
-CREATE INDEX idx_resume_patch_draft_status
-    ON learning_evidence.resume_template_patch_draft(status);
-
-CREATE TABLE learning_evidence.resume_template_export (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template(id) ON DELETE CASCADE,
-    user_id VARCHAR(120) NOT NULL,
-    base_version INTEGER NOT NULL,
-    export_version INTEGER NOT NULL,
-    patch_draft_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.resume_template_patch_draft(id) ON DELETE CASCADE,
-    filename VARCHAR(255) NOT NULL,
-    file_path VARCHAR(700) NOT NULL,
-    storage_type VARCHAR(30) NOT NULL,
-    object_key VARCHAR(700),
-    public_url VARCHAR(700),
-    layout_validation_json TEXT NOT NULL DEFAULT '{}',
-    idempotency_key VARCHAR(160) NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'EXPORTED',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_resume_template_export_idempotency UNIQUE (template_id, user_id, idempotency_key)
-);
-
-CREATE INDEX idx_resume_template_export_template
-    ON learning_evidence.resume_template_export(template_id, export_version DESC);
 
 CREATE TABLE learning_evidence.rag_query_history (
     id BIGSERIAL PRIMARY KEY,
@@ -423,9 +272,22 @@ CREATE INDEX idx_log_error_material_id
     ON learning_evidence.log_error(material_id);
 
 -- Agent 第二阶段任务、工具、审批和可撤销操作表。
+CREATE TABLE learning_evidence.agent_conversation_folder (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    name VARCHAR(80) NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_conversation_folder_user_sort
+    ON learning_evidence.agent_conversation_folder(user_id, sort_order, updated_at DESC);
+
 CREATE TABLE learning_evidence.agent_task (
     id VARCHAR(120) PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
+    folder_id VARCHAR(120) REFERENCES learning_evidence.agent_conversation_folder(id) ON DELETE SET NULL,
     task_type VARCHAR(40) NOT NULL,
     status VARCHAR(40) NOT NULL DEFAULT 'CREATED',
     title VARCHAR(255),
@@ -443,9 +305,78 @@ CREATE TABLE learning_evidence.agent_task (
 CREATE INDEX idx_agent_task_user_status_updated
     ON learning_evidence.agent_task(user_id, status, updated_at DESC);
 
+CREATE INDEX idx_agent_task_user_folder_updated
+    ON learning_evidence.agent_task(user_id, folder_id, updated_at DESC);
+
 CREATE INDEX idx_agent_task_python_thread
     ON learning_evidence.agent_task(python_thread_id)
     WHERE python_thread_id IS NOT NULL;
+
+CREATE TABLE learning_evidence.agent_chat_message (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.agent_task(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    sequence_no BIGINT NOT NULL DEFAULT 0,
+    role VARCHAR(30) NOT NULL,
+    message_type VARCHAR(60) NOT NULL,
+    content TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    source_event_type VARCHAR(80),
+    source_id VARCHAR(160),
+    dedupe_key VARCHAR(220) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX uk_agent_chat_message_dedupe
+    ON learning_evidence.agent_chat_message(task_id, dedupe_key);
+
+CREATE INDEX idx_agent_chat_message_task_created
+    ON learning_evidence.agent_chat_message(task_id, created_at);
+
+CREATE UNIQUE INDEX uk_agent_chat_message_task_sequence
+    ON learning_evidence.agent_chat_message(task_id, sequence_no);
+
+CREATE INDEX idx_agent_chat_message_user_updated
+    ON learning_evidence.agent_chat_message(user_id, updated_at DESC);
+
+CREATE TABLE learning_evidence.agent_conversation_summary (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL REFERENCES learning_evidence.agent_task(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    summary_type VARCHAR(40) NOT NULL DEFAULT 'CONTEXT_COMPRESSION',
+    covered_message_start_id VARCHAR(120),
+    covered_message_end_id VARCHAR(120),
+    covered_message_count INTEGER NOT NULL DEFAULT 0,
+    raw_token_estimate INTEGER NOT NULL DEFAULT 0,
+    compressed_token_estimate INTEGER NOT NULL DEFAULT 0,
+    summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    summary_text TEXT NOT NULL,
+    key_facts_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    evidence_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    compression_model VARCHAR(120),
+    compression_prompt_version VARCHAR(80) NOT NULL DEFAULT 'agent-context-compression-v1',
+    compression_version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(40) NOT NULL DEFAULT 'ACTIVE',
+    diagnostics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_conversation_summary_task_status_updated
+    ON learning_evidence.agent_conversation_summary(task_id, status, updated_at DESC);
+
+CREATE INDEX idx_agent_conversation_summary_user_task_status
+    ON learning_evidence.agent_conversation_summary(user_id, task_id, status, updated_at DESC);
+
+CREATE INDEX idx_agent_conversation_summary_covered_range
+    ON learning_evidence.agent_conversation_summary(task_id, covered_message_start_id, covered_message_end_id);
+
+CREATE INDEX idx_agent_conversation_summary_summary_gin
+    ON learning_evidence.agent_conversation_summary USING GIN (summary_json);
+
+CREATE INDEX idx_agent_conversation_summary_key_facts_gin
+    ON learning_evidence.agent_conversation_summary USING GIN (key_facts_json);
 
 CREATE TABLE learning_evidence.agent_tool_call (
     id VARCHAR(120) PRIMARY KEY,
@@ -638,74 +569,6 @@ CREATE INDEX idx_agent_memory_audit_memory_created
 
 CREATE INDEX idx_agent_memory_audit_user_created
     ON learning_evidence.agent_memory_audit(user_id, created_at DESC);
-
-CREATE TABLE learning_evidence.video_slice (
-    id BIGSERIAL PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    topic VARCHAR(255) NOT NULL,
-    start_time VARCHAR(20) NOT NULL,
-    end_time VARCHAR(20) NOT NULL,
-    status VARCHAR(80) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_video_slice_title_start UNIQUE (title, start_time)
-);
-
-CREATE INDEX idx_video_slice_updated_at
-    ON learning_evidence.video_slice(updated_at DESC);
-
-CREATE TABLE learning_evidence.resume_evidence_alignment (
-    id BIGSERIAL PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    requirement VARCHAR(255) NOT NULL,
-    evidence TEXT NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_resume_evidence_user_requirement UNIQUE (user_id, requirement)
-);
-
-CREATE INDEX idx_resume_evidence_status
-    ON learning_evidence.resume_evidence_alignment(status);
-
-CREATE INDEX idx_resume_evidence_user_updated
-    ON learning_evidence.resume_evidence_alignment(user_id, updated_at DESC);
-
-CREATE TABLE learning_evidence.jd_analysis_report (
-    id BIGSERIAL PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    report_key VARCHAR(80) NOT NULL,
-    job_description TEXT NOT NULL,
-    match_score INTEGER NOT NULL DEFAULT 0,
-    mastered_percent INTEGER NOT NULL DEFAULT 0,
-    partial_percent INTEGER NOT NULL DEFAULT 0,
-    gap_percent INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_jd_analysis_report_key UNIQUE (report_key)
-);
-
-CREATE TABLE learning_evidence.jd_analysis_skill (
-    id BIGSERIAL PRIMARY KEY,
-    report_id BIGINT NOT NULL REFERENCES learning_evidence.jd_analysis_report(id) ON DELETE CASCADE,
-    skill_name VARCHAR(160) NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_jd_analysis_skill UNIQUE (report_id, skill_name)
-);
-
-CREATE INDEX idx_jd_analysis_report_user_updated
-    ON learning_evidence.jd_analysis_report(user_id, updated_at DESC);
-
-CREATE TABLE learning_evidence.jd_learning_plan_item (
-    id BIGSERIAL PRIMARY KEY,
-    report_id BIGINT NOT NULL REFERENCES learning_evidence.jd_analysis_report(id) ON DELETE CASCADE,
-    step_no INTEGER NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_jd_learning_plan_item UNIQUE (report_id, step_no)
-);
 
 CREATE TABLE learning_evidence.system_setting (
     setting_key VARCHAR(120) PRIMARY KEY,

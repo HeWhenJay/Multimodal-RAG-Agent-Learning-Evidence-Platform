@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+﻿import type { ReactNode } from 'react';
 
 interface MarkdownTextProps {
   content: string;
@@ -6,13 +6,13 @@ interface MarkdownTextProps {
   rewriteHref?: (href: string, contextText?: string) => string;
 }
 
-// 渲染后端 RAG 回答中的 Markdown 子集，避免把模型文本作为 HTML 注入页面。
+// 娓叉煋鍚庣 RAG 鍥炵瓟涓殑 Markdown 瀛愰泦锛岄伩鍏嶆妸妯″瀷鏂囨湰浣滀负 HTML 娉ㄥ叆椤甸潰銆?
 export function MarkdownText({ content, className = '', rewriteHref }: MarkdownTextProps) {
   const blocks = renderMarkdownBlocks(content || '', rewriteHref);
   return <div className={`markdown-text ${className}`.trim()}>{blocks}</div>;
 }
 
-// 将 Markdown 行拆成标题、段落、列表、引用和代码块。
+// 灏?Markdown 琛屾媶鎴愭爣棰樸€佹钀姐€佸垪琛ㄣ€佸紩鐢ㄥ拰浠ｇ爜鍧椼€?
 function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, contextText?: string) => string) {
   const lines = normalizeGeneratedMarkdown(content).split('\n');
   const blocks: ReactNode[] = [];
@@ -107,18 +107,18 @@ function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, cont
   flushParagraph();
   flushList();
 
-  return blocks.length ? blocks : [<p key="empty">暂无内容</p>];
+  return blocks.length ? blocks : [<p key="empty">鏆傛棤鍐呭</p>];
 }
 
-// 模型有时把列表压成一行，这里只做保守换行，避免影响普通句子。
+// 妯″瀷鏈夋椂鎶婂垪琛ㄥ帇鎴愪竴琛岋紝杩欓噷鍙仛淇濆畧鎹㈣锛岄伩鍏嶅奖鍝嶆櫘閫氬彞瀛愩€?
 function normalizeGeneratedMarkdown(content: string) {
   return content
     .replace(/\r\n/g, '\n')
-    .replace(/([。；;:：])\s+(\d+[.)]\s+\*\*)/g, '$1\n$2')
+    .replace(/([銆傦紱;:锛歖)\s+(\d+[.)]\s+\*\*)/g, '$1\n$2')
     .replace(/\s+(-\s+\u2757\s*)/g, '\n$1');
 }
 
-// 显式选择 HTML 标题标签，避免动态 JSX 标签被全局 Three 类型误判。
+// 鏄惧紡閫夋嫨 HTML 鏍囬鏍囩锛岄伩鍏嶅姩鎬?JSX 鏍囩琚叏灞€ Three 绫诲瀷璇垽銆?
 function renderHeading(level: number, text: string, key: string, rewriteHref?: (href: string, contextText?: string) => string) {
   if (level <= 4) {
     return <h4 key={key}>{renderInlineMarkdown(text, text, rewriteHref)}</h4>;
@@ -129,7 +129,7 @@ function renderHeading(level: number, text: string, key: string, rewriteHref?: (
   return <h6 key={key}>{renderInlineMarkdown(text, text, rewriteHref)}</h6>;
 }
 
-// 渲染常见内联语法：链接、证据 ID、加粗、代码和简易数学片段。
+// 娓叉煋甯歌鍐呰仈璇硶锛氶摼鎺ャ€佽瘉鎹?ID銆佸姞绮椼€佷唬鐮佸拰绠€鏄撴暟瀛︾墖娈点€?
 function renderInlineMarkdown(text: string, contextText = text, rewriteHref?: (href: string, contextText?: string) => string): ReactNode[] {
   const nodes: ReactNode[] = [];
   const pattern = /(\[evidenceId=([^\]]+)])|(\[([^\]]+)]\(([^)]+)\))|(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\$([^$\n]+)\$)/g;
@@ -164,7 +164,7 @@ function renderInlineMarkdown(text: string, contextText = text, rewriteHref?: (h
   return nodes;
 }
 
-// 只允许常规站内页面和 http(s) 链接；原 Markdown 目录锚点不对应当前应用目标。
+// 鍙厑璁稿父瑙勭珯鍐呴〉闈㈠拰 http(s) 閾炬帴锛涘師 Markdown 鐩綍閿氱偣涓嶅搴斿綋鍓嶅簲鐢ㄧ洰鏍囥€?
 function normalizeMarkdownHref(rawHref: string, contextText = '', rewriteHref?: (href: string, contextText?: string) => string) {
   const href = rawHref.trim().split(/\s+/)[0].replace(/^<|>$/g, '');
   const rewritten = rewriteHref?.(href, contextText);
@@ -183,7 +183,7 @@ function normalizeMarkdownHref(rawHref: string, contextText = '', rewriteHref?: 
   return '';
 }
 
-// 兼容旧回答：把“位置”的当前应用 hash 链接重写到同一行的 OSS 来源 URL。
+// 鍏煎鏃у洖绛旓細鎶娾€滀綅缃€濈殑褰撳墠搴旂敤 hash 閾炬帴閲嶅啓鍒板悓涓€琛岀殑 OSS 鏉ユ簮 URL銆?
 function buildSourceBackedHashLink(href: string, contextText: string, rewriteHref?: (href: string, contextText?: string) => string) {
   const source = extractHttpSourceFromEvidenceText(contextText);
   if (!source) return '';
@@ -192,9 +192,9 @@ function buildSourceBackedHashLink(href: string, contextText: string, rewriteHre
   return rewriteHref?.(sourceBackedHref, contextText) || sourceBackedHref;
 }
 
-// 从“来源：https://...”字段提取浏览器可打开的资料 URL。
+// 浠庘€滄潵婧愶細https://...鈥濆瓧娈垫彁鍙栨祻瑙堝櫒鍙墦寮€鐨勮祫鏂?URL銆?
 function extractHttpSourceFromEvidenceText(text: string) {
-  const match = /来源：\s*(https?:\/\/[^\s；;，,]+)/i.exec(text);
+  const match = /鏉ユ簮锛歕s*(https?:\/\/[^\s锛?锛?]+)/i.exec(text);
   return match?.[1] || '';
 }
 
@@ -203,7 +203,7 @@ function extractHash(href: string) {
   return hashIndex >= 0 ? href.slice(hashIndex + 1) : '';
 }
 
-// 原文目录链接可能被模型改写成当前应用根路径 hash，但页面没有对应文档锚点。
+// 鍘熸枃鐩綍閾炬帴鍙兘琚ā鍨嬫敼鍐欐垚褰撳墠搴旂敤鏍硅矾寰?hash锛屼絾椤甸潰娌℃湁瀵瑰簲鏂囨。閿氱偣銆?
 function isCurrentAppHashOnlyLink(href: string) {
   if (!/^https?:\/\//i.test(href) || typeof window === 'undefined') {
     return false;
@@ -225,12 +225,13 @@ function isCurrentAppHashOnlyLink(href: string) {
   }
 }
 
-// 本地开发常在 localhost 和 127.0.0.1 之间切换，二者都指向当前应用。
+// 鏈湴寮€鍙戝父鍦?localhost 鍜?127.0.0.1 涔嬮棿鍒囨崲锛屼簩鑰呴兘鎸囧悜褰撳墠搴旂敤銆?
 function isLoopbackHost(hostname: string) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
 }
 
-// 预览页和外部来源都应在新标签打开，站内普通导航可沿用当前页。
+// 棰勮椤靛拰澶栭儴鏉ユ簮閮藉簲鍦ㄦ柊鏍囩鎵撳紑锛岀珯鍐呮櫘閫氬鑸彲娌跨敤褰撳墠椤点€?
 function isExternalOrPreviewHref(href: string) {
-  return href.startsWith('http') || href.startsWith('/preview/') || href.startsWith('/videos');
+  return href.startsWith('http') || href.startsWith('/preview/');
 }
+

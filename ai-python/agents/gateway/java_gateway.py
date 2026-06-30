@@ -66,6 +66,39 @@ class JavaAgentGatewayClient:
         )
         self._post_json(self.callback_url, payload)
 
+    def restore_context(
+        self,
+        task_id: str,
+        *,
+        query: str = "",
+        recent_limit: int = 12,
+        summary_limit: int = 6,
+        best_window_tokens: int = 18000,
+    ) -> dict[str, Any]:
+        """通过 Java 内部接口恢复消息窗口和摘要段，禁止 Python 直连业务库。"""
+        url = f"{self.java_tool_gateway_base_url}/api/internal/agent/tasks/{task_id}/context"
+        params = {
+            "query": query,
+            "recentLimit": recent_limit,
+            "summaryLimit": summary_limit,
+            "bestWindowTokens": best_window_tokens,
+        }
+        agent_log("恢复 Java 上下文", taskId=task_id, recentLimit=recent_limit, summaryLimit=summary_limit)
+        return self._get_json(url, params)
+
+    def save_context_summary(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """保存压缩摘要段到 Java/PostgreSQL。"""
+        url = f"{self.java_tool_gateway_base_url}/api/internal/agent/tasks/{task_id}/summaries"
+        agent_log("保存上下文摘要", taskId=task_id, summaryId=payload.get("summaryId"))
+        return self._post_json(url, payload)
+
+    def recall_context_messages(self, task_id: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """按 summary/range/anchor 回捞摘要覆盖范围附近原文。"""
+        url = f"{self.java_tool_gateway_base_url}/api/internal/agent/tasks/{task_id}/context/messages"
+        agent_log("回捞上下文原文", taskId=task_id, summaryId=params.get("summaryId"), anchorMessageId=params.get("anchorMessageId"))
+        result = self._get_json(url, params)
+        return result if isinstance(result, list) else []
+
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         if "/internal/rag/" in url:
             raise RuntimeError("Python Agent 不允许直连 Python RAG 内部接口")
@@ -82,6 +115,20 @@ class JavaAgentGatewayClient:
                 resultStatus=result.get("status") if isinstance(result, dict) else None,
                 accepted=result.get("accepted") if isinstance(result, dict) else None,
             )
+            return result
+
+    def _get_json(self, url: str, params: dict[str, Any]) -> Any:
+        if "/internal/rag/" in url:
+            raise RuntimeError("Python Agent 不允许直连 Python RAG 内部接口")
+        headers = {"X-Agent-Internal-Token": self.internal_token}
+        filtered_params = {key: value for key, value in params.items() if value is not None and value != ""}
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.get(url, params=filtered_params, headers=headers)
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            result = response.json()
+            agent_log("Java 查询响应", statusCode=response.status_code)
             return result
 
     def _task_id_from_callback(self) -> str:

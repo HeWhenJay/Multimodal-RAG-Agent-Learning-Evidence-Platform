@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.AgentConversationFolderMapper">
+
+    <resultMap id="AgentConversationFolderResultMap" type="com.itxiang.evidence.entity.AgentConversationFolder">
+        <id property="id" column="id"/>
+        <result property="userId" column="user_id"/>
+        <result property="name" column="name"/>
+        <result property="sortOrder" column="sort_order"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.AgentConversationFolder">
+        INSERT INTO agent_conversation_folder (
+            id,
+            user_id,
+            name,
+            sort_order
+        )
+        VALUES (
+            #{id},
+            #{userId},
+            #{name},
+            #{sortOrder}
+        )
+    </insert>
+
+    <select id="findByUserId" resultMap="AgentConversationFolderResultMap">
+        SELECT
+            id,
+            user_id,
+            name,
+            sort_order,
+            created_at,
+            updated_at
+        FROM agent_conversation_folder
+        WHERE user_id = #{userId}
+        ORDER BY sort_order ASC, updated_at DESC, id ASC
+    </select>
+
+    <select id="findByIdAndUserId" resultMap="AgentConversationFolderResultMap">
+        SELECT
+            id,
+            user_id,
+            name,
+            sort_order,
+            created_at,
+            updated_at
+        FROM agent_conversation_folder
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </select>
+
+    <select id="nextSortOrder" resultType="java.lang.Integer">
+        SELECT COALESCE(MAX(sort_order), 0) + 1
+        FROM agent_conversation_folder
+        WHERE user_id = #{userId}
+    </select>
+
+    <update id="update" parameterType="com.itxiang.evidence.entity.AgentConversationFolder">
+        UPDATE agent_conversation_folder
+        SET name = #{name},
+            sort_order = #{sortOrder},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </update>
+
+    <delete id="deleteByIdAndUserId">
+        DELETE FROM agent_conversation_folder
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </delete>
+</mapper>

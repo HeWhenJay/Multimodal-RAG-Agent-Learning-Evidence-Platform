@@ -1,134 +1,181 @@
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
-import { Archive, BookOpenCheck, Bot, Check, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FileText, Highlighter, Loader2, MessageCircle, RotateCcw, Save, Search, Send, ShieldCheck, Sparkles, ThumbsUp, Trash2, TriangleAlert, Upload, XCircle } from 'lucide-react';
-import { type ReactNode, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { archiveAgentMemory, confirmAgentMemory, createAgentTask, decideAgentReview, deleteAgentMemory, fetchAgentMemories, fetchAgentTask, fetchAgentTools, rejectAgentMemory, undoAgentOperation } from '../../api/agent';
-import { deleteResumeTemplate, exportResumeTemplate, fetchMaterial, fetchMaterials, fetchResumeTemplates, generateResumePatches, uploadResumeTemplate, validateResumePatches } from '../../api/rag';
-import type { AgentHumanReview, AgentMemory, AgentOperation, AgentTask, AgentToolCall, AgentToolDefinition, LearningMaterial, ResumeContentPatch, ResumePatchDraft, ResumeTemplate, ResumeTemplateExport } from '../../api/types';
+import {
+  Archive,
+  Bot,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  Circle,
+  Clock3,
+  History,
+  Info,
+  Layers3,
+  ListChecks,
+  Loader2,
+  MessageCircle,
+  PanelTopOpen,
+  RotateCcw,
+  Search,
+  Send,
+  Trash2,
+  X,
+  XCircle
+} from 'lucide-react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import {
+  archiveAgentMemory,
+  confirmAgentMemory,
+  createAgentTask,
+  decideAgentReview,
+  deleteAgentMemory,
+  fetchAgentMemories,
+  fetchAgentTask,
+  fetchAgentTaskMessages,
+  fetchAgentTasks,
+  rejectAgentMemory,
+  subscribeAgentTask,
+  undoAgentOperation
+} from '../../api/agent';
+import type { AgentChatMessage, AgentHumanReview, AgentMemory, AgentOperation, AgentStreamEvent, AgentTask, AgentToolCall } from '../../api/types';
 import { MarkdownText } from '../../components/MarkdownText';
 
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELED']);
 
-type AgentWorkspaceMode = 'read' | 'planning' | 'general';
-type ReadToolMode = 'rag' | 'coverage';
+type AgentWorkspaceMode = 'read' | 'free_explore';
+type DetailTab = 'environment' | 'progress' | 'plan' | 'evidence' | 'approval' | 'history';
 
-interface AgentOption<T extends string> {
-  value: T;
-  label: string;
+interface FeatureOption {
+  value: AgentWorkspaceMode;
+  title: string;
   description: string;
-  badge?: string;
-  icon?: ReactNode;
+  icon: ReactNode;
+  tags: string[];
+  defaultGoal: string;
 }
 
-const MODE_OPTIONS: Array<AgentOption<AgentWorkspaceMode> & { features: string[] }> = [
+const COPY = {
+  readTitle: '\u53ea\u8bfb\u95ee\u7b54',
+  readDesc: '\u53ea\u8bfb\u53d6\u5f53\u524d\u77e5\u8bc6\u5e93\u548c\u4efb\u52a1\u4e0a\u4e0b\u6587\uff0c\u751f\u6210\u5e26\u8bc1\u636e\u7684\u56de\u7b54\uff0c\u4e0d\u5199\u5165\u4e1a\u52a1\u6570\u636e\u3002',
+  freeTitle: '\u81ea\u7531\u63a2\u7d22',
+  freeDesc: '\u81ea\u7531\u63d0\u95ee\u3001\u6574\u7406\u60f3\u6cd5\u3001\u62c6\u89e3\u5b66\u4e60\u4e3b\u9898\uff0c\u4f18\u5148\u8054\u7f51\u67e5\u8be2\u83b7\u53d6\u5916\u90e8\u8d44\u6599\uff0cRAG \u4ec5\u4f5c\u4e3a\u672c\u5730\u8bc1\u636e\u8865\u5145\u6216\u964d\u7ea7\u8def\u5f84\u3002',
+  emptyTitle: '\u4eca\u5929\u60f3\u8ba9 Agent \u5e2e\u4f60\u5904\u7406\u4ec0\u4e48\uff1f',
+  emptyDesc: '\u9009\u62e9\u529f\u80fd\u540e\u76f4\u63a5\u63cf\u8ff0\u76ee\u6807\uff0cAgent \u4f1a\u6574\u7406\u8ba1\u5212\u3001\u68c0\u7d22\u4f9d\u636e\u5e76\u7ed9\u51fa\u53ef\u8ffd\u8e2a\u7ed3\u679c\u3002',
+  composerPlaceholder: '\u63cf\u8ff0\u4f60\u7684\u76ee\u6807\uff0cAgent \u4f1a\u5904\u7406\u8ba1\u5212\u3001\u68c0\u7d22\u4f9d\u636e\u548c\u6700\u7ec8\u56de\u7b54',
+  taskPanel: '\u4efb\u52a1\u9762\u677f',
+  environment: '\u73af\u5883\u4fe1\u606f',
+  progress: '\u8fdb\u5ea6',
+  plan: '\u8ba1\u5212',
+  evidence: '\u4f9d\u636e',
+  approval: '\u5ba1\u6279',
+  history: '\u5386\u53f2',
+  userGoal: '\u7528\u6237\u76ee\u6807',
+  executionNote: '\u6267\u884c\u8bf4\u660e',
+  reasoningSummary: '\u601d\u8003\u6458\u8981',
+  finalAnswer: '\u6700\u7ec8\u56de\u7b54',
+  toolCall: '\u5de5\u5177\u8c03\u7528',
+  changeOperation: '\u53d8\u66f4\u64cd\u4f5c',
+  memoryConfirm: '\u8bb0\u5fc6\u786e\u8ba4',
+  contextSummary: '\u4e0a\u4e0b\u6587\u538b\u7f29',
+  defaultGoalRead: '\u6211\u7684\u77e5\u8bc6\u5e93\u91cc Redis \u5b66\u5230\u4e86\u4ec0\u4e48\uff1f',
+  defaultGoalFree: '\u5e2e\u6211\u6574\u7406\u4e00\u4e2a\u65b0\u7684\u5b66\u4e60\u4e3b\u9898\uff0c\u6216\u7ed3\u5408 JD \u548c\u89c6\u9891\u5b66\u4e60\u8bc1\u636e\u5206\u6790\u4e0b\u4e00\u6b65\u8d44\u6599\u6536\u96c6\u5efa\u8bae\u3002'
+};
+
+const FEATURE_OPTIONS: FeatureOption[] = [
   {
     value: 'read',
-    label: '只读问答',
-    description: '从当前知识库检索并回答，保留 evidence 引用，不写入查询历史或业务数据。',
-    badge: '无需审批',
-    icon: <Search size={18} />,
-    features: ['RAG 非持久化探针', '检索覆盖诊断', '只读工具观察']
+    title: COPY.readTitle,
+    description: COPY.readDesc,
+    icon: <Search size={17} />,
+    tags: ['\u9ed8\u8ba4', '\u53ea\u8bfb', '\u65e0\u9700\u5ba1\u6279'],
+    defaultGoal: COPY.defaultGoalRead
   },
   {
-    value: 'planning',
-    label: 'JD 适配规划',
-    description: '分析岗位 JD、简历摘要和学习证据，生成证据对齐、能力缺口、学习建议和可审批草稿。',
-    badge: '计划审批',
-    icon: <BookOpenCheck size={18} />,
-    features: ['JD/简历证据对齐', '能力缺口分析', '输出确认与保存审批']
-  },
-  {
-    value: 'general',
-    label: '自由探索',
-    description: '用于自然语言探索知识库、视频 evidence 和松散学习资料；真正写入 RAG 库仍走资料上传入口。',
-    badge: '探索模式',
-    icon: <MessageCircle size={18} />,
-    features: ['自由提问', '视频证据自然检索', '入库路径提示']
+    value: 'free_explore',
+    title: COPY.freeTitle,
+    description: COPY.freeDesc,
+    icon: <MessageCircle size={17} />,
+    tags: ['\u63a2\u7d22', '\u53ea\u8bfb\u8fb9\u754c'],
+    defaultGoal: COPY.defaultGoalFree
   }
 ];
 
-const TOOL_MODE_OPTIONS: Array<AgentOption<ReadToolMode>> = [
-  {
-    value: 'rag',
-    label: 'RAG 非持久化探针',
-    description: '临时检索当前用户知识库，返回答案、引用和扩展查询，不写 rag_query_history。',
-    badge: '推荐'
-  },
-  {
-    value: 'coverage',
-    label: '检索覆盖诊断',
-    description: '查看召回分布、资料类型覆盖和证据数量，适合判断资料是否需要补充。',
-    badge: '诊断'
-  }
+const DETAIL_TABS: Array<{ value: DetailTab; label: string; icon: ReactNode }> = [
+  { value: 'environment', label: COPY.environment, icon: <Info size={15} /> },
+  { value: 'progress', label: COPY.progress, icon: <ListChecks size={15} /> },
+  { value: 'plan', label: COPY.plan, icon: <Layers3 size={15} /> },
+  { value: 'evidence', label: COPY.evidence, icon: <Search size={15} /> },
+  { value: 'approval', label: COPY.approval, icon: <CheckCircle2 size={15} /> },
+  { value: 'history', label: COPY.history, icon: <History size={15} /> }
 ];
 
-const DOCUMENT_TYPE_OPTIONS: Array<AgentOption<string>> = [
-  { value: '', label: '全部资料', description: '不限制资料类型，按当前用户知识库统一检索。' },
-  { value: 'markdown', label: 'Markdown', description: '优先检索 Markdown 笔记、课程整理和技术文档。' },
-  { value: 'pdf', label: 'PDF', description: '优先检索 PDF 课件、论文、书籍和报告。' },
-  { value: 'text', label: '文本', description: '优先检索纯文本资料和粘贴内容。' }
-];
-
-// Agent 工作台负责创建只读任务和规划类任务，并展示审批闭环。
 export function AgentWorkspace() {
-  const [goal, setGoal] = useState('我的知识库里 Redis 学到了什么？');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [goal, setGoal] = useState('');
   const [workspaceMode, setWorkspaceMode] = useState<AgentWorkspaceMode>('read');
-  const [toolMode, setToolMode] = useState<ReadToolMode>('rag');
-  const [topK, setTopK] = useState(5);
-  const [documentType, setDocumentType] = useState('');
-  const [jobDescription, setJobDescription] = useState('岗位要求熟悉 Java、Spring Boot、Redis、MySQL，有 RAG 项目经验优先。');
-  const [resumeText, setResumeText] = useState('');
-  const [resumeMaterials, setResumeMaterials] = useState<LearningMaterial[]>([]);
-  const [selectedResumeMaterialId, setSelectedResumeMaterialId] = useState<number | null>(null);
-  const [resumeMaterialsLoading, setResumeMaterialsLoading] = useState(false);
-  const [resumeMaterialDetailLoadingId, setResumeMaterialDetailLoadingId] = useState<number | null>(null);
-  const [resumeMaterialError, setResumeMaterialError] = useState('');
-  const [saveDraft, setSaveDraft] = useState(false);
-  const [enableWebSearch, setEnableWebSearch] = useState(false);
-  const [webSearchQuery, setWebSearchQuery] = useState('');
-  const [selectedResumeTemplateId, setSelectedResumeTemplateId] = useState('');
-  const [resumeTemplates, setResumeTemplates] = useState<ResumeTemplate[]>([]);
-  const [templateLoading, setTemplateLoading] = useState(false);
-  const [templateUploading, setTemplateUploading] = useState(false);
-  const [templateDeleting, setTemplateDeleting] = useState('');
-  const [templateError, setTemplateError] = useState('');
-  const [resumePatchDraft, setResumePatchDraft] = useState<ResumePatchDraft | null>(null);
-  const [resumePatchExport, setResumePatchExport] = useState<ResumeTemplateExport | null>(null);
-  const [resumePatchBusy, setResumePatchBusy] = useState(false);
-  const [resumePatchMessage, setResumePatchMessage] = useState('');
-  const [resumePatchError, setResumePatchError] = useState('');
+  const [featurePanelOpen, setFeaturePanelOpen] = useState(false);
+  const [detailPanelOpen, setDetailPanelOpen] = useState(false);
+  const [detailTab, setDetailTab] = useState<DetailTab>('progress');
   const [task, setTask] = useState<AgentTask | null>(null);
-  const [tools, setTools] = useState<AgentToolDefinition[]>([]);
+  const [historyTasks, setHistoryTasks] = useState<AgentTask[]>([]);
   const [memories, setMemories] = useState<AgentMemory[]>([]);
-  const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryAction, setMemoryAction] = useState('');
   const [memoryError, setMemoryError] = useState('');
+  const [conversationMessages, setConversationMessages] = useState<AgentChatMessage[]>([]);
+  const [hasMoreBefore, setHasMoreBefore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [reviewing, setReviewing] = useState('');
   const [undoing, setUndoing] = useState('');
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState('');
+  const featureMenuRef = useRef<HTMLDivElement | null>(null);
+  const detailPanelRef = useRef<HTMLDivElement | null>(null);
+  const streamRef = useRef<EventSource | null>(null);
+
+  const activeFeature = findFeature(workspaceMode);
+  const hasConversation = Boolean(task);
+  const visibleMessages = conversationMessages.length ? conversationMessages : (task?.messages || []);
+  const hasServerMessages = Boolean(visibleMessages.length);
+  const pendingReviews = (task?.reviews || []).filter((review) => review.status === 'PENDING');
+  const pendingMemoryCandidates = memories.filter((item) => item.status === 'PENDING_REVIEW');
+  const finalAnswer = stringValue(task?.final?.answer);
+  const draftSummary = stringValue(task?.draft?.matchSummary) || stringValue(task?.draft?.answer);
+  const backendNotice = task ? buildBackendNotice(task) : '';
+  const evidenceIds = useMemo(() => uniqueList([...normalizeStringList(task?.final?.evidenceIds), ...normalizeStringList(task?.draft?.evidenceIds)]), [task?.final, task?.draft]);
+  const expandedQueries = useMemo(() => normalizeStringList(task?.final?.expandedQueries || task?.draft?.expandedQueries), [task?.final, task?.draft]);
+  const progressSteps = useMemo(() => buildProgressSteps(task), [task]);
+  const routeTaskId = searchParams.get('taskId') || '';
 
   useEffect(() => {
-    void fetchAgentTools()
-      .then(setTools)
-      .catch((toolError) => setError(toolError instanceof Error ? toolError.message : '工具能力加载失败'));
     void loadMemories();
+    void loadHistory();
+    return () => {
+      streamRef.current?.close();
+    };
   }, []);
 
   useEffect(() => {
-    if (workspaceMode !== 'planning') {
-      setTemplateError('');
-      setResumeMaterialError('');
-      clearResumePatchState();
-      return;
-    }
-    void loadResumeTemplateHistory();
-    void loadResumeMaterials();
-  }, [workspaceMode]);
+    if (!routeTaskId || routeTaskId === task?.id) return;
+    void openHistoryTask(routeTaskId);
+  }, [routeTaskId, task?.id]);
 
   useEffect(() => {
-    if (!task?.id || TERMINAL_STATUSES.has(task.status)) {
+    function closeOnOutside(event: MouseEvent) {
+      const target = event.target as Node;
+      if (featureMenuRef.current && !featureMenuRef.current.contains(target)) {
+        setFeaturePanelOpen(false);
+      }
+      if (detailPanelRef.current && !detailPanelRef.current.contains(target)) {
+        setDetailPanelOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', closeOnOutside);
+    return () => document.removeEventListener('mousedown', closeOnOutside);
+  }, []);
+
+  useEffect(() => {
+    if (!task?.id || task.status === 'CREATING' || TERMINAL_STATUSES.has(task.status)) {
       setPolling(false);
       return undefined;
     }
@@ -139,364 +186,242 @@ export function AgentWorkspace() {
     return () => window.clearInterval(timer);
   }, [task?.id, task?.status]);
 
-  const finalAnswer = stringValue(task?.final?.answer);
-  const evidenceIds = useMemo(() => normalizeStringList(task?.final?.evidenceIds), [task?.final]);
-  const draftEvidenceIds = useMemo(() => normalizeStringList(task?.draft?.evidenceIds), [task?.draft]);
-  const expandedQueries = useMemo(() => normalizeStringList(task?.final?.expandedQueries || task?.draft?.expandedQueries), [task?.final, task?.draft]);
-  const readTools = tools.filter((item) => item.toolType === 'READ');
-  const mutationTools = tools.filter((item) => item.toolType === 'MUTATION');
-  const pendingReviews = (task?.reviews || []).filter((review) => review.status === 'PENDING');
-  const usedMemoryContext = useMemo(
-    () => normalizeRecordList(task?.final?.memoryContext || task?.draft?.memoryContext),
-    [task?.final, task?.draft]
-  );
-  const pendingMemoryCandidates = memories.filter((item) => item.status === 'PENDING_REVIEW');
-  const visibleMemories = memories.slice(0, 8);
-  const taskType = workspaceMode === 'planning' ? 'planning_task' : 'pure_read_query';
-  const activeMode = MODE_OPTIONS.find((item) => item.value === workspaceMode) || MODE_OPTIONS[0];
-  const selectedResumeTemplate = useMemo(
-    () => resumeTemplates.find((item) => item.templateId === selectedResumeTemplateId) || null,
-    [resumeTemplates, selectedResumeTemplateId]
-  );
-  const selectedResumeMaterial = useMemo(
-    () => resumeMaterials.find((item) => item.id === selectedResumeMaterialId) || null,
-    [resumeMaterials, selectedResumeMaterialId]
-  );
-  const resumePatchConfirmedCount = useMemo(
-    () => (resumePatchDraft?.patches || []).filter((patch) => patch.status === 'CONFIRMED' || patch.status === 'VALIDATED').length,
-    [resumePatchDraft]
-  );
-
-  // 读取当前用户上传过的 DOCX 简历模板历史。
-  async function loadResumeTemplateHistory() {
-    try {
-      setTemplateLoading(true);
-      setTemplateError('');
-      const templates = await fetchResumeTemplates(12);
-      setResumeTemplates(templates);
-      if (selectedResumeTemplateId && !templates.some((item) => item.templateId === selectedResumeTemplateId)) {
-        setSelectedResumeTemplateId('');
-      }
-    } catch (loadError) {
-      setTemplateError(loadError instanceof Error ? loadError.message : '简历模板历史加载失败');
-    } finally {
-      setTemplateLoading(false);
+  function chooseFeature(feature: FeatureOption) {
+    setWorkspaceMode(feature.value);
+    setFeaturePanelOpen(false);
+    setError('');
+    if (!goal.trim() || FEATURE_OPTIONS.some((item) => item.defaultGoal === goal)) {
+      setGoal(feature.defaultGoal);
     }
   }
 
-  // 读取用户已上传的资料，从中筛选可作为简历来源的文档。
-  async function loadResumeMaterials() {
-    try {
-      setResumeMaterialsLoading(true);
-      setResumeMaterialError('');
-      const materials = await fetchMaterials();
-      const candidates = rankResumeMaterials(materials);
-      setResumeMaterials(candidates);
-      if (selectedResumeMaterialId && !candidates.some((item) => item.id === selectedResumeMaterialId)) {
-        setSelectedResumeMaterialId(null);
-        setResumeText('');
-      }
-    } catch (loadError) {
-      setResumeMaterialError(loadError instanceof Error ? loadError.message : '已上传简历资料加载失败');
-    } finally {
-      setResumeMaterialsLoading(false);
-    }
-  }
-
-  // 选择一份已上传简历，读取解析摘要作为 Agent 的简历摘要输入。
-  async function selectResumeMaterial(material: LearningMaterial) {
-    setSelectedResumeMaterialId(material.id);
-    setResumeMaterialError('');
-    setResumeText((material.documentSummary || '').trim());
-    if ((material.documentSummary || '').trim()) {
-      clearResumePatchState();
-      return;
-    }
-    try {
-      setResumeMaterialDetailLoadingId(material.id);
-      const detail = await fetchMaterial(material.id);
-      setResumeMaterials((previous) => rankResumeMaterials(previous.map((item) => item.id === detail.id ? detail : item)));
-      setResumeText((detail.documentSummary || '').trim());
-      if (!(detail.documentSummary || '').trim()) {
-        setResumeMaterialError('选中的简历资料尚未生成摘要，请等待解析完成或重新上传后再创建 JD 适配任务');
-      }
-    } catch (detailError) {
-      setResumeMaterialError(detailError instanceof Error ? detailError.message : '简历资料摘要读取失败');
-    } finally {
-      setResumeMaterialDetailLoadingId(null);
-      clearResumePatchState();
-    }
-  }
-
-  // 选择历史模板，供后续进入预览确认页或生成补丁草稿使用。
-  function selectResumeTemplate(template: ResumeTemplate) {
-    if (!templateCanFill(template)) {
-      setTemplateError('该模板尚未解析完成，请等待解析成功后再使用');
-      return;
-    }
-    setTemplateError('');
-    setSelectedResumeTemplateId(template.templateId);
-    clearResumePatchState();
-  }
-
-  // 上传新的 DOCX 模板并立即加入历史模板列表。
-  async function submitResumeTemplate(file: File | null) {
-    if (!file) return;
-    try {
-      setTemplateUploading(true);
-      setTemplateError('');
-      const uploaded = await uploadResumeTemplate(file);
-      setResumeTemplates((previous) => [
-        uploaded,
-        ...previous.filter((item) => item.templateId !== uploaded.templateId)
-      ]);
-      setSelectedResumeTemplateId(uploaded.templateId);
-      clearResumePatchState();
-    } catch (uploadError) {
-      setTemplateError(uploadError instanceof Error ? uploadError.message : '简历模板上传解析失败');
-    } finally {
-      setTemplateUploading(false);
-    }
-  }
-
-  // 基于 Agent 页面的岗位 JD 生成字段级简历补丁草稿。
-  async function generateResumePatchDraft(useConfirmedAnnotations: boolean) {
-    if (!selectedResumeTemplate) {
-      setResumePatchError('请先选择简历模板');
-      return;
-    }
-    if (!jobDescription.trim()) {
-      setResumePatchError('请先填写岗位 JD');
-      return;
-    }
-    if (!selectedResumeMaterial || !resumeText.trim()) {
-      setResumePatchError('请先选择已上传简历资料，并等待系统读取到解析摘要');
-      return;
-    }
-    try {
-      setResumePatchBusy(true);
-      setResumePatchError('');
-      setResumePatchMessage('');
-      setResumePatchExport(null);
-      const draft = await generateResumePatches(selectedResumeTemplate.templateId, {
-        version: selectedResumeTemplate.version,
-        jobDescription,
-        resumeText,
-        resumeMaterialId: selectedResumeMaterial.id,
-        resumeMaterialTitle: selectedResumeMaterial.title,
-        topK,
-        useConfirmedAnnotations
-      });
-      setResumePatchDraft(draft);
-      setResumePatchMessage(draft.validationErrors.length ? '补丁草稿已生成，但仍有校验提示需要处理' : '补丁草稿已生成，请逐条确认或拒绝');
-    } catch (generateError) {
-      setResumePatchError(generateError instanceof Error ? generateError.message : '简历补丁草稿生成失败');
-    } finally {
-      setResumePatchBusy(false);
-    }
-  }
-
-  // 更新单条补丁状态或内容，并清除旧导出结果。
-  function updateResumePatch(fieldId: string, updater: (patch: ResumeContentPatch) => ResumeContentPatch, feedback = '') {
-    setResumePatchDraft((previous) => {
-      if (!previous) return previous;
-      return {
-        ...previous,
-        status: 'DRAFT',
-        validationErrors: [],
-        patches: previous.patches.map((patch) => patch.fieldId === fieldId ? updater(patch) : patch)
-      };
-    });
-    setResumePatchExport(null);
-    setResumePatchMessage(feedback);
-    setResumePatchError('');
-  }
-
-  // 校验用户确认后的字段补丁。
-  async function validateResumePatchDraft() {
-    if (!selectedResumeTemplate || !resumePatchDraft) return;
-    try {
-      setResumePatchBusy(true);
-      setResumePatchError('');
-      setResumePatchMessage('');
-      const result = await validateResumePatches(selectedResumeTemplate.templateId, {
-        version: selectedResumeTemplate.version,
-        patchDraftId: resumePatchDraft.patchDraftId,
-        patches: resumePatchDraft.patches
-      });
-      setResumePatchDraft(result);
-      setResumePatchMessage(result.validationErrors.length ? '补丁仍有校验问题，请处理后再次校验' : '补丁已通过校验，可以导出 DOCX');
-    } catch (validateError) {
-      setResumePatchError(validateError instanceof Error ? validateError.message : '简历补丁校验失败');
-    } finally {
-      setResumePatchBusy(false);
-    }
-  }
-
-  // 导出确认后的 DOCX 新版本。
-  async function exportResumePatchDraft() {
-    if (!selectedResumeTemplate || !resumePatchDraft) return;
-    try {
-      setResumePatchBusy(true);
-      setResumePatchError('');
-      setResumePatchMessage('');
-      const result = await exportResumeTemplate(selectedResumeTemplate.templateId, {
-        version: selectedResumeTemplate.version,
-        patchDraftId: resumePatchDraft.patchDraftId,
-        idempotencyKey: `${selectedResumeTemplate.templateId}-${resumePatchDraft.patchDraftId}-${resumePatchConfirmedCount}`
-      });
-      setResumePatchExport(result);
-      setResumePatchMessage('确认后的简历 DOCX 已导出');
-    } catch (exportError) {
-      setResumePatchError(exportError instanceof Error ? exportError.message : '简历 DOCX 导出失败');
-    } finally {
-      setResumePatchBusy(false);
-    }
-  }
-
-  function clearResumePatchState() {
-    setResumePatchDraft(null);
-    setResumePatchExport(null);
-    setResumePatchBusy(false);
-    setResumePatchMessage('');
-    setResumePatchError('');
-  }
-
-  // 创建 Agent 任务。
   async function submit() {
     const trimmedGoal = goal.trim();
     if (!trimmedGoal) {
-      setError('请输入 Agent 目标');
+      setError('\u8bf7\u8f93\u5165\u8981\u4ea4\u7ed9 Agent \u7684\u76ee\u6807');
       return;
     }
-    if (taskType === 'planning_task' && !selectedResumeMaterialId) {
-      setError('请选择已上传的简历资料，系统会使用该资料的解析摘要进行 JD 适配');
-      return;
-    }
-    if (taskType === 'planning_task' && !resumeText.trim()) {
-      setError('选中的简历资料暂无可用摘要，请等待解析完成、重新上传或先在资料库修复解析');
-      return;
-    }
+    const taskType = workspaceMode === 'read' ? 'pure_read_query' : 'planning_task';
+    const enableWebSearch = workspaceMode === 'free_explore';
+    const input = {
+      goal: buildGoalForMode(workspaceMode, trimmedGoal),
+      workspaceMode,
+      topK: 5,
+      candidateMultiplier: 4,
+      enableWebSearch,
+      webSearchQuery: enableWebSearch ? trimmedGoal : undefined,
+      toolHints: buildToolHints(workspaceMode)
+    };
+    const optimisticTask: AgentTask = {
+      id: `local-pending-${Date.now()}`,
+      taskType,
+      status: 'CREATING',
+      title: trimmedGoal.slice(0, 48),
+      input,
+      plan: {},
+      draft: {
+        message: '\u6b63\u5728\u521b\u5efa Agent \u4efb\u52a1\uff0c\u5efa\u7acb\u4e0e\u540e\u7aef\u7684\u4e8b\u4ef6\u6d41\u8fde\u63a5\u3002'
+      },
+      final: {},
+      toolCalls: [],
+      reviews: [],
+      operations: []
+    };
     try {
+      streamRef.current?.close();
+      streamRef.current = null;
+      setTask(optimisticTask);
+      setDetailTab('progress');
       setSubmitting(true);
       setError('');
-      const metadataFilter: Record<string, unknown> = {};
-      if (documentType) {
-        metadataFilter.documentType = documentType;
-      }
       const created = await createAgentTask({
         taskType,
         title: trimmedGoal.slice(0, 48),
-        input: {
-          goal: buildGoalForMode(workspaceMode, trimmedGoal),
-          topK,
-          candidateMultiplier: 4,
-          jobDescription: taskType === 'planning_task' ? jobDescription : undefined,
-          resumeText: taskType === 'planning_task' ? resumeText : undefined,
-          toolHints: taskType === 'planning_task'
-            ? [
-                'resume_evidence_aligner',
-                'gap_analyzer',
-                ...(saveDraft ? ['resume_revision_save'] : []),
-                ...(enableWebSearch ? ['web_search_probe'] : [])
-              ]
-            : [toolMode === 'coverage' ? 'retrieval_coverage_probe' : 'rag_query_probe_non_persistent'],
-          workspaceMode,
-          saveDraft: taskType === 'planning_task' ? saveDraft : undefined,
-          enableWebSearch: taskType === 'planning_task' ? enableWebSearch : undefined,
-          webSearchQuery: taskType === 'planning_task' && webSearchQuery.trim() ? webSearchQuery.trim() : undefined,
-          webSearchMaxResults: taskType === 'planning_task' && enableWebSearch ? 5 : undefined,
-          resumeMaterialId: taskType === 'planning_task' && selectedResumeMaterial ? selectedResumeMaterial.id : undefined,
-          resumeMaterialTitle: taskType === 'planning_task' && selectedResumeMaterial ? selectedResumeMaterial.title : undefined,
-          resumeTemplateId: taskType === 'planning_task' && selectedResumeTemplateId ? selectedResumeTemplateId : undefined,
-          metadataFilter
-        }
+        input
       });
       setTask(created);
+      applyTaskMessages(created);
+      setSearchParams({ taskId: created.id });
+      setDetailTab('progress');
+      setPolling(true);
+      setGoal(trimmedGoal);
+      connectTaskStream(created.id);
       void refreshTask(created.id);
+      void loadHistory();
+      notifyConversationTreeChanged();
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'Agent 任务创建失败');
+      const message = submitError instanceof Error ? submitError.message : 'Agent \u4efb\u52a1\u521b\u5efa\u5931\u8d25';
+      setTask({
+        ...optimisticTask,
+        status: 'FAILED',
+        errorCode: 'AGENT_CREATE_FAILED',
+        errorMessage: message
+      });
+      setError('');
     } finally {
       setSubmitting(false);
     }
   }
 
-  // 加载当前用户可管理的 Agent 记忆。
+  async function loadHistory() {
+    try {
+      setHistoryLoading(true);
+      const items = await fetchAgentTasks(24);
+      setHistoryTasks(items);
+    } catch {
+      setHistoryTasks([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function openHistoryTask(taskId: string) {
+    try {
+      setError('');
+      const latest = await fetchAgentTask(taskId);
+      setTask(latest);
+      applyTaskMessages(latest);
+      setSearchParams({ taskId: latest.id });
+      setGoal(displayUserGoal(latest.input?.goal || latest.title || ''));
+      setWorkspaceMode(normalizeMode(latest.input?.workspaceMode));
+      setDetailTab('progress');
+      setDetailPanelOpen(false);
+      connectTaskStream(latest.id);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : '\u5386\u53f2\u4f1a\u8bdd\u8bfb\u53d6\u5931\u8d25');
+    }
+  }
+
   async function loadMemories() {
     try {
-      setMemoryLoading(true);
       setMemoryError('');
       const items = await fetchAgentMemories();
       setMemories(items);
     } catch (loadError) {
-      setMemoryError(loadError instanceof Error ? loadError.message : 'Agent 记忆加载失败');
-    } finally {
-      setMemoryLoading(false);
+      setMemoryError(loadError instanceof Error ? loadError.message : 'Agent \u8bb0\u5fc6\u52a0\u8f7d\u5931\u8d25');
     }
   }
 
-  // 执行记忆确认、拒绝、归档或删除，并刷新列表。
   async function actOnMemory(memory: AgentMemory, action: 'confirm' | 'reject' | 'archive' | 'delete') {
-    if (action === 'delete' && !window.confirm('确认删除这条 Agent 记忆？删除后正文会被擦除。')) {
-      return;
-    }
+    if (action === 'delete' && !window.confirm('\u786e\u8ba4\u5220\u9664\u8fd9\u6761 Agent \u8bb0\u5fc6\uff1f\u5220\u9664\u540e\u6b63\u6587\u4f1a\u88ab\u64e6\u9664\u3002')) return;
     try {
       setMemoryAction(`${memory.id}-${action}`);
       setMemoryError('');
-      if (action === 'confirm') {
-        await confirmAgentMemory(memory.id);
-      } else if (action === 'reject') {
-        await rejectAgentMemory(memory.id);
-      } else if (action === 'archive') {
-        await archiveAgentMemory(memory.id);
-      } else {
-        await deleteAgentMemory(memory.id);
-      }
+      if (action === 'confirm') await confirmAgentMemory(memory.id);
+      else if (action === 'reject') await rejectAgentMemory(memory.id);
+      else if (action === 'archive') await archiveAgentMemory(memory.id);
+      else await deleteAgentMemory(memory.id);
       await loadMemories();
     } catch (actionError) {
-      setMemoryError(actionError instanceof Error ? actionError.message : 'Agent 记忆操作失败');
+      setMemoryError(actionError instanceof Error ? actionError.message : 'Agent \u8bb0\u5fc6\u64cd\u4f5c\u5931\u8d25');
     } finally {
       setMemoryAction('');
     }
   }
 
-  // 删除当前用户上传的历史模板，并同步清理页面选中状态。
-  async function removeResumeTemplate(templateId: string) {
-    if (!templateId || !window.confirm('确认删除这份简历模板及其预览、草稿和导出记录？')) {
-      return;
-    }
-    try {
-      setTemplateDeleting(templateId);
-      setTemplateError('');
-      await deleteResumeTemplate(templateId);
-      setResumeTemplates((previous) => previous.filter((item) => item.templateId !== templateId));
-      if (selectedResumeTemplateId === templateId) {
-        setSelectedResumeTemplateId('');
-        clearResumePatchState();
-      }
-    } catch (deleteError) {
-      setTemplateError(deleteError instanceof Error ? deleteError.message : '简历模板删除失败');
-    } finally {
-      setTemplateDeleting('');
-    }
-  }
-
-  // 轮询 Java 任务详情。
   async function refreshTask(taskId: string) {
     try {
       const latest = await fetchAgentTask(taskId);
       setTask(latest);
+      applyTaskMessages(latest);
+      notifyConversationTreeChanged();
       if (TERMINAL_STATUSES.has(latest.status)) {
         setPolling(false);
         void loadMemories();
+        void loadHistory();
       }
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : 'Agent 任务刷新失败');
+      setError(loadError instanceof Error ? loadError.message : 'Agent \u4efb\u52a1\u5237\u65b0\u5931\u8d25');
       setPolling(false);
     }
   }
 
-  // 提交计划或输出审批。
+  function connectTaskStream(taskId: string) {
+    streamRef.current?.close();
+    const source = subscribeAgentTask(taskId, {
+      onTask: (latest) => {
+        setTask(latest);
+        applyTaskMessages(latest);
+        notifyConversationTreeChanged();
+        if (TERMINAL_STATUSES.has(latest.status)) {
+          setPolling(false);
+          void loadMemories();
+          void loadHistory();
+        } else {
+          setPolling(true);
+        }
+      },
+      onAgentEvent: (event) => {
+        mergeStreamEvent(event);
+      },
+      onDone: () => {
+        setPolling(false);
+        void loadMemories();
+        void loadHistory();
+        notifyConversationTreeChanged();
+      },
+      onError: () => {
+        streamRef.current?.close();
+        streamRef.current = null;
+      }
+    });
+    streamRef.current = source;
+  }
+
+  function applyTaskMessages(latest: AgentTask) {
+    setConversationMessages((current) => mergeMessages(current, latest.messages || []));
+    setHasMoreBefore(Boolean(latest.hasMoreMessagesBefore));
+  }
+
+  async function loadOlderMessages() {
+    if (!task?.id || loadingOlder || !hasMoreBefore) return;
+    const oldest = oldestMessageSequence(conversationMessages);
+    if (!oldest) return;
+    try {
+      setLoadingOlder(true);
+      const page = await fetchAgentTaskMessages(task.id, { beforeSequenceNo: oldest, limit: 30 });
+      setConversationMessages((current) => mergeMessages(page.messages || [], current));
+      setHasMoreBefore(Boolean(page.hasMoreBefore));
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : '更早消息加载失败');
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
+
+  function mergeStreamEvent(event: AgentStreamEvent) {
+    if (!task || event.taskId !== task.id) return;
+    const draft = normalizeRecord(event.draft);
+    const message = stringValue(draft.message) || stringValue(event.errorMessage) || streamEventTitle(event.eventType);
+    if (!message) return;
+    const sourceKey = streamSourceKey(event, draft);
+    const dedupeKey = streamDedupeKey(event, draft, message);
+    const synthetic: AgentChatMessage = {
+      id: `stream-${dedupeKey}`,
+      taskId: event.taskId,
+      sequenceNo: null,
+      role: event.eventType === 'CONTEXT_COMPRESSED' ? 'SYSTEM' : 'ASSISTANT',
+      messageType: event.eventType === 'TOOL_CALL_STARTED' || event.eventType === 'TOOL_CALL_COMPLETED' ? 'TOOL_OBSERVATION' : event.eventType === 'CONTEXT_COMPRESSED' ? 'CONTEXT_SUMMARY' : 'STATUS',
+      content: message,
+      payload: {
+        ...draft,
+        eventType: event.eventType,
+        status: event.status,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolStatus: event.toolStatus,
+        errorCode: event.errorCode,
+        errorMessage: event.errorMessage
+      },
+      sourceEventType: event.eventType,
+      sourceId: sourceKey,
+      dedupeKey,
+      createdAt: event.createdAt || new Date().toISOString(),
+      updatedAt: event.createdAt || new Date().toISOString()
+    };
+    setConversationMessages((current) => mergeMessages(current, [synthetic]));
+  }
+
   async function decide(review: AgentHumanReview, decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') {
     if (!task) return;
     try {
@@ -504,21 +429,18 @@ export function AgentWorkspace() {
       setError('');
       const latest = await decideAgentReview(task.id, review.id, {
         decision,
-        comment: decision === 'APPROVED' ? '同意继续' : decision === 'REJECTED' ? '拒绝该审批' : '请调整计划或输出',
+        comment: decision === 'APPROVED' ? '\u540c\u610f\u7ee7\u7eed' : decision === 'REJECTED' ? '\u62d2\u7edd\u8be5\u5ba1\u6279' : '\u8bf7\u8c03\u6574\u8ba1\u5212\u6216\u8f93\u51fa',
         changes: {}
       });
       setTask(latest);
-      if (!TERMINAL_STATUSES.has(latest.status)) {
-        void refreshTask(latest.id);
-      }
+      if (!TERMINAL_STATUSES.has(latest.status)) void refreshTask(latest.id);
     } catch (reviewError) {
-      setError(reviewError instanceof Error ? reviewError.message : '审批提交失败');
+      setError(reviewError instanceof Error ? reviewError.message : '\u5ba1\u6279\u63d0\u4ea4\u5931\u8d25');
     } finally {
       setReviewing('');
     }
   }
 
-  // 撤销窗口内恢复 Agent 操作前状态。
   async function undoOperation(operation: AgentOperation) {
     if (!task) return;
     try {
@@ -526,806 +448,621 @@ export function AgentWorkspace() {
       setError('');
       await undoAgentOperation(operation.id, {
         idempotencyKey: `undo-${operation.id}`,
-        reason: '用户在 Agent 工作台撤销'
+        reason: '\u7528\u6237\u5728 Agent \u5de5\u4f5c\u53f0\u64a4\u9500'
       });
       await refreshTask(task.id);
     } catch (undoError) {
-      setError(undoError instanceof Error ? undoError.message : '撤销操作失败');
+      setError(undoError instanceof Error ? undoError.message : '\u64a4\u9500\u64cd\u4f5c\u5931\u8d25');
     } finally {
       setUndoing('');
     }
   }
 
   return (
-    <div className="page-stack">
-      <section className="page-heading">
-        <div>
-          <h2>Agent 任务</h2>
-          <p>只读检索、计划审批、JD/简历证据对齐和输出确认</p>
-        </div>
-        <div className={`status-pill ${taskStatusClass(task?.status)}`}>
-          {statusIcon(task?.status, submitting || polling)}
-          {task ? statusLabel(task.status) : '待创建'}
-        </div>
-      </section>
+    <div className={`agent-page-v2 ${hasConversation ? 'has-conversation' : 'is-empty'}`}>
+      <div className="agent-context-anchor" ref={detailPanelRef}>
+        <button className={detailPanelOpen ? 'agent-context-button is-open' : 'agent-context-button'} type="button" onClick={() => setDetailPanelOpen((open) => !open)}>
+          <PanelTopOpen size={17} />
+          <span>{COPY.taskPanel}</span>
+          {pendingReviews.length ? <em>{pendingReviews.length}</em> : null}
+        </button>
+        {detailPanelOpen ? (
+          <DetailPanel
+            activeFeature={activeFeature}
+            detailTab={detailTab}
+            evidenceIds={evidenceIds}
+            expandedQueries={expandedQueries}
+            historyLoading={historyLoading}
+            historyTasks={historyTasks}
+            memories={memories}
+            memoryAction={memoryAction}
+            memoryError={memoryError}
+            pendingMemoryCandidates={pendingMemoryCandidates}
+            pendingReviews={pendingReviews}
+            progressSteps={progressSteps}
+            reviewing={reviewing}
+            task={task}
+            undoing={undoing}
+            onClose={() => setDetailPanelOpen(false)}
+            onDecide={(review, decision) => void decide(review, decision)}
+            onMemoryAction={(memory, action) => void actOnMemory(memory, action)}
+            onOpenHistory={(taskId) => void openHistoryTask(taskId)}
+            onRefreshHistory={() => void loadHistory()}
+            onSetTab={setDetailTab}
+            onUndo={(operation) => void undoOperation(operation)}
+          />
+        ) : null}
+      </div>
 
-      <section className="agent-workspace-grid">
-        <article className="panel agent-compose-panel">
-          <div className="panel-title">
-            <h3><Bot size={20} />创建任务</h3>
-            <span className="status-pill"><ShieldCheck size={14} />Java 权限边界</span>
+      {!hasConversation ? (
+        <section className="agent-empty-center">
+          <div className="agent-empty-copy">
+            <h2>{COPY.emptyTitle}</h2>
+            <p>{COPY.emptyDesc}</p>
           </div>
-          <div className="agent-mode-cards" aria-label="任务模式">
-            {MODE_OPTIONS.map((mode) => (
-              <button
-                className={workspaceMode === mode.value ? 'agent-mode-card is-active' : 'agent-mode-card'}
-                key={mode.value}
-                onClick={() => setWorkspaceMode(mode.value)}
-                type="button"
-              >
-                <span className="agent-mode-card-head">
-                  <span className="agent-mode-icon">{mode.icon}</span>
-                  <span>
-                    <strong>{mode.label}</strong>
-                    <small>{mode.badge}</small>
-                  </span>
-                </span>
-                <span className="agent-mode-card-copy">{mode.description}</span>
-                <span className="agent-mode-feature-row">
-                  {mode.features.map((feature) => <span key={feature}>{feature}</span>)}
-                </span>
-              </button>
+          <Composer
+            activeFeature={activeFeature}
+            error={error}
+            featurePanelOpen={featurePanelOpen}
+            goal={goal}
+            submitting={submitting}
+            workspaceMode={workspaceMode}
+            featureMenuRef={featureMenuRef}
+            onChooseFeature={chooseFeature}
+            onGoalChange={setGoal}
+            onSubmit={() => void submit()}
+            onToggleFeature={() => setFeaturePanelOpen((open) => !open)}
+          />
+        </section>
+      ) : (
+        <main className="agent-conversation-main">
+          <div className="agent-chat-stream">
+            {hasServerMessages && task ? (
+              <ServerMessageStream
+                activeFeature={activeFeature}
+                error={error}
+                hasMoreBefore={hasMoreBefore}
+                loadingOlder={loadingOlder}
+                messages={visibleMessages}
+                polling={submitting || polling}
+                status={task.status}
+                onLoadOlder={() => void loadOlderMessages()}
+              />
+            ) : (
+              <LegacyTaskStream
+                activeFeature={activeFeature}
+                backendNotice={backendNotice}
+                draftSummary={draftSummary}
+                error={error}
+                evidenceIds={evidenceIds}
+                expandedQueries={expandedQueries}
+                finalAnswer={finalAnswer}
+                goal={goal}
+                polling={submitting || polling}
+                task={task}
+              />
+            )}
+            {pendingReviews.map((review) => (
+              <ReviewMessage key={review.id} review={review} reviewing={reviewing} onDecide={(decision) => void decide(review, decision)} />
             ))}
+            {(task?.operations || []).map((operation) => (
+              <OperationMessage key={operation.id} operation={operation} undoing={undoing === operation.id} onUndo={() => void undoOperation(operation)} />
+            ))}
+            {pendingMemoryCandidates.map((memory) => (
+              <ChatMessage key={memory.id} role="assistant" title={COPY.memoryConfirm}>
+                <MemoryItem memory={memory} busyAction={memoryAction} onAction={(action) => void actOnMemory(memory, action)} />
+              </ChatMessage>
+            ))}
+            {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} /> : null}
           </div>
-          <div className="agent-mode-guidance">
-            <div>
-              <strong>{activeMode.label}能做什么</strong>
-              <p>{activeMode.description}</p>
-            </div>
-            {workspaceMode === 'general' ? (
-              <Link className="agent-inline-link" to="/materials">
-                <Database size={15} />
-                <span>需要入库时去资料库上传</span>
-              </Link>
+          <div className="agent-bottom-composer">
+            <Composer
+              activeFeature={activeFeature}
+              error={error}
+              featurePanelOpen={featurePanelOpen}
+              goal={goal}
+              submitting={submitting}
+              workspaceMode={workspaceMode}
+              featureMenuRef={featureMenuRef}
+              onChooseFeature={chooseFeature}
+              onGoalChange={setGoal}
+              onSubmit={() => void submit()}
+              onToggleFeature={() => setFeaturePanelOpen((open) => !open)}
+            />
+          </div>
+        </main>
+      )}
+    </div>
+  );
+}
+
+function Composer({
+  activeFeature,
+  error,
+  featureMenuRef,
+  featurePanelOpen,
+  goal,
+  submitting,
+  workspaceMode,
+  onChooseFeature,
+  onGoalChange,
+  onSubmit,
+  onToggleFeature
+}: {
+  activeFeature: FeatureOption;
+  error: string;
+  featureMenuRef: { current: HTMLDivElement | null };
+  featurePanelOpen: boolean;
+  goal: string;
+  submitting: boolean;
+  workspaceMode: AgentWorkspaceMode;
+  onChooseFeature: (feature: FeatureOption) => void;
+  onGoalChange: (goal: string) => void;
+  onSubmit: () => void;
+  onToggleFeature: () => void;
+}) {
+  return (
+    <section className="agent-composer-v2">
+      <div className="agent-composer-box">
+        <textarea
+          value={goal}
+          onChange={(event) => onGoalChange(event.target.value)}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+              event.preventDefault();
+              onSubmit();
+            }
+          }}
+          placeholder={COPY.composerPlaceholder}
+          rows={3}
+        />
+        <div className="agent-composer-actions">
+          <div className="agent-feature-menu" ref={(node) => { featureMenuRef.current = node; }}>
+            <button className={featurePanelOpen ? 'agent-feature-trigger is-open' : 'agent-feature-trigger'} onClick={onToggleFeature} type="button">
+              {activeFeature.icon}
+              <span>{activeFeature.title}</span>
+              <ChevronDown size={15} />
+            </button>
+            {featurePanelOpen ? (
+              <div className="agent-feature-waterfall-v2" role="menu">
+                {FEATURE_OPTIONS.map((feature) => (
+                  <button className={workspaceMode === feature.value ? 'is-active' : ''} key={feature.value} onClick={() => onChooseFeature(feature)} type="button" role="menuitem">
+                    <span className="agent-feature-icon">{feature.icon}</span>
+                    <span className="agent-feature-copy">
+                      <strong>{feature.title}</strong>
+                      <small>{feature.description}</small>
+                      <span className="agent-feature-tags">
+                        {feature.tags.map((tag) => <em key={tag}>{tag}</em>)}
+                      </span>
+                    </span>
+                    {workspaceMode === feature.value ? <Check size={17} /> : null}
+                  </button>
+                ))}
+              </div>
             ) : null}
           </div>
-          <label className="agent-field">
-            <span>目标</span>
-            <textarea value={goal} onChange={(event) => setGoal(event.target.value)} />
-          </label>
-          {taskType === 'planning_task' ? (
-            <div className="agent-planning-inputs">
-              <label className="agent-field">
-                <span>岗位 JD</span>
-                <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} />
-              </label>
-              <ResumeMaterialSelector
-                error={resumeMaterialError}
-                loading={resumeMaterialsLoading}
-                loadingDetailId={resumeMaterialDetailLoadingId}
-                materials={resumeMaterials}
-                onRefresh={() => void loadResumeMaterials()}
-                onSelect={(material) => void selectResumeMaterial(material)}
-                resumeText={resumeText}
-                selectedMaterial={selectedResumeMaterial}
-                selectedMaterialId={selectedResumeMaterialId}
-              />
-            </div>
-          ) : null}
-          {taskType === 'planning_task' ? (
-            <label className="agent-check-row">
-              <input type="checkbox" checked={saveDraft} onChange={(event) => setSaveDraft(event.target.checked)} />
-              <span><Save size={16} />输出确认后进入保存审批</span>
-            </label>
-          ) : null}
-          {taskType === 'planning_task' ? (
-            <div className="agent-web-search-box">
-              <label className="agent-check-row">
-                <input type="checkbox" checked={enableWebSearch} onChange={(event) => setEnableWebSearch(event.target.checked)} />
-                <span><Search size={16} />联网补充公司背景和技能趋势</span>
-              </label>
-              {enableWebSearch ? (
-                <label className="agent-field">
-                  <span>联网检索词</span>
-                  <input value={webSearchQuery} onChange={(event) => setWebSearchQuery(event.target.value)} placeholder="默认由目标和 JD 自动生成" />
-                </label>
-              ) : null}
-            </div>
-          ) : null}
-          {taskType === 'planning_task' ? (
-            <ResumeTemplateSelector
-              error={templateError}
-              loading={templateLoading}
-              onDelete={(templateId) => void removeResumeTemplate(templateId)}
-              onSelect={selectResumeTemplate}
-              onUpload={(file) => void submitResumeTemplate(file)}
-              selectedTemplate={selectedResumeTemplate}
-              selectedTemplateId={selectedResumeTemplateId}
-              deletingTemplateId={templateDeleting}
-              templates={resumeTemplates}
-              uploading={templateUploading}
-            />
-          ) : null}
-          {taskType === 'planning_task' ? (
-            <ResumePatchPanel
-              busy={resumePatchBusy}
-              confirmedCount={resumePatchConfirmedCount}
-              draft={resumePatchDraft}
-              error={resumePatchError}
-              exportResult={resumePatchExport}
-              message={resumePatchMessage}
-              onExport={() => void exportResumePatchDraft()}
-              onGenerateAllFields={() => void generateResumePatchDraft(false)}
-              onGenerateConfirmedRegions={() => void generateResumePatchDraft(true)}
-              onUpdatePatch={updateResumePatch}
-              onValidate={() => void validateResumePatchDraft()}
-              selectedTemplate={selectedResumeTemplate}
-            />
-          ) : null}
-          <div className="agent-control-grid">
-            <AgentListbox
-              label={taskType === 'planning_task' ? '只读检索基线' : '工具路线'}
-              value={toolMode}
-              onChange={setToolMode}
-              options={TOOL_MODE_OPTIONS}
-              disabled={taskType === 'planning_task'}
-              disabledHint="JD 适配规划会固定执行证据对齐、能力缺口和输出审批。"
-            />
-            <AgentListbox
-              label="资料类型"
-              value={documentType}
-              onChange={setDocumentType}
-              options={DOCUMENT_TYPE_OPTIONS}
-            />
-            <label className="agent-field">
-              <span>topK</span>
-              <input type="number" min={1} max={20} value={topK} onChange={(event) => setTopK(clamp(Number(event.target.value), 1, 20))} />
-            </label>
-          </div>
-          {error ? <p className="form-message danger">{error}</p> : null}
-          <button className="primary-action agent-submit" onClick={submit} disabled={submitting}>
-            {submitting ? <Loader2 className="spin" size={17} /> : <Send size={17} />}
-            <span>{submitting ? '创建中' : '创建任务'}</span>
+          <button className="send-button agent-send-v2" onClick={onSubmit} disabled={submitting} type="button" aria-label="\u53d1\u9001\u7ed9 Agent">
+            {submitting ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
           </button>
-        </article>
-
-        <article className="panel agent-side-panel">
-          <div className="panel-title">
-            <h3><Sparkles size={20} />开放工具</h3>
-          </div>
-          <div className="agent-tool-list">
-            {readTools.map((tool) => (
-              <div className="agent-tool-item" key={tool.toolName}>
-                <strong>{tool.toolName}</strong>
-                <span>阶段 {tool.stage} · {tool.description}</span>
-              </div>
-            ))}
-            {mutationTools.map((tool) => (
-              <div className="agent-tool-item mutation" key={tool.toolName}>
-                <strong>{tool.toolName}</strong>
-                <span>阶段 {tool.stage} · 需 {tool.approvalType} 审批 · {tool.description}</span>
-              </div>
-            ))}
-            {!readTools.length ? <p className="agent-empty">暂无工具能力</p> : null}
-          </div>
-        </article>
-      </section>
-
-      {task ? <AgentConversation task={task} /> : null}
-
-      {task ? (
-        <section className="agent-result-grid">
-          <article className="panel">
-            <div className="panel-title">
-              <h3><Clock3 size={20} />任务状态</h3>
-              <span className={`status-pill ${taskStatusClass(task.status)}`}>{statusLabel(task.status)}</span>
-            </div>
-            <div className="agent-task-meta">
-              <MetaItem label="任务 ID" value={task.id} />
-              <MetaItem label="线程 ID" value={task.pythonThreadId || task.id} />
-              <MetaItem label="更新时间" value={formatTime(task.updatedAt)} />
-              {task.errorCode ? <MetaItem label="错误码" value={task.errorCode} /> : null}
-            </div>
-            {task.errorMessage ? <p className="form-message danger">{task.errorMessage}</p> : null}
-          </article>
-
-          <article className="panel">
-            <div className="panel-title">
-              <h3><Search size={20} />工具观察</h3>
-              <span className="status-pill">{task.toolCalls?.length || 0} 次调用</span>
-            </div>
-            <div className="agent-timeline">
-              {(task.toolCalls || []).map((call) => <ToolCallItem key={call.id} call={call} />)}
-              {!(task.toolCalls || []).length ? <p className="agent-empty">等待工具观察回写</p> : null}
-            </div>
-          </article>
-        </section>
-      ) : null}
-
-      {task || memories.length || memoryLoading || memoryError ? (
-        <section className="agent-memory-grid">
-          <article className="panel agent-memory-panel">
-            <div className="panel-title">
-              <h3><Database size={20} />本次使用的记忆</h3>
-              <span className="status-pill">{usedMemoryContext.length} 条上下文</span>
-            </div>
-            <div className="agent-memory-context-list">
-              {usedMemoryContext.map((item) => (
-                <div className="agent-memory-context-row" key={String(item.memoryId || item.subjectKey)}>
-                  <div>
-                    <strong>{String(item.subjectKey || item.namespace || 'Agent 记忆')}</strong>
-                    <p>{String(item.summary || '无摘要')}</p>
-                  </div>
-                  <div className="query-tags agent-tags">
-                    {item.memoryType ? <span>{String(item.memoryType)}</span> : null}
-                    {item.scope ? <span>{String(item.scope)}</span> : null}
-                    {item.score !== undefined ? <span>分数 {String(item.score)}</span> : null}
-                  </div>
-                </div>
-              ))}
-              {!usedMemoryContext.length ? <p className="agent-empty">本次任务没有注入 ACTIVE 记忆。</p> : null}
-            </div>
-          </article>
-
-          <article className="panel agent-memory-panel">
-            <div className="panel-title">
-              <h3><ShieldCheck size={20} />待确认记忆</h3>
-              <button className="chip-button" onClick={() => void loadMemories()} disabled={memoryLoading} type="button">
-                {memoryLoading ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />}
-                刷新
-              </button>
-            </div>
-            {memoryError ? <p className="form-message danger">{memoryError}</p> : null}
-            <div className="agent-memory-list">
-              {pendingMemoryCandidates.map((memory) => (
-                <MemoryItem
-                  key={memory.id}
-                  memory={memory}
-                  busyAction={memoryAction}
-                  onAction={(action) => void actOnMemory(memory, action)}
-                />
-              ))}
-              {!pendingMemoryCandidates.length ? <p className="agent-empty">暂无待确认候选。任务完成后候选会先停留在这里。</p> : null}
-            </div>
-          </article>
-
-          <article className="panel agent-memory-panel wide">
-            <div className="panel-title">
-              <h3><Archive size={20} />记忆管理</h3>
-              <span className="status-pill">{memories.length} 条未删除记忆</span>
-            </div>
-            <div className="agent-memory-list compact">
-              {visibleMemories.map((memory) => (
-                <MemoryItem
-                  key={memory.id}
-                  memory={memory}
-                  busyAction={memoryAction}
-                  onAction={(action) => void actOnMemory(memory, action)}
-                />
-              ))}
-              {!visibleMemories.length ? <p className="agent-empty">当前还没有 Agent 记忆。</p> : null}
-            </div>
-          </article>
-        </section>
-      ) : null}
-
-      {task && pendingReviews.length > 0 ? (
-        <section className="agent-review-grid">
-          {pendingReviews.map((review) => (
-            <article className="panel agent-review-card" key={review.id}>
-              <div className="panel-title">
-                <h3><ThumbsUp size={20} />{reviewTitle(review.reviewType)}</h3>
-                <span className="status-pill running">待审批</span>
-              </div>
-              <ReviewProposal review={review} />
-              <div className="agent-review-actions">
-                <button className="primary-action" onClick={() => void decide(review, 'APPROVED')} disabled={Boolean(reviewing)}>
-                  {reviewing === `${review.id}-APPROVED` ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}
-                  <span>同意</span>
-                </button>
-                <button className="ghost-action" onClick={() => void decide(review, 'CHANGES_REQUESTED')} disabled={Boolean(reviewing)}>
-                  <Clock3 size={16} />
-                  <span>要求调整</span>
-                </button>
-                <button className="ghost-action" onClick={() => void decide(review, 'REJECTED')} disabled={Boolean(reviewing)}>
-                  <XCircle size={16} />
-                  <span>拒绝</span>
-                </button>
-              </div>
-            </article>
-          ))}
-        </section>
-      ) : null}
-
-      {task && (task.operations || []).length > 0 ? (
-        <section className="panel agent-operation-panel">
-          <div className="panel-title">
-            <h3><RotateCcw size={20} />变更操作</h3>
-            <span className="status-pill">{task.operations?.length || 0} 条记录</span>
-          </div>
-          <div className="agent-operation-list">
-            {(task.operations || []).map((operation) => (
-              <OperationItem
-                key={operation.id}
-                operation={operation}
-                undoing={undoing === operation.id}
-                onUndo={() => void undoOperation(operation)}
-              />
-            ))}
-          </div>
-        </section>
-      ) : null}
-
-      {task ? (
-        <section className="panel agent-final-panel">
-          <div className="panel-title">
-            <h3><FileText size={20} />最终结果</h3>
-            <span className="status-pill">{Math.max(evidenceIds.length, draftEvidenceIds.length)} 条 evidence</span>
-          </div>
-          {finalAnswer || task.draft?.matchSummary ? (
-            <>
-              <MarkdownText className="answer-copy" content={finalAnswer || stringValue(task.draft?.matchSummary)} />
-              <PlanningResult task={task} />
-            </>
-          ) : (
-            <p className="agent-empty">{task.status === 'CREATED' ? '任务已创建，等待 Java 启动 Python Agent。' : '等待最终结果回写。'}</p>
-          )}
-          <div className="query-tags agent-tags">
-            {[...evidenceIds, ...draftEvidenceIds].map((id) => <span key={id}>{id}</span>)}
-            {expandedQueries.map((query) => <span key={query}>{query}</span>)}
-          </div>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
-function AgentListbox<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-  disabled = false,
-  disabledHint
-}: {
-  label: string;
-  value: T;
-  options: Array<AgentOption<T>>;
-  onChange: (value: T) => void;
-  disabled?: boolean;
-  disabledHint?: string;
-}) {
-  const selected = options.find((item) => item.value === value) || options[0];
-  return (
-    <div className="agent-field agent-select-field">
-      <span>{label}</span>
-      <Listbox value={selected.value} onChange={onChange} disabled={disabled}>
-        <div className="agent-select">
-          <ListboxButton className={disabled ? 'agent-select-button is-disabled' : 'agent-select-button'}>
-            <span className="agent-select-value">
-              <strong>{selected.label}</strong>
-              <small>{disabled && disabledHint ? disabledHint : selected.description}</small>
-            </span>
-            <span className="agent-select-end">
-              {selected.badge ? <em>{selected.badge}</em> : null}
-              <ChevronDown size={16} />
-            </span>
-          </ListboxButton>
-          <ListboxOptions className="agent-select-options">
-            {options.map((option) => (
-              <ListboxOption
-                className={({ focus, selected: isSelected }) =>
-                  ['agent-select-option', focus ? 'is-focused' : '', isSelected ? 'is-selected' : ''].filter(Boolean).join(' ')
-                }
-                key={option.value}
-                value={option.value}
-              >
-                {({ selected: isSelected }) => (
-                  <>
-                    <span>
-                      <strong>{option.label}</strong>
-                      <small>{option.description}</small>
-                    </span>
-                    {option.badge ? <em>{option.badge}</em> : null}
-                    {isSelected ? <Check className="agent-select-check" size={16} /> : null}
-                  </>
-                )}
-              </ListboxOption>
-            ))}
-          </ListboxOptions>
         </div>
-      </Listbox>
-    </div>
-  );
-}
-
-// 展示任务创建后的对话流摘要，用户目标固定在右侧。
-function AgentConversation({ task }: { task: AgentTask }) {
-  const input = task.input || {};
-  const userGoal = displayUserGoal(input.goal || input.question || task.title);
-  const planTitle = stringValue(task.plan?.title) || stringValue(task.draft?.planSummary);
-  const pendingReview = (task.reviews || []).find((review) => review.status === 'PENDING');
-  const botStatus = pendingReview?.reviewType === 'PLAN'
-    ? '规划器已完成初始路线，等待你批准、要求修改或拒绝。'
-    : statusLabel(task.status);
-  return (
-    <section className="agent-conversation-stream" aria-label="Agent 任务对话">
-      <div className="agent-chat-row user">
-        <div className="agent-chat-bubble user">
-          <strong>用户目标</strong>
-          <p>{userGoal}</p>
-          <div className="query-tags agent-tags">
-            {input.workspaceMode ? <span>{String(input.workspaceMode)}</span> : null}
-            {normalizeStringList(input.toolHints).map((tool) => <span key={tool}>{tool}</span>)}
-          </div>
-        </div>
-        <span className="agent-chat-avatar user">我</span>
       </div>
-      <div className="agent-chat-row assistant">
-        <span className="agent-chat-avatar assistant"><Bot size={16} /></span>
-        <div className="agent-chat-bubble assistant">
-          <strong>执行说明</strong>
-          <p>{planTitle || botStatus}</p>
-          <div className="query-tags agent-tags">
-            <span>{statusLabel(task.status)}</span>
-            <span>{(task.toolCalls || []).length} 次工具观察</span>
-          </div>
+      {error ? <p className="form-message danger">{error}</p> : null}
+    </section>
+  );
+}
+
+function DetailPanel(props: {
+  activeFeature: FeatureOption;
+  detailTab: DetailTab;
+  evidenceIds: string[];
+  expandedQueries: string[];
+  historyLoading: boolean;
+  historyTasks: AgentTask[];
+  memories: AgentMemory[];
+  memoryAction: string;
+  memoryError: string;
+  pendingMemoryCandidates: AgentMemory[];
+  pendingReviews: AgentHumanReview[];
+  progressSteps: Array<{ label: string; done: boolean; active: boolean }>;
+  reviewing: string;
+  task: AgentTask | null;
+  undoing: string;
+  onClose: () => void;
+  onDecide: (review: AgentHumanReview, decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') => void;
+  onMemoryAction: (memory: AgentMemory, action: 'confirm' | 'reject' | 'archive' | 'delete') => void;
+  onOpenHistory: (taskId: string) => void;
+  onRefreshHistory: () => void;
+  onSetTab: (tab: DetailTab) => void;
+  onUndo: (operation: AgentOperation) => void;
+}) {
+  return (
+    <div className="agent-detail-popover" role="dialog" aria-label="Agent task panel">
+      <header className="agent-detail-popover-head">
+        <div>
+          <strong>{COPY.taskPanel}</strong>
+          <span>{props.task ? props.task.title : '\u5c1a\u672a\u521b\u5efa\u4efb\u52a1'}</span>
         </div>
+        <button className="icon-button tiny" type="button" onClick={props.onClose} aria-label="\u5173\u95ed\u4efb\u52a1\u9762\u677f">
+          <X size={16} />
+        </button>
+      </header>
+      <div className="agent-detail-tabs" role="tablist">
+        {DETAIL_TABS.map((tab) => (
+          <button className={props.detailTab === tab.value ? 'is-active' : ''} key={tab.value} type="button" onClick={() => props.onSetTab(tab.value)}>
+            {tab.icon}
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </div>
+      <div className="agent-detail-body">
+        {props.detailTab === 'environment' ? <EnvironmentTab activeFeature={props.activeFeature} memories={props.memories} task={props.task} /> : null}
+        {props.detailTab === 'progress' ? <ProgressTab steps={props.progressSteps} task={props.task} /> : null}
+        {props.detailTab === 'plan' ? <PlanTab activeFeature={props.activeFeature} task={props.task} /> : null}
+        {props.detailTab === 'evidence' ? <EvidenceTab evidenceIds={props.evidenceIds} expandedQueries={props.expandedQueries} task={props.task} /> : null}
+        {props.detailTab === 'approval' ? (
+          <ApprovalTab
+            memoryAction={props.memoryAction}
+            memoryError={props.memoryError}
+            pendingMemoryCandidates={props.pendingMemoryCandidates}
+            pendingReviews={props.pendingReviews}
+            reviewing={props.reviewing}
+            task={props.task}
+            undoing={props.undoing}
+            onDecide={props.onDecide}
+            onMemoryAction={props.onMemoryAction}
+            onUndo={props.onUndo}
+          />
+        ) : null}
+        {props.detailTab === 'history' ? <HistoryTab historyLoading={props.historyLoading} historyTasks={props.historyTasks} onOpenHistory={props.onOpenHistory} onRefreshHistory={props.onRefreshHistory} /> : null}
+      </div>
+    </div>
+  );
+}
+
+function EnvironmentTab({ activeFeature, memories, task }: { activeFeature: FeatureOption; memories: AgentMemory[]; task: AgentTask | null }) {
+  const summaryCount = task?.summaries?.length || task?.summaryCount || 0;
+  return (
+    <div className="agent-detail-section">
+      <MetaItem label="\u5f53\u524d\u529f\u80fd" value={activeFeature.title} />
+      <MetaItem label="\u4efb\u52a1\u72b6\u6001" value={statusLabel(task?.status)} />
+      <MetaItem label="\u66f4\u65b0\u65f6\u95f4" value={formatTime(task?.updatedAt)} />
+      <MetaItem label="\u6700\u8fd1\u8bb0\u5fc6" value={`${memories.length} \u6761`} />
+      <MetaItem label="\u5df2\u538b\u7f29\u4e0a\u4e0b\u6587" value={summaryCount ? `${summaryCount} \u6bb5` : '\u6682\u65e0'} />
+      {summaryCount ? <p className="agent-detail-note">{`\u65e9\u671f\u4e0a\u4e0b\u6587\u5df2\u538b\u7f29\uff0c\u4fdd\u7559\u6700\u8fd1 ${task?.messages?.length || 0} \u6761\u539f\u6587\u548c\u53ef\u6062\u590d\u6458\u8981\u3002`}</p> : null}
+      <p className="agent-detail-note">{'\u9875\u9762\u53ea\u5c55\u793a\u601d\u8003\u6458\u8981\u3001\u6267\u884c\u8bf4\u660e\u548c\u5224\u65ad\u4f9d\u636e\uff0c\u4e0d\u5c55\u793a\u9690\u85cf\u63a8\u7406\u94fe\u3002'}</p>
+    </div>
+  );
+}
+
+function ProgressTab({ steps, task }: { steps: Array<{ label: string; done: boolean; active: boolean }>; task: AgentTask | null }) {
+  return (
+    <div className="agent-progress-list">
+      {steps.map((step) => (
+        <div className={step.done ? 'done' : step.active ? 'active' : ''} key={step.label}>
+          {step.done ? <CheckCircle2 size={16} /> : step.active ? <Loader2 className="spin" size={16} /> : <Circle size={16} />}
+          <span>{step.label}</span>
+        </div>
+      ))}
+      {task?.errorMessage ? <p className="form-message danger">{task.errorMessage}</p> : null}
+    </div>
+  );
+}
+
+function PlanTab({ activeFeature, task }: { activeFeature: FeatureOption; task: AgentTask | null }) {
+  const steps = normalizePlanSteps(task?.plan?.steps);
+  return (
+    <div className="agent-detail-section">
+      <strong>{activeFeature.title}</strong>
+      {steps.length ? (
+        <ol className="agent-compact-list agent-plan-step-list">
+          {steps.map((step, index) => (
+            <li key={`${index}-${planStepKey(step)}`}>
+              <PlanStepItem step={step} />
+            </li>
+          ))}
+        </ol>
+      ) : <p className="agent-empty">{'\u540e\u7aef\u5c1a\u672a\u56de\u5199\u8ba1\u5212\u3002'}</p>}
+    </div>
+  );
+}
+
+function EvidenceTab({ evidenceIds, expandedQueries, task }: { evidenceIds: string[]; expandedQueries: string[]; task: AgentTask | null }) {
+  return (
+    <div className="agent-detail-section">
+      <EvidenceSummary evidenceIds={evidenceIds} expandedQueries={expandedQueries} task={task} />
+    </div>
+  );
+}
+
+function ApprovalTab({
+  memoryAction,
+  memoryError,
+  pendingMemoryCandidates,
+  pendingReviews,
+  reviewing,
+  task,
+  undoing,
+  onDecide,
+  onMemoryAction,
+  onUndo
+}: {
+  memoryAction: string;
+  memoryError: string;
+  pendingMemoryCandidates: AgentMemory[];
+  pendingReviews: AgentHumanReview[];
+  reviewing: string;
+  task: AgentTask | null;
+  undoing: string;
+  onDecide: (review: AgentHumanReview, decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') => void;
+  onMemoryAction: (memory: AgentMemory, action: 'confirm' | 'reject' | 'archive' | 'delete') => void;
+  onUndo: (operation: AgentOperation) => void;
+}) {
+  return (
+    <div className="agent-detail-section">
+      {pendingReviews.map((review) => <ReviewControls key={review.id} review={review} reviewing={reviewing} onDecide={(decision) => onDecide(review, decision)} />)}
+      {pendingMemoryCandidates.map((memory) => <MemoryItem key={memory.id} memory={memory} busyAction={memoryAction} onAction={(action) => onMemoryAction(memory, action)} />)}
+      {(task?.operations || []).map((operation) => <OperationInline key={operation.id} operation={operation} undoing={undoing === operation.id} onUndo={() => onUndo(operation)} />)}
+      {!pendingReviews.length && !pendingMemoryCandidates.length && !(task?.operations || []).length ? <p className="agent-empty">{'\u6682\u65e0\u9700\u8981\u5904\u7406\u7684\u5ba1\u6279\u6216\u64a4\u9500\u9879\u3002'}</p> : null}
+      {memoryError ? <p className="form-message danger">{memoryError}</p> : null}
+    </div>
+  );
+}
+
+function HistoryTab({ historyLoading, historyTasks, onOpenHistory, onRefreshHistory }: { historyLoading: boolean; historyTasks: AgentTask[]; onOpenHistory: (taskId: string) => void; onRefreshHistory: () => void }) {
+  return (
+    <div className="agent-detail-section">
+      <div className="agent-history-head">
+        <strong>{'\u5386\u53f2\u4f1a\u8bdd'}</strong>
+        <button className="chip-button" type="button" onClick={onRefreshHistory}>{historyLoading ? '\u5237\u65b0\u4e2d' : '\u5237\u65b0'}</button>
+      </div>
+      <div className="agent-history-list">
+        {historyTasks.map((item) => (
+          <button key={item.id} type="button" onClick={() => onOpenHistory(item.id)}>
+            <strong>{item.title || '\u672a\u547d\u540d Agent \u4efb\u52a1'}</strong>
+            <span>{statusLabel(item.status)} · {formatTime(item.updatedAt)}</span>
+          </button>
+        ))}
+        {!historyTasks.length ? <p className="agent-empty">{historyLoading ? '\u6b63\u5728\u8bfb\u53d6\u5386\u53f2\u4f1a\u8bdd...' : '\u6682\u65e0\u5386\u53f2\u4f1a\u8bdd\u3002'}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+function ChatMessage({ role, title, children }: { role: 'user' | 'assistant' | 'system'; title: string; children: ReactNode }) {
+  return (
+    <section className={`agent-chat-message ${role}`}>
+      <div className="agent-avatar">{role === 'user' ? '\u6211' : <Bot size={16} />}</div>
+      <div className="agent-message-body">
+        <strong>{title}</strong>
+        {children}
       </div>
     </section>
   );
 }
 
-function ResumeMaterialSelector({
-  materials,
-  selectedMaterialId,
-  selectedMaterial,
-  resumeText,
-  loading,
-  loadingDetailId,
+function ServerMessageStream({
+  activeFeature,
   error,
-  onSelect,
-  onRefresh
+  hasMoreBefore,
+  loadingOlder,
+  messages,
+  polling,
+  status,
+  onLoadOlder
 }: {
-  materials: LearningMaterial[];
-  selectedMaterialId: number | null;
-  selectedMaterial: LearningMaterial | null;
-  resumeText: string;
-  loading: boolean;
-  loadingDetailId: number | null;
+  activeFeature: FeatureOption;
   error: string;
-  onSelect: (material: LearningMaterial) => void;
-  onRefresh: () => void;
+  hasMoreBefore: boolean;
+  loadingOlder: boolean;
+  messages: AgentChatMessage[];
+  polling: boolean;
+  status?: string;
+  onLoadOlder: () => void;
 }) {
   return (
-    <div className="agent-resume-material-box">
-      <div className="agent-template-box-head">
-        <div>
-          <strong>选择已上传简历</strong>
-          <span>系统读取资料解析摘要作为 Agent 简历摘要，再结合岗位 JD 和所选模板生成修改建议</span>
-        </div>
-        <button className="chip-button" onClick={onRefresh} disabled={loading} type="button">
-          {loading ? <Loader2 className="spin" size={15} /> : <RotateCcw size={15} />}
-          刷新
-        </button>
-      </div>
-
-      <div className="agent-resume-material-grid">
-        {loading ? (
-          <div className="agent-template-state">
-            <Loader2 className="spin" size={17} />
-            <span>正在读取已上传简历</span>
-          </div>
-        ) : materials.length ? (
-          materials.map((material) => {
-            const active = material.id === selectedMaterialId;
-            const usable = materialCanUseAsResume(material);
-            const summary = (material.documentSummary || '').trim();
-            const loadingDetail = loadingDetailId === material.id;
-            return (
-              <button
-                className={[
-                  'agent-resume-material-card',
-                  active ? 'is-active' : '',
-                  usable ? '' : 'is-disabled'
-                ].filter(Boolean).join(' ')}
-                disabled={!usable || Boolean(loadingDetailId)}
-                key={material.id}
-                onClick={() => onSelect(material)}
-                type="button"
-              >
-                <span className="agent-resume-material-top">
-                  <FileText size={18} />
-                  <em>{formatMaterialStatus(material.status)}</em>
-                </span>
-                <strong>{material.originalFilename || material.title}</strong>
-                <small>{material.documentType} · {formatTime(material.updatedAt || material.createdAt)}</small>
-                <span className="agent-resume-material-summary">
-                  {loadingDetail ? '正在读取摘要...' : summary || '暂无摘要，选择后会尝试读取详情'}
-                </span>
-              </button>
-            );
-          })
-        ) : (
-          <div className="empty-state compact">暂无可用简历资料，请先到资料库上传并等待解析完成</div>
-        )}
-      </div>
-
-      {selectedMaterial ? (
-        <div className="agent-resume-summary-card">
-          <div>
-            <span>当前摘要来源</span>
-            <strong>{selectedMaterial.originalFilename || selectedMaterial.title}</strong>
-          </div>
-          <p>{resumeText || '这份资料暂未生成摘要，无法用于 JD 适配任务。'}</p>
+    <>
+      {hasMoreBefore ? (
+        <div className="agent-load-older-row">
+          <button className="chip-button" type="button" onClick={onLoadOlder} disabled={loadingOlder}>
+            {loadingOlder ? <Loader2 className="spin" size={15} /> : <History size={15} />}
+            <span>{loadingOlder ? '正在加载更早消息' : '加载更早消息'}</span>
+          </button>
         </div>
       ) : null}
+      {messages.map((message) => <ServerMessage key={message.id || `${message.messageType}-${message.dedupeKey}`} activeFeature={activeFeature} message={message} polling={polling} status={status} />)}
+      {error ? (
+        <ChatMessage role="assistant" title={COPY.executionNote}>
+          <p className="form-message danger">{error}</p>
+        </ChatMessage>
+      ) : null}
+    </>
+  );
+}
 
-      {error ? <p className="form-message danger agent-template-message">{error}</p> : null}
+function ServerMessage({ activeFeature, message, polling, status }: { activeFeature: FeatureOption; message: AgentChatMessage; polling: boolean; status?: string }) {
+  const role = normalizeMessageRole(message.role);
+  const title = messageTitle(message);
+  if (message.messageType === 'USER_GOAL') {
+    return (
+      <ChatMessage role="user" title={COPY.userGoal}>
+        <p>{displayUserGoal(message.content)}</p>
+        <div className="query-tags agent-tags">
+          <span>{activeFeature.title}</span>
+          {activeFeature.tags.map((tag) => <span key={tag}>{tag}</span>)}
+        </div>
+      </ChatMessage>
+    );
+  }
+  if (message.messageType === 'TOOL_OBSERVATION') {
+    const payload = normalizeRecord(message.payload);
+    return (
+      <ChatMessage role="assistant" title={title}>
+        <div className="agent-tool-call-card">
+          <div className="agent-timeline-head">
+            <strong>{String(payload.toolName || message.sourceId || '\u5de5\u5177')}</strong>
+            {payload.status ? <span className={`status-pill ${taskStatusClass(String(payload.status))}`}>{statusLabel(String(payload.status))}</span> : null}
+          </div>
+          <p>{message.content}</p>
+          {payload.errorMessage ? <small>{String(payload.errorCode || '')}: {String(payload.errorMessage)}</small> : null}
+        </div>
+      </ChatMessage>
+    );
+  }
+  if (message.messageType === 'FINAL_ANSWER') {
+    return (
+      <ChatMessage role="assistant" title={title}>
+        <MarkdownText className="answer-copy" content={message.content} />
+      </ChatMessage>
+    );
+  }
+  if (message.messageType === 'ERROR') {
+    return (
+      <ChatMessage role="assistant" title={title}>
+        <p className="form-message danger">{message.content}</p>
+      </ChatMessage>
+    );
+  }
+  if (message.messageType === 'CONTEXT_SUMMARY') {
+    const payload = normalizeRecord(message.payload);
+    return (
+      <ChatMessage role="system" title={COPY.contextSummary}>
+        <div className="agent-status-line">
+          <span className="status-pill neutral">{String(payload.status || '\u5df2\u4fdd\u5b58')}</span>
+          <span>{message.content}</span>
+        </div>
+      </ChatMessage>
+    );
+  }
+  return (
+    <ChatMessage role={role} title={title}>
+      <div className="agent-status-line">
+        {message.messageType === 'STATUS' ? <span className={`status-pill ${taskStatusClass(status)}`}>{statusIcon(status, polling)}{statusLabel(status)}</span> : null}
+        <span>{message.content}</span>
+      </div>
+    </ChatMessage>
+  );
+}
+
+function LegacyTaskStream({
+  activeFeature,
+  backendNotice,
+  draftSummary,
+  error,
+  evidenceIds,
+  expandedQueries,
+  finalAnswer,
+  goal,
+  polling,
+  task
+}: {
+  activeFeature: FeatureOption;
+  backendNotice: string;
+  draftSummary: string;
+  error: string;
+  evidenceIds: string[];
+  expandedQueries: string[];
+  finalAnswer: string;
+  goal: string;
+  polling: boolean;
+  task: AgentTask | null;
+}) {
+  return (
+    <>
+      <ChatMessage role="user" title={COPY.userGoal}>
+        <p>{displayUserGoal(task?.input?.goal || goal)}</p>
+        <div className="query-tags agent-tags">
+          <span>{activeFeature.title}</span>
+          {activeFeature.tags.map((tag) => <span key={tag}>{tag}</span>)}
+        </div>
+      </ChatMessage>
+      {backendNotice || error ? (
+        <ChatMessage role="assistant" title={COPY.executionNote}>
+          <div className="agent-status-line">
+            <span className={`status-pill ${taskStatusClass(task?.status)}`}>{statusIcon(task?.status, polling)}{statusLabel(task?.status)}</span>
+            {backendNotice ? <span>{backendNotice}</span> : null}
+          </div>
+          {error ? <p className="form-message danger">{error}</p> : null}
+        </ChatMessage>
+      ) : null}
+      {(task?.toolCalls || []).map((call) => <ToolCallMessage key={call.id} call={call} />)}
+      {evidenceIds.length || expandedQueries.length ? (
+        <ChatMessage role="assistant" title={COPY.evidence}>
+          <EvidenceSummary evidenceIds={evidenceIds} expandedQueries={expandedQueries} task={task} />
+        </ChatMessage>
+      ) : null}
+      {task ? <PlanningResult task={task} /> : null}
+      {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} /> : null}
+    </>
+  );
+}
+
+function ToolCallMessage({ call }: { call: AgentToolCall }) {
+  return (
+    <ChatMessage role="assistant" title={COPY.toolCall}>
+      <div className="agent-tool-call-card">
+        <div className="agent-timeline-head">
+          <strong>{call.toolName}</strong>
+          <span className={`status-pill ${taskStatusClass(call.status)}`}>{statusLabel(call.status)}</span>
+        </div>
+        <p>{formatToolResponse(call.response)}</p>
+        {call.errorMessage ? <small>{call.errorCode}: {call.errorMessage}</small> : null}
+      </div>
+    </ChatMessage>
+  );
+}
+
+function EvidenceSummary({ evidenceIds, expandedQueries, task }: { evidenceIds: string[]; expandedQueries: string[]; task: AgentTask | null }) {
+  const diagnostics = normalizeRecord(task?.final?.diagnostics || task?.draft?.diagnostics);
+  return (
+    <div className="agent-evidence-panel">
+      <div className="query-tags agent-tags">
+        {evidenceIds.map((id) => <span key={id}>Evidence {id}</span>)}
+        {!evidenceIds.length ? <span>{'\u6682\u65e0 evidence \u56de\u5199'}</span> : null}
+      </div>
+      {expandedQueries.length ? (
+        <div className="query-tags agent-tags">
+          {expandedQueries.map((query) => <span key={query}>{query}</span>)}
+        </div>
+      ) : null}
+      {Object.keys(diagnostics).length ? <p>{formatToolResponse(diagnostics)}</p> : null}
     </div>
   );
 }
 
-function ResumeTemplateSelector({
-  templates,
-  selectedTemplateId,
-  selectedTemplate,
-  loading,
-  uploading,
-  deletingTemplateId,
-  error,
-  onSelect,
-  onDelete,
-  onUpload
-}: {
-  templates: ResumeTemplate[];
-  selectedTemplateId: string;
-  selectedTemplate: ResumeTemplate | null;
-  loading: boolean;
-  uploading: boolean;
-  deletingTemplateId: string;
-  error: string;
-  onSelect: (template: ResumeTemplate) => void;
-  onDelete: (templateId: string) => void;
-  onUpload: (file: File | null) => void;
-}) {
+function ReviewMessage({ review, reviewing, onDecide }: { review: AgentHumanReview; reviewing: string; onDecide: (decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') => void }) {
   return (
-    <div className="agent-template-box">
-      <div className="agent-template-box-head">
-        <div>
-          <strong>简历 DOCX 模板</strong>
-          <span>选择历史模板后，先到简历模板页确认可修改区域；Agent 不再绕过确认直接改 DOCX</span>
-        </div>
-        <span className="status-pill">{selectedTemplate ? '已选择' : `${templates.length} 个历史模板`}</span>
+    <ChatMessage role="assistant" title={reviewTitle(review.reviewType)}>
+      <ReviewControls review={review} reviewing={reviewing} onDecide={onDecide} />
+    </ChatMessage>
+  );
+}
+
+function ReviewControls({ review, reviewing, onDecide }: { review: AgentHumanReview; reviewing: string; onDecide: (decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') => void }) {
+  return (
+    <div className="agent-review-card inline">
+      <ReviewProposal review={review} />
+      <div className="agent-review-actions">
+        <button className="primary-action" onClick={() => onDecide('APPROVED')} disabled={Boolean(reviewing)} type="button">
+          {reviewing === `${review.id}-APPROVED` ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />}<span>{'\u6279\u51c6'}</span>
+        </button>
+        <button className="ghost-action" onClick={() => onDecide('CHANGES_REQUESTED')} disabled={Boolean(reviewing)} type="button">
+          <Clock3 size={16} /><span>{'\u8981\u6c42\u4fee\u6539'}</span>
+        </button>
+        <button className="ghost-action" onClick={() => onDecide('REJECTED')} disabled={Boolean(reviewing)} type="button">
+          <XCircle size={16} /><span>{'\u62d2\u7edd'}</span>
+        </button>
       </div>
-      <Link className="agent-inline-link" to="/resume-template">
-        <ExternalLink size={15} />
-        <span>打开图片预览确认页</span>
-      </Link>
-
-      <div className="agent-template-history-grid">
-        {loading ? (
-          <div className="agent-template-state">
-            <Loader2 className="spin" size={17} />
-            <span>正在读取历史模板</span>
-          </div>
-        ) : templates.length ? (
-          templates.map((template) => {
-            const active = template.templateId === selectedTemplateId;
-            const canFill = templateCanFill(template);
-            return (
-              <div className="agent-template-history-item" key={template.templateId}>
-                <button
-                  className={[
-                    'agent-template-history-card',
-                    active ? 'is-active' : '',
-                    canFill ? '' : 'is-disabled'
-                  ].filter(Boolean).join(' ')}
-                  disabled={!canFill}
-                  onClick={() => onSelect(template)}
-                  type="button"
-                >
-                  <span className="agent-template-card-top">
-                    <FileText size={18} />
-                    <span>{formatTemplateStatus(template.status)}</span>
-                  </span>
-                  <strong>{template.filename}</strong>
-                  <small>版本 {template.version} · {template.unsupportedRegionCount} 个复杂区域</small>
-                  <span className="agent-template-card-time">{formatTime(template.updatedAt || template.createdAt)}</span>
-                </button>
-                <button
-                  className="agent-template-delete"
-                  disabled={deletingTemplateId === template.templateId}
-                  onClick={() => onDelete(template.templateId)}
-                  type="button"
-                >
-                  {deletingTemplateId === template.templateId ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-                  <span>删除</span>
-                </button>
-              </div>
-            );
-          })
-        ) : (
-          <div className="empty-state compact">暂无上传过的简历模板，先在下方上传 DOCX 并提取字段</div>
-        )}
-      </div>
-
-      {selectedTemplate ? (
-        <div className="agent-template-selected">
-          <span>当前模板</span>
-          <strong>{selectedTemplate.filename}</strong>
-          <small>{selectedTemplate.currentFilePath || '模板文件路径已由后端托管，前端不再直连本地文件。'}</small>
-          <div className="agent-template-selected-actions">
-            <Link className="chip-button" to="/resume-template">
-              <ExternalLink size={15} />确认可修改区域
-            </Link>
-            <button className="chip-button danger" onClick={() => onDelete(selectedTemplate.templateId)} disabled={deletingTemplateId === selectedTemplate.templateId} type="button">
-              {deletingTemplateId === selectedTemplate.templateId ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-              删除模板
-            </button>
-          </div>
-        </div>
-      ) : null}
-
-      {error ? <p className="form-message danger agent-template-message">{error}</p> : null}
-
-      <label className={uploading ? 'agent-template-upload is-busy' : 'agent-template-upload'}>
-        {uploading ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
-        <span>{uploading ? '正在解析模板' : '上传简历提取模板'}</span>
-        <input
-          type="file"
-          accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          disabled={uploading}
-          onChange={(event) => {
-            const file = event.target.files?.[0] || null;
-            event.target.value = '';
-            onUpload(file);
-          }}
-        />
-      </label>
     </div>
   );
 }
 
-function ResumePatchPanel({
-  selectedTemplate,
-  draft,
-  exportResult,
-  confirmedCount,
-  busy,
-  message,
-  error,
-  onGenerateConfirmedRegions,
-  onGenerateAllFields,
-  onUpdatePatch,
-  onValidate,
-  onExport
-}: {
-  selectedTemplate: ResumeTemplate | null;
-  draft: ResumePatchDraft | null;
-  exportResult: ResumeTemplateExport | null;
-  confirmedCount: number;
-  busy: boolean;
-  message: string;
-  error: string;
-  onGenerateConfirmedRegions: () => void;
-  onGenerateAllFields: () => void;
-  onUpdatePatch: (fieldId: string, updater: (patch: ResumeContentPatch) => ResumeContentPatch, feedback?: string) => void;
-  onValidate: () => void;
-  onExport: () => void;
-}) {
-  const canExport = Boolean(draft && ['CONFIRMED', 'VALIDATED'].includes(draft.status) && confirmedCount > 0);
+function FinalAnswer({ task, finalAnswer, draftSummary }: { task: AgentTask; finalAnswer: string; draftSummary: string }) {
+  const content = finalAnswer || draftSummary;
+  if (!content && !task.errorMessage) return null;
   return (
-    <div className="agent-resume-patch-box">
-      <div className="agent-template-box-head">
-        <div>
-          <strong>按岗位 JD 修改简历模板</strong>
-          <span>先生成字段补丁草稿，逐条确认或拒绝，再校验并导出 DOCX</span>
-        </div>
-        <span className={`status-pill ${canExport ? 'indexed' : draft ? 'running' : ''}`}>
-          {draft ? `${confirmedCount}/${draft.patches.length} 已确认` : '等待生成'}
-        </span>
-      </div>
-      <div className="agent-resume-patch-actions">
-        <button className="primary-action" disabled={busy || !selectedTemplate} onClick={onGenerateConfirmedRegions} type="button">
-          {busy ? <Loader2 className="spin" size={16} /> : <Highlighter size={16} />}
-          <span>按已保存图片区域生成</span>
-        </button>
-        <button className="ghost-action" disabled={busy || !selectedTemplate} onClick={onGenerateAllFields} type="button">
-          <FileText size={16} />
-          <span>按全部安全字段生成</span>
-        </button>
-      </div>
-      {!selectedTemplate ? <div className="empty-state compact">先选择一份已解析的简历模板</div> : null}
-      {message ? <p className="form-message agent-template-message">{message}</p> : null}
-      {error ? <p className="form-message danger agent-template-message">{error}</p> : null}
-      {draft ? (
-        <div className="resume-patch-list agent-resume-patch-list">
-          {draft.patches.map((patch) => {
-            return (
-              <div className={`resume-patch-row ${patchRowClass(patch.status)}`} key={patch.fieldId}>
-                <div className="resume-patch-head">
-                  <div>
-                    <strong>待确认改写项</strong>
-                    <span>{patch.confidence ? `${Math.round(patch.confidence * 100)}%` : '待评估'} · 字段内容由后端托管</span>
-                  </div>
-                  <span className={`evidence-status ${patchStatusClass(patch.status)}`}>
-                    {patch.status === 'REJECTED' ? <XCircle size={15} /> : <CheckCircle2 size={15} />}
-                    {formatPatchStatus(patch.status)}
-                  </span>
-                </div>
-                <div className="resume-patch-compare">
-                  <label>
-                    <span>新文本</span>
-                    <textarea
-                      value={patch.newText}
-                      onChange={(event) => onUpdatePatch(patch.fieldId, (current) => ({ ...current, newText: event.target.value, status: 'DRAFT' }))}
-                    />
-                  </label>
-                </div>
-                <p className="resume-patch-reason">{patch.rewriteReason}</p>
-                <div className="resume-risk-row">
-                  {patch.riskFlags.map((flag) => <span key={flag} className={flag === 'NONE' ? 'risk-ok' : 'risk-warn'}>{formatRisk(flag)}</span>)}
-                  {patch.evidenceIds.map((id) => <span key={id}>证据 {id}</span>)}
-                </div>
-                <div className="resume-patch-actions agent-patch-row-actions">
-                  <span className={`resume-patch-decision-note ${patchRowClass(patch.status)}`}>
-                    {patch.status === 'CONFIRMED' ? '本条已确认，校验后会参与导出' : patch.status === 'REJECTED' ? '本条已拒绝，导出时不会应用' : '等待人工确认'}
-                  </span>
-                  <div>
-                    <button
-                      className={patch.status === 'CONFIRMED' ? 'chip-button is-active' : 'chip-button'}
-                      disabled={busy}
-                      onClick={() => onUpdatePatch(
-                        patch.fieldId,
-                        (current) => ({ ...current, status: 'CONFIRMED' }),
-                        '该改写项已确认，校验后会参与导出'
-                      )}
-                      type="button"
-                    >
-                      <CheckCircle2 size={16} />{patch.status === 'CONFIRMED' ? '已确认' : '确认'}
-                    </button>
-                    <button
-                      className={patch.status === 'REJECTED' ? 'chip-button danger is-active' : 'chip-button danger'}
-                      disabled={busy}
-                      onClick={() => onUpdatePatch(
-                        patch.fieldId,
-                        (current) => ({ ...current, status: 'REJECTED' }),
-                        '该改写项已拒绝，导出时不会应用'
-                      )}
-                      type="button"
-                    >
-                      <XCircle size={16} />{patch.status === 'REJECTED' ? '已拒绝' : '拒绝'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-      {draft?.validationErrors.length ? (
-        <div className="resume-validation-errors">
-          {draft.validationErrors.map((item) => <span key={item}><TriangleAlert size={15} />{item}</span>)}
-        </div>
-      ) : null}
-      <div className="resume-template-actions agent-resume-export-actions">
-        <button className="ghost-action" onClick={onValidate} disabled={busy || !draft} type="button">
-          <ShieldCheck size={17} />校验补丁
-        </button>
-        <button className="primary-action" onClick={onExport} disabled={busy || !canExport} type="button">
-          <Download size={17} />导出 DOCX
-        </button>
-      </div>
-      {exportResult ? (
-        <div className="resume-export-result agent-export-result">
-          <strong>{exportResult.filename}</strong>
-          <span>版本 {exportResult.baseVersion} → {exportResult.exportVersion}</span>
-          <p>{exportResult.publicUrl || exportResult.filePath}</p>
-          <p>{String(exportResult.layoutValidation?.message || 'XML 结构 fingerprint 已通过校验')}</p>
-        </div>
-      ) : null}
-    </div>
+    <ChatMessage role="assistant" title={COPY.finalAnswer}>
+      {content ? <MarkdownText className="answer-copy" content={content} /> : <p className="form-message danger">{formatTaskError(task)}</p>}
+    </ChatMessage>
   );
 }
 
@@ -1333,15 +1070,7 @@ function ReviewProposal({ review }: { review: AgentHumanReview }) {
   const proposal = review.proposal || {};
   return (
     <div className="agent-review-proposal">
-      <strong>{stringValue(proposal.title) || stringValue(proposal.summary) || '待确认内容'}</strong>
-      {review.reviewType === 'CRUD' ? (
-        <div className="agent-crud-summary">
-          <MetaItem label="操作类型" value={String(proposal.operationType || '未返回')} />
-          <MetaItem label="资源类型" value={String(proposal.resourceType || '未返回')} />
-          <MetaItem label="幂等键" value={String(proposal.idempotencyKey || '未返回')} />
-          <MetaItem label="撤销窗口" value={proposal.undoWindowMinutes ? `${String(proposal.undoWindowMinutes)} 分钟` : '未返回'} />
-        </div>
-      ) : null}
+      <strong>{stringValue(proposal.title) || stringValue(proposal.summary) || '\u5f85\u786e\u8ba4\u5185\u5bb9'}</strong>
       {Array.isArray(proposal.steps) ? (
         <ol className="agent-plan-step-list">
           {proposal.steps.map((step, index) => (
@@ -1353,36 +1082,44 @@ function ReviewProposal({ review }: { review: AgentHumanReview }) {
       ) : null}
       <div className="query-tags agent-tags">
         {normalizeStringList(proposal.tools).map((tool) => <span key={tool}>{tool}</span>)}
-        {normalizeStringList(proposal.internalSubgraphs).map((subgraph) => <span key={subgraph}>子图 {subgraph}</span>)}
+        {normalizeStringList(proposal.internalSubgraphs).map((subgraph) => <span key={subgraph}>{'\u5b50\u56fe'} {subgraph}</span>)}
         {proposal.toolName ? <span>{String(proposal.toolName)}</span> : null}
-        {proposal.riskLevel ? <span>风险 {String(proposal.riskLevel)}</span> : null}
-        {proposal.evidenceCount !== undefined ? <span>证据 {String(proposal.evidenceCount)}</span> : null}
-        {proposal.undoable ? <span>可撤销</span> : null}
+        {proposal.riskLevel ? <span>{'\u98ce\u9669'} {String(proposal.riskLevel)}</span> : null}
+        {proposal.evidenceCount !== undefined ? <span>{'\u8bc1\u636e'} {String(proposal.evidenceCount)}</span> : null}
+        {proposal.undoable ? <span>{'\u53ef\u64a4\u9500'}</span> : null}
       </div>
       {proposal.summary ? <p>{String(proposal.summary)}</p> : null}
     </div>
   );
 }
 
-// 将后端返回的计划步骤对象拆成可读字段，避免渲染成 [object Object]。
 function PlanStepItem({ step }: { step: unknown }) {
   if (!step || typeof step !== 'object' || Array.isArray(step)) {
-    return <span>{String(step || '未命名步骤')}</span>;
+    return <span>{String(step || '\u5f85\u6267\u884c\u6b65\u9aa4')}</span>;
   }
   const item = step as Record<string, unknown>;
+  const description = stringValue(item.description) || stringValue(item.title) || '\u5f85\u6267\u884c\u6b65\u9aa4';
   return (
     <div className="agent-plan-step">
-      <strong>{stringValue(item.description) || stringValue(item.title) || '未命名步骤'}</strong>
+      <strong>{description}</strong>
       <div className="query-tags agent-tags">
-        {item.toolName ? <span>工具 {String(item.toolName)}</span> : null}
-        {item.toolType ? <span>{String(item.toolType)}</span> : null}
+        {item.toolName ? <span>{String(item.toolName)}</span> : null}
+        {item.expectedOutput ? <span>{String(item.expectedOutput)}</span> : null}
+        {item.riskLevel ? <span>{'\u98ce\u9669'} {String(item.riskLevel)}</span> : null}
       </div>
-      {item.expectedOutput ? <p>{String(item.expectedOutput)}</p> : null}
     </div>
   );
 }
 
-function OperationItem({ operation, undoing, onUndo }: { operation: AgentOperation; undoing: boolean; onUndo: () => void }) {
+function OperationMessage({ operation, undoing, onUndo }: { operation: AgentOperation; undoing: boolean; onUndo: () => void }) {
+  return (
+    <ChatMessage role="assistant" title={COPY.changeOperation}>
+      <OperationInline operation={operation} undoing={undoing} onUndo={onUndo} />
+    </ChatMessage>
+  );
+}
+
+function OperationInline({ operation, undoing, onUndo }: { operation: AgentOperation; undoing: boolean; onUndo: () => void }) {
   const undoable = operation.status === 'APPLIED_UNDOABLE' && !undoExpired(operation.undoDeadline);
   return (
     <div className="agent-operation-row">
@@ -1392,29 +1129,16 @@ function OperationItem({ operation, undoing, onUndo }: { operation: AgentOperati
           <span className={`status-pill ${operationStatusClass(operation.status)}`}>{operationStatusLabel(operation.status)}</span>
         </div>
         <p>{operation.resourceType} · {operation.resourceId}</p>
-        <div className="query-tags agent-tags">
-          <span>{operation.idempotencyKey}</span>
-          {operation.undoDeadline ? <span>撤销截止 {formatTime(operation.undoDeadline)}</span> : null}
-        </div>
-        {operation.errorMessage ? <small>{operation.errorCode}：{operation.errorMessage}</small> : null}
+        {operation.errorMessage ? <small>{operation.errorCode}: {operation.errorMessage}</small> : null}
       </div>
       <button className="ghost-action" onClick={onUndo} disabled={!undoable || undoing} type="button">
-        {undoing ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}
-        <span>{undoable ? '撤销' : '不可撤销'}</span>
+        {undoing ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}<span>{undoable ? '\u64a4\u9500' : '\u4e0d\u53ef\u64a4\u9500'}</span>
       </button>
     </div>
   );
 }
 
-function MemoryItem({
-  memory,
-  busyAction,
-  onAction
-}: {
-  memory: AgentMemory;
-  busyAction: string;
-  onAction: (action: 'confirm' | 'reject' | 'archive' | 'delete') => void;
-}) {
+function MemoryItem({ memory, busyAction, onAction }: { memory: AgentMemory; busyAction: string; onAction: (action: 'confirm' | 'reject' | 'archive' | 'delete') => void }) {
   const isPending = memory.status === 'PENDING_REVIEW' || memory.status === 'INDEX_FAILED';
   const canArchive = !['ARCHIVED', 'DELETED', 'REJECTED', 'SUPERSEDED'].includes(memory.status);
   const busy = (action: string) => busyAction === `${memory.id}-${action}`;
@@ -1425,38 +1149,27 @@ function MemoryItem({
           <strong>{memory.summary || memory.subjectKey}</strong>
           <span className={`status-pill ${memoryStatusClass(memory.status)}`}>{memoryStatusLabel(memory.status)}</span>
         </div>
-        <p>{memory.content || '无正文'}</p>
-        <div className="query-tags agent-tags">
-          <span>{memory.memoryType}</span>
-          <span>{memory.namespace}</span>
-          <span>{memory.scopeType}{memory.scopeId ? `:${memory.scopeId}` : ''}</span>
-          {memory.sourceTaskId ? <span>任务 {memory.sourceTaskId}</span> : null}
-          {memory.importance !== undefined && memory.importance !== null ? <span>重要度 {Math.round(memory.importance * 100)}%</span> : null}
-        </div>
+        <p>{memory.content || '\u65e0\u6b63\u6587'}</p>
       </div>
       <div className="agent-memory-actions">
         {isPending ? (
           <>
             <button className="chip-button is-active" onClick={() => onAction('confirm')} disabled={Boolean(busyAction)} type="button">
-              {busy('confirm') ? <Loader2 className="spin" size={15} /> : <CheckCircle2 size={15} />}
-              确认
+              {busy('confirm') ? <Loader2 className="spin" size={15} /> : <CheckCircle2 size={15} />}{'\u786e\u8ba4'}
             </button>
             <button className="chip-button danger" onClick={() => onAction('reject')} disabled={Boolean(busyAction)} type="button">
-              {busy('reject') ? <Loader2 className="spin" size={15} /> : <XCircle size={15} />}
-              拒绝
+              {busy('reject') ? <Loader2 className="spin" size={15} /> : <XCircle size={15} />}{'\u62d2\u7edd'}
             </button>
           </>
         ) : null}
         {canArchive ? (
           <button className="chip-button" onClick={() => onAction('archive')} disabled={Boolean(busyAction)} type="button">
-            {busy('archive') ? <Loader2 className="spin" size={15} /> : <Archive size={15} />}
-            归档
+            {busy('archive') ? <Loader2 className="spin" size={15} /> : <Archive size={15} />}{'\u5f52\u6863'}
           </button>
         ) : null}
         {memory.status !== 'DELETED' ? (
           <button className="chip-button danger" onClick={() => onAction('delete')} disabled={Boolean(busyAction)} type="button">
-            {busy('delete') ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-            删除
+            {busy('delete') ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}{'\u5220\u9664'}
           </button>
         ) : null}
       </div>
@@ -1469,222 +1182,172 @@ function PlanningResult({ task }: { task: AgentTask }) {
   const alignment = Array.isArray(source?.alignment) ? source.alignment : [];
   const gaps = Array.isArray(source?.gaps) ? source.gaps : [];
   const webReferences = Array.isArray(source?.webReferences) ? source.webReferences : [];
-  const resumeTemplateFill = source?.resumeTemplateFill && typeof source.resumeTemplateFill === 'object'
-    ? source.resumeTemplateFill as Record<string, unknown>
-    : null;
-  if (!alignment.length && !gaps.length && !webReferences.length && !resumeTemplateFill) return null;
+  if (!alignment.length && !gaps.length && !webReferences.length) return null;
   return (
-    <div className="agent-planning-result">
-      {alignment.length ? (
-        <div>
-          <h4>证据对齐</h4>
-          <div className="agent-alignment-list">
-            {alignment.map((item) => {
-              const entry = item as Record<string, unknown>;
-              const status = stringValue(entry.status);
-              return (
-                <div className="agent-alignment-row" key={`${String(entry.requirement)}-${status}`}>
-                  <span className={`evidence-status ${alignmentStatusClass(status)}`}>{alignmentStatusLabel(status)}</span>
-                  <strong>{String(entry.requirement || '未命名要求')}</strong>
-                  <small>{String(entry.reason || '')}</small>
-                  <div className="query-tags agent-tags">
-                    {normalizeStringList(entry.evidenceIds).map((id) => <span key={id}>{id}</span>)}
+    <ChatMessage role="assistant" title={COPY.reasoningSummary}>
+      <div className="agent-planning-result">
+        {alignment.length ? (
+          <div>
+            <h4>{'\u8bc1\u636e\u5bf9\u9f50'}</h4>
+            <div className="agent-alignment-list">
+              {alignment.map((item) => {
+                const entry = item as Record<string, unknown>;
+                const status = stringValue(entry.status);
+                return (
+                  <div className="agent-alignment-row" key={`${String(entry.requirement)}-${status}`}>
+                    <span className={`evidence-status ${alignmentStatusClass(status)}`}>{alignmentStatusLabel(status)}</span>
+                    <strong>{String(entry.requirement || '\u672a\u547d\u540d\u8981\u6c42')}</strong>
+                    <small>{String(entry.reason || '')}</small>
+                    <div className="query-tags agent-tags">{normalizeStringList(entry.evidenceIds).map((id) => <span key={id}>{id}</span>)}</div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-      {gaps.length ? (
-        <div>
-          <h4>能力缺口</h4>
-          <div className="agent-gap-list">
-            {gaps.map((item) => {
-              const gap = item as Record<string, unknown>;
-              return (
-                <div className="agent-gap-row" key={String(gap.skill)}>
-                  <strong>{String(gap.skill || '待补充能力')}</strong>
-                  <span>{String(gap.priority || 'MEDIUM')}</span>
-                  <p>{String(gap.suggestion || '')}</p>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-      {webReferences.length ? (
-        <div className="agent-web-reference-section">
-          <h4>联网参考</h4>
-          <div className="agent-web-reference-list">
-            {webReferences.map((item) => {
-              const reference = item as Record<string, unknown>;
-              return (
-                <a className="agent-web-reference-row" href={String(reference.sourceUrl || '#')} target="_blank" rel="noreferrer" key={String(reference.sourceUrl || reference.title)}>
-                  <strong>{String(reference.title || '外部参考')}</strong>
-                  <span>{String(reference.confidence || 'LOW')} · {String(reference.score ?? '')}</span>
-                  <p>{String(reference.summary || '')}</p>
-                </a>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-      {resumeTemplateFill ? (
-        <div className="agent-template-fill-section">
-          <h4>简历模板填充</h4>
-          <div className="agent-template-fill-card">
-            <strong>{String(resumeTemplateFill.status || 'UNKNOWN')}</strong>
-            {resumeTemplateFill.outputPath ? <p>{String(resumeTemplateFill.outputPath)}</p> : null}
-            {resumeTemplateFill.errorMessage ? <p>{String(resumeTemplateFill.errorMessage)}</p> : null}
-            <div className="query-tags agent-tags">
-              {normalizeStringList(resumeTemplateFill.placeholders).map((placeholder) => <span key={placeholder}>{placeholder}</span>)}
+                );
+              })}
             </div>
           </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function ToolCallItem({ call }: { call: AgentToolCall }) {
-  return (
-    <div className="agent-timeline-item">
-      <span className={`agent-timeline-dot ${taskStatusClass(call.status)}`} />
-      <div>
-        <div className="agent-timeline-head">
-          <strong>{call.toolName}</strong>
-          <span className={`status-pill ${taskStatusClass(call.status)}`}>{statusLabel(call.status)}</span>
-        </div>
-        <p>{formatToolResponse(call.response)}</p>
-        {call.errorMessage ? <small>{call.errorCode}：{call.errorMessage}</small> : null}
+        ) : null}
+        {gaps.length ? (
+          <div>
+            <h4>{'\u80fd\u529b\u7f3a\u53e3'}</h4>
+            <div className="agent-gap-list">
+              {gaps.map((item) => {
+                const gap = item as Record<string, unknown>;
+                return (
+                  <div className="agent-gap-row" key={String(gap.skill)}>
+                    <strong>{String(gap.skill || '\u5f85\u8865\u5145\u80fd\u529b')}</strong>
+                    <span>{String(gap.priority || 'MEDIUM')}</span>
+                    <p>{String(gap.suggestion || '')}</p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+        {webReferences.length ? (
+          <div className="agent-web-reference-section">
+            <h4>{'\u8054\u7f51\u53c2\u8003'}</h4>
+            <div className="agent-web-reference-list">
+              {webReferences.map((item) => {
+                const reference = item as Record<string, unknown>;
+                return (
+                  <a className="agent-web-reference-row" href={String(reference.sourceUrl || '#')} target="_blank" rel="noreferrer" key={String(reference.sourceUrl || reference.title)}>
+                    <strong>{String(reference.title || '\u5916\u90e8\u53c2\u8003')}</strong>
+                    <span>{String(reference.confidence || 'LOW')} · {String(reference.score ?? '')}</span>
+                    <p>{String(reference.summary || '')}</p>
+                  </a>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
       </div>
-    </div>
+    </ChatMessage>
   );
 }
 
 function MetaItem({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div className="agent-meta-item">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
 }
 
+function findFeature(mode: AgentWorkspaceMode) {
+  return FEATURE_OPTIONS.find((item) => item.value === mode) || FEATURE_OPTIONS[0];
+}
+
+function normalizeMode(value: unknown): AgentWorkspaceMode {
+  if (value === 'jd_video') return 'free_explore';
+  return value === 'free_explore' ? 'free_explore' : 'read';
+}
+
+function buildToolHints(mode: AgentWorkspaceMode) {
+  if (mode === 'free_explore') return ['web_search_probe', 'rag_query_probe_non_persistent'];
+  return ['rag_query_probe_non_persistent'];
+}
+
+function buildGoalForMode(mode: AgentWorkspaceMode, goal: string) {
+  if (mode === 'free_explore') {
+    return [
+      goal,
+      '',
+      '\u8bf7\u6309\u81ea\u7531\u63a2\u7d22\u6a21\u5f0f\u5904\u7406\uff1a\u6570\u636e\u6765\u6e90\u4f18\u5148\u4f7f\u7528\u8054\u7f51\u67e5\u8be2\uff0cRAG \u53ea\u4f5c\u4e3a\u672c\u5730 evidence \u8865\u5145\u6216\u8054\u7f51\u4e0d\u53ef\u7528\u65f6\u7684\u964d\u7ea7\u8def\u5f84\u3002',
+      '\u53ef\u4ee5\u89e3\u91ca\u3001\u6574\u7406\u677e\u6563\u8d44\u6599\u3001\u7ed3\u5408 JD \u548c\u89c6\u9891\u5b66\u4e60\u8bc1\u636e\uff0c\u7ed9\u51fa\u8d44\u6599\u6807\u9898\u3001\u6807\u7b7e\u3001\u6458\u8981\u548c\u4e0b\u4e00\u6b65\u5efa\u8bae\u3002',
+      '\u5982\u9700\u5199\u5165\u77e5\u8bc6\u5e93\uff0c\u53ea\u63d0\u4f9b\u4e0a\u4f20\u6216\u5165\u5e93\u5efa\u8bae\uff0c\u4e0d\u76f4\u63a5\u6267\u884c\u5199\u5165\u6216\u72b6\u6001\u53d8\u66f4\u3002'
+    ].join('\n');
+  }
+  return goal;
+}
+
+function buildProgressSteps(task: AgentTask | null) {
+  const status = task?.status || 'IDLE';
+  const hasTools = Boolean(task?.toolCalls?.length);
+  const hasReview = Boolean(task?.reviews?.length);
+  const hasFinal = Boolean(task?.final && Object.keys(task.final).length);
+  const hasPlan = Boolean(task?.plan && Object.keys(task.plan).length);
+  return [
+    { label: '\u521b\u5efa\u4efb\u52a1', done: Boolean(task) && status !== 'CREATING', active: !task || status === 'CREATING' },
+    { label: '\u6574\u7406\u8ba1\u5212', done: hasPlan, active: status === 'CREATED' || (status === 'RUNNING' && !hasPlan) },
+    { label: '\u8c03\u7528\u5de5\u5177', done: hasTools, active: status === 'WAITING_TOOL_RESULT' },
+    { label: '\u786e\u8ba4\u5ba1\u6279', done: hasReview && !task?.reviews?.some((review) => review.status === 'PENDING'), active: status.includes('REVIEW') },
+    { label: '\u751f\u6210\u6700\u7ec8\u56de\u7b54', done: hasFinal || status === 'COMPLETED', active: status === 'RUNNING' && hasTools }
+  ];
+}
+
+function buildBackendNotice(task: AgentTask) {
+  if (task.errorMessage) return formatTaskError(task);
+  if (task.status === 'COMPLETED') return '';
+  if (task.status === 'CANCELED') return '\u4efb\u52a1\u5df2\u53d6\u6d88\u3002';
+  const draft = normalizeRecord(task.draft);
+  const draftMessage = stringValue(draft.message);
+  if (draftMessage) return draftMessage;
+  if (task.status === 'CREATING') return '\u6b63\u5728\u521b\u5efa Agent \u4efb\u52a1\uff0c\u4efb\u52a1 ID \u8fd4\u56de\u540e\u4f1a\u81ea\u52a8\u63a5\u5165\u4e8b\u4ef6\u6d41\u3002';
+  if (task.status === 'CREATED') return '\u4efb\u52a1\u5df2\u521b\u5efa\uff0c\u6b63\u5728\u542f\u52a8 Python Agent\u3002';
+  if (task.status === 'RUNNING') {
+    if (!task.plan || !Object.keys(task.plan).length) {
+      return '\u540e\u7aef\u5df2\u63a5\u6536\u4efb\u52a1\uff0cAgent \u6b63\u5728\u751f\u6210\u8ba1\u5212\u548c\u5de5\u5177\u8def\u7ebf\u3002';
+    }
+    if (!task.toolCalls?.length) {
+      return '\u8ba1\u5212\u5df2\u56de\u5199\uff0cAgent \u6b63\u5728\u51c6\u5907\u6267\u884c\u5de5\u5177\u3002';
+    }
+    return '\u5de5\u5177\u89c2\u5bdf\u5df2\u56de\u5199\uff0cAgent \u6b63\u5728\u6574\u5408\u7ed3\u679c\u3002';
+  }
+  if (task.status === 'WAITING_TOOL_RESULT') return '\u5de5\u5177\u8bf7\u6c42\u5df2\u53d1\u8d77\uff0c\u6b63\u5728\u7b49\u5f85 Java Tool Gateway \u56de\u5199\u89c2\u5bdf\u7ed3\u679c\u3002';
+  if (task.status === 'WAITING_PLAN_REVIEW') return '\u89c4\u5212\u5668\u5df2\u751f\u6210\u6267\u884c\u8def\u7ebf\uff0c\u7b49\u5f85\u4f60\u6279\u51c6\u6216\u8981\u6c42\u4fee\u6539\u3002';
+  if (task.status === 'WAITING_OUTPUT_REVIEW') return '\u8f93\u51fa\u8349\u7a3f\u5df2\u751f\u6210\uff0c\u7b49\u5f85\u4f60\u786e\u8ba4\u540e\u518d\u5b8c\u6210\u4efb\u52a1\u3002';
+  if (task.status === 'WAITING_CRUD_REVIEW') return '\u68c0\u6d4b\u5230\u53d8\u66f4\u610f\u56fe\uff0c\u6b63\u7b49\u5f85\u4f60\u5ba1\u6279\u5177\u4f53\u5199\u64cd\u4f5c\u3002';
+  return '';
+}
+
+function formatTaskError(task: AgentTask) {
+  const code = stringValue(task.errorCode);
+  const message = stringValue(task.errorMessage);
+  if (code && message) return `${code}: ${message}`;
+  return message || code || '后端未返回错误详情';
+}
+
 function statusLabel(status?: string) {
   const labels: Record<string, string> = {
-    CREATED: '已创建',
-    RUNNING: '运行中',
-    WAITING_TOOL_RESULT: '等待工具',
-    WAITING_PLAN_REVIEW: '等待计划审批',
-    WAITING_CRUD_REVIEW: '等待变更审批',
-    WAITING_OUTPUT_REVIEW: '等待输出确认',
-    COMPLETED: '已完成',
-    CANCELED: '已取消',
-    FAILED: '失败',
-    SUCCEEDED: '成功',
-    REJECTED: '已拒绝',
-    PENDING: '等待中',
-    APPLIED_UNDOABLE: '可撤销',
-    UNDONE: '已撤销',
-    UNDO_EXPIRED: '撤销过期'
+    IDLE: '\u672a\u521b\u5efa',
+    CREATING: '\u521b\u5efa\u4e2d',
+    CREATED: '\u5df2\u521b\u5efa',
+    RUNNING: '\u8fd0\u884c\u4e2d',
+    WAITING_TOOL_RESULT: '\u7b49\u5f85\u5de5\u5177',
+    WAITING_PLAN_REVIEW: '\u7b49\u5f85\u8ba1\u5212\u5ba1\u6279',
+    WAITING_CRUD_REVIEW: '\u7b49\u5f85\u53d8\u66f4\u5ba1\u6279',
+    WAITING_OUTPUT_REVIEW: '\u7b49\u5f85\u8f93\u51fa\u786e\u8ba4',
+    COMPLETED: '\u5df2\u5b8c\u6210',
+    CANCELED: '\u5df2\u53d6\u6d88',
+    FAILED: '\u5931\u8d25',
+    SUCCEEDED: '\u6210\u529f',
+    REJECTED: '\u5df2\u62d2\u7edd',
+    PENDING: '\u7b49\u5f85\u4e2d',
+    APPLIED_UNDOABLE: '\u53ef\u64a4\u9500',
+    UNDONE: '\u5df2\u64a4\u9500',
+    UNDO_EXPIRED: '\u64a4\u9500\u8fc7\u671f'
   };
-  return labels[status || ''] || status || '未知';
-}
-
-function formatTemplateStatus(status: string) {
-  if (status === 'READY') return '已解析';
-  if (status === 'PARSING') return '解析中';
-  if (status === 'EXPORTED') return '已导出';
-  if (status === 'FAILED') return '解析失败';
-  return status || '未知状态';
-}
-
-function formatPatchStatus(status?: string) {
-  if (status === 'CONFIRMED') return '已确认';
-  if (status === 'VALIDATED') return '已校验';
-  if (status === 'REJECTED') return '已拒绝';
-  if (status === 'EXPORTED') return '已导出';
-  return '待确认';
-}
-
-function patchStatusClass(status?: string) {
-  if (status === 'CONFIRMED' || status === 'VALIDATED' || status === 'EXPORTED') return 'indexed';
-  if (status === 'REJECTED') return 'danger';
-  return 'running';
-}
-
-function patchRowClass(status?: string) {
-  if (status === 'CONFIRMED' || status === 'VALIDATED' || status === 'EXPORTED') return 'is-confirmed';
-  if (status === 'REJECTED') return 'is-rejected';
-  return 'is-draft';
-}
-
-function formatRisk(flag: string) {
-  const labels: Record<string, string> = {
-    NONE: '无风险',
-    MISSING_EVIDENCE: '缺少证据',
-    LOW_CONFIDENCE: '低置信度',
-    OVER_LENGTH: '长度风险',
-    LAYOUT_RISK: '版式风险',
-    SENSITIVE_INFO: '敏感信息',
-    UNSUPPORTED_REGION: '不支持区域',
-    INJECTION_RISK: '注入风险'
-  };
-  return labels[flag] || flag;
-}
-
-function templateCanFill(template: ResumeTemplate) {
-  return ['READY', 'EXPORTED'].includes(template.status);
-}
-
-function rankResumeMaterials(materials: LearningMaterial[]) {
-  return [...materials]
-    .filter((material) => materialCanShowAsResumeCandidate(material))
-    .sort((left, right) => {
-      const scoreDelta = resumeMaterialScore(right) - resumeMaterialScore(left);
-      if (scoreDelta !== 0) return scoreDelta;
-      return timeValue(right.updatedAt || right.createdAt) - timeValue(left.updatedAt || left.createdAt);
-    });
-}
-
-function materialCanShowAsResumeCandidate(material: LearningMaterial) {
-  const documentType = (material.documentType || '').toLowerCase();
-  const name = `${material.title || ''} ${material.originalFilename || ''}`.toLowerCase();
-  const typeAllowed = ['docx', 'doc', 'pdf', 'markdown', 'text', 'txt'].includes(documentType);
-  const nameLooksLikeResume = name.includes('简历') || name.includes('resume') || /\bcv\b/.test(name);
-  return typeAllowed || nameLooksLikeResume || Boolean((material.documentSummary || '').trim());
-}
-
-function resumeMaterialScore(material: LearningMaterial) {
-  const name = `${material.title || ''} ${material.originalFilename || ''}`.toLowerCase();
-  const documentType = (material.documentType || '').toLowerCase();
-  let score = 0;
-  if (name.includes('简历') || name.includes('resume') || /\bcv\b/.test(name)) score += 100;
-  if ((material.documentSummary || '').trim()) score += 30;
-  if (material.status === 'READY' || material.status === 'PARTIAL') score += 20;
-  if (['docx', 'doc', 'pdf'].includes(documentType)) score += 10;
-  return score;
-}
-
-function materialCanUseAsResume(material: LearningMaterial) {
-  return ['READY', 'PARTIAL'].includes(material.status) || Boolean((material.documentSummary || '').trim());
-}
-
-function formatMaterialStatus(status: string) {
-  if (status === 'READY') return '已入库';
-  if (status === 'PARTIAL') return '部分可用';
-  if (status === 'PARSING') return '解析中';
-  if (status === 'REINDEXING') return '重建索引';
-  if (status === 'PROCESSING') return '处理中';
-  if (status === 'FAILED') return '解析失败';
-  return status || '未知状态';
-}
-
-function timeValue(value?: string | null) {
-  const parsed = value ? Date.parse(value) : 0;
-  return Number.isFinite(parsed) ? parsed : 0;
+  return labels[status || 'IDLE'] || status || '\u672a\u77e5';
 }
 
 function statusIcon(status: string | undefined, active: boolean) {
@@ -1694,17 +1357,39 @@ function statusIcon(status: string | undefined, active: boolean) {
   return <Clock3 size={15} />;
 }
 
+function normalizeMessageRole(role?: string): 'user' | 'assistant' | 'system' {
+  if (role === 'USER') return 'user';
+  if (role === 'SYSTEM') return 'system';
+  return 'assistant';
+}
+
+function messageTitle(message: AgentChatMessage) {
+  const titles: Record<string, string> = {
+    USER_GOAL: COPY.userGoal,
+    STATUS: COPY.executionNote,
+    TOOL_OBSERVATION: COPY.toolCall,
+    CONTEXT_SUMMARY: COPY.contextSummary,
+    PLAN_REVIEW: '\u8ba1\u5212\u786e\u8ba4',
+    OUTPUT_REVIEW: '\u8f93\u51fa\u786e\u8ba4',
+    FINAL_ANSWER: COPY.finalAnswer,
+    ERROR: '\u6267\u884c\u5931\u8d25',
+    REVIEW_DECISION: '\u5ba1\u6279\u51b3\u7b56',
+    OPERATION_UNDO: '\u64a4\u9500\u64cd\u4f5c'
+  };
+  return titles[message.messageType] || COPY.executionNote;
+}
+
 function taskStatusClass(status?: string) {
   if (status === 'COMPLETED' || status === 'SUCCEEDED') return 'indexed';
   if (status === 'FAILED' || status === 'REJECTED') return 'danger';
-  if (status === 'RUNNING' || status === 'WAITING_TOOL_RESULT' || status === 'WAITING_PLAN_REVIEW' || status === 'WAITING_CRUD_REVIEW' || status === 'WAITING_OUTPUT_REVIEW') return 'running';
+  if (status === 'CREATING' || status === 'RUNNING' || status === 'WAITING_TOOL_RESULT' || status === 'WAITING_PLAN_REVIEW' || status === 'WAITING_CRUD_REVIEW' || status === 'WAITING_OUTPUT_REVIEW' || status === 'PENDING') return 'running';
   return '';
 }
 
 function reviewTitle(reviewType: string) {
-  if (reviewType === 'OUTPUT') return '输出确认';
-  if (reviewType === 'CRUD') return '变更确认';
-  return '计划确认';
+  if (reviewType === 'OUTPUT') return '\u8f93\u51fa\u786e\u8ba4';
+  if (reviewType === 'CRUD') return '\u53d8\u66f4\u786e\u8ba4';
+  return '\u8ba1\u5212\u786e\u8ba4';
 }
 
 function operationStatusLabel(status: string) {
@@ -1719,16 +1404,16 @@ function operationStatusClass(status: string) {
 
 function memoryStatusLabel(status: string) {
   const labels: Record<string, string> = {
-    PENDING_REVIEW: '待确认',
-    PENDING_INDEX: '待索引',
-    ACTIVE: '已激活',
-    INDEX_FAILED: '索引失败',
-    ARCHIVED: '已归档',
-    SUPERSEDED: '已替换',
-    REJECTED: '已拒绝',
-    DELETED: '已删除'
+    PENDING_REVIEW: '\u5f85\u786e\u8ba4',
+    PENDING_INDEX: '\u5f85\u7d22\u5f15',
+    ACTIVE: '\u5df2\u6fc0\u6d3b',
+    INDEX_FAILED: '\u7d22\u5f15\u5931\u8d25',
+    ARCHIVED: '\u5df2\u5f52\u6863',
+    SUPERSEDED: '\u5df2\u66ff\u6362',
+    REJECTED: '\u5df2\u62d2\u7edd',
+    DELETED: '\u5df2\u5220\u9664'
   };
-  return labels[status] || status || '未知';
+  return labels[status] || status || '\u672a\u77e5';
 }
 
 function memoryStatusClass(status: string) {
@@ -1745,70 +1430,137 @@ function alignmentStatusClass(status: string) {
 }
 
 function alignmentStatusLabel(status: string) {
-  if (status === 'supported') return '已支持';
-  if (status === 'weak') return '证据偏弱';
-  return '缺证据';
+  if (status === 'supported') return '\u5df2\u652f\u6301';
+  if (status === 'weak') return '\u8bc1\u636e\u504f\u5f31';
+  return '\u7f3a\u8bc1\u636e';
 }
 
-function formatToolResponse(response?: Record<string, unknown>) {
-  if (!response) return '暂无观察摘要';
+function formatToolResponse(response?: Record<string, unknown> | null) {
+  if (!response) return '\u6682\u65e0\u8f93\u51fa\u6458\u8981';
   const parts = [
-    response.evidenceCount !== undefined ? `证据 ${response.evidenceCount}` : '',
-    response.answerLength !== undefined ? `回答长度 ${response.answerLength}` : '',
-    response.expandedQueryCount !== undefined ? `扩展查询 ${response.expandedQueryCount}` : '',
-    response.operationId !== undefined ? `操作 ${response.operationId}` : '',
-    response.undoDeadline !== undefined ? `撤销 ${formatTime(String(response.undoDeadline))}` : '',
-    Array.isArray(response.diagnosticKeys) ? `诊断 ${response.diagnosticKeys.length}` : ''
+    response.evidenceCount !== undefined ? `\u8bc1\u636e ${response.evidenceCount}` : '',
+    response.answerLength !== undefined ? `\u56de\u7b54\u957f\u5ea6 ${response.answerLength}` : '',
+    response.expandedQueryCount !== undefined ? `\u6269\u5c55\u67e5\u8be2 ${response.expandedQueryCount}` : '',
+    response.operationId !== undefined ? `\u64cd\u4f5c ${response.operationId}` : '',
+    response.undoDeadline !== undefined ? `\u64a4\u9500 ${formatTime(String(response.undoDeadline))}` : '',
+    Array.isArray(response.diagnosticKeys) ? `\u8bca\u65ad ${response.diagnosticKeys.length}` : '',
+    response.summary ? String(response.summary) : ''
   ].filter(Boolean);
   if (parts.length) return parts.join(' · ');
-  return JSON.stringify(response);
+  const keys = Object.keys(response).slice(0, 5);
+  return keys.length ? `\u8fd4\u56de\u5b57\u6bb5\uff1a${keys.join('\u3001')}` : '\u5de5\u5177\u5df2\u8fd4\u56de\u7ed3\u679c';
+}
+
+function normalizePlanSteps(value: unknown): unknown[] {
+  return Array.isArray(value) ? value.filter((item) => item !== null && item !== undefined && String(item).trim() !== '') : [];
 }
 
 function normalizeStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
 }
 
-function normalizeRecordList(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
+function uniqueList(items: string[]) {
+  return Array.from(new Set(items.filter(Boolean)));
 }
 
-function displayUserGoal(value: unknown) {
-  return stringValue(value).split('\n\n')[0] || '未返回用户目标';
+function mergeMessages(first: AgentChatMessage[], second: AgentChatMessage[]) {
+  const merged = new Map<string, AgentChatMessage>();
+  [...first, ...second].forEach((message) => {
+    const key = message.dedupeKey || `${message.sourceEventType || ''}-${message.sourceId || ''}-${message.content}` || message.id;
+    const existing = merged.get(key);
+    if (!existing || (message.sequenceNo !== null && message.sequenceNo !== undefined)) {
+      merged.set(key, message);
+    }
+  });
+  return Array.from(merged.values()).sort((left, right) => {
+    const leftSeq = left.sequenceNo ?? Number.MAX_SAFE_INTEGER;
+    const rightSeq = right.sequenceNo ?? Number.MAX_SAFE_INTEGER;
+    if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+    return new Date(left.createdAt || 0).getTime() - new Date(right.createdAt || 0).getTime();
+  });
 }
 
-function planStepKey(step: unknown) {
-  if (!step || typeof step !== 'object' || Array.isArray(step)) return String(step || 'step');
-  const item = step as Record<string, unknown>;
-  return [item.description, item.toolName, item.expectedOutput].map((value) => String(value || '')).join('-') || 'step';
+function oldestMessageSequence(messages: AgentChatMessage[]) {
+  const sequences = messages.map((message) => message.sequenceNo).filter((value): value is number => typeof value === 'number');
+  return sequences.length ? Math.min(...sequences) : null;
 }
 
-function buildGoalForMode(mode: AgentWorkspaceMode, goal: string) {
-  if (mode !== 'general') return goal;
+function streamDedupeKey(event: AgentStreamEvent, draft: Record<string, unknown>, message: string) {
+  if (event.toolCallId) return `tool_${event.toolCallId}`;
+  const reviewRequest = normalizeRecord(event.reviewRequest);
+  const reviewId = stringValue(reviewRequest.id);
+  if (reviewId) return `review_${reviewId}`;
+  if (event.eventType === 'TASK_COMPLETED') return 'final_answer';
+  if (event.eventType === 'TASK_FAILED') return 'task_failed';
+  const source = streamSourceKey(event, draft);
+  return `event_${event.eventType.toLowerCase()}_${javaStringHashHex(`${source}|${message}`)}`;
+}
+
+function streamSourceKey(event: AgentStreamEvent, draft: Record<string, unknown>) {
+  if (event.toolCallId) return event.toolCallId;
+  const reviewRequest = normalizeRecord(event.reviewRequest);
+  const reviewId = stringValue(reviewRequest.id);
+  if (reviewId) return reviewId;
   return [
-    goal,
-    '',
-    '请按自由探索模式处理：可以自然语言解释知识库内容、检索视频 evidence、整理松散学习资料、给出推荐的资料标题、标签、摘要和入库步骤。',
-    '如果用户想把内容写入 RAG 数据库，只给出资料库上传/粘贴入库建议，不执行任何写入或状态变更。'
-  ].join('\n');
+    event.eventType || 'event',
+    stringValue(draft.node) || 'node',
+    stringValue(draft.phase) || 'phase',
+    stringValue(draft.progressStatus) || 'status'
+  ].join(':');
+}
+
+function javaStringHashHex(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash * 31) + value.charCodeAt(index)) | 0;
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function streamEventTitle(eventType: string) {
+  const titles: Record<string, string> = {
+    AGENT_NODE_STARTED: '节点开始执行',
+    AGENT_NODE_DELTA: '节点输出更新',
+    AGENT_NODE_COMPLETED: '节点执行完成',
+    TOOL_CALL_STARTED: '工具调用开始',
+    TOOL_CALL_COMPLETED: '工具调用完成',
+    CONTEXT_COMPRESSED: '上下文已压缩',
+    CONTEXT_RECALLED: '上下文已回捞',
+    TASK_FAILED: '任务执行失败'
+  };
+  return titles[eventType] || '';
+}
+
+function normalizeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function stringValue(value: unknown) {
   return typeof value === 'string' ? value : '';
 }
 
-function formatTime(value?: string | null) {
-  if (!value) return '未返回';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+function displayUserGoal(value: unknown) {
+  return stringValue(value).split('\n\n')[0] || '\u672a\u8fd4\u56de\u7528\u6237\u76ee\u6807';
 }
 
-function clamp(value: number, min: number, max: number) {
-  if (Number.isNaN(value)) return min;
-  return Math.max(min, Math.min(max, value));
+function planStepKey(step: unknown) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return String(step || 'step');
+  const item = step as Record<string, unknown>;
+  return [item.description, item.title, item.toolName, item.expectedOutput].map((value) => String(value || '')).join('-') || 'step';
+}
+
+function formatTime(value?: string | null) {
+  if (!value) return '\u672a\u8fd4\u56de';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
 function undoExpired(value?: string | null) {
   if (!value) return true;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) || date.getTime() <= Date.now();
+}
+
+function notifyConversationTreeChanged() {
+  window.dispatchEvent(new Event('agent-conversations-updated'));
 }

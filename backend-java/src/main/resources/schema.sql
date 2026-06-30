@@ -57,128 +57,6 @@ CREATE TABLE IF NOT EXISTS learning_material (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS resume_template (
-    id VARCHAR(120) PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    template_name VARCHAR(255) NOT NULL,
-    original_filename VARCHAR(255) NOT NULL,
-    original_file_path VARCHAR(700) NOT NULL,
-    storage_type VARCHAR(30) NOT NULL DEFAULT 'local',
-    object_key VARCHAR(700),
-    public_url VARCHAR(700),
-    current_filename VARCHAR(255),
-    current_file_path VARCHAR(700),
-    current_storage_type VARCHAR(30),
-    current_object_key VARCHAR(700),
-    current_public_url VARCHAR(700),
-    file_type VARCHAR(20) NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    status VARCHAR(30) NOT NULL DEFAULT 'PARSING',
-    layout_fingerprint_json CLOB NOT NULL DEFAULT '{}',
-    unsupported_regions_json CLOB NOT NULL DEFAULT '[]',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS resume_template_field (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    field_id VARCHAR(120) NOT NULL,
-    section_key VARCHAR(60) NOT NULL,
-    display_name VARCHAR(255) NOT NULL,
-    source_text CLOB NOT NULL,
-    source_text_hash VARCHAR(128) NOT NULL,
-    location_refs_json CLOB NOT NULL DEFAULT '[]',
-    style_fingerprint_json CLOB NOT NULL DEFAULT '{}',
-    max_chars INTEGER NOT NULL,
-    max_lines INTEGER NOT NULL,
-    required_evidence_policy VARCHAR(30) NOT NULL,
-    unsupported_regions_json CLOB NOT NULL DEFAULT '[]',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_resume_template_field_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
-    CONSTRAINT uk_resume_template_field UNIQUE (template_id, template_version, field_id)
-);
-
-CREATE TABLE IF NOT EXISTS resume_template_preview_page (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    page_index INTEGER NOT NULL,
-    storage_type VARCHAR(30) NOT NULL,
-    file_path VARCHAR(700),
-    object_key VARCHAR(700),
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_resume_preview_page_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
-    CONSTRAINT uk_resume_template_preview_page UNIQUE (template_id, template_version, page_index)
-);
-
-CREATE TABLE IF NOT EXISTS resume_template_region_annotation (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    field_id VARCHAR(120),
-    page_index INTEGER NOT NULL,
-    rect_json CLOB NOT NULL,
-    source_type VARCHAR(30) NOT NULL,
-    editable BOOLEAN NOT NULL DEFAULT FALSE,
-    section_key VARCHAR(60) NOT NULL,
-    user_instruction VARCHAR(500),
-    required_evidence_policy VARCHAR(30) NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    annotation_revision INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_resume_region_annotation_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS resume_template_patch_draft (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL,
-    user_id VARCHAR(120) NOT NULL,
-    template_version INTEGER NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'DRAFT',
-    job_description_hash VARCHAR(128) NOT NULL,
-    patches_json CLOB NOT NULL DEFAULT '[]',
-    evidence_candidates_json CLOB NOT NULL DEFAULT '[]',
-    validation_errors_json CLOB NOT NULL DEFAULT '[]',
-    allowed_field_ids_json CLOB NOT NULL DEFAULT '[]',
-    annotation_revision INTEGER,
-    provider VARCHAR(40),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_resume_patch_draft_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS resume_template_export (
-    id VARCHAR(120) PRIMARY KEY,
-    template_id VARCHAR(120) NOT NULL,
-    user_id VARCHAR(120) NOT NULL,
-    base_version INTEGER NOT NULL,
-    export_version INTEGER NOT NULL,
-    patch_draft_id VARCHAR(120) NOT NULL,
-    filename VARCHAR(255) NOT NULL,
-    file_path VARCHAR(700) NOT NULL,
-    storage_type VARCHAR(30) NOT NULL,
-    object_key VARCHAR(700),
-    public_url VARCHAR(700),
-    layout_validation_json CLOB NOT NULL DEFAULT '{}',
-    idempotency_key VARCHAR(160) NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'EXPORTED',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_resume_template_export_template FOREIGN KEY (template_id) REFERENCES resume_template(id) ON DELETE CASCADE,
-    CONSTRAINT fk_resume_template_export_draft FOREIGN KEY (patch_draft_id) REFERENCES resume_template_patch_draft(id) ON DELETE CASCADE,
-    CONSTRAINT uk_resume_template_export_idempotency UNIQUE (template_id, user_id, idempotency_key)
-);
-
 CREATE TABLE IF NOT EXISTS rag_query_history (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
@@ -261,9 +139,22 @@ CREATE TABLE IF NOT EXISTS log_error (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS agent_conversation_folder (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    name VARCHAR(80) NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_folder_user_sort
+    ON agent_conversation_folder(user_id, sort_order, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS agent_task (
     id VARCHAR(120) PRIMARY KEY,
     user_id VARCHAR(120) NOT NULL,
+    folder_id VARCHAR(120),
     task_type VARCHAR(40) NOT NULL,
     status VARCHAR(40) NOT NULL DEFAULT 'CREATED',
     title VARCHAR(255),
@@ -275,14 +166,78 @@ CREATE TABLE IF NOT EXISTS agent_task (
     error_code VARCHAR(120),
     error_message VARCHAR(1000),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_task_folder FOREIGN KEY (folder_id) REFERENCES agent_conversation_folder(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_task_user_status_updated
     ON agent_task(user_id, status, updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_agent_task_user_folder_updated
+    ON agent_task(user_id, folder_id, updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_agent_task_python_thread
     ON agent_task(python_thread_id);
+
+CREATE TABLE IF NOT EXISTS agent_chat_message (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    sequence_no BIGINT NOT NULL DEFAULT 0,
+    role VARCHAR(30) NOT NULL,
+    message_type VARCHAR(60) NOT NULL,
+    content CLOB NOT NULL,
+    payload_json CLOB NOT NULL DEFAULT '{}',
+    source_event_type VARCHAR(80),
+    source_id VARCHAR(160),
+    dedupe_key VARCHAR(220) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_chat_message_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE,
+    CONSTRAINT uk_agent_chat_message_dedupe UNIQUE (task_id, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_chat_message_task_created
+    ON agent_chat_message(task_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_chat_message_task_sequence
+    ON agent_chat_message(task_id, sequence_no);
+
+CREATE INDEX IF NOT EXISTS idx_agent_chat_message_user_updated
+    ON agent_chat_message(user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_conversation_summary (
+    id VARCHAR(120) PRIMARY KEY,
+    task_id VARCHAR(120) NOT NULL,
+    user_id VARCHAR(120) NOT NULL,
+    summary_type VARCHAR(40) NOT NULL DEFAULT 'CONTEXT_COMPRESSION',
+    covered_message_start_id VARCHAR(120),
+    covered_message_end_id VARCHAR(120),
+    covered_message_count INTEGER NOT NULL DEFAULT 0,
+    raw_token_estimate INTEGER NOT NULL DEFAULT 0,
+    compressed_token_estimate INTEGER NOT NULL DEFAULT 0,
+    summary_json CLOB NOT NULL DEFAULT '{}',
+    summary_text CLOB NOT NULL,
+    key_facts_json CLOB NOT NULL DEFAULT '[]',
+    evidence_refs_json CLOB NOT NULL DEFAULT '[]',
+    compression_model VARCHAR(120),
+    compression_prompt_version VARCHAR(80) NOT NULL DEFAULT 'agent-context-compression-v1',
+    compression_version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(40) NOT NULL DEFAULT 'ACTIVE',
+    diagnostics_json CLOB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_conversation_summary_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_summary_task_status_updated
+    ON agent_conversation_summary(task_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_summary_user_task_status
+    ON agent_conversation_summary(user_id, task_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_summary_covered_range
+    ON agent_conversation_summary(task_id, covered_message_start_id, covered_message_end_id);
 
 CREATE TABLE IF NOT EXISTS agent_tool_call (
     id VARCHAR(120) PRIMARY KEY,
@@ -480,63 +435,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_memory_audit_memory_created
 
 CREATE INDEX IF NOT EXISTS idx_agent_memory_audit_user_created
     ON agent_memory_audit(user_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS video_slice (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    topic VARCHAR(255) NOT NULL,
-    start_time VARCHAR(20) NOT NULL,
-    end_time VARCHAR(20) NOT NULL,
-    status VARCHAR(80) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_video_slice_title_start UNIQUE (title, start_time)
-);
-
-CREATE TABLE IF NOT EXISTS resume_evidence_alignment (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    requirement VARCHAR(255) NOT NULL,
-    evidence CLOB NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uk_resume_evidence_user_requirement UNIQUE (user_id, requirement)
-);
-
-CREATE TABLE IF NOT EXISTS jd_analysis_report (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    user_id VARCHAR(120) NOT NULL,
-    report_key VARCHAR(80) NOT NULL UNIQUE,
-    job_description CLOB NOT NULL,
-    match_score INTEGER DEFAULT 0,
-    mastered_percent INTEGER DEFAULT 0,
-    partial_percent INTEGER DEFAULT 0,
-    gap_percent INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS jd_analysis_skill (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    report_id BIGINT NOT NULL,
-    skill_name VARCHAR(160) NOT NULL,
-    status VARCHAR(30) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_jd_analysis_skill_report FOREIGN KEY (report_id) REFERENCES jd_analysis_report(id) ON DELETE CASCADE,
-    CONSTRAINT uk_jd_analysis_skill UNIQUE (report_id, skill_name)
-);
-
-CREATE TABLE IF NOT EXISTS jd_learning_plan_item (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    report_id BIGINT NOT NULL,
-    step_no INTEGER NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description CLOB NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_jd_learning_plan_report FOREIGN KEY (report_id) REFERENCES jd_analysis_report(id) ON DELETE CASCADE,
-    CONSTRAINT uk_jd_learning_plan_item UNIQUE (report_id, step_no)
-);
 
 CREATE TABLE IF NOT EXISTS system_setting (
     setting_key VARCHAR(120) PRIMARY KEY,

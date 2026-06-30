@@ -1,11 +1,7 @@
 import type {
   DashboardData,
-  JdAnalysis,
-  JdAnalysisRequest,
   Result,
-  ResumeEvidenceAlignment,
-  SystemSetting,
-  VideoSlice
+  SystemSetting
 } from './types';
 import { getStoredAuthToken } from './auth';
 
@@ -44,32 +40,6 @@ export function fetchDashboardData(options: { startDate?: string; endDate?: stri
   }
   const query = params.toString();
   return request<DashboardData>(`/api/page-data/dashboard${query ? `?${query}` : ''}`);
-}
-
-// 获取最近一次 JD 分析数据。
-export function fetchJdAnalysis(): Promise<JdAnalysis | null> {
-  return request<JdAnalysis | null>('/api/page-data/jd-analysis');
-}
-
-// 提交 JD 和简历文本，运行 RAG 证据适配分析。
-export function analyzeJd(payload: JdAnalysisRequest): Promise<JdAnalysis> {
-  return request<JdAnalysis>('/api/page-data/jd-analysis/analyze', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-}
-
-// 获取简历证据对齐数据。
-export function fetchResumeAlignments(): Promise<ResumeEvidenceAlignment[]> {
-  return request<ResumeEvidenceAlignment[]>('/api/page-data/resume-adaptation');
-}
-
-// 获取视频切片数据。
-export function fetchVideoSlices(): Promise<VideoSlice[]> {
-  return request<VideoSlice[]>('/api/page-data/video-review');
 }
 
 // 获取系统设置展示数据。

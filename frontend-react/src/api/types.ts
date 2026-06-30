@@ -168,197 +168,6 @@ export interface RagQueryHistory {
   updatedAt?: string | null;
 }
 
-export interface ResumeTemplateFieldBinding {
-  templateId: string;
-  version: number;
-  fieldId: string;
-  sectionKey: string;
-  displayName: string;
-  sourceText: string;
-  sourceTextHash: string;
-  locationRefs?: Record<string, unknown>[];
-  styleFingerprint?: Record<string, unknown>;
-  maxChars: number;
-  maxLines: number;
-  requiredEvidencePolicy: string;
-  unsupportedRegions: string[];
-}
-
-export interface ResumeTemplate {
-  templateId: string;
-  version: number;
-  status: string;
-  filename: string;
-  currentFilePath?: string | null;
-  currentPublicUrl?: string | null;
-  fileType: string;
-  fieldCount: number;
-  unsupportedRegionCount: number;
-  createdAt?: string | null;
-  updatedAt?: string | null;
-}
-
-export interface ResumeTemplatePreviewRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface ResumeTemplatePreviewPage {
-  pageIndex: number;
-  width: number;
-  height: number;
-  imageUrl: string;
-}
-
-export interface ResumeTemplateRegionAnnotation {
-  annotationId?: string | null;
-  fieldId?: string | null;
-  pageIndex: number;
-  rect: ResumeTemplatePreviewRect;
-  sourceType: 'AUTO' | 'MANUAL_BOUND' | 'MANUAL_UNBOUND' | string;
-  editable: boolean;
-  sectionKey: string;
-  userInstruction?: string | null;
-  requiredEvidencePolicy: 'NONE' | 'OPTIONAL' | 'REQUIRED' | string;
-  status: 'ACTIVE' | 'IGNORED' | string;
-  annotationRevision?: number | null;
-}
-
-export interface ResumeTemplatePreview {
-  templateId: string;
-  version: number;
-  previewStatus: 'READY' | 'PARTIAL' | 'UNAVAILABLE' | string;
-  pages: ResumeTemplatePreviewPage[];
-  annotations: ResumeTemplateRegionAnnotation[];
-  unmappedFields: Record<string, unknown>[];
-  warnings: string[];
-  generatedAt?: string | null;
-}
-
-export interface ResumeContentPatch {
-  fieldId: string;
-  sourceTextHash: string;
-  newText: string;
-  rewriteReason: string;
-  evidenceIds: string[];
-  confidence: number;
-  riskFlags: string[];
-  status: 'DRAFT' | 'VALIDATED' | 'CONFIRMED' | 'REJECTED' | 'EXPORTED' | string;
-}
-
-export interface ResumePatchEvidence {
-  evidenceId: string;
-  documentTitle?: string | null;
-  sectionName?: string | null;
-  snippet?: string | null;
-  source?: string | null;
-  score?: number | null;
-}
-
-export interface ResumePatchDraft {
-  patchDraftId: string;
-  templateId: string;
-  version: number;
-  status: string;
-  provider?: string | null;
-  patches: ResumeContentPatch[];
-  evidenceCandidates: ResumePatchEvidence[];
-  validationErrors: string[];
-  allowedFieldIds?: string[];
-  annotationRevision?: number | null;
-  createdAt?: string | null;
-  updatedAt?: string | null;
-}
-
-export interface LayoutAllowedChange {
-  type: 'TEXT_REPLACE' | 'STYLE_RANGE' | 'INSERT_PARAGRAPH' | 'DELETE_PARAGRAPH' | string;
-  fieldId?: string | null;
-  sectionKey?: string | null;
-  textRange?: string | null;
-  stylePatch?: Record<string, unknown>;
-  maxParagraphs?: number;
-  styleSource?: 'current_run' | 'previous_paragraph' | 'section_default' | string;
-}
-
-export interface LayoutChangeContract {
-  mode: 'PRESERVE_LAYOUT' | 'CONTROLLED_EDIT' | 'RELAYOUT' | string;
-  allowedChanges?: LayoutAllowedChange[];
-  maxPageDelta?: number;
-  maxParagraphDelta?: number;
-  maxRunDelta?: number;
-  requireVisualCheck?: boolean;
-}
-
-export interface ResumeTemplateExport {
-  exportId: string;
-  templateId: string;
-  baseVersion: number;
-  exportVersion: number;
-  patchDraftId: string;
-  filename: string;
-  filePath: string;
-  storageType: string;
-  publicUrl?: string | null;
-  status: string;
-  layoutValidation?: Record<string, unknown>;
-  createdAt?: string | null;
-  updatedAt?: string | null;
-}
-
-export interface VideoSlice {
-  id: number;
-  title: string;
-  topic: string;
-  startTime: string;
-  endTime: string;
-  status: string;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-export interface ResumeEvidenceAlignment {
-  id: number;
-  userId?: string | null;
-  requirement: string;
-  evidence: string;
-  status: string;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-export interface JdAnalysisSkill {
-  id: number;
-  skillName: string;
-  status: string;
-}
-
-export interface JdLearningPlanItem {
-  id: number;
-  stepNo: number;
-  title: string;
-  description: string;
-}
-
-export interface JdAnalysis {
-  id: number;
-  userId?: string | null;
-  jobDescription: string;
-  matchScore: number;
-  masteredPercent: number;
-  partialPercent: number;
-  gapPercent: number;
-  skills: JdAnalysisSkill[];
-  learningPlan: JdLearningPlanItem[];
-  updatedAt?: string;
-}
-
-export interface JdAnalysisRequest {
-  jobDescription: string;
-  resumeText?: string;
-}
-
 export interface SystemSetting {
   key: string;
   group: string;
@@ -370,8 +179,6 @@ export interface SystemSetting {
 export interface DashboardData {
   materialCount: number;
   materialDelta7Days: number;
-  videoSliceCount: number;
-  videoSliceDelta7Days: number;
   evidenceCount: number;
   openErrorCount: number;
   errorCount30Days: number;
@@ -379,9 +186,6 @@ export interface DashboardData {
   recentTaskEndDate?: string | null;
   recentTaskLimit?: number | null;
   recentMaterials: LearningMaterial[];
-  recentVideoSlices: VideoSlice[];
-  latestJdAnalysis: JdAnalysis | null;
-  resumeAlignments: ResumeEvidenceAlignment[];
 }
 
 export interface AgentTaskInput {
@@ -398,13 +202,13 @@ export interface AgentTaskInput {
   webSearchMaxResults?: number;
   resumeMaterialId?: number;
   resumeMaterialTitle?: string;
-  resumeTemplateId?: string;
   toolHints?: string[];
   metadataFilter?: Record<string, unknown>;
 }
 
 export interface AgentTaskCreatePayload {
   taskType: 'pure_read_query' | 'planning_task' | 'mutation_task';
+  folderId?: string | null;
   title?: string;
   input: AgentTaskInput;
 }
@@ -436,8 +240,71 @@ export interface AgentToolCall {
   updatedAt?: string | null;
 }
 
+export interface AgentChatMessage {
+  id: string;
+  taskId?: string;
+  sequenceNo?: number | null;
+  role: 'USER' | 'ASSISTANT' | 'SYSTEM' | 'TOOL' | string;
+  messageType: 'USER_GOAL' | 'STATUS' | 'TOOL_OBSERVATION' | 'PLAN_REVIEW' | 'OUTPUT_REVIEW' | 'FINAL_ANSWER' | 'ERROR' | 'REVIEW_DECISION' | 'OPERATION_UNDO' | string;
+  content: string;
+  payload?: Record<string, unknown>;
+  sourceEventType?: string | null;
+  sourceId?: string | null;
+  dedupeKey?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface AgentMessagePage {
+  taskId: string;
+  messages: AgentChatMessage[];
+  oldestSequenceNo?: number | null;
+  newestSequenceNo?: number | null;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+  limit: number;
+}
+
+export interface AgentStreamEvent {
+  taskId: string;
+  status?: string;
+  eventType: string;
+  pythonThreadId?: string | null;
+  draft?: Record<string, unknown>;
+  toolCallId?: string | null;
+  toolName?: string | null;
+  toolStatus?: string | null;
+  reviewRequest?: Record<string, unknown> | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  createdAt?: string | null;
+}
+
+export interface AgentConversationSummary {
+  id: string;
+  taskId?: string;
+  summaryType: string;
+  coveredMessageStartId?: string | null;
+  coveredMessageEndId?: string | null;
+  coveredMessageCount?: number | null;
+  rawTokenEstimate?: number | null;
+  compressedTokenEstimate?: number | null;
+  summary?: Record<string, unknown>;
+  summaryText: string;
+  keyFacts?: Array<Record<string, unknown>>;
+  evidenceRefs?: Array<Record<string, unknown>>;
+  compressionModel?: string | null;
+  compressionPromptVersion?: string | null;
+  compressionVersion?: number | null;
+  status: string;
+  diagnostics?: Record<string, unknown>;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface AgentTask {
   id: string;
+  folderId?: string | null;
   taskType: string;
   status: 'CREATED' | 'RUNNING' | 'WAITING_TOOL_RESULT' | 'COMPLETED' | 'CANCELED' | 'FAILED' | string;
   title: string;
@@ -451,8 +318,39 @@ export interface AgentTask {
   toolCalls?: AgentToolCall[];
   reviews?: AgentHumanReview[];
   operations?: AgentOperation[];
+  messages?: AgentChatMessage[];
+  summaries?: AgentConversationSummary[];
+  messageWindowLimit?: number | null;
+  hasMoreMessagesBefore?: boolean | null;
+  summaryWindowLimit?: number | null;
+  hasMoreSummaries?: boolean | null;
+  summaryCount?: number | null;
   createdAt?: string | null;
   updatedAt?: string | null;
+}
+
+export interface AgentConversationFolder {
+  id: string | null;
+  name: string;
+  sortOrder?: number | null;
+  conversationCount: number;
+  conversations: AgentTask[];
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface AgentConversationTree {
+  unfiled: AgentConversationFolder;
+  folders: AgentConversationFolder[];
+}
+
+export interface AgentConversationFolderPayload {
+  name: string;
+  sortOrder?: number | null;
+}
+
+export interface AgentConversationMovePayload {
+  folderId?: string | null;
 }
 
 export interface AgentHumanReview {

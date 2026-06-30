@@ -9,6 +9,7 @@ public class AgentTask {
 
     private String id;
     private String userId;
+    private String folderId;
     private String taskType;
     private String status;
     private String title;

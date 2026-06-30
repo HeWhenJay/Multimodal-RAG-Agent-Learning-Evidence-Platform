@@ -1,6 +1,13 @@
 import type {
+  AgentConversationFolder,
+  AgentConversationFolderPayload,
+  AgentConversationMovePayload,
+  AgentConversationTree,
   AgentMemory,
   AgentMemoryCreatePayload,
+  AgentChatMessage,
+  AgentMessagePage,
+  AgentStreamEvent,
   AgentOperation,
   AgentOperationUndoPayload,
   AgentReviewDecisionPayload,
@@ -33,7 +40,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return envelope.data;
 }
 
-// 创建阶段 2 只读 Agent 任务。
+// 创建 Agent 任务。
 export function createAgentTask(payload: AgentTaskCreatePayload): Promise<AgentTask> {
   return request<AgentTask>('/api/agent/tasks', {
     method: 'POST',
@@ -42,9 +49,94 @@ export function createAgentTask(payload: AgentTaskCreatePayload): Promise<AgentT
   });
 }
 
+// 查询当前用户最近的 Agent 会话任务。
+export function fetchAgentTasks(limit = 20): Promise<AgentTask[]> {
+  return request<AgentTask[]>(`/api/agent/tasks?limit=${limit}`);
+}
+
 // 读取 Agent 任务详情，前端通过轮询展示事件回写结果。
 export function fetchAgentTask(taskId: string): Promise<AgentTask> {
   return request<AgentTask>(`/api/agent/tasks/${taskId}`);
+}
+
+// 查询当前任务的后端持久化聊天消息流。
+export function fetchAgentTaskMessages(taskId: string, params: { beforeSequenceNo?: number | null; afterSequenceNo?: number | null; limit?: number } = {}): Promise<AgentMessagePage> {
+  const searchParams = new URLSearchParams();
+  if (params.beforeSequenceNo !== undefined && params.beforeSequenceNo !== null) searchParams.set('beforeSequenceNo', String(params.beforeSequenceNo));
+  if (params.afterSequenceNo !== undefined && params.afterSequenceNo !== null) searchParams.set('afterSequenceNo', String(params.afterSequenceNo));
+  if (params.limit) searchParams.set('limit', String(params.limit));
+  const suffix = searchParams.toString() ? `?${searchParams.toString()}` : '';
+  return request<AgentMessagePage>(`/api/agent/tasks/${taskId}/messages${suffix}`);
+}
+
+// 查询侧边栏 Agent 会话树。
+export function fetchAgentConversationTree(limitPerFolder = 8): Promise<AgentConversationTree> {
+  return request<AgentConversationTree>(`/api/agent/conversations/tree?limitPerFolder=${limitPerFolder}`);
+}
+
+// 创建当前用户会话文件夹。
+export function createAgentConversationFolder(payload: AgentConversationFolderPayload): Promise<AgentConversationFolder> {
+  return request<AgentConversationFolder>('/api/agent/conversation-folders', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 更新当前用户会话文件夹。
+export function updateAgentConversationFolder(folderId: string, payload: AgentConversationFolderPayload): Promise<AgentConversationFolder> {
+  return request<AgentConversationFolder>(`/api/agent/conversation-folders/${folderId}`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 删除当前用户会话文件夹，会话回到未分类。
+export function deleteAgentConversationFolder(folderId: string): Promise<void> {
+  return request<void>(`/api/agent/conversation-folders/${folderId}`, {
+    method: 'DELETE'
+  });
+}
+
+// 移动会话到指定文件夹，folderId 为空表示未分类。
+export function moveAgentConversation(taskId: string, payload: AgentConversationMovePayload): Promise<AgentTask> {
+  return request<AgentTask>(`/api/agent/tasks/${taskId}/folder`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 订阅 Agent 任务快照流，后端按任务事件增量推送最新状态。
+export function subscribeAgentTask(
+  taskId: string,
+  handlers: {
+    onTask: (task: AgentTask) => void;
+    onAgentEvent?: (event: AgentStreamEvent) => void;
+    onError?: (error: Event) => void;
+    onDone?: (task: AgentTask) => void;
+  }
+): EventSource | null {
+  const token = getStoredAuthToken();
+  if (!token) return null;
+  const source = new EventSource(`/api/agent/tasks/${taskId}/stream?token=${encodeURIComponent(token)}`);
+  source.addEventListener('task', (event) => {
+    handlers.onTask(JSON.parse((event as MessageEvent).data) as AgentTask);
+  });
+  source.addEventListener('agent_event', (event) => {
+    handlers.onAgentEvent?.(JSON.parse((event as MessageEvent).data) as AgentStreamEvent);
+  });
+  source.addEventListener('done', (event) => {
+    const task = JSON.parse((event as MessageEvent).data) as AgentTask;
+    handlers.onTask(task);
+    handlers.onDone?.(task);
+    source.close();
+  });
+  source.onerror = (event) => {
+    handlers.onError?.(event);
+  };
+  return source;
 }
 
 // 提交计划或输出审批决策。

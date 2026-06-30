@@ -20,7 +20,7 @@ def execute_approved_mutation(
     status = str(result.get("status") or "FAILED")
     client.publish_event(
         AgentTaskEvent(
-            eventType="TOOL_OBSERVATION",
+            eventType="TOOL_CALL_COMPLETED",
             status="RUNNING" if status == "SUCCEEDED" else "FAILED",
             pythonThreadId=thread_id,
             toolCall=AgentToolCallEvent(
