@@ -1,10 +1,12 @@
 # Agent 记忆接口文档
 
-更新日期：2026-06-24
+更新日期：2026-07-03
 
 ## 变更摘要
 
 新增 Agent 记忆最小可运行版本接口契约。该契约只覆盖当前用户记忆的查看、创建、确认、拒绝、编辑、归档、删除，以及 Java Tool Gateway 到 Python Memory Service 的候选提炼、冲突判断、索引和检索闭环。
+
+2026-07-03 更新：PostgreSQL 后端的记忆索引写入改为复用 RAG 主链路 `embed_text` 生成真实 1024 维语义向量；记忆查询改为 BM25 与 PostgreSQL/pgvector `<=>` 向量召回共同参与 RRF 融合，并对只由向量召回命中的记忆回填元数据后再返回。
 
 核心边界：
 
@@ -242,7 +244,10 @@ Python 约束：
 - 只能处理 Java 传入的 `memoryId/userId/scope`。
 - 只读写 `agent_memory_embedding`，查询时可 join `agent_memory_item` 做状态过滤。
 - 不读取或修改 `agent_task`、`learning_material`、`resume_template`、`rag_query_history` 等业务表。
-- 记忆检索初版使用确定性 Multi-Query、BM25、hash embedding、RRF 和时近性/重要性/置信度加权。
+- 记忆检索使用确定性 Multi-Query、BM25、embedding 向量召回、RRF 和时近性/重要性/置信度加权。
+- 无 `RAG_DATABASE_URL` 或 `DATABASE_URL` 时，Python Memory Service 使用内存索引和 hash embedding，主要用于离线单测与本地演示。
+- 配置 PostgreSQL 后端时，写入侧复用 RAG 主链路 `embed_text` 生成真实语义向量并写入 `agent_memory_embedding.embedding`；查询侧使用 `embedding.embedding <=> %s::vector` 执行 pgvector 向量召回。
+- 查询响应的 `diagnostics` 至少应能标识 `retrievalProvider`、`embeddingProvider`、`pgvectorUsed`、`bm25CandidateCount`、`vectorHitCount`、`finalCandidateCount`、`rankedListCount`、`expandedQueries` 和 `vectorDimensions`，用于确认当前是否命中 PostgreSQL/pgvector 路径。
 
 ## 错误码
 

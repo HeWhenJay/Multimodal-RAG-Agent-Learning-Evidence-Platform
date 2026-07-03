@@ -23,9 +23,9 @@ from app.schemas.agent_memory import (
     MemoryQueryResponse,
     MemoryQueryResult,
 )
-from rag.indexes.pgvector_store import quote_identifier, vector_literal
+from rag.indexes.pgvector_store import vector_literal
 from rag.retrievers.query_expansion import local_expand_queries
-from rag.retrievers.retrieval import hash_embed_text, reciprocal_rank_fusion, tokenize
+from rag.retrievers.retrieval import embed_text, embedding_provider_name, hash_embed_text, reciprocal_rank_fusion, tokenize
 
 
 IN_MEMORY_INDEX: dict[str, dict[str, Any]] = {}
@@ -41,14 +41,32 @@ class AgentMemoryService:
 
     def query(self, request: MemoryQueryRequest) -> MemoryQueryResponse:
         """在 Java 已授权范围内执行记忆混合检索。"""
-        rows = self._load_memory_rows(request)
         expanded_queries = local_expand_queries(request.query, count=5)
         ranked_lists: list[list[tuple[str, float]]] = []
-        for query in expanded_queries:
-            ranked_lists.append(self._bm25_search(query, rows, limit=max(request.topK * 4, 10)))
-            ranked_lists.append(self._vector_search(query, rows, limit=max(request.topK * 4, 10)))
-        fused = reciprocal_rank_fusion(ranked_lists)
-        row_by_id = {str(row["memoryId"]): row for row in rows}
+        retrieval_limit = max(request.topK * 4, 10)
+        vector_hit_ids: set[str] = set()
+
+        if self.database_url:
+            rows = self._load_memory_rows(request, limit=200)
+            for query in expanded_queries:
+                ranked_lists.append(self._bm25_search(query, rows, limit=retrieval_limit))
+                vector_hits = self._pgvector_search(query, request, limit=retrieval_limit)
+                vector_hit_ids.update(memory_id for memory_id, _score in vector_hits)
+                ranked_lists.append(vector_hits)
+            fused = reciprocal_rank_fusion(ranked_lists)
+            fused_memory_ids = [memory_id for memory_id, _score in fused]
+            final_rows = self._load_memory_rows_by_ids(request, fused_memory_ids)
+            row_by_id = {str(row["memoryId"]): row for row in final_rows}
+        else:
+            rows = self._load_memory_rows(request, limit=200)
+            for query in expanded_queries:
+                ranked_lists.append(self._bm25_search(query, rows, limit=retrieval_limit))
+                vector_hits = self._vector_search(query, rows, limit=retrieval_limit)
+                vector_hit_ids.update(memory_id for memory_id, _score in vector_hits)
+                ranked_lists.append(vector_hits)
+            fused = reciprocal_rank_fusion(ranked_lists)
+            row_by_id = {str(row["memoryId"]): row for row in rows}
+
         scored: list[dict[str, Any]] = []
         for rank, (memory_id, fusion_score) in enumerate(fused, start=1):
             row = row_by_id.get(memory_id)
@@ -63,8 +81,14 @@ class AgentMemoryService:
             diagnostics={
                 "expandedQueries": expanded_queries,
                 "candidateCount": len(rows),
+                "bm25CandidateCount": len(rows),
+                "vectorHitCount": len(vector_hit_ids),
+                "finalCandidateCount": len(row_by_id),
                 "rankedListCount": len(ranked_lists),
                 "retrievalProvider": "pgvector" if self.database_url else "memory",
+                "embeddingProvider": embedding_provider_name() if self.database_url else "hash",
+                "pgvectorUsed": bool(self.database_url),
+                "vectorDimensions": self.dimensions,
             },
         )
 
@@ -139,7 +163,6 @@ class AgentMemoryService:
         """写入或更新一条已由 Java 授权的记忆索引。"""
         retrieval_text = request.retrievalText or f"{request.namespace}\n{request.subjectKey}\n{request.summary}"
         term_counts = dict(Counter(tokenize(retrieval_text)))
-        embedding = hash_embed_text(retrieval_text, self.dimensions)
         metadata = {
             "userId": request.userId,
             "memoryType": request.memoryType,
@@ -153,6 +176,7 @@ class AgentMemoryService:
             "sensitivityLevel": request.sensitivityLevel,
         }
         if not self.database_url:
+            embedding = hash_embed_text(retrieval_text, self.dimensions)
             IN_MEMORY_INDEX[request.memoryId] = {
                 "memoryId": request.memoryId,
                 "userId": request.userId,
@@ -172,9 +196,24 @@ class AgentMemoryService:
                 "deletedAt": None,
                 "updatedAt": now_iso(),
             }
-            return MemoryIndexUpsertResponse(memoryId=request.memoryId, indexed=True, status="ACTIVE", diagnostics={"backend": "memory"})
+            return MemoryIndexUpsertResponse(
+                memoryId=request.memoryId,
+                indexed=True,
+                status="ACTIVE",
+                diagnostics={"backend": "memory", "embeddingProvider": "hash", "vectorDimensions": self.dimensions},
+            )
+        embedding = embed_text(retrieval_text, dimensions=self.dimensions)
         self._upsert_pgvector(request, retrieval_text, term_counts, embedding, metadata)
-        return MemoryIndexUpsertResponse(memoryId=request.memoryId, indexed=True, status="ACTIVE", diagnostics={"backend": "pgvector"})
+        return MemoryIndexUpsertResponse(
+            memoryId=request.memoryId,
+            indexed=True,
+            status="ACTIVE",
+            diagnostics={
+                "backend": "pgvector",
+                "embeddingProvider": embedding_provider_name(),
+                "vectorDimensions": self.dimensions,
+            },
+        )
 
     def delete_index(self, request: MemoryIndexDeleteRequest) -> MemoryIndexDeleteResponse:
         """删除或停用一条记忆索引。"""
@@ -218,7 +257,38 @@ class AgentMemoryService:
             sensitivityLevel="LOW",
         )
 
-    def _load_memory_rows(self, request: MemoryQueryRequest) -> list[dict[str, Any]]:
+    def _memory_filter_clause(
+        self,
+        request: MemoryQueryRequest,
+        *,
+        item_alias: str = "item",
+        embedding_alias: str = "embedding",
+    ) -> tuple[str, list[Any]]:
+        """生成 PostgreSQL 记忆查询的授权、状态和范围过滤条件。"""
+        where_parts = [
+            f"{item_alias}.user_id = %s",
+            f"{item_alias}.status = 'ACTIVE'",
+            f"{item_alias}.deleted_at IS NULL",
+            f"({item_alias}.valid_until IS NULL OR {item_alias}.valid_until > CURRENT_TIMESTAMP)",
+            f"COALESCE({item_alias}.sensitivity_level, 'LOW') != 'HIGH'",
+            f"{embedding_alias}.status = 'ACTIVE'",
+            f"{embedding_alias}.deleted_at IS NULL",
+        ]
+        params: list[Any] = [request.userId]
+        if request.namespaces:
+            where_parts.append(f"{item_alias}.namespace = ANY(%s)")
+            params.append(request.namespaces)
+        if request.memoryTypes:
+            where_parts.append(f"{item_alias}.memory_type = ANY(%s)")
+            params.append(request.memoryTypes)
+        scope_clause, scope_params = build_scope_clause(request.allowedScopes, item_alias=item_alias)
+        if scope_clause:
+            where_parts.append(scope_clause)
+            params.extend(scope_params)
+        return " AND ".join(where_parts), params
+
+    def _load_memory_rows(self, request: MemoryQueryRequest, limit: int = 200) -> list[dict[str, Any]]:
+        """加载 BM25 所需的记忆元数据与词频，不读取 pgvector embedding。"""
         if not self.database_url:
             return [
                 normalize_memory_row(row)
@@ -229,26 +299,8 @@ class AgentMemoryService:
                 and namespace_allowed(row, request)
                 and scope_allowed(row, request)
             ]
-        where_parts = [
-            "item.user_id = %s",
-            "item.status = 'ACTIVE'",
-            "item.deleted_at IS NULL",
-            "(item.valid_until IS NULL OR item.valid_until > CURRENT_TIMESTAMP)",
-            "item.sensitivity_level != 'HIGH'",
-            "embedding.status = 'ACTIVE'",
-            "embedding.deleted_at IS NULL",
-        ]
-        params: list[Any] = [request.userId]
-        if request.namespaces:
-            where_parts.append("item.namespace = ANY(%s)")
-            params.append(request.namespaces)
-        if request.memoryTypes:
-            where_parts.append("item.memory_type = ANY(%s)")
-            params.append(request.memoryTypes)
-        scope_clause, scope_params = build_scope_clause(request.allowedScopes)
-        if scope_clause:
-            where_parts.append(scope_clause)
-            params.extend(scope_params)
+        where_sql, params = self._memory_filter_clause(request)
+        params.append(limit)
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -272,9 +324,61 @@ class AgentMemoryService:
                         embedding.term_counts
                     FROM agent_memory_embedding embedding
                     JOIN agent_memory_item item ON item.id = embedding.memory_id
-                    WHERE {" AND ".join(where_parts)}
+                    WHERE {where_sql}
                     ORDER BY item.updated_at DESC
-                    LIMIT 200
+                    LIMIT %s
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+        return [normalize_memory_row(row) for row in rows]
+
+    def _load_memory_rows_by_ids(self, request: MemoryQueryRequest, memory_ids: list[str]) -> list[dict[str, Any]]:
+        """按融合后的记忆 ID 回填最终组装字段，避免 pgvector-only 命中丢失。"""
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return []
+        if not self.database_url:
+            rows = [
+                row
+                for row in IN_MEMORY_INDEX.values()
+                if str(row.get("memoryId")) in unique_ids
+                and row.get("userId") == request.userId
+                and row.get("status") == "ACTIVE"
+                and row.get("deletedAt") is None
+                and namespace_allowed(row, request)
+                and scope_allowed(row, request)
+            ]
+            return [normalize_memory_row(row) for row in rows]
+        where_sql, params = self._memory_filter_clause(request)
+        params.extend([unique_ids, len(unique_ids)])
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        item.id AS memory_id,
+                        item.user_id,
+                        item.memory_type,
+                        item.namespace,
+                        item.scope_type,
+                        item.scope_id,
+                        item.subject_key,
+                        item.summary,
+                        item.content,
+                        item.status,
+                        item.confidence,
+                        item.importance,
+                        item.deleted_at,
+                        item.updated_at,
+                        embedding.retrieval_text,
+                        embedding.term_counts
+                    FROM agent_memory_embedding embedding
+                    JOIN agent_memory_item item ON item.id = embedding.memory_id
+                    WHERE {where_sql}
+                      AND item.id = ANY(%s)
+                    ORDER BY item.updated_at DESC
+                    LIMIT %s
                     """,
                     params,
                 )
@@ -307,6 +411,7 @@ class AgentMemoryService:
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
     def _vector_search(self, query: str, rows: list[dict[str, Any]], limit: int) -> list[tuple[str, float]]:
+        """内存后端使用 hash embedding 余弦相似度作为离线降级向量召回。"""
         query_vector = hash_embed_text(query, self.dimensions)
         scores = []
         for row in rows:
@@ -317,6 +422,35 @@ class AgentMemoryService:
             if score > 0:
                 scores.append((str(row["memoryId"]), score))
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
+
+    def _pgvector_search(self, query: str, request: MemoryQueryRequest, limit: int) -> list[tuple[str, float]]:
+        """PostgreSQL 后端使用 pgvector 距离算子执行真实向量召回。"""
+        query_vector = vector_literal(embed_text(query, dimensions=self.dimensions))
+        where_sql, params = self._memory_filter_clause(request)
+        execute_params: list[Any] = [query_vector, *params, query_vector, limit]
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        item.id AS memory_id,
+                        1 - (embedding.embedding <=> %s::vector) AS score
+                    FROM agent_memory_embedding embedding
+                    JOIN agent_memory_item item ON item.id = embedding.memory_id
+                    WHERE {where_sql}
+                    ORDER BY embedding.embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    execute_params,
+                )
+                rows = cursor.fetchall()
+        results: list[tuple[str, float]] = []
+        for row in rows:
+            memory_id = row.get("memory_id") or row.get("memoryId")
+            if memory_id is None:
+                continue
+            results.append((str(memory_id), float(row.get("score") or 0.0)))
+        return results
 
     def _final_score(self, row: dict[str, Any], fusion_score: float, rank: int) -> float:
         relevance = min(1.0, fusion_score * 20)
@@ -408,21 +542,22 @@ class AgentMemoryService:
         return Json
 
 
-def build_scope_clause(scopes: list[Any]) -> tuple[str, list[Any]]:
+def build_scope_clause(scopes: list[Any], *, item_alias: str = "item") -> tuple[str, list[Any]]:
+    """按 Java 传入的 allowedScopes 生成记忆可见范围过滤条件。"""
     if not scopes:
-        return "item.scope_type = 'USER'", []
+        return f"{item_alias}.scope_type = 'USER'", []
     clauses: list[str] = []
     params: list[Any] = []
     for scope in scopes:
         scope_type = getattr(scope, "scopeType", None)
         scope_id = getattr(scope, "scopeId", None)
         if scope_type == "USER":
-            clauses.append("(item.scope_type = 'USER' AND item.scope_id IS NULL)")
+            clauses.append(f"({item_alias}.scope_type = 'USER' AND {item_alias}.scope_id IS NULL)")
         elif scope_type and scope_id:
-            clauses.append("(item.scope_type = %s AND item.scope_id = %s)")
+            clauses.append(f"({item_alias}.scope_type = %s AND {item_alias}.scope_id = %s)")
             params.extend([scope_type, scope_id])
     if not clauses:
-        return "item.scope_type = 'USER'", []
+        return f"{item_alias}.scope_type = 'USER'", []
     return "(" + " OR ".join(clauses) + ")", params
 
 
