@@ -37,6 +37,32 @@ rag:
   callbacks:
     event-url: ${RAG_EVENT_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/events}
     error-url: ${RAG_ERROR_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/errors}
+  kafka:
+    enabled: ${RAG_KAFKA_ENABLED:false}
+    bootstrap-servers: ${RAG_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    java-base-url: ${RAG_JAVA_BASE_URL:http://127.0.0.1:7080}
+    java-internal-token: ${RAG_JAVA_INTERNAL_TOKEN:}
+    topics:
+      index-request: ${RAG_KAFKA_TOPIC_INDEX_REQUEST:rag.material.index.request.v1}
+      index-result: ${RAG_KAFKA_TOPIC_INDEX_RESULT:rag.material.index.result.v1}
+      progress: ${RAG_KAFKA_TOPIC_PROGRESS:rag.material.index.progress.v1}
+      promote-request: ${RAG_KAFKA_TOPIC_PROMOTE_REQUEST:rag.material.index.promote.request.v1}
+      promote-result: ${RAG_KAFKA_TOPIC_PROMOTE_RESULT:rag.material.index.promote.result.v1}
+      index-retry-1m: ${RAG_KAFKA_TOPIC_INDEX_RETRY_1M:rag.material.index.retry.1m.v1}
+      index-retry-10m: ${RAG_KAFKA_TOPIC_INDEX_RETRY_10M:rag.material.index.retry.10m.v1}
+      index-retry-1h: ${RAG_KAFKA_TOPIC_INDEX_RETRY_1H:rag.material.index.retry.1h.v1}
+      index-dlq: ${RAG_KAFKA_TOPIC_INDEX_DLQ:rag.material.index.dlq.v1}
+    retry:
+      max-attempts: ${RAG_KAFKA_MAX_ATTEMPTS:3}
+      delay-1m-seconds: ${RAG_KAFKA_RETRY_1M_SECONDS:60}
+      delay-10m-seconds: ${RAG_KAFKA_RETRY_10M_SECONDS:600}
+      delay-1h-seconds: ${RAG_KAFKA_RETRY_1H_SECONDS:3600}
+      max-sleep-seconds: ${RAG_KAFKA_RETRY_MAX_SLEEP_SECONDS:30}
+    progress:
+      chunk-interval: ${RAG_KAFKA_PROGRESS_CHUNK_INTERVAL:10}
+      min-seconds: ${RAG_KAFKA_PROGRESS_MIN_SECONDS:2}
+  staging-retention-hours: ${RAG_STAGING_RETENTION_HOURS:24}
+  staging-failed-retention-hours: ${RAG_STAGING_FAILED_RETENTION_HOURS:168}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}

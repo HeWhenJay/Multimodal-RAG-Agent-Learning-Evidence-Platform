@@ -38,6 +38,20 @@ public interface LearningMaterialMapper {
     void updateStatus(@Param("id") Long id, @Param("status") String status);
 
     /**
+     * 设置当前生效索引任务和请求版本。
+     */
+    void updateActiveIndexJob(@Param("id") Long id,
+                              @Param("activeIndexJobId") String activeIndexJobId,
+                              @Param("indexRequestVersion") Integer indexRequestVersion,
+                              @Param("status") String status);
+
+    /**
+     * 清理当前生效索引任务。
+     */
+    void clearActiveIndexJob(@Param("id") Long id,
+                             @Param("activeIndexJobId") String activeIndexJobId);
+
+    /**
      * 回写原始文件对象存储位置。
      */
     void updateStorageInfo(@Param("id") Long id,
@@ -50,6 +64,11 @@ public interface LearningMaterialMapper {
      * 按 ID 查询学习资料。
      */
     LearningMaterial findByIdAndUserId(@Param("id") Long id, @Param("userId") String userId);
+
+    /**
+     * 内部任务按 ID 查询资料，不暴露给用户接口。
+     */
+    LearningMaterial findById(@Param("id") Long id);
 
     /**
      * 查询最近学习资料列表。

@@ -21,6 +21,8 @@ public class LearningMaterial {
     private String storageType;
     private String objectKey;
     private String publicUrl;
+    private String activeIndexJobId;
+    private Integer indexRequestVersion;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

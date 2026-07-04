@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.RagOutboxEventMapper">
+
+    <resultMap id="RagOutboxEventResultMap" type="com.itxiang.evidence.entity.RagOutboxEvent">
+        <id property="id" column="id"/>
+        <result property="topic" column="topic"/>
+        <result property="messageKey" column="message_key"/>
+        <result property="eventType" column="event_type"/>
+        <result property="idempotencyKey" column="idempotency_key"/>
+        <result property="payloadJson" column="payload_json"/>
+        <result property="status" column="status"/>
+        <result property="attempt" column="attempt"/>
+        <result property="nextAttemptAt" column="next_attempt_at"/>
+        <result property="leaseUntil" column="lease_until"/>
+        <result property="lockedBy" column="locked_by"/>
+        <result property="publishedAt" column="published_at"/>
+        <result property="errorMessage" column="error_message"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.RagOutboxEvent">
+        INSERT INTO rag_outbox_event (
+            topic,
+            message_key,
+            event_type,
+            idempotency_key,
+            payload_json,
+            status,
+            attempt,
+            next_attempt_at
+        )
+        VALUES (
+            #{topic},
+            #{messageKey},
+            #{eventType},
+            #{idempotencyKey},
+            #{payloadJson},
+            COALESCE(#{status}, 'NEW'),
+            COALESCE(#{attempt}, 0),
+            COALESCE(#{nextAttemptAt}, CURRENT_TIMESTAMP)
+        )
+        ON CONFLICT (topic, idempotency_key) DO NOTHING
+    </insert>
+
+    <select id="findDueForPublish" resultMap="RagOutboxEventResultMap">
+        SELECT *
+        FROM rag_outbox_event
+        WHERE status IN ('NEW', 'FAILED')
+          AND next_attempt_at &lt;= #{now}
+          AND (lease_until IS NULL OR lease_until &lt;= #{now})
+        ORDER BY id ASC
+        LIMIT #{limit}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <update id="lease">
+        UPDATE rag_outbox_event
+        SET status = 'PUBLISHING',
+            locked_by = #{lockedBy},
+            lease_until = #{leaseUntil},
+            attempt = attempt + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('NEW', 'FAILED')
+    </update>
+
+    <update id="markPublished">
+        UPDATE rag_outbox_event
+        SET status = 'PUBLISHED',
+            published_at = CURRENT_TIMESTAMP,
+            lease_until = NULL,
+            error_message = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <update id="markFailed">
+        UPDATE rag_outbox_event
+        SET status = 'FAILED',
+            error_message = #{errorMessage},
+            next_attempt_at = #{nextAttemptAt},
+            lease_until = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+</mapper>

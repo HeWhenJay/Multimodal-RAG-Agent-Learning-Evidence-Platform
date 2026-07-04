@@ -14,7 +14,9 @@ import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
+import com.itxiang.evidence.service.RagIndexTaskPublisher;
 import com.itxiang.evidence.service.RagService;
+import com.itxiang.evidence.service.command.RagUploadFinalizeCommand;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.MaterialPreviewVO;
@@ -62,7 +64,7 @@ public class RagServiceImpl implements RagService {
     private final PythonRagClient pythonRagClient;
     private final LogService logService;
     private final ObjectStorageService objectStorageService;
-    private final RagIndexWorker ragIndexWorker;
+    private final RagIndexTaskPublisher ragIndexTaskPublisher;
     private final RagUploadWorker ragUploadWorker;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
@@ -229,6 +231,17 @@ public class RagServiceImpl implements RagService {
 
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
+        if (ragIndexTaskPublisher.kafkaEnabled()) {
+            ragIndexTaskPublisher.publishTextIndex(material, scopedUserId, dto);
+            logService.recordRagEvent(
+                    "material",
+                    "index",
+                    "material_index_text_queued",
+                    "文本学习资料已提交 Kafka 索引队列",
+                    materialContext(material)
+            );
+            return convertToVO(material);
+        }
         try {
             PythonRagClient.IndexResult result = pythonRagClient.indexText(material.getId(), scopedUserId, dto);
             recordIndexResultAnomalies(material, result);
@@ -307,11 +320,7 @@ public class RagServiceImpl implements RagService {
 
         learningMaterialMapper.updateStatus(material.getId(), "PARSING");
         material.setStatus("PARSING");
-        scheduleAfterCommit(() -> ragIndexWorker.indexStoredMaterial(
-                material.getId(),
-                scopedUserId,
-                Boolean.TRUE.equals(highPrecision)
-        ));
+        dispatchStoredMaterialIndex(material, scopedUserId, Boolean.TRUE.equals(highPrecision), "INDEX_UPLOAD");
         return convertToVO(material);
     }
 
@@ -430,11 +439,7 @@ public class RagServiceImpl implements RagService {
                 startContext
         );
 
-        scheduleAfterCommit(() -> ragIndexWorker.reindexStoredMaterial(
-                material.getId(),
-                scopedUserId,
-                Boolean.TRUE.equals(highPrecision)
-        ));
+        dispatchStoredMaterialIndex(material, scopedUserId, Boolean.TRUE.equals(highPrecision), "REINDEX");
         return convertToVO(material);
     }
     private PythonRagClient.IndexResult indexStoredUpload(Long materialId,
@@ -504,7 +509,7 @@ public class RagServiceImpl implements RagService {
         LearningMaterial material = transactionTemplate.execute(status -> {
             LearningMaterial pendingMaterial = createPendingUploadMaterial(filename, userId);
             recordChunkProcessingProgress(pendingMaterial, uploadId, totalChunks);
-            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+            dispatchUploadFinalize(new RagUploadFinalizeCommand(
                     pendingMaterial.getId(),
                     userId,
                     directory,
@@ -544,7 +549,7 @@ public class RagServiceImpl implements RagService {
             learningMaterialMapper.updateStatus(material.getId(), "PENDING");
             material.setStatus("PENDING");
             recordChunkProcessingProgress(material, uploadId, totalChunks);
-            scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+            dispatchUploadFinalize(new RagUploadFinalizeCommand(
                     material.getId(),
                     userId,
                     directory,
@@ -1481,6 +1486,35 @@ public class RagServiceImpl implements RagService {
             throw new IllegalArgumentException("登录状态已失效");
         }
         return userId.trim();
+    }
+
+    /**
+     * 按 Kafka 开关调度资料索引，Kafka 模式需在当前事务内写 Outbox。
+     */
+    private void dispatchStoredMaterialIndex(LearningMaterial material, String userId, Boolean highPrecision, String operation) {
+        if (ragIndexTaskPublisher.kafkaEnabled()) {
+            ragIndexTaskPublisher.publishStoredMaterialIndex(material, userId, highPrecision, operation);
+            return;
+        }
+        scheduleAfterCommit(() -> ragIndexTaskPublisher.publishStoredMaterialIndex(material, userId, highPrecision, operation));
+    }
+
+    /**
+     * 分片收尾依赖本机临时目录，始终在接收最后分片的 Java 实例本地异步执行。
+     */
+    private void dispatchUploadFinalize(RagUploadFinalizeCommand command) {
+        scheduleAfterCommit(() -> ragUploadWorker.completeChunkedUpload(
+                command.materialId(),
+                command.userId(),
+                command.directory(),
+                command.chunkRoot(),
+                command.uploadId(),
+                command.filename(),
+                command.contentType(),
+                command.totalChunks(),
+                command.totalSize(),
+                command.highPrecision()
+        ));
     }
 
     /**

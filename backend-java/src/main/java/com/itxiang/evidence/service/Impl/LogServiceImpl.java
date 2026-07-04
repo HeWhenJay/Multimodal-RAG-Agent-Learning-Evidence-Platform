@@ -334,6 +334,15 @@ public class LogServiceImpl implements LogService {
         }
         String stage = defaultText(event.getStage(), text(context, "stageCode"));
         String progressStatus = normalizeStatus(text(context, "status"));
+        if ("index.completed".equals(stage) && context.get("stagingDocumentId") != null && context.get("promoteConfirmed") == null) {
+            learningMaterialMapper.updateProgressStatus(
+                    event.getMaterialId(),
+                    "PARSING",
+                    defaultText(event.getParser(), text(context, "parser")),
+                    null
+            );
+            return;
+        }
         if ("index.completed".equals(stage)) {
             String parseStatus = normalizeStatus(text(context, "parseStatus"));
             String finalStatus = isFinalSuccessStatus(parseStatus) ? parseStatus : "READY";

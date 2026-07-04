@@ -15,10 +15,11 @@ class FakeChunker:
 
 
 class FakeCursor:
-    def __init__(self, committed_count=None):
+    def __init__(self, committed_count=None, rows=None):
         self.executed = []
         self.chunk_inserts = 0
         self.committed_count = committed_count
+        self.rows = rows or []
 
     def execute(self, sql, params=None):
         sql_text = str(sql)
@@ -28,6 +29,9 @@ class FakeCursor:
 
     def fetchone(self):
         return {"chunk_count": self.committed_count if self.committed_count is not None else self.chunk_inserts}
+
+    def fetchall(self):
+        return self.rows
 
 
 class FakeContext:
@@ -179,6 +183,88 @@ def test_pgvector_index_blocks_cleans_index_when_committed_count_mismatches(monk
         )
 
     assert cleaned == ["doc-mismatch"]
+
+
+def test_pgvector_promote_staged_index_is_idempotent(monkeypatch):
+    """canonical 已由同一 staging/job 提升过时，重复 promote 直接成功。"""
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+
+    def fake_count(document_id):
+        return 3 if document_id in {"material-1", "material-1__job-job-1"} else 0
+
+    monkeypatch.setattr(store, "_count_document_chunks", fake_count)
+    monkeypatch.setattr(
+        store,
+        "_first_chunk_metadata",
+        lambda document_id: {
+            "sourceJobId": "job-1",
+            "requestVersion": 2,
+            "stagingDocumentId": "material-1__job-job-1",
+        },
+    )
+
+    result = store.promote_staged_index(
+        canonical_document_id="material-1",
+        staging_document_id="material-1__job-job-1",
+        job_id="job-1",
+        request_version=2,
+        expected_chunk_count=3,
+    )
+
+    assert result["alreadyPromoted"] is True
+    assert result["canonicalChunkCount"] == 3
+
+
+def test_pgvector_promote_rejects_lower_request_version(monkeypatch):
+    """canonical 已是更高 requestVersion 时，旧 promote 不得覆盖。"""
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+
+    def fake_count(document_id):
+        return 2 if document_id in {"material-1", "material-1__job-job-old"} else 0
+
+    monkeypatch.setattr(store, "_count_document_chunks", fake_count)
+    monkeypatch.setattr(
+        store,
+        "_first_chunk_metadata",
+        lambda document_id: {
+            "sourceJobId": "job-new",
+            "requestVersion": 3,
+            "stagingDocumentId": "material-1__job-job-new",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="旧版本 staging"):
+        store.promote_staged_index(
+            canonical_document_id="material-1",
+            staging_document_id="material-1__job-job-old",
+            job_id="job-old",
+            request_version=2,
+            expected_chunk_count=2,
+        )
+
+
+def test_pgvector_cleanup_staging_indexes_uses_retention_windows(monkeypatch):
+    """过期 staging 清理只处理 job staging 文档，并区分成功和失败保留期。"""
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+    cursor = FakeCursor(
+        rows=[
+            {"document_id": "material-1__job-job-1", "visibility_scope": "staging_promoted"},
+            {"document_id": "material-2__job-job-2", "visibility_scope": "staging"},
+        ]
+    )
+    connection = FakeConnection(cursor)
+    deleted = []
+    monkeypatch.setattr(store, "_connect", lambda: connection)
+    monkeypatch.setattr(store, "_delete_document_index_with_cursor", lambda cursor, document_id: deleted.append(document_id))
+
+    result = store.cleanup_staging_indexes(promoted_retention_hours=24, failed_retention_hours=168)
+
+    select_sql, params = cursor.executed[0]
+    assert "visibility_scope = 'staging_promoted'" in select_sql
+    assert "visibility_scope = 'staging'" in select_sql
+    assert params == ("%__job-%", 24, 168)
+    assert deleted == ["material-1__job-job-1", "material-2__job-job-2"]
+    assert result == {"promotedDeleted": 1, "failedDeleted": 1, "totalDeleted": 2}
 
 
 def sample_block(document_id):

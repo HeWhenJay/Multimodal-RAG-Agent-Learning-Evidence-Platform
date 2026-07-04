@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.RagIndexJobMapper">
+
+    <resultMap id="RagIndexJobResultMap" type="com.itxiang.evidence.entity.RagIndexJob">
+        <id property="id" column="id"/>
+        <result property="materialId" column="material_id"/>
+        <result property="canonicalDocumentId" column="canonical_document_id"/>
+        <result property="stagingDocumentId" column="staging_document_id"/>
+        <result property="userId" column="user_id"/>
+        <result property="operation" column="operation"/>
+        <result property="status" column="status"/>
+        <result property="requestVersion" column="request_version"/>
+        <result property="idempotencyKey" column="idempotency_key"/>
+        <result property="attempt" column="attempt"/>
+        <result property="requestJson" column="request_json"/>
+        <result property="resultJson" column="result_json"/>
+        <result property="errorCode" column="error_code"/>
+        <result property="errorMessage" column="error_message"/>
+        <result property="requestedAt" column="requested_at"/>
+        <result property="startedAt" column="started_at"/>
+        <result property="indexedAt" column="indexed_at"/>
+        <result property="promotedAt" column="promoted_at"/>
+        <result property="finishedAt" column="finished_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.itxiang.evidence.entity.RagIndexJob">
+        INSERT INTO rag_index_job (
+            id,
+            material_id,
+            canonical_document_id,
+            staging_document_id,
+            user_id,
+            operation,
+            status,
+            request_version,
+            idempotency_key,
+            attempt,
+            request_json,
+            result_json
+        )
+        VALUES (
+            #{id},
+            #{materialId},
+            #{canonicalDocumentId},
+            #{stagingDocumentId},
+            #{userId},
+            #{operation},
+            #{status},
+            #{requestVersion},
+            #{idempotencyKey},
+            #{attempt},
+            #{requestJson},
+            #{resultJson}
+        )
+    </insert>
+
+    <select id="findById" resultMap="RagIndexJobResultMap">
+        SELECT *
+        FROM rag_index_job
+        WHERE id = #{id}
+    </select>
+
+    <update id="markIndexed">
+        UPDATE rag_index_job
+        SET status = #{status},
+            result_json = #{resultJson},
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            indexed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <update id="markFinished">
+        UPDATE rag_index_job
+        SET status = #{status},
+            result_json = #{resultJson},
+            error_code = #{errorCode},
+            error_message = #{errorMessage},
+            promoted_at = CASE WHEN #{status} = 'SUCCEEDED' THEN CURRENT_TIMESTAMP ELSE promoted_at END,
+            finished_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <update id="markIgnored">
+        UPDATE rag_index_job
+        SET status = #{status},
+            error_message = #{errorMessage},
+            finished_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+</mapper>

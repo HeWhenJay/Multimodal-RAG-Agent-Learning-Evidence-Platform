@@ -6,6 +6,16 @@ server:
 spring:
   application:
     name: learning-evidence-backend
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
   data:
     redis:
       host: ${SPRING_DATA_REDIS_HOST:127.0.0.1}
@@ -47,6 +57,33 @@ evidence:
     max-stack-trace-bytes: 20480
     retention-days: 30
     internal-token: ${EVIDENCE_INTERNAL_LOG_TOKEN:}
+  rag:
+    kafka:
+      enabled: ${EVIDENCE_RAG_KAFKA_ENABLED:false}
+      bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+      internal-base-url: ${EVIDENCE_RAG_INTERNAL_BASE_URL:http://127.0.0.1:7080}
+      internal-token: ${EVIDENCE_RAG_INTERNAL_TOKEN:}
+      internal-token-file: ${EVIDENCE_RAG_INTERNAL_TOKEN_FILE:}
+      topics:
+        index-request: rag.material.index.request.v1
+        upload-finalize-request: rag.upload.finalize.request.v1
+        progress: rag.material.index.progress.v1
+        index-result: rag.material.index.result.v1
+        promote-request: rag.material.index.promote.request.v1
+        promote-result: rag.material.index.promote.result.v1
+        index-dlq: rag.material.index.dlq.v1
+        upload-finalize-dlq: rag.upload.finalize.dlq.v1
+      groups:
+        upload-finalizers: rag-java-upload-finalizers
+        progress-writers: rag-java-progress-writers
+        result-writers: rag-java-result-writers
+        promote-result-writers: rag-java-promote-result-writers
+        dlq-writers: rag-java-dlq-writers
+      outbox:
+        batch-size: ${EVIDENCE_RAG_OUTBOX_BATCH_SIZE:50}
+        lease-seconds: ${EVIDENCE_RAG_OUTBOX_LEASE_SECONDS:60}
+        publish-fixed-delay-ms: ${EVIDENCE_RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS:1000}
+        max-attempts: ${EVIDENCE_RAG_OUTBOX_MAX_ATTEMPTS:8}
   agent:
     internal-token: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
     java-base-url: ${EVIDENCE_AGENT_JAVA_BASE_URL:http://127.0.0.1:7080}

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.itxiang.evidence.mapper.RagConsumedEventMapper">
+
+    <insert id="insertIgnore" parameterType="com.itxiang.evidence.entity.RagConsumedEvent">
+        INSERT INTO rag_consumed_event (
+            consumer_name,
+            message_id,
+            message_type,
+            idempotency_key,
+            job_id,
+            progress_sequence,
+            status,
+            error_message
+        )
+        VALUES (
+            #{consumerName},
+            #{messageId},
+            #{messageType},
+            #{idempotencyKey},
+            #{jobId},
+            #{progressSequence},
+            COALESCE(#{status}, 'CONSUMED'),
+            #{errorMessage}
+        )
+        ON CONFLICT DO NOTHING
+    </insert>
+</mapper>

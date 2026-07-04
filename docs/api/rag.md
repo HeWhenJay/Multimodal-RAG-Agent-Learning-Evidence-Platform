@@ -1,10 +1,10 @@
 # RAG 接口文档
 
-更新日期：2026-06-24
+更新日期：2026-07-04
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。第一阶段只实现 RAG 闭环，不实现 Agent 编排、自主规划、长任务调度或工具调用。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段只把上传、重建、视频分片收尾和索引终态同步接入 Kafka；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。
 
 边界约定：
 
@@ -15,7 +15,8 @@
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
 - RAG 进度事件复用 `log_event` 表，`event_type=rag_progress`，不新增独立进度表；Python 方法级控制面板日志使用 `event_type=rag_process`，错误仍写入 `log_error`。
 - RAG 询问历史由 Java 写入 `rag_query_history`，只保存业务查询快照、问题、回答、证据 JSON 和状态；Python 查询任务仍是进程内短期进度快照，不承担长期历史存储。
-- Git 提交时只维护 `infra/sql/init.sql`，本地增量迁移目录不作为必须提交内容。
+- Kafka 默认关闭。关闭时 Java 保留现有 `@Async + HTTP` 后台索引链路；开启后才使用 `rag_index_job`、`rag_outbox_event`、`rag_consumed_event`、Kafka request/progress/result/promote topics 和 Python Kafka worker。
+- Git 提交时同步维护 `infra/sql/init.sql` 和 `infra/sql/alter-database/` 下对应增量迁移。
 
 鉴权约定：
 
@@ -35,6 +36,137 @@
 | `REINDEXING` | 资料重新解析/重新索引中 | 重建索引 |
 
 `PARTIAL` 不是接口失败。Java 应保存该状态并返回资料摘要、切块数和可检索 evidence；前端应提示“部分完成”，允许用户继续检索。
+
+## Kafka 高吞吐索引流水线
+
+Kafka 仅用于高吞吐索引、视频分片收尾和索引终态同步，不改变查询默认路径。开启条件为 Java `evidence.rag.kafka.enabled=true` 且 Python `RAG_KAFKA_ENABLED=true`；任一侧未开启时，旧 HTTP 索引链路必须保持可用。
+
+### 核心不变量
+
+- Java 在同一事务内写入 `learning_material`、`rag_index_job` 和 `rag_outbox_event`，上传接口或重建接口快速返回。
+- Python index worker 永远只写 `stagingDocumentId`，例如 `material-88__job-job_20260704_001`，`visibility_scope='staging'`。
+- Java 只有在 `learning_material.active_index_job_id` 等于 result 的 `jobId`，且 `learning_material.index_request_version` 等于 result 的 `requestVersion` 时，才发布 `RAG_PROMOTE_REQUESTED`。
+- Python Promote Worker 执行 promote 前必须再次调用 Java active-check 内部接口校验 `materialId/jobId/requestVersion` 仍为 active job；校验失败不得调用 pgvector promote。
+- `PgVectorRagStore.promote_staged_index(...)` 还需做存储层防御：如果 canonical 已存在且其 metadata 中 `requestVersion` 大于本次请求版本，必须拒绝覆盖。
+- stale job、过期 retry、取消 job 即使完成，也只能保留 staging，不得覆盖 canonical。
+- 查询仍由 Java 强制 `metadataFilter.userId=currentUserId` 和 `visibilityScope='private'`，staging 不得被 private 查询命中。
+- Java 不直接操作 Python RAG 表，staging promote 只能由 Python 执行。
+
+### Kafka topics
+
+| Topic | 生产者 | 消费者组 | Key | 用途 |
+| --- | --- | --- | --- | --- |
+| `rag.material.index.request.v1` | Java Outbox | `rag-python-index-workers` | `canonicalDocumentId` | 触发 Python 索引 staging |
+| `rag.upload.finalize.request.v1` | Java Outbox | `rag-java-upload-finalizers` | `uploadId` | 触发 Java 分片合并与后续索引 |
+| `rag.material.index.progress.v1` | Python | `rag-java-progress-writers` | `canonicalDocumentId` | 写入用户可见进度 |
+| `rag.material.index.result.v1` | Python | `rag-java-result-writers` | `canonicalDocumentId` | Java 校验 active job 后发布 promote |
+| `rag.material.index.promote.request.v1` | Java | `rag-python-promote-workers` | `canonicalDocumentId` | 触发 staging 提升为 canonical |
+| `rag.material.index.promote.result.v1` | Python | `rag-java-promote-result-writers` | `canonicalDocumentId` | Java 更新资料和 job 终态 |
+| `rag.material.index.retry.1m.v1` / `rag.material.index.retry.10m.v1` / `rag.material.index.retry.1h.v1` | Python | Python retry scheduler | `canonicalDocumentId` | 按 `notBefore` 延迟重投 request |
+| `rag.material.index.dlq.v1` | Python | `rag-java-dlq-writers` | `canonicalDocumentId` | 记录不可恢复索引失败 |
+| `rag.upload.finalize.dlq.v1` | Java | `rag-java-dlq-writers` | `uploadId` | 记录分片收尾失败 |
+
+Kafka 没有原生延迟消息。retry scheduler 消费 retry topic 后，如果 `notBefore` 未到，应暂停对应 partition 并等待，不提交 offset；到期后发回 request topic，发送成功才提交原 offset。
+
+### Envelope
+
+所有 Kafka 消息使用统一 JSON envelope：
+
+```json
+{
+  "schemaVersion": "1.0",
+  "messageId": "uuid",
+  "originalMessageId": "uuid",
+  "messageType": "RAG_INDEX_REQUESTED",
+  "eventTime": "2026-07-04T10:00:00Z",
+  "producer": "backend-java",
+  "traceId": "trace-id",
+  "correlationId": "material-88",
+  "partitionKey": "material-88",
+  "idempotencyKey": "RAG_INDEX:material-88:job_20260704_001:v1",
+  "attempt": 0,
+  "notBefore": null,
+  "payload": {}
+}
+```
+
+幂等键按消息类型独立生成：
+
+| 消息类型 | 幂等键 |
+| --- | --- |
+| index request/retry | `RAG_INDEX:{canonicalDocumentId}:{jobId}:v1` |
+| progress | `RAG_PROGRESS:{canonicalDocumentId}:{jobId}:{progressSequence}:v1` |
+| index result | `RAG_INDEX_RESULT:{canonicalDocumentId}:{jobId}:v1` |
+| promote request | `RAG_PROMOTE:{canonicalDocumentId}:{jobId}:v1` |
+| promote result | `RAG_PROMOTE_RESULT:{canonicalDocumentId}:{jobId}:v1` |
+| DLQ | `RAG_DLQ:{canonicalDocumentId}:{jobId}:{attempt}:v1` |
+| upload finalize request | `RAG_UPLOAD_FINALIZE:{uploadId}:{materialId}:v1` |
+
+`RAG_INDEX_REQUESTED.payload` 至少包含：
+
+- `jobId`、`operation`，其中 operation 为 `INDEX_UPLOAD`、`REINDEX` 或 `INDEX_TEXT`。
+- `materialId`、`canonicalDocumentId`、`stagingDocumentId`、`userId`、`title`、`documentType`、`source`。
+- `visibilityScope='private'`、`stagingVisibilityScope='staging'`、`highPrecision`、`requestVersion`。
+- `sourceRef`，支持 `INLINE_TEXT` 和 `JAVA_SOURCE_API`。`JAVA_SOURCE_API` 包含 `javaBaseUrl`、`downloadPath`、`filename`、`contentType`、`storageType`、`sourcePath`、`objectKey`、`publicUrl`。
+- `text`，仅 `INLINE_TEXT` 使用；日志、DLQ 和错误上下文不得记录正文。
+
+`RAG_INDEX_PROGRESS.payload` 对齐现有 `ProgressEvent`，并额外携带 `jobId`、`materialId`、`canonicalDocumentId`、`stagingDocumentId`、`userId`、`parser`、`requestVersion` 和 `progressSequence`。
+
+`RAG_INDEX_RESULT.payload` 对齐现有 `IndexResponse`，并额外携带 `jobId`、`materialId`、`canonicalDocumentId`、`stagingDocumentId`、`requestVersion`、`errorCode` 和 `errorMessage`。
+
+`RAG_PROMOTE_REQUESTED.payload` 携带 `jobId`、`materialId`、`canonicalDocumentId`、`stagingDocumentId`、`requestVersion` 和 `chunkCount`。`RAG_PROMOTE_RESULT.payload` 携带 `alreadyPromoted`、`canonicalChunkCount`、`stagingChunkCount`、`status` 和错误字段。
+
+### Outbox 与消费幂等
+
+- `rag_outbox_event(topic,idempotency_key)` 唯一，发布器多实例抢占 `NEW/FAILED` 到期事件，状态改为 `PUBLISHING` 并设置 `lease_until` 和 `locked_by`，成功后标记 `PUBLISHED`，失败后标记 `FAILED` 并设置 `next_attempt_at`。
+- `rag_consumed_event(consumer_name,message_id)` 与 `rag_consumed_event(consumer_name,message_type,idempotency_key)` 唯一，保证每个消费者幂等。progress 的幂等键包含 `progressSequence`，100 条不同进度不得被去重成 1 条。
+- Python worker manual commit：staging 写入成功且 result/retry/DLQ 发送 ack/flush 成功后，才提交原 offset。result/retry/DLQ 发送失败时不提交，等待 Kafka redelivery。
+- DLQ payload 和日志上下文只能保存资料 ID、文件名、错误码、错误摘要、attempt、topic、jobId 和 requestVersion，不得包含文档正文、简历全文、API key 或 OSS secret。
+
+### Java 内部 Source API
+
+Kafka worker 需要从 Java 读取原始资料时使用内部接口：
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/internal/rag/materials/{materialId}/source` |
+| Header | `X-RAG-Internal-Token: <token>` |
+| Query | `jobId`、`requestVersion` |
+| 响应 | 原始资料字节流，保留 `Content-Type` 和 `Content-Disposition` |
+
+Java 必须校验内部 token、资料存在、`active_index_job_id` 匹配、`index_request_version` 匹配、job 未取消且未终态。失败响应使用中文错误：`401` 表示缺少或错误 token，`403` 表示 job 与资料当前 active job 不匹配，`404` 表示资料不存在，`410` 表示 job 已过期或被新版本取代。
+Java Source API 使用服务端流式响应，Python worker 使用 `httpx.stream()` 写入临时文件；文档类解析在现有 parser 需要 bytes 时才读取临时文件，视频类解析优先使用临时文件路径。临时文件必须在解析完成或失败后清理。
+
+### Java 内部 active-check API
+
+Promote Worker 在真正改写 canonical 前必须重新向 Java 校验 active job：
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/internal/rag/materials/{materialId}/index-jobs/{jobId}/active` |
+| Header | `X-RAG-Internal-Token: <token>` |
+| Query | `requestVersion` |
+| 成功响应 | `Result<Map>`，`data.active=true`、`materialId`、`jobId`、`requestVersion` |
+
+失败语义与 Source API 一致：`403/410` 表示 stale 或过期，Python 必须发送 `RAG_PROMOTE_RESULT.status=FAILED` 且 `errorCode=RAG_PROMOTE_STALE`，同时不得调用 `promote_staged_index(...)`。
+
+### Python staging promote
+
+Python index worker 调用现有解析、递归切块、摘要、embedding 后，以 `stagingDocumentId` 调 `PgVectorRagStore.index_blocks()`，metadata 写入 `canonicalDocumentId`、`jobId`、`requestVersion`、`stagingDocumentId`、`sourceJobId`，`visibilityScope='staging'`。
+
+`PgVectorRagStore.promote_staged_index(...)` 需要幂等：
+
+1. 如果 canonical 已存在，并且 metadata 中的 `sourceJobId/requestVersion/stagingDocumentId` 与本次请求一致，且 canonical chunk 数等于 staging/result chunkCount，直接返回 `alreadyPromoted=true`。
+2. 如果 canonical 已存在且 metadata 中 `requestVersion` 大于本次请求版本，直接拒绝，避免旧 promote 覆盖新 canonical。
+3. 正常 promote 在同一事务内删除 canonical，插入 canonical document，把 staging chunks 复制为 canonical chunks，`chunk_id` 从 staging 前缀替换为 canonical 前缀，metadata 中 `documentId` 改为 canonical，同时保留 `sourceJobId/requestVersion/stagingDocumentId`。
+4. promote 后 staging 可标记为 `staging_promoted`；Java 确认 promote result、job 进入 `SUCCEEDED` 前，不物理删除 staging。
+5. 清理任务只清理 `SUCCEEDED` 且超过 `RAG_STAGING_RETENTION_HOURS`（默认 24 小时）的 staging；`FAILED/DLQ` staging 默认保留 7 天。
+
+### 分片收尾部署限制
+
+第一阶段 Kafka 不承载本地分片目录路径。长视频分片合并、对象存储上传仍固定由接收最后一个分片的 Java 实例通过本地 `@Async` 完成；合并完成后，如果 Kafka 已开启，仅后续 RAG 索引请求进入 Kafka。这样避免多 Java 实例部署时 `directory/chunkRoot` 指向另一台机器导致收尾失败。保留 `rag.upload.finalize.request.v1` 与 DLQ consumer 只用于未来共享分片存储或 host affinity 模式，当前默认不发布该 topic。
 
 ## RAG 进度事件
 

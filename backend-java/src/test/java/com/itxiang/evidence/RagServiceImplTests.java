@@ -13,9 +13,10 @@ import com.itxiang.evidence.mapper.LogEventMapper;
 import com.itxiang.evidence.mapper.RagQueryHistoryMapper;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
-import com.itxiang.evidence.service.Impl.RagIndexWorker;
+import com.itxiang.evidence.service.RagIndexTaskPublisher;
 import com.itxiang.evidence.service.Impl.RagServiceImpl;
 import com.itxiang.evidence.service.Impl.RagUploadWorker;
+import com.itxiang.evidence.service.command.RagUploadFinalizeCommand;
 import com.itxiang.evidence.vo.LearningMaterialVO;
 import com.itxiang.evidence.vo.MaterialUploadChunkVO;
 import com.itxiang.evidence.vo.MaterialPreviewVO;
@@ -82,7 +83,7 @@ class RagServiceImplTests {
     private ObjectStorageService objectStorageService;
 
     @Mock
-    private RagIndexWorker ragIndexWorker;
+    private RagIndexTaskPublisher ragIndexTaskPublisher;
 
     @Mock
     private RagUploadWorker ragUploadWorker;
@@ -103,6 +104,7 @@ class RagServiceImplTests {
     void setUp() {
         ReflectionTestUtils.setField(ragService, "chunkRootOverride", tempDir.resolve("chunks"));
         ReflectionTestUtils.setField(ragService, "objectMapper", new ObjectMapper());
+        lenient().when(ragIndexTaskPublisher.kafkaEnabled()).thenReturn(false);
         lenient().when(transactionTemplate.execute(any())).thenAnswer(invocation -> {
             TransactionCallback<?> callback = invocation.getArgument(0);
             return callback.doInTransaction(new SimpleTransactionStatus());
@@ -154,6 +156,65 @@ class RagServiceImplTests {
                 isNull(),
                 argThat(context -> containsErrorLocation(context, "video.frame_ocr[1]"))
         );
+    }
+
+    @Test
+    void indexTextUsesKafkaPublisherWhenEnabled() {
+        when(ragIndexTaskPublisher.kafkaEnabled()).thenReturn(true);
+        RagIndexTextDTO dto = new RagIndexTextDTO();
+        dto.setTitle("Kafka 文本资料");
+        dto.setDocumentType("markdown");
+        dto.setSource("manual");
+        dto.setContent("Kafka 索引文本");
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(77L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        when(logEventMapper.findRecentProgressByMaterialId(eq(77L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(77L), eq(80))).thenReturn(List.of());
+
+        LearningMaterialVO result = ragService.indexText(dto, "7");
+
+        assertThat(result.getStatus()).isEqualTo("PARSING");
+        verify(ragIndexTaskPublisher).publishTextIndex(argThat(material -> Long.valueOf(77L).equals(material.getId())), eq("7"), eq(dto));
+        verify(pythonRagClient, never()).indexText(any(), anyString(), any(RagIndexTextDTO.class));
+    }
+
+    @Test
+    void uploadMaterialUsesTaskPublisherAndReturnsQuickly() {
+        MockMultipartFile file = new MockMultipartFile(
+                "file",
+                "rag-note.md",
+                "text/markdown",
+                "## Kafka\n高吞吐索引".getBytes(StandardCharsets.UTF_8)
+        );
+        when(objectStorageService.store(eq(file), eq("rag-note.md"), eq("7"), eq("markdown")))
+                .thenReturn(new ObjectStorageService.StoredObject(
+                        "local",
+                        "uploads/rag/rag-note.md",
+                        null,
+                        null
+                ));
+        doAnswer(invocation -> {
+            LearningMaterial material = invocation.getArgument(0);
+            material.setId(78L);
+            return null;
+        }).when(learningMaterialMapper).insert(any(LearningMaterial.class));
+        when(logEventMapper.findRecentProgressByMaterialId(eq(78L), eq(40))).thenReturn(List.of());
+        when(logEventMapper.findVideoProgressByMaterialId(eq(78L), eq(80))).thenReturn(List.of());
+
+        LearningMaterialVO result = ragService.uploadMaterial(file, false, "7");
+
+        assertThat(result.getId()).isEqualTo(78L);
+        assertThat(result.getStatus()).isEqualTo("PARSING");
+        verify(ragIndexTaskPublisher).publishStoredMaterialIndex(
+                argThat(material -> Long.valueOf(78L).equals(material.getId()) && "PARSING".equals(material.getStatus())),
+                eq("7"),
+                eq(false),
+                eq("INDEX_UPLOAD")
+        );
+        verify(pythonRagClient, never()).indexFile(any(), anyString(), any(LearningMaterial.class), any(), any());
     }
 
     @Test
@@ -511,6 +572,7 @@ class RagServiceImplTests {
                 eq(5L),
                 eq(false)
         );
+        verify(ragIndexTaskPublisher, never()).publishUploadFinalize(any(RagUploadFinalizeCommand.class));
         verify(objectStorageService, never()).store(any(Path.class), anyString(), anyString(), anyString(), any());
     }
 
@@ -572,18 +634,7 @@ class RagServiceImplTests {
         assertThat(result.getNextChunkIndex()).isEqualTo(1);
         assertThat(Files.exists(chunkPath)).isTrue();
         verify(learningMaterialMapper, never()).insert(any(LearningMaterial.class));
-        verify(ragUploadWorker, never()).completeChunkedUpload(
-                any(),
-                anyString(),
-                any(Path.class),
-                any(Path.class),
-                anyString(),
-                anyString(),
-                anyString(),
-                any(),
-                any(),
-                any()
-        );
+        verify(ragUploadWorker, never()).completeChunkedUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test

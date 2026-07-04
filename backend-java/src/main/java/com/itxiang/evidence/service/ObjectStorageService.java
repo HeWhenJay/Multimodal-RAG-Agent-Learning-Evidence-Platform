@@ -2,6 +2,7 @@ package com.itxiang.evidence.service;
 
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.InputStream;
 import java.nio.file.Path;
 
 public interface ObjectStorageService {
@@ -20,6 +21,11 @@ public interface ObjectStorageService {
      * 读取已保存的原始文件，用于重新解析和补跑索引。
      */
     LoadedObject load(String storageType, String sourcePath, String objectKey, String filename);
+
+    /**
+     * 打开已保存原始文件的流，调用方必须关闭返回对象。
+     */
+    OpenedObject open(String storageType, String sourcePath, String objectKey, String filename);
 
     /**
      * 删除已保存的私有文件，删除失败时由实现层记录日志并保持业务删除可完成。
@@ -45,5 +51,30 @@ public interface ObjectStorageService {
             String filename,
             String contentType
     ) {
+    }
+
+    /**
+     * 可关闭的原始文件读取流。
+     */
+    record OpenedObject(
+            InputStream inputStream,
+            String filename,
+            String contentType,
+            Long contentLength,
+            Runnable closeAction
+    ) implements AutoCloseable {
+
+        @Override
+        public void close() {
+            try {
+                inputStream.close();
+            } catch (Exception ignored) {
+                // 关闭失败不影响业务响应，调用方日志已覆盖主流程。
+            } finally {
+                if (closeAction != null) {
+                    closeAction.run();
+                }
+            }
+        }
     }
 }

@@ -26,6 +26,7 @@
 | Python AI/RAG | `http://127.0.0.1:8090` | 内部 RAG、Agent、解析和检索服务 |
 | PostgreSQL/pgvector | `127.0.0.1:5433` | RAG 与业务权威数据 |
 | Redis | `127.0.0.1:6379` | Agent 短期运行态，可降级 |
+| Kafka | `127.0.0.1:9092` | 可选高吞吐 RAG 索引队列，默认关闭 |
 
 默认本地管理员账号是 `admin / 123456`，仅用于本机开发和演示。
 
@@ -50,6 +51,34 @@
 本项目的 RAG 不是前端直接调用 Python，也不是把 AI 逻辑写在 Java 里。业务边界是：React 只面向用户交互，Java Spring Boot 负责业务状态、资料记录、权限边界和统一 `Result<T>` 响应，Python FastAPI 负责文档识别、递归切块、索引、混合检索和证据引用。替换向量库、embedding 模型或增加重排序模型时，不需要破坏 Java 业务接口。
 
 日志记录是横切能力：Java 统一接收并写入 `log_event` / `log_error`，RAG 使用 `domain=rag`，Agent 编排、审批和记忆链路也通过 Java 边界复用同一套 `domain/module/stage/action/errorCode/contextJson` 结构。
+
+### Kafka 高吞吐索引模式
+
+Kafka 模式用于优化资料上传、重建索引和长视频分片合并完成后的高吞吐索引，不改变查询默认路径。默认关闭时，Java 继续使用现有 `@Async + HTTP` 调 Python 的后台索引链路，适合本地开发和不部署 Kafka 的环境。开启后，Java 在事务内写入 `learning_material`、`rag_index_job` 和 `rag_outbox_event`，Outbox Publisher 发布索引请求，Python Kafka worker 写入 staging pgvector 文档，Java 校验 active job 与 requestVersion 后再发送 promote 请求，Python Promote Worker 执行前再次调用 Java active-check，确认仍为 active job 后才将 staging 幂等提升为 canonical。查询仍通过 HTTP，并强制只检索 `visibilityScope='private'`。
+
+本地开启示例：
+
+```powershell
+$env:EVIDENCE_RAG_KAFKA_ENABLED='true'
+$env:SPRING_KAFKA_BOOTSTRAP_SERVERS='127.0.0.1:9092'
+$env:EVIDENCE_RAG_INTERNAL_TOKEN='<shared-internal-token>'
+$env:RAG_KAFKA_ENABLED='true'
+$env:RAG_KAFKA_BOOTSTRAP_SERVERS='127.0.0.1:9092'
+$env:RAG_JAVA_INTERNAL_TOKEN='<shared-internal-token>'
+```
+
+可按需覆盖 `RAG_KAFKA_MAX_ATTEMPTS`、`RAG_KAFKA_RETRY_1M_SECONDS`、`RAG_KAFKA_RETRY_10M_SECONDS`、`RAG_KAFKA_RETRY_1H_SECONDS` 和 `RAG_KAFKA_RETRY_MAX_SLEEP_SECONDS` 调整 Python retry scheduler 的重试上限、延迟时间和单次暂停等待上限。
+
+Python worker 启动：
+
+```powershell
+cd ai-python
+conda activate learning-evidence-rag
+$env:PYTHONPATH='.'
+python -m app.kafka_worker
+```
+
+Kafka topics 和消息 envelope 详见 [RAG 接口契约](docs/api/rag.md)。`rag.material.index.retry.*` topic 由 Python retry scheduler 根据 `notBefore` 暂停等待后再投递，Kafka 本身不提供延迟消息。第一阶段长视频分片收尾仍由接收最后一个分片的 Java 实例本地 `@Async` 完成，Kafka 只接管合并完成后的 RAG 索引，避免多实例部署时本地 chunk 目录不可见。
 
 ### RAG 闭环与视频证据流程图
 
@@ -538,6 +567,15 @@ Agent 工作台本地联调不需要分别为 Java 和 Python 手工设置内部
 | `RAG_EVENT_CALLBACK_URL` / `RAG_ERROR_CALLBACK_URL` | 可选 | Python RAG 处理日志回写 Java 内部日志接口 | `http://127.0.0.1:7080/api/logs/internal/events` / `.../errors` |
 | `VITE_API_PROXY_TARGET` | 前端代理自定义时可选 | Vite 开发代理指向 Java 后端 | `http://127.0.0.1:7080` |
 | `EVIDENCE_AGENT_JAVA_BASE_URL` | Python 调 Java 内部 Agent API 时可选 | Java Agent API 基础地址 | `http://127.0.0.1:7080` |
+| `EVIDENCE_RAG_KAFKA_ENABLED` / `RAG_KAFKA_ENABLED` | 可选 | Java / Python 是否启用 Kafka 索引链路 | `false` |
+| `SPRING_KAFKA_BOOTSTRAP_SERVERS` / `RAG_KAFKA_BOOTSTRAP_SERVERS` | Kafka 模式必填 | Kafka broker 地址 | `127.0.0.1:9092` |
+| `EVIDENCE_RAG_INTERNAL_TOKEN` / `RAG_JAVA_INTERNAL_TOKEN` | Kafka `JAVA_SOURCE_API` 必填 | Python worker 调 Java Source API 的共享内部令牌 | 自定义随机字符串 |
+| `EVIDENCE_RAG_INTERNAL_BASE_URL` / `RAG_JAVA_BASE_URL` | Kafka 模式可选 | Java 内部 Source API 基础地址 | `http://127.0.0.1:7080` |
+| `RAG_KAFKA_PROGRESS_CHUNK_INTERVAL` / `RAG_KAFKA_PROGRESS_MIN_SECONDS` | 可选 | Python Kafka progress 节流参数 | `10` / `2` |
+| `RAG_STAGING_RETENTION_HOURS` | 可选 | 成功 staging 索引保留小时数 | `24` |
+| `RAG_STAGING_FAILED_RETENTION_HOURS` | 可选 | 失败、DLQ 或 stale staging 索引保留小时数 | `168` |
+
+吞吐基线：当前实现提供 50 个小 Markdown 并发上传压测脚本入口与 Kafka 消息链路单元测试；需要本机 Kafka、PostgreSQL/pgvector 和百炼 embedding 配齐后才能跑完整 p95 上传压测。未启用 Kafka 时，上传接口仍会快速返回并沿用旧后台 HTTP 索引。
 
 ### RAG、模型与解析能力
 

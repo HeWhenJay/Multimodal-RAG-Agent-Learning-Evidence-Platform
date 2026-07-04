@@ -8,16 +8,43 @@
 flowchart LR
     A["React 前端"] --> B["Java Spring Boot API"]
     B --> C["MyBatis Mapper / H2 或 PostgreSQL"]
-    B --> D["Python FastAPI RAG 服务"]
-    D --> E["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
-    E --> F["DocumentBlock 统一模型"]
+    B --> D{"Kafka 是否开启"}
+    D -->|"否"| E["旧 @Async + HTTP 索引<br/>本地开发默认路径"]
+    D -->|"是"| O["rag_index_job + rag_outbox_event<br/>事务内创建索引任务"]
+    O --> KAFKA["Kafka request/progress/result/promote topics"]
+    KAFKA --> PYW["Python Kafka Index Worker"]
+    E --> PYHTTP["Python FastAPI RAG 服务"]
+    PYW --> PYPIPE["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
+    PYHTTP --> PYPIPE
+    PYPIPE --> F["DocumentBlock 统一模型"]
     F --> V["视频画面 OCR 近重复治理<br/>frame_ocr 聚合与时间范围保留"]
     V --> G["递归切块"]
     G --> H["摘要索引"]
-    H --> I["BM25 + PostgreSQL/pgvector 检索"]
+    H --> S["staging pgvector 文档<br/>visibility_scope=staging"]
+    S --> PR["Java 校验 active job + requestVersion"]
+    PR --> PM["Python Promote Worker<br/>staging 提升 canonical"]
+    PM --> I["BM25 + PostgreSQL/pgvector private 检索"]
     I --> J["RRF / RAG-Fusion"]
-    J --> K["证据引用回答"]
+    J --> R["证据引用回答"]
 ```
+
+Kafka 是高吞吐索引通道，不是查询通道。`/api/rag/query` 和查询任务继续由 Java 通过 HTTP 调 Python，并由 Java 强制当前用户与 `visibilityScope='private'` 过滤。Kafka 关闭时，架构退回旧的 `@Async + HTTP` 索引路径，资料状态、进度和最终结果保持兼容。
+
+## Kafka 索引流水线
+
+索引链路升级后的关键步骤：
+
+1. Java 上传或重建资料时，在同一事务内写 `learning_material`、`rag_index_job` 和 `rag_outbox_event`。
+2. Java Outbox Publisher 多实例安全抢占到期事件，发布 `rag.material.index.request.v1`。
+3. Python Index Worker 按 `canonicalDocumentId` 串行处理同一资料的索引请求，不同资料可并发；解析、切块、摘要和 embedding 后只写 `stagingDocumentId`。
+4. Python 通过 `rag.material.index.progress.v1` 上报节流进度，通过 `rag.material.index.result.v1` 上报 staging 索引终态。
+5. Java Result Consumer 写进度、校验 `active_index_job_id` 和 `index_request_version`。只有当前 active job 才发布 `rag.material.index.promote.request.v1`。
+6. Python Promote Worker 在执行 pgvector promote 前再次调用 Java active-check；仍为 active job 才能把 staging 复制为 canonical，重复 promote 必须幂等成功。pgvector 层还会拒绝低 `requestVersion` 覆盖高版本 canonical。
+7. Java Promote Result Consumer 更新 `learning_material` 和 `rag_index_job` 终态。stale job、过期 retry 或取消 job 不会污染 private 查询。
+
+长视频分片收尾仍由接收最后一个分片的 Java 实例本机 `@Async` 合并并上传对象存储；Kafka 只接管合并完成后的 RAG 索引。`rag.upload.finalize.request.v1` 保留给未来共享 chunkRoot 或 host affinity 模式。
+
+Outbox 表和消费者幂等表承担 Java 侧“至少一次发布、消费幂等”的职责。Python 消费 request 时使用 manual commit：result、retry 或 DLQ 消息发送成功后才提交原 offset，避免 worker 重启造成请求丢失。
 
 ## Python RAG 流程
 
@@ -31,6 +58,7 @@ flowchart LR
 6. 视频 `frame_ocr` 在递归切块前先做近重复聚合，保留 `duplicateGroupId`、`representativeTime`、`timeRanges` 和 `mergedFrameCount`，避免同一画面以多个原子块重复入库。
 7. 为文档和章节建立摘要索引。
 8. 为 chunk 建 BM25 词项统计，调用百炼 `text-embedding-v4` 生成 1024 维向量，并写入 PostgreSQL/pgvector 的 `rag_chunk.embedding`，evidence 元数据保存在 `rag_chunk.metadata`。
+9. Kafka worker 模式先写 staging 文档，metadata 保留 `canonicalDocumentId/jobId/requestVersion/stagingDocumentId/sourceJobId`；Java 校验通过后再由 Python promote 为 canonical 文档。
 
 查询阶段：
 

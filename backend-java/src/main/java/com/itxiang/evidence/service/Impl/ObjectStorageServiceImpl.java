@@ -84,6 +84,21 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
+     * 打开原始文件流，供内部 Source API 流式返回大文件。
+     */
+    @Override
+    public OpenedObject open(String storageType, String sourcePath, String objectKey, String filename) {
+        String provider = storageType == null ? "local" : storageType.trim().toLowerCase(Locale.ROOT);
+        if ("oss".equals(provider)) {
+            return openFromOss(sourcePath, objectKey, filename);
+        }
+        if ("local".equals(provider)) {
+            return openFromLocal(sourcePath, filename);
+        }
+        throw new IllegalArgumentException("当前资料没有可读取的原始上传文件，无法重建索引");
+    }
+
+    /**
      * 删除本地或 OSS 中的私有文件。
      */
     @Override
@@ -229,6 +244,31 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
     }
 
     /**
+     * 本地模式打开原始文件流。
+     */
+    private OpenedObject openFromLocal(String sourcePath, String filename) {
+        if (isBlank(sourcePath)) {
+            throw new IllegalArgumentException("本地资料缺少原始文件路径，无法重建索引");
+        }
+        Path target = resolveLocalPath(sourcePath);
+        if (!Files.exists(target) || !Files.isRegularFile(target)) {
+            throw new IllegalStateException("本地原始文件不存在，无法重建索引: " + sourcePath);
+        }
+        try {
+            String contentType = Files.probeContentType(target);
+            return new OpenedObject(
+                    Files.newInputStream(target),
+                    blankToDefault(filename, target.getFileName().toString()),
+                    contentType,
+                    Files.size(target),
+                    null
+            );
+        } catch (IOException e) {
+            throw new IllegalStateException("打开本地原始文件失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * 从阿里 OSS 读取原始文件。
      */
     private LoadedObject loadFromOss(String sourcePath, String objectKey, String filename) {
@@ -255,6 +295,39 @@ public class ObjectStorageServiceImpl implements ObjectStorageService {
             throw new IllegalStateException("读取 OSS 文件流失败: " + e.getMessage(), e);
         } finally {
             ossClient.shutdown();
+        }
+    }
+
+    /**
+     * OSS 模式打开原始文件流，关闭返回对象时同步释放 OSS client。
+     */
+    private OpenedObject openFromOss(String sourcePath, String objectKey, String filename) {
+        ObjectStorageProperties.Oss ossProperties = properties.getOss();
+        validateOssProperties(ossProperties);
+        String key = blankToDefault(objectKey, parseObjectKeyFromOssUri(sourcePath, ossProperties.getBucket()));
+        if (isBlank(key)) {
+            throw new IllegalArgumentException("OSS 资料缺少 objectKey，无法重建索引");
+        }
+        OSS ossClient = new OSSClientBuilder().build(
+                ossProperties.getEndpoint(),
+                ossProperties.getAccessKeyId(),
+                ossProperties.getAccessKeySecret()
+        );
+        try {
+            OSSObject ossObject = ossClient.getObject(ossProperties.getBucket(), key);
+            ObjectMetadata metadata = ossObject.getObjectMetadata();
+            String contentType = metadata == null ? null : metadata.getContentType();
+            Long contentLength = metadata == null ? null : metadata.getContentLength();
+            return new OpenedObject(
+                    ossObject.getObjectContent(),
+                    blankToDefault(filename, Path.of(key).getFileName().toString()),
+                    contentType,
+                    contentLength,
+                    ossClient::shutdown
+            );
+        } catch (OSSException | ClientException e) {
+            ossClient.shutdown();
+            throw new IllegalStateException("从阿里 OSS 打开原始文件失败: " + e.getMessage(), e);
         }
     }
 

@@ -38,7 +38,7 @@ class RagProcessLogger:
         self.module = module
         self.schema = os.getenv("RAG_DATABASE_SCHEMA", "learning_evidence")
         self.database_url = database_url or os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL")
-        self.persist = persist and bool(self.database_url)
+        self.persist = persist and bool(self.database_url) and process_log_persist_enabled()
         self.material_id = parse_material_id(document_id)
 
     @contextmanager
@@ -426,6 +426,14 @@ def use_process_logger(process_logger: RagProcessLogger):
 def current_process_logger() -> RagProcessLogger | None:
     """读取当前请求绑定的处理日志器。"""
     return _CURRENT_PROCESS_LOGGER.get()
+
+
+def process_log_persist_enabled() -> bool:
+    """判断过程日志是否需要写入数据库，内存后端默认跳过落库。"""
+    configured = os.getenv("RAG_PROCESS_LOG_PERSIST_ENABLED")
+    if configured is not None and configured.strip() != "":
+        return configured.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return os.getenv("RAG_STORE_BACKEND", "").strip().lower() != "memory"
 
 
 def logged_rag_method(stage: str, action: str, message: str):

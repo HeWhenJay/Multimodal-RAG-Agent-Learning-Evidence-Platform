@@ -163,6 +163,7 @@ class PgVectorRagStore:
         status: str,
         source_path: str | None = None,
         progress_reporter: RagProgressReporter | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> IndexResponse:
         document_id = clean_postgres_text(document_id)
         title = clean_postgres_text(title)
@@ -194,6 +195,8 @@ class PgVectorRagStore:
             "parseStatus": status,
             "parseQuality": metadata_parse_quality,
         })
+        if extra_metadata:
+            metadata.update(sanitize_for_postgres(extra_metadata))
         if progress_reporter:
             progress_reporter.emit("chunk.recursive", "正在按标题、段落、句子和长度预算执行递归切块", current_step=5, total_steps=8, percent=32)
         chunks = sanitize_chunks(self.chunker.split_blocks(blocks, document_id=document_id, metadata=metadata))
@@ -698,6 +701,172 @@ class PgVectorRagStore:
                 rows = cursor.fetchall()
         return [self._to_evidence(normalize_row(row), 1.0, retrieval_source="summary") for row in rows]
 
+    @logged_rag_method("index.promote", "pgvector_promote_staged_index", "将 staging 索引提升为 canonical")
+    def promote_staged_index(
+        self,
+        *,
+        canonical_document_id: str,
+        staging_document_id: str,
+        job_id: str,
+        request_version: int,
+        expected_chunk_count: int | None = None,
+    ) -> dict[str, Any]:
+        """幂等提升 staging 索引；只有 Java 校验 active job 后才会调用。"""
+        canonical_document_id = clean_postgres_text(canonical_document_id)
+        staging_document_id = clean_postgres_text(staging_document_id)
+        job_id = clean_postgres_text(job_id)
+        staging_count = self._count_document_chunks(staging_document_id)
+        if staging_count <= 0:
+            raise RuntimeError(f"staging 索引不存在或切块为空: {staging_document_id}")
+        expected_count = expected_chunk_count or staging_count
+        if expected_count != staging_count:
+            raise RuntimeError(
+                "staging 切块数与 Java result 不一致："
+                f"staging={staging_count}, expected={expected_count}, documentId={staging_document_id}"
+            )
+        existing_metadata = self._first_chunk_metadata(canonical_document_id)
+        canonical_count = self._count_document_chunks(canonical_document_id)
+        if canonical_count > 0 and metadata_request_version(existing_metadata) > int(request_version):
+            raise RuntimeError(
+                "拒绝用旧版本 staging 覆盖新 canonical："
+                f"canonicalVersion={metadata_request_version(existing_metadata)}, requestVersion={request_version}, "
+                f"documentId={canonical_document_id}"
+            )
+        if canonical_count == expected_count and metadata_matches_promote(
+            existing_metadata,
+            job_id=job_id,
+            request_version=request_version,
+            staging_document_id=staging_document_id,
+        ):
+            return {
+                "alreadyPromoted": True,
+                "canonicalChunkCount": canonical_count,
+                "stagingChunkCount": staging_count,
+            }
+
+        Json = self._json_adapter()
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT *
+                        FROM {self.document_table}
+                        WHERE document_id = %s
+                        """,
+                        (staging_document_id,),
+                    )
+                    document = cursor.fetchone()
+                    if not document:
+                        raise RuntimeError(f"staging 文档不存在: {staging_document_id}")
+                    cursor.execute(
+                        f"""
+                        SELECT *
+                        FROM {self.chunk_table}
+                        WHERE document_id = %s
+                        ORDER BY chunk_position ASC
+                        """,
+                        (staging_document_id,),
+                    )
+                    chunks = cursor.fetchall()
+                    self._delete_document_index_with_cursor(cursor, canonical_document_id)
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.document_table} (
+                            document_id,
+                            title,
+                            document_type,
+                            source,
+                            user_id,
+                            visibility_scope,
+                            language,
+                            parser,
+                            document_summary,
+                            section_summaries,
+                            chunk_count
+                        )
+                        VALUES (%s, %s, %s, %s, %s, 'private', %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            canonical_document_id,
+                            document["title"],
+                            document["document_type"],
+                            document["source"],
+                            document["user_id"],
+                            document["language"],
+                            document["parser"],
+                            document["document_summary"],
+                            document["section_summaries"],
+                            staging_count,
+                        ),
+                    )
+                    for row in chunks:
+                        metadata = ensure_dict(row["metadata"])
+                        metadata.update(
+                            {
+                                "documentId": canonical_document_id,
+                                "canonicalDocumentId": canonical_document_id,
+                                "stagingDocumentId": staging_document_id,
+                                "sourceJobId": job_id,
+                                "jobId": job_id,
+                                "requestVersion": request_version,
+                                "visibilityScope": "private",
+                            }
+                        )
+                        new_chunk_id = promote_chunk_id(
+                            str(row["chunk_id"]),
+                            staging_document_id=staging_document_id,
+                            canonical_document_id=canonical_document_id,
+                            position=int(row["chunk_position"] or 0),
+                        )
+                        cursor.execute(
+                            f"""
+                            INSERT INTO {self.chunk_table} (
+                                chunk_id,
+                                document_id,
+                                chunk_position,
+                                section_name,
+                                text,
+                                metadata,
+                                term_counts,
+                                token_count,
+                                embedding
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                            """,
+                            (
+                                new_chunk_id,
+                                canonical_document_id,
+                                row["chunk_position"],
+                                row["section_name"],
+                                row["text"],
+                                Json(sanitize_for_postgres(metadata)),
+                                Json(ensure_dict(row["term_counts"])),
+                                row["token_count"],
+                                vector_literal_from_db(row["embedding"]),
+                            ),
+                        )
+                    cursor.execute(
+                        f"""
+                        UPDATE {self.document_table}
+                        SET visibility_scope = 'staging_promoted',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE document_id = %s
+                        """,
+                        (staging_document_id,),
+                    )
+        canonical_count = self._count_document_chunks(canonical_document_id)
+        if canonical_count != staging_count:
+            raise RuntimeError(
+                "promote 后 canonical 切块数不一致："
+                f"canonical={canonical_count}, staging={staging_count}, documentId={canonical_document_id}"
+            )
+        return {
+            "alreadyPromoted": False,
+            "canonicalChunkCount": canonical_count,
+            "stagingChunkCount": staging_count,
+        }
+
     @logged_rag_method("index.schema", "pgvector_ensure_schema", "检查 pgvector RAG 表结构")
     def ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -805,6 +974,48 @@ class PgVectorRagStore:
                 with conn.cursor() as cursor:
                     self._delete_document_index_with_cursor(cursor, document_id)
 
+    @logged_rag_method("index.cleanup", "pgvector_cleanup_staging_index", "清理过期 staging 索引")
+    def cleanup_staging_indexes(
+        self,
+        *,
+        promoted_retention_hours: int | None = None,
+        failed_retention_hours: int | None = None,
+    ) -> dict[str, int]:
+        """清理过期 staging 文档，成功提升的默认保留 24 小时，失败/DLQ 默认保留 7 天。"""
+        promoted_hours = promoted_retention_hours or int(os.getenv("RAG_STAGING_RETENTION_HOURS", "24"))
+        failed_hours = failed_retention_hours or int(os.getenv("RAG_STAGING_FAILED_RETENTION_HOURS", "168"))
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT document_id, visibility_scope
+                        FROM {self.document_table}
+                        WHERE document_id LIKE %s
+                          AND (
+                            (visibility_scope = 'staging_promoted' AND updated_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour'))
+                            OR (visibility_scope = 'staging' AND updated_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour'))
+                          )
+                        ORDER BY updated_at ASC
+                        """,
+                        ("%__job-%", promoted_hours, failed_hours),
+                    )
+                    rows = cursor.fetchall()
+                    promoted_deleted = 0
+                    failed_deleted = 0
+                    for row in rows:
+                        document_id = row["document_id"]
+                        if row.get("visibility_scope") == "staging_promoted":
+                            promoted_deleted += 1
+                        else:
+                            failed_deleted += 1
+                        self._delete_document_index_with_cursor(cursor, document_id)
+        return {
+            "promotedDeleted": promoted_deleted,
+            "failedDeleted": failed_deleted,
+            "totalDeleted": promoted_deleted + failed_deleted,
+        }
+
     def _delete_document_index_with_cursor(self, cursor, document_id: str) -> None:
         cursor.execute(f"DELETE FROM {self.chunk_table} WHERE document_id = %s", (document_id,))
         cursor.execute(f"DELETE FROM {self.document_table} WHERE document_id = %s", (document_id,))
@@ -818,6 +1029,22 @@ class PgVectorRagStore:
         cursor.execute(f"SELECT COUNT(1) AS chunk_count FROM {self.chunk_table} WHERE document_id = %s", (document_id,))
         row = cursor.fetchone() or {}
         return int(row.get("chunk_count") or 0)
+
+    def _first_chunk_metadata(self, document_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT metadata
+                    FROM {self.chunk_table}
+                    WHERE document_id = %s
+                    ORDER BY chunk_position ASC
+                    LIMIT 1
+                    """,
+                    (document_id,),
+                )
+                row = cursor.fetchone()
+        return ensure_dict(row.get("metadata")) if row else {}
 
     def _connect(self):
         try:
@@ -997,6 +1224,40 @@ def build_filter_clause(metadata_filter: dict[str, Any]) -> tuple[str, list[Any]
     if not clauses:
         return "", []
     return "WHERE " + " AND ".join(clauses), params
+
+
+def metadata_matches_promote(metadata: dict[str, Any], *, job_id: str, request_version: int, staging_document_id: str) -> bool:
+    """判断 canonical 是否已经由同一个 staging/job promote 过。"""
+    return (
+        str(metadata.get("sourceJobId") or metadata.get("jobId") or "") == str(job_id)
+        and str(metadata.get("requestVersion") or "") == str(request_version)
+        and str(metadata.get("stagingDocumentId") or "") == str(staging_document_id)
+    )
+
+
+def metadata_request_version(metadata: dict[str, Any]) -> int:
+    """读取 metadata 中的请求版本，缺失或非法时按 0 处理。"""
+    try:
+        return int(metadata.get("requestVersion") or 0)
+    except Exception:
+        return 0
+
+
+def promote_chunk_id(chunk_id: str, *, staging_document_id: str, canonical_document_id: str, position: int) -> str:
+    """将 staging chunk_id 转为 canonical chunk_id。"""
+    if chunk_id.startswith(staging_document_id):
+        return canonical_document_id + chunk_id[len(staging_document_id):]
+    return f"{canonical_document_id}-{position}"
+
+
+def vector_literal_from_db(value: Any) -> str:
+    """把 psycopg 读取到的 vector 值重新转成 SQL literal。"""
+    if isinstance(value, str):
+        return value if value.startswith("[") else f"[{value}]"
+    if isinstance(value, list | tuple):
+        return vector_literal([float(item) for item in value])
+    text = str(value)
+    return text if text.startswith("[") else f"[{text}]"
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -19,6 +19,8 @@
         <result property="storageType" column="storage_type"/>
         <result property="objectKey" column="object_key"/>
         <result property="publicUrl" column="public_url"/>
+        <result property="activeIndexJobId" column="active_index_job_id"/>
+        <result property="indexRequestVersion" column="index_request_version"/>
         <result property="createdAt" column="created_at"/>
         <result property="updatedAt" column="updated_at"/>
     </resultMap>
@@ -83,6 +85,23 @@
         WHERE id = #{id}
     </update>
 
+    <update id="updateActiveIndexJob">
+        UPDATE learning_material
+        SET active_index_job_id = #{activeIndexJobId},
+            index_request_version = #{indexRequestVersion},
+            status = #{status},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <update id="clearActiveIndexJob">
+        UPDATE learning_material
+        SET active_index_job_id = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND active_index_job_id = #{activeIndexJobId}
+    </update>
+
     <update id="updateStorageInfo">
         UPDATE learning_material
         SET original_file_path = #{originalFilePath},
@@ -109,6 +128,8 @@
             storage_type,
             object_key,
             public_url,
+            active_index_job_id,
+            index_request_version,
             created_at,
             updated_at
         FROM learning_material
@@ -133,6 +154,8 @@
             storage_type,
             object_key,
             public_url,
+            active_index_job_id,
+            index_request_version,
             created_at,
             updated_at
         FROM learning_material
@@ -159,11 +182,37 @@
             storage_type,
             object_key,
             public_url,
+            active_index_job_id,
+            index_request_version,
             created_at,
             updated_at
         FROM learning_material
         WHERE id = #{id}
           AND user_id = #{userId}
+    </select>
+
+    <select id="findById" resultMap="LearningMaterialResultMap">
+        SELECT
+            id,
+            title,
+            user_id,
+            document_type,
+            source,
+            status,
+            parser,
+            document_summary,
+            chunk_count,
+            original_filename,
+            original_file_path,
+            storage_type,
+            object_key,
+            public_url,
+            active_index_job_id,
+            index_request_version,
+            created_at,
+            updated_at
+        FROM learning_material
+        WHERE id = #{id}
     </select>
 
     <select id="countAllByUserId" resultType="long">

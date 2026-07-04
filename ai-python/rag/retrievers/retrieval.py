@@ -119,6 +119,7 @@ class InMemoryRagStore:
         status: str,
         source_path: str | None = None,
         progress_reporter: RagProgressReporter | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> IndexResponse:
         document_id = clean_postgres_text(document_id)
         title = clean_postgres_text(title)
@@ -150,6 +151,8 @@ class InMemoryRagStore:
             "parseStatus": status,
             "parseQuality": metadata_parse_quality,
         })
+        if extra_metadata:
+            metadata.update(sanitize_for_postgres(extra_metadata))
         self._remove_document(document_id)
         if progress_reporter:
             progress_reporter.emit("chunk.recursive", "正在按标题、段落、句子和长度预算执行递归切块", current_step=5, total_steps=8, percent=32)
@@ -497,6 +500,86 @@ class InMemoryRagStore:
             if chunk.document_id == document_id
         ]
         return [self._to_evidence(chunk_id, 1.0, retrieval_source="summary") for chunk_id in chunk_ids[:limit]]
+
+    def promote_staged_index(
+        self,
+        *,
+        canonical_document_id: str,
+        staging_document_id: str,
+        job_id: str,
+        request_version: int,
+        expected_chunk_count: int | None = None,
+    ) -> dict[str, Any]:
+        """内存模式下幂等复制 staging chunks 为 canonical chunks。"""
+        staging_chunks = [
+            chunk
+            for chunk in sorted(self.chunks.values(), key=lambda item: int(item.metadata.get("chunkPosition") or 0))
+            if chunk.document_id == staging_document_id
+        ]
+        if not staging_chunks:
+            raise RuntimeError(f"staging 索引不存在或切块为空: {staging_document_id}")
+        expected_count = expected_chunk_count or len(staging_chunks)
+        if expected_count != len(staging_chunks):
+            raise RuntimeError("staging 切块数与 Java result 不一致")
+        canonical_chunks = [chunk for chunk in self.chunks.values() if chunk.document_id == canonical_document_id]
+        if canonical_chunks:
+            try:
+                canonical_version = int(canonical_chunks[0].metadata.get("requestVersion") or 0)
+            except Exception:
+                canonical_version = 0
+            if canonical_version > int(request_version):
+                raise RuntimeError(
+                    "拒绝用旧版本 staging 覆盖新 canonical："
+                    f"canonicalVersion={canonical_version}, requestVersion={request_version}, documentId={canonical_document_id}"
+                )
+        if len(canonical_chunks) == expected_count and canonical_chunks:
+            metadata = canonical_chunks[0].metadata
+            if (
+                str(metadata.get("sourceJobId") or metadata.get("jobId") or "") == str(job_id)
+                and str(metadata.get("requestVersion") or "") == str(request_version)
+                and str(metadata.get("stagingDocumentId") or "") == str(staging_document_id)
+            ):
+                return {
+                    "alreadyPromoted": True,
+                    "canonicalChunkCount": len(canonical_chunks),
+                    "stagingChunkCount": len(staging_chunks),
+                }
+        self._remove_document(canonical_document_id)
+        staging_doc = dict(self.documents.get(staging_document_id) or {})
+        staging_doc["documentId"] = canonical_document_id
+        staging_doc["visibilityScope"] = "private"
+        self.documents[canonical_document_id] = staging_doc
+        for chunk in staging_chunks:
+            metadata = dict(chunk.metadata)
+            metadata.update(
+                {
+                    "documentId": canonical_document_id,
+                    "canonicalDocumentId": canonical_document_id,
+                    "stagingDocumentId": staging_document_id,
+                    "sourceJobId": job_id,
+                    "jobId": job_id,
+                    "requestVersion": request_version,
+                    "visibilityScope": "private",
+                }
+            )
+            new_chunk_id = chunk.chunk_id.replace(staging_document_id, canonical_document_id, 1)
+            promoted = Chunk(
+                chunk_id=new_chunk_id,
+                document_id=canonical_document_id,
+                text=chunk.text,
+                metadata=metadata,
+            )
+            self.chunks[new_chunk_id] = promoted
+            self.term_freqs[new_chunk_id] = Counter(tokenize(promoted.text))
+            self.doc_freq.update(set(self.term_freqs[new_chunk_id]))
+            self.embeddings[new_chunk_id] = list(self.embeddings.get(chunk.chunk_id, []))
+        if staging_document_id in self.documents:
+            self.documents[staging_document_id]["visibilityScope"] = "staging_promoted"
+        return {
+            "alreadyPromoted": False,
+            "canonicalChunkCount": len(staging_chunks),
+            "stagingChunkCount": len(staging_chunks),
+        }
 
     @logged_rag_method("index.cleanup", "memory_remove_document", "清理旧内存索引")
     def _remove_document(self, document_id: str) -> None:

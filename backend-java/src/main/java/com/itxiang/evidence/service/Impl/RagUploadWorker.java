@@ -2,10 +2,12 @@ package com.itxiang.evidence.service.Impl;
 
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
+import com.itxiang.evidence.service.RagIndexTaskPublisher;
 import com.itxiang.evidence.service.LogService;
 import com.itxiang.evidence.service.ObjectStorageService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -27,7 +29,7 @@ public class RagUploadWorker {
 
     private final LearningMaterialMapper learningMaterialMapper;
     private final ObjectStorageService objectStorageService;
-    private final RagIndexWorker ragIndexWorker;
+    private final ObjectProvider<RagIndexTaskPublisher> ragIndexTaskPublisherProvider;
     private final LogService logService;
     private final TransactionTemplate transactionTemplate;
 
@@ -45,9 +47,61 @@ public class RagUploadWorker {
                                       Integer totalChunks,
                                       Long totalSize,
                                       Boolean highPrecision) {
+        completeChunkedUploadNow(materialId, userId, directory, chunkRoot, uploadId, filename, contentType, totalChunks, totalSize, highPrecision);
+    }
+
+    /**
+     * 同步完成分片收尾，供 Kafka consumer 在提交 offset 前执行完整处理。
+     */
+    public void completeChunkedUploadNow(Long materialId,
+                                         String userId,
+                                         Path directory,
+                                         Path chunkRoot,
+                                         String uploadId,
+                                         String filename,
+                                         String contentType,
+                                         Integer totalChunks,
+                                         Long totalSize,
+                                         Boolean highPrecision) {
+        completeChunkedUploadInternal(materialId, userId, directory, chunkRoot, uploadId, filename, contentType, totalChunks, totalSize, highPrecision, false);
+    }
+
+    /**
+     * Kafka consumer 使用的同步收尾入口，失败会重新抛出以便发送 DLQ 后再提交 offset。
+     */
+    public void completeChunkedUploadForKafka(Long materialId,
+                                              String userId,
+                                              Path directory,
+                                              Path chunkRoot,
+                                              String uploadId,
+                                              String filename,
+                                              String contentType,
+                                              Integer totalChunks,
+                                              Long totalSize,
+                                              Boolean highPrecision) {
+        completeChunkedUploadInternal(materialId, userId, directory, chunkRoot, uploadId, filename, contentType, totalChunks, totalSize, highPrecision, true);
+    }
+
+    /**
+     * 执行分片收尾主流程，按调用场景决定失败是否向上抛出。
+     */
+    private void completeChunkedUploadInternal(Long materialId,
+                                               String userId,
+                                               Path directory,
+                                               Path chunkRoot,
+                                               String uploadId,
+                                               String filename,
+                                               String contentType,
+                                               Integer totalChunks,
+                                               Long totalSize,
+                                               Boolean highPrecision,
+                                               boolean rethrowOnFailure) {
         LearningMaterial material = learningMaterialMapper.findByIdAndUserId(materialId, userId);
         if (material == null) {
             log.warn("分片上传后台收尾跳过，资料不存在或用户不匹配: materialId={}, userId={}", materialId, userId);
+            if (rethrowOnFailure) {
+                throw new IllegalStateException("分片上传资料不存在或用户不匹配");
+            }
             return;
         }
         try {
@@ -93,7 +147,12 @@ public class RagUploadWorker {
             });
 
             cleanupChunkDirectory(directory, chunkRoot);
-            ragIndexWorker.indexStoredMaterial(material.getId(), userId, Boolean.TRUE.equals(highPrecision));
+            ragIndexTaskPublisherProvider.getObject().publishStoredMaterialIndex(
+                    material,
+                    userId,
+                    Boolean.TRUE.equals(highPrecision),
+                    "INDEX_UPLOAD"
+            );
             log.info("RAG分片上传后台收尾完成: materialId={}, uploadId={}", materialId, uploadId);
         } catch (Exception e) {
             log.warn("RAG分片上传后台收尾失败: materialId={}, uploadId={}, reason={}", materialId, uploadId, e.getMessage());
@@ -108,6 +167,9 @@ public class RagUploadWorker {
                     materialContext(material)
             );
             transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
+            if (rethrowOnFailure) {
+                throw new IllegalStateException("RAG分片上传Kafka收尾失败: " + e.getMessage(), e);
+            }
         }
     }
 

@@ -60,15 +60,26 @@ class RagProgressReporter:
         database_url: str | None = None,
         persist: bool = True,
         on_emit: Callable[[ProgressEvent], None] | None = None,
+        delivery_mode: str | None = None,
+        kafka_producer: Any | None = None,
+        kafka_context: dict[str, Any] | None = None,
     ) -> None:
         self.document_id = document_id
         self.user_id = user_id or "anonymous"
         self.schema = os.getenv("RAG_DATABASE_SCHEMA", "learning_evidence")
         self.database_url = database_url or os.getenv("RAG_DATABASE_URL") or os.getenv("DATABASE_URL")
-        self.persist = persist and bool(self.database_url)
+        self.delivery_mode = normalize_delivery_mode(delivery_mode, persist=persist, on_emit=on_emit)
+        self.persist = (
+            persist
+            and bool(self.database_url)
+            and self.delivery_mode in {"http", "database"}
+            and progress_persist_enabled()
+        )
         self.material_id = parse_material_id(document_id)
         self.events: list[ProgressEvent] = []
         self.on_emit = on_emit
+        self.kafka_producer = kafka_producer
+        self.kafka_context = kafka_context or {}
 
     def emit(
         self,
@@ -111,11 +122,36 @@ class RagProgressReporter:
             except Exception as exc:
                 logger.debug("RAG 进度回调失败，已忽略: %s", exc)
         self._console(event)
-        if self._post_callback(event, parser=parser, extra_context=extra_context):
+        if self.delivery_mode == "none" or self.delivery_mode == "memory":
+            return event
+        if self.delivery_mode == "kafka":
+            self._publish_kafka(event, parser=parser, extra_context=extra_context)
+            return event
+        if self.delivery_mode == "http" and self._post_callback(event, parser=parser, extra_context=extra_context):
             return event
         if self.persist:
             self._persist(event, parser=parser, extra_context=extra_context)
         return event
+
+    def _publish_kafka(self, event: ProgressEvent, *, parser: str | None, extra_context: dict[str, Any] | None) -> None:
+        """Kafka worker 模式只通过 progress topic 上报，避免 HTTP 回调和 DB fallback 重复落库。"""
+        if self.kafka_producer is None:
+            logger.debug("RAG Kafka progress producer 未配置，跳过进度发送: %s", event.stageCode)
+            return
+        context = dict(self.kafka_context)
+        if extra_context:
+            context.update(extra_context)
+        try:
+            self.kafka_producer.send_progress(
+                event=event,
+                document_id=self.document_id,
+                material_id=self.material_id,
+                user_id=self.user_id,
+                parser=parser,
+                extra_context=context,
+            )
+        except Exception as exc:
+            logger.warning("RAG Kafka 进度发送失败: %s", exc)
 
     def _console(self, event: ProgressEvent) -> None:
         """每个用户可见进度都输出到 Python 控制台，便于大文件解析时定位当前阶段。"""
@@ -247,3 +283,24 @@ def console_progress_enabled() -> bool:
     """读取控制台进度输出开关，默认开启。"""
     value = os.getenv("RAG_CONSOLE_PROGRESS_ENABLED", "true").strip().lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def progress_persist_enabled() -> bool:
+    """判断进度事件是否需要写入数据库，内存后端默认跳过落库。"""
+    configured = os.getenv("RAG_PROGRESS_PERSIST_ENABLED")
+    if configured is not None and configured.strip() != "":
+        return configured.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return os.getenv("RAG_STORE_BACKEND", "").strip().lower() != "memory"
+
+
+def normalize_delivery_mode(delivery_mode: str | None, *, persist: bool, on_emit: Callable[[ProgressEvent], None] | None) -> str:
+    """根据显式参数和旧 persist/on_emit 语义选择进度投递模式。"""
+    if delivery_mode:
+        mode = delivery_mode.strip().lower()
+    elif on_emit is not None and not persist:
+        mode = "memory"
+    else:
+        mode = os.getenv("RAG_PROGRESS_DELIVERY_MODE", "http").strip().lower()
+    if mode not in {"http", "database", "kafka", "memory", "none"}:
+        return "http"
+    return mode
