@@ -3,13 +3,13 @@ package com.itxiang.evidence.service.Impl;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.itxiang.evidence.config.AgentProperties;
+import com.itxiang.evidence.mapper.AgentCacheRepairTaskMapper;
 import com.itxiang.evidence.service.AgentRuntimeStateAdapter;
 import com.itxiang.evidence.vo.AgentChatMessageVO;
 import com.itxiang.evidence.vo.AgentContextRestoreVO;
 import com.itxiang.evidence.vo.AgentConversationSummaryVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.context.annotation.Primary;
@@ -27,7 +27,6 @@ import java.util.Optional;
 @Component
 @Primary
 @RequiredArgsConstructor
-@ConditionalOnBean(StringRedisTemplate.class)
 @ConditionalOnProperty(prefix = "evidence.agent.redis", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class RedisAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
 
@@ -39,10 +38,15 @@ public class RedisAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
     private final StringRedisTemplate redisTemplate;
     private final AgentProperties agentProperties;
     private final ObjectMapper objectMapper;
+    private final AgentCacheRepairTaskMapper agentCacheRepairTaskMapper;
 
     @Override
     public Optional<AgentContextRestoreVO> readContext(String userId, String taskId) {
         try {
+            if (agentCacheRepairTaskMapper.hasPending(taskId)) {
+                log.debug("Agent 上下文缓存存在待修复删除任务，改从 PostgreSQL 恢复: taskId={}", taskId);
+                return Optional.empty();
+            }
             String contextJson = redisTemplate.opsForValue().get(contextKey(userId, taskId));
             String messagesJson = redisTemplate.opsForValue().get(messageKey(userId, taskId));
             if (contextJson == null || contextJson.isBlank() || messagesJson == null || messagesJson.isBlank()) {
@@ -71,6 +75,8 @@ public class RedisAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
             return;
         }
         try {
+            // 先清除旧的成对缓存，避免第二次 set 失败时组合出新旧不一致的上下文。
+            redisTemplate.delete(List.of(contextKey(context.getUserId(), context.getTaskId()), messageKey(context.getUserId(), context.getTaskId())));
             Map<String, Object> metadata = new LinkedHashMap<>(context.getBudgetMetadata() == null ? Map.of() : context.getBudgetMetadata());
             metadata.put("restoreSource", "postgresql_backfilled_to_redis");
             metadata.put("lastCompressionAt", metadata.getOrDefault("lastCompressionAt", ""));
@@ -133,6 +139,20 @@ public class RedisAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
             ));
         } catch (Exception e) {
             log.debug("更新 Agent Redis 摘要热态失败: taskId={}, message={}", taskId, e.getMessage());
+        }
+    }
+
+    /**
+     * 删除可从 PostgreSQL 重建的上下文和消息缓存；失败由持久化修复任务继续处理。
+     */
+    @Override
+    public boolean invalidateContext(String userId, String taskId) {
+        try {
+            redisTemplate.delete(List.of(contextKey(userId, taskId), messageKey(userId, taskId)));
+            return true;
+        } catch (Exception e) {
+            log.warn("删除 Agent Redis 上下文缓存失败，将由修复任务重试: taskId={}, message={}", taskId, e.getMessage());
+            return false;
         }
     }
 

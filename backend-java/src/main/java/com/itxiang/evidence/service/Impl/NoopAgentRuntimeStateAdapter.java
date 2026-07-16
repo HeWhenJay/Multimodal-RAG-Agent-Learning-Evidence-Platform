@@ -4,6 +4,7 @@ import com.itxiang.evidence.service.AgentRuntimeStateAdapter;
 import com.itxiang.evidence.vo.AgentChatMessageVO;
 import com.itxiang.evidence.vo.AgentContextRestoreVO;
 import com.itxiang.evidence.vo.AgentConversationSummaryVO;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -11,6 +12,7 @@ import java.util.Map;
 import java.util.Optional;
 
 @Component
+@ConditionalOnProperty(prefix = "evidence.agent.redis", name = "enabled", havingValue = "false")
 public class NoopAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
 
     @Override
@@ -28,6 +30,11 @@ public class NoopAgentRuntimeStateAdapter implements AgentRuntimeStateAdapter {
 
     @Override
     public void updateSummary(String userId, String taskId, AgentConversationSummaryVO summary, boolean terminal) {
+    }
+
+    @Override
+    public boolean invalidateContext(String userId, String taskId) {
+        return true;
     }
 
     @Override

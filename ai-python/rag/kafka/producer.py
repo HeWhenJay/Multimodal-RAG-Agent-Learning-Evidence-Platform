@@ -57,7 +57,12 @@ class KafkaJsonProducer:
             from confluent_kafka import Producer
         except ImportError as exc:
             raise RuntimeError("使用 RAG Kafka worker 需要安装 confluent-kafka") from exc
-        self.producer = Producer({"bootstrap.servers": bootstrap_servers or os.getenv("RAG_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")})
+        self.producer = Producer(
+            {
+                "bootstrap.servers": bootstrap_servers or os.getenv("RAG_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
+                "message.timeout.ms": positive_int("RAG_KAFKA_PRODUCER_MESSAGE_TIMEOUT_MS", 5000),
+            }
+        )
 
     def send(self, topic: str, key: str, envelope: KafkaEnvelope) -> None:
         """发送消息并等待本地 flush，失败抛异常供 caller 决定是否提交 offset。"""
@@ -73,11 +78,29 @@ class KafkaJsonProducer:
             value=envelope.model_dump_json(),
             callback=callback,
         )
-        remaining = self.producer.flush(30)
+        remaining = self.producer.flush(positive_float("RAG_KAFKA_PRODUCER_FLUSH_SECONDS", 5.0))
         if remaining and remaining > 0:
             raise RuntimeError(f"Kafka 消息发送超时，仍有 {remaining} 条消息未投递")
         if error_holder:
             raise error_holder[0]
+
+
+def positive_int(name: str, default: int) -> int:
+    """读取正整数配置，非法值使用安全默认值。"""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def positive_float(name: str, default: float) -> float:
+    """读取正数秒级配置，非法值使用安全默认值。"""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 @dataclass

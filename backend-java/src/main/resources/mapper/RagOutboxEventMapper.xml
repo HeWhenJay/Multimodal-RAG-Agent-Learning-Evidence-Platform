@@ -49,9 +49,15 @@
     <select id="findDueForPublish" resultMap="RagOutboxEventResultMap">
         SELECT *
         FROM rag_outbox_event
-        WHERE status IN ('NEW', 'FAILED')
-          AND next_attempt_at &lt;= #{now}
-          AND (lease_until IS NULL OR lease_until &lt;= #{now})
+        WHERE (
+                status IN ('NEW', 'FAILED')
+                AND next_attempt_at &lt;= #{now}
+                AND (lease_until IS NULL OR lease_until &lt;= #{now})
+            )
+           OR (
+                status = 'PUBLISHING'
+                AND lease_until &lt;= #{now}
+            )
         ORDER BY id ASC
         LIMIT #{limit}
         FOR UPDATE SKIP LOCKED
@@ -65,7 +71,10 @@
             attempt = attempt + 1,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status IN ('NEW', 'FAILED')
+          AND (
+                status IN ('NEW', 'FAILED')
+                OR (status = 'PUBLISHING' AND lease_until &lt;= CURRENT_TIMESTAMP)
+            )
     </update>
 
     <update id="markPublished">
@@ -73,6 +82,7 @@
         SET status = 'PUBLISHED',
             published_at = CURRENT_TIMESTAMP,
             lease_until = NULL,
+            locked_by = NULL,
             error_message = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
@@ -84,6 +94,7 @@
             error_message = #{errorMessage},
             next_attempt_at = #{nextAttemptAt},
             lease_until = NULL,
+            locked_by = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
     </update>

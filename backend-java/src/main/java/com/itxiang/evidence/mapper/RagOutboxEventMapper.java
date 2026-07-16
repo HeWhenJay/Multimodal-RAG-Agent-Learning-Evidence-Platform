@@ -4,7 +4,7 @@ import com.itxiang.evidence.entity.RagOutboxEvent;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.List;
 
 @Mapper
@@ -18,7 +18,7 @@ public interface RagOutboxEventMapper {
     /**
      * 多实例安全查询到期待发布事件。
      */
-    List<RagOutboxEvent> findDueForPublish(@Param("now") LocalDateTime now,
+    List<RagOutboxEvent> findDueForPublish(@Param("now") OffsetDateTime now,
                                            @Param("limit") Integer limit);
 
     /**
@@ -26,7 +26,7 @@ public interface RagOutboxEventMapper {
      */
     int lease(@Param("id") Long id,
               @Param("lockedBy") String lockedBy,
-              @Param("leaseUntil") LocalDateTime leaseUntil);
+              @Param("leaseUntil") OffsetDateTime leaseUntil);
 
     /**
      * 标记事件已成功发布。
@@ -38,5 +38,5 @@ public interface RagOutboxEventMapper {
      */
     int markFailed(@Param("id") Long id,
                    @Param("errorMessage") String errorMessage,
-                   @Param("nextAttemptAt") LocalDateTime nextAttemptAt);
+                   @Param("nextAttemptAt") OffsetDateTime nextAttemptAt);
 }

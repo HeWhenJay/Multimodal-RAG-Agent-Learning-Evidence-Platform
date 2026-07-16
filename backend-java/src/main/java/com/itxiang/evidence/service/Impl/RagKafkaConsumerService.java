@@ -23,8 +23,11 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.LocalDateTime;
+import java.security.MessageDigest;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -52,6 +55,7 @@ public class RagKafkaConsumerService {
      * 消费 Python 进度事件并写入 log_event。
      */
     @KafkaListener(
+            containerFactory = "ragKafkaListenerContainerFactory",
             topics = "${evidence.rag.kafka.topics.progress:rag.material.index.progress.v1}",
             groupId = "${evidence.rag.kafka.groups.progress-writers:rag-java-progress-writers}"
     )
@@ -80,6 +84,7 @@ public class RagKafkaConsumerService {
      * 消费 Python staging 索引结果，只有 active job 才能进入 promote。
      */
     @KafkaListener(
+            containerFactory = "ragKafkaListenerContainerFactory",
             topics = "${evidence.rag.kafka.topics.index-result:rag.material.index.result.v1}",
             groupId = "${evidence.rag.kafka.groups.result-writers:rag-java-result-writers}"
     )
@@ -95,7 +100,7 @@ public class RagKafkaConsumerService {
         LearningMaterial material = materialId == null ? null : learningMaterialMapper.findById(materialId);
         RagIndexJob job = jobId == null ? null : ragIndexJobMapper.findById(jobId);
         if (!isActive(material, job, integer(payload, "requestVersion"))) {
-            markIgnored(job, "stale index result ignored");
+            markIgnored(job, "过期索引结果已忽略");
             return;
         }
         if ("FAILED".equals(text(payload, "status"))) {
@@ -113,6 +118,7 @@ public class RagKafkaConsumerService {
      * 消费 Python promote 结果，只有 promote 成功后才更新资料终态。
      */
     @KafkaListener(
+            containerFactory = "ragKafkaListenerContainerFactory",
             topics = "${evidence.rag.kafka.topics.promote-result:rag.material.index.promote.result.v1}",
             groupId = "${evidence.rag.kafka.groups.promote-result-writers:rag-java-promote-result-writers}"
     )
@@ -128,7 +134,7 @@ public class RagKafkaConsumerService {
         LearningMaterial material = materialId == null ? null : learningMaterialMapper.findById(materialId);
         RagIndexJob job = jobId == null ? null : ragIndexJobMapper.findById(jobId);
         if (!isActive(material, job, integer(payload, "requestVersion"))) {
-            markIgnored(job, "stale promote result ignored");
+            markIgnored(job, "过期提升结果已忽略");
             return;
         }
         if (!"SUCCEEDED".equals(text(payload, "status"))) {
@@ -152,6 +158,7 @@ public class RagKafkaConsumerService {
      * 消费 Kafka 分片收尾请求，执行 Java 本地合并和对象存储上传。
      */
     @KafkaListener(
+            containerFactory = "ragKafkaListenerContainerFactory",
             topics = "${evidence.rag.kafka.topics.upload-finalize-request:rag.upload.finalize.request.v1}",
             groupId = "${evidence.rag.kafka.groups.upload-finalizers:rag-java-upload-finalizers}"
     )
@@ -184,6 +191,7 @@ public class RagKafkaConsumerService {
      * 记录 DLQ 摘要，禁止记录文档正文。
      */
     @KafkaListener(
+            containerFactory = "ragKafkaListenerContainerFactory",
             topics = {
                     "${evidence.rag.kafka.topics.index-dlq:rag.material.index.dlq.v1}",
                     "${evidence.rag.kafka.topics.upload-finalize-dlq:rag.upload.finalize.dlq.v1}"
@@ -198,20 +206,72 @@ public class RagKafkaConsumerService {
             return;
         }
         Map<String, Object> context = new LinkedHashMap<>();
-        for (String key : new String[]{"jobId", "materialId", "canonicalDocumentId", "requestVersion", "attempt", "topic", "errorCode", "errorMessage"}) {
+        for (String key : new String[]{
+                "jobId", "materialId", "canonicalDocumentId", "requestVersion", "attempt",
+                "topic", "sourceTopic", "partition", "offset", "messageHash",
+                "sourceMessageId", "sourceMessageType", "sourceIdempotencyKey",
+                "uploadId", "errorCode", "errorMessage"
+        }) {
             if (payload.containsKey(key)) {
                 context.put(key, payload.get(key));
             }
         }
+        applyDlqTerminalState(payload);
         logService.recordRagError(
                 "material",
                 "kafka.dlq",
                 "rag_kafka_dlq_received",
                 defaultText(text(payload, "errorCode"), "RAG_KAFKA_DLQ"),
-                "RAG Kafka 消息进入 DLQ",
+                dlqLogMessage(payload),
                 null,
                 context
         );
+    }
+
+    /**
+     * 对索引、提升和分片收尾的终态 DLQ 回写失败状态，避免资料长期停留在解析中。
+     */
+    private void applyDlqTerminalState(Map<String, Object> payload) {
+        String sourceTopic = defaultText(text(payload, "sourceTopic"), text(payload, "topic"));
+        if (!isTerminalDlqTopic(sourceTopic)) {
+            return;
+        }
+        String jobId = text(payload, "jobId");
+        Long materialId = longValue(payload.get("materialId"));
+        String errorCode = defaultText(text(payload, "errorCode"), "RAG_KAFKA_DLQ");
+        String errorMessage = defaultText(text(payload, "errorMessage"), "RAG Kafka 消息进入 DLQ");
+        RagIndexJob job = jobId == null ? null : ragIndexJobMapper.findById(jobId);
+        if (job != null) {
+            ragIndexJobMapper.markFinished(jobId, "DLQ", toJson(payload), errorCode, truncate(errorMessage, 1000));
+            if (materialId == null) {
+                materialId = job.getMaterialId();
+            }
+        }
+        if (materialId == null) {
+            return;
+        }
+        LearningMaterial material = learningMaterialMapper.findById(materialId);
+        if (material == null || (jobId != null && !jobId.equals(material.getActiveIndexJobId()))) {
+            return;
+        }
+        learningMaterialMapper.updateIndexResult(
+                material.getId(),
+                "FAILED",
+                "kafka-dlq",
+                truncate(errorMessage, 500),
+                0
+        );
+        if (jobId != null) {
+            learningMaterialMapper.clearActiveIndexJob(material.getId(), jobId);
+        }
+    }
+
+    private boolean isTerminalDlqTopic(String topic) {
+        return properties.getTopics().getIndexRequest().equals(topic)
+                || properties.getTopics().getIndexResult().equals(topic)
+                || properties.getTopics().getPromoteRequest().equals(topic)
+                || properties.getTopics().getPromoteResult().equals(topic)
+                || properties.getTopics().getUploadFinalizeRequest().equals(topic);
     }
 
     /**
@@ -242,7 +302,7 @@ public class RagKafkaConsumerService {
         event.setPayloadJson(toJson(promote));
         event.setStatus("NEW");
         event.setAttempt(0);
-        event.setNextAttemptAt(LocalDateTime.now());
+        event.setNextAttemptAt(OffsetDateTime.now(ZoneOffset.UTC));
         ragOutboxEventMapper.insert(event);
     }
 
@@ -259,7 +319,7 @@ public class RagKafkaConsumerService {
         dlqPayload.put("attempt", sourceEnvelope.getAttempt());
         dlqPayload.put("topic", properties.getTopics().getUploadFinalizeRequest());
         dlqPayload.put("errorCode", "RAG_UPLOAD_FINALIZE_FAILED");
-        dlqPayload.put("errorMessage", truncate(error.getMessage(), 500));
+        dlqPayload.put("errorMessage", safeErrorSummary(error));
         String idempotencyKey = "RAG_UPLOAD_FINALIZE_DLQ:%s:%s:%s:v1".formatted(uploadId, materialId, sourceEnvelope.getAttempt());
         RagKafkaEnvelope dlq = RagKafkaMessageFactory.envelope(
                 "RAG_UPLOAD_FINALIZE_DLQ",
@@ -307,7 +367,7 @@ public class RagKafkaConsumerService {
         try {
             return objectMapper.readValue(message, RagKafkaEnvelope.class);
         } catch (Exception e) {
-            throw new IllegalArgumentException("RAG Kafka 消息 envelope 解析失败: " + e.getMessage(), e);
+            throw new IllegalArgumentException("RAG Kafka 消息 envelope 解析失败");
         }
     }
 
@@ -382,5 +442,41 @@ public class RagKafkaConsumerService {
             return value;
         }
         return value.substring(0, maxLength);
+    }
+
+    private String safeErrorSummary(Exception error) {
+        Throwable current = error;
+        while (current.getCause() != null) {
+            current = current.getCause();
+        }
+        return "RAG 分片收尾失败：" + current.getClass().getSimpleName();
+    }
+
+    /**
+     * 为 DLQ 错误生成不含原文的稳定定位摘要，使不同消息不会被通用错误聚合覆盖。
+     */
+    private String dlqLogMessage(Map<String, Object> payload) {
+        return "RAG Kafka 消息进入 DLQ（定位：" + dlqLogLocator(payload) + "）";
+    }
+
+    private String dlqLogLocator(Map<String, Object> payload) {
+        String identity = String.join("|",
+                defaultText(text(payload, "messageHash"), ""),
+                defaultText(text(payload, "sourceMessageId"), ""),
+                defaultText(text(payload, "jobId"), ""),
+                defaultText(text(payload, "uploadId"), ""),
+                defaultText(text(payload, "sourceTopic"), defaultText(text(payload, "topic"), "")),
+                defaultText(text(payload, "partition"), ""),
+                defaultText(text(payload, "offset"), ""));
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder(digest.length * 2);
+            for (byte item : digest) {
+                builder.append(String.format("%02x", item));
+            }
+            return builder.substring(0, 16);
+        } catch (Exception e) {
+            return Integer.toUnsignedString(identity.hashCode(), 16);
+        }
     }
 }

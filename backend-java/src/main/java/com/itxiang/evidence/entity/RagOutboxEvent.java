@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class RagOutboxEvent {
@@ -15,11 +15,11 @@ public class RagOutboxEvent {
     private String payloadJson;
     private String status;
     private Integer attempt;
-    private LocalDateTime nextAttemptAt;
-    private LocalDateTime leaseUntil;
+    private OffsetDateTime nextAttemptAt;
+    private OffsetDateTime leaseUntil;
     private String lockedBy;
-    private LocalDateTime publishedAt;
+    private OffsetDateTime publishedAt;
     private String errorMessage;
-    private LocalDateTime createdAt;
-    private LocalDateTime updatedAt;
+    private OffsetDateTime createdAt;
+    private OffsetDateTime updatedAt;
 }

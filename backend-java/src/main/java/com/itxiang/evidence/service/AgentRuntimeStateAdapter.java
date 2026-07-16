@@ -31,6 +31,13 @@ public interface AgentRuntimeStateAdapter {
     void updateSummary(String userId, String taskId, AgentConversationSummaryVO summary, boolean terminal);
 
     /**
+     * 删除可由 PostgreSQL 重建的上下文热缓存。
+     *
+     * @return 删除命令是否已被 Redis 接收
+     */
+    boolean invalidateContext(String userId, String taskId);
+
+    /**
      * 写入任务事件缓冲，供 SSE 重连恢复。
      */
     void appendSseEvent(String taskId, Map<String, Object> event);

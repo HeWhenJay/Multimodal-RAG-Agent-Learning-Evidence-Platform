@@ -65,6 +65,8 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "kafka", "java-internal-token"): "RAG_JAVA_INTERNAL_TOKEN",
     ("rag", "kafka", "worker", "reconnect-initial-seconds"): "RAG_KAFKA_RECONNECT_INITIAL_SECONDS",
     ("rag", "kafka", "worker", "reconnect-max-seconds"): "RAG_KAFKA_RECONNECT_MAX_SECONDS",
+    ("rag", "kafka", "producer", "flush-seconds"): "RAG_KAFKA_PRODUCER_FLUSH_SECONDS",
+    ("rag", "kafka", "producer", "message-timeout-ms"): "RAG_KAFKA_PRODUCER_MESSAGE_TIMEOUT_MS",
     ("rag", "kafka", "topics", "index-request"): "RAG_KAFKA_TOPIC_INDEX_REQUEST",
     ("rag", "kafka", "topics", "index-result"): "RAG_KAFKA_TOPIC_INDEX_RESULT",
     ("rag", "kafka", "topics", "progress"): "RAG_KAFKA_TOPIC_PROGRESS",

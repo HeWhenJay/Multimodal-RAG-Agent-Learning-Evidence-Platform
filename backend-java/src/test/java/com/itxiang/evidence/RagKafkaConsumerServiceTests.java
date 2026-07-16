@@ -129,7 +129,7 @@ class RagKafkaConsumerServiceTests {
                 "documentSummary", "旧结果"
         )));
 
-        verify(indexJobMapper).markIgnored(eq("job-old"), eq("STALE_IGNORED"), eq("stale index result ignored"));
+        verify(indexJobMapper).markIgnored(eq("job-old"), eq("STALE_IGNORED"), eq("过期索引结果已忽略"));
         verify(outboxEventMapper, never()).insert(any());
         verify(learningMaterialMapper, never()).updateIndexResult(any(), any(), any(), any(), any());
     }
@@ -163,6 +163,57 @@ class RagKafkaConsumerServiceTests {
         )));
 
         verify(kafkaTemplate).send(eq("rag.upload.finalize.dlq.v1"), eq("upload-1"), contains("RAG_UPLOAD_FINALIZE_FAILED"));
+    }
+
+    @Test
+    void terminalDlqMarksActiveJobAndMaterialFailed() throws Exception {
+        when(consumedEventMapper.insertIgnore(any(RagConsumedEvent.class))).thenReturn(1);
+        RagIndexJob job = new RagIndexJob();
+        job.setId("job-88");
+        job.setMaterialId(88L);
+        LearningMaterial material = new LearningMaterial();
+        material.setId(88L);
+        material.setActiveIndexJobId("job-88");
+        when(indexJobMapper.findById("job-88")).thenReturn(job);
+        when(learningMaterialMapper.findById(88L)).thenReturn(material);
+
+        Map<String, Object> dlqPayload = new LinkedHashMap<>();
+        dlqPayload.put("jobId", "job-88");
+        dlqPayload.put("materialId", 88);
+        dlqPayload.put("canonicalDocumentId", "material-88");
+        dlqPayload.put("topic", "rag.material.index.request.v1");
+        dlqPayload.put("sourceTopic", "rag.material.index.request.v1");
+        dlqPayload.put("partition", 0);
+        dlqPayload.put("offset", 7L);
+        dlqPayload.put("messageHash", "safe-message-hash");
+        dlqPayload.put("request", "正文不应进入日志");
+        dlqPayload.put("errorCode", "RAG_KAFKA_RETRY_EXHAUSTED");
+        dlqPayload.put("errorMessage", "索引重试次数已耗尽");
+        service.consumeDlq(envelopeJson("RAG_INDEX_DLQ", "RAG_DLQ:material-88:job-88:3:v1", dlqPayload));
+
+        verify(indexJobMapper).markFinished(eq("job-88"), eq("DLQ"), any(), eq("RAG_KAFKA_RETRY_EXHAUSTED"), contains("重试次数已耗尽"));
+        verify(learningMaterialMapper).updateIndexResult(eq(88L), eq("FAILED"), eq("kafka-dlq"), contains("重试次数已耗尽"), eq(0));
+        verify(learningMaterialMapper).clearActiveIndexJob(88L, "job-88");
+        ArgumentCaptor<String> messageCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Map<String, Object>> contextCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(logService).recordRagError(
+                eq("material"),
+                eq("kafka.dlq"),
+                eq("rag_kafka_dlq_received"),
+                any(),
+                messageCaptor.capture(),
+                any(),
+                contextCaptor.capture()
+        );
+        assertThat(messageCaptor.getValue())
+                .startsWith("RAG Kafka 消息进入 DLQ（定位：")
+                .doesNotContain("正文不应进入日志");
+        assertThat(contextCaptor.getValue())
+                .containsEntry("sourceTopic", "rag.material.index.request.v1")
+                .containsEntry("partition", 0)
+                .containsEntry("offset", 7)
+                .containsEntry("messageHash", "safe-message-hash")
+                .doesNotContainKey("request");
     }
 
     private String envelopeJson(String messageType, String idempotencyKey, Map<String, Object> payload) throws Exception {

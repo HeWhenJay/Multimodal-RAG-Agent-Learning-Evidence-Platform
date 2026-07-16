@@ -20,6 +20,7 @@ DROP TABLE IF EXISTS learning_evidence.agent_operation_snapshot;
 DROP TABLE IF EXISTS learning_evidence.agent_operation;
 DROP TABLE IF EXISTS learning_evidence.agent_human_review;
 DROP TABLE IF EXISTS learning_evidence.agent_tool_call;
+DROP TABLE IF EXISTS learning_evidence.agent_cache_repair_task;
 DROP TABLE IF EXISTS learning_evidence.agent_conversation_summary;
 DROP TABLE IF EXISTS learning_evidence.agent_chat_message;
 DROP TABLE IF EXISTS learning_evidence.agent_task;
@@ -385,6 +386,21 @@ CREATE TABLE learning_evidence.agent_task (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE learning_evidence.agent_cache_repair_task (
+    task_id VARCHAR(120) PRIMARY KEY REFERENCES learning_evidence.agent_task(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_error VARCHAR(1000),
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_cache_repair_status_next
+    ON learning_evidence.agent_cache_repair_task(status, next_attempt_at);
 
 CREATE INDEX idx_agent_task_user_status_updated
     ON learning_evidence.agent_task(user_id, status, updated_at DESC);

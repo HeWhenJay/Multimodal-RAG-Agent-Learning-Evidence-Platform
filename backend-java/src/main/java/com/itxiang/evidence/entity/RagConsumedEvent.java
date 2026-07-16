@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class RagConsumedEvent {
@@ -16,7 +16,7 @@ public class RagConsumedEvent {
     private Integer progressSequence;
     private String status;
     private String errorMessage;
-    private LocalDateTime consumedAt;
-    private LocalDateTime createdAt;
-    private LocalDateTime updatedAt;
+    private OffsetDateTime consumedAt;
+    private OffsetDateTime createdAt;
+    private OffsetDateTime updatedAt;
 }

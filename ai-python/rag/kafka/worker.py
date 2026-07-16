@@ -65,7 +65,7 @@ class RagKafkaIndexWorker:
             if is_permanent_source_error(exc) or envelope.attempt >= self.max_attempts:
                 self._send_failed_result(envelope, payload, exc)
                 self._send_dlq(envelope, payload, exc)
-                return {"status": "FAILED", "errorMessage": str(exc)[:500]}
+                return {"status": "FAILED", "errorMessage": safe_error_summary(exc)}
             self._send_retry(envelope, payload, exc)
             return {
                 "status": "RETRY_SCHEDULED",
@@ -199,7 +199,7 @@ class RagKafkaIndexWorker:
         not_before = datetime.now(timezone.utc) + timedelta(seconds=self.retry_delays[bucket])
         retry_payload = payload.model_dump(mode="json")
         retry_payload["lastErrorCode"] = "RAG_KAFKA_TRANSIENT_INDEX_ERROR"
-        retry_payload["lastErrorMessage"] = str(exc)[:500]
+        retry_payload["lastErrorMessage"] = safe_error_summary(exc)
         out = build_envelope(
             message_type="RAG_INDEX_RETRY",
             partition_key=payload.canonicalDocumentId,
@@ -221,7 +221,7 @@ class RagKafkaIndexWorker:
             "attempt": envelope.attempt,
             "topic": os.getenv("RAG_KAFKA_TOPIC_INDEX_REQUEST", "rag.material.index.request.v1"),
             "errorCode": "RAG_KAFKA_PERMANENT_SOURCE_ERROR",
-            "errorMessage": str(exc)[:500],
+            "errorMessage": safe_error_summary(exc),
             "request": redacted_json(payload.model_dump(mode="json")),
         }
         out = build_envelope(
@@ -293,7 +293,7 @@ class RagKafkaRetryScheduler:
             "attempt": envelope.attempt,
             "topic": self.request_topic,
             "errorCode": "RAG_KAFKA_RETRY_EXHAUSTED",
-            "errorMessage": str(exc)[:500],
+            "errorMessage": safe_error_summary(exc),
             "request": redacted_json(payload.model_dump(mode="json")),
         }
         out = build_envelope(
@@ -323,8 +323,8 @@ def build_failed_result_payload(payload: IndexRequestPayload, exc: Exception, er
         "status": "FAILED",
         "chunkCount": 0,
         "parser": "kafka-worker-error",
-        "documentSummary": str(exc)[:500],
-        "parseQuality": {"score": 0.0, "messages": [str(exc)[:300]]},
+        "documentSummary": safe_error_summary(exc),
+        "parseQuality": {"score": 0.0, "messages": [safe_error_summary(exc)]},
         "progressEvents": [],
         "jobId": payload.jobId,
         "materialId": payload.materialId,
@@ -332,7 +332,7 @@ def build_failed_result_payload(payload: IndexRequestPayload, exc: Exception, er
         "stagingDocumentId": payload.stagingDocumentId,
         "requestVersion": payload.requestVersion,
         "errorCode": error_code,
-        "errorMessage": str(exc)[:1000],
+        "errorMessage": safe_error_summary(exc),
     }
 
 
@@ -397,7 +397,7 @@ class RagKafkaPromoteWorker:
                 "canonicalChunkCount": 0,
                 "stagingChunkCount": 0,
                 "errorCode": "RAG_PROMOTE_STALE" if stale else "RAG_PROMOTE_FAILED",
-                "errorMessage": str(exc)[:1000],
+                "errorMessage": safe_error_summary(exc),
             }
         out = build_envelope(
             message_type="RAG_PROMOTE_RESULT",
@@ -455,8 +455,8 @@ def download_java_source(source_ref, job_id: str, request_version: int) -> Downl
     with httpx.Client(timeout=float(os.getenv("RAG_JAVA_SOURCE_TIMEOUT_SECONDS", "60"))) as client:
         with client.stream("GET", url, headers=headers) as response:
             if response.status_code in {404, 410}:
-                body = response.read()
-                raise PermanentSourceError(f"Java Source API 返回 {response.status_code}: {body[:200].decode('utf-8', errors='ignore')}")
+                response.read()
+                raise PermanentSourceError(f"Java Source API 返回 {response.status_code}")
             response.raise_for_status()
             suffix = Path(source_ref.filename or "material.bin").suffix
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as file:
@@ -495,6 +495,21 @@ class PermanentSourceError(RuntimeError):
 
 class StalePromoteRequestError(RuntimeError):
     """表示 promote 请求已经不是当前 active job。"""
+
+
+def safe_error_summary(exc: Exception) -> str:
+    """Kafka 失败结果和 DLQ 不回显异常文本，避免第三方响应或原始资料进入消息系统。"""
+    if isinstance(exc, PermanentSourceError):
+        return "Java Source API 返回不可恢复错误"
+    if isinstance(exc, StalePromoteRequestError):
+        return "索引提升请求已过期"
+    if isinstance(exc, httpx.TimeoutException):
+        return "下游 HTTP 调用超时"
+    if isinstance(exc, httpx.HTTPError):
+        return "下游 HTTP 调用失败"
+    if isinstance(exc, ValueError):
+        return "消息字段校验失败"
+    return f"RAG Kafka 处理失败：{exc.__class__.__name__}"
 
 
 def is_permanent_source_error(exc: Exception) -> bool:

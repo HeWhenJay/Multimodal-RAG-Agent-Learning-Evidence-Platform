@@ -251,6 +251,22 @@ CREATE TABLE IF NOT EXISTS agent_task (
     CONSTRAINT fk_agent_task_folder FOREIGN KEY (folder_id) REFERENCES agent_conversation_folder(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_cache_repair_task (
+    task_id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_error VARCHAR(1000),
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_agent_cache_repair_task FOREIGN KEY (task_id) REFERENCES agent_task(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_cache_repair_status_next
+    ON agent_cache_repair_task(status, next_attempt_at);
+
 CREATE INDEX IF NOT EXISTS idx_agent_task_user_status_updated
     ON agent_task(user_id, status, updated_at DESC);
 

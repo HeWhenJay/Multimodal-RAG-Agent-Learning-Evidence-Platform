@@ -2,7 +2,7 @@ package com.itxiang.evidence.entity;
 
 import lombok.Data;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 @Data
 public class RagIndexJob {
@@ -21,11 +21,11 @@ public class RagIndexJob {
     private String resultJson;
     private String errorCode;
     private String errorMessage;
-    private LocalDateTime requestedAt;
-    private LocalDateTime startedAt;
-    private LocalDateTime indexedAt;
-    private LocalDateTime promotedAt;
-    private LocalDateTime finishedAt;
-    private LocalDateTime createdAt;
-    private LocalDateTime updatedAt;
+    private OffsetDateTime requestedAt;
+    private OffsetDateTime startedAt;
+    private OffsetDateTime indexedAt;
+    private OffsetDateTime promotedAt;
+    private OffsetDateTime finishedAt;
+    private OffsetDateTime createdAt;
+    private OffsetDateTime updatedAt;
 }

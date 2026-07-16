@@ -27,6 +27,7 @@ import com.itxiang.evidence.mapper.AgentOperationSnapshotMapper;
 import com.itxiang.evidence.mapper.AgentTaskMapper;
 import com.itxiang.evidence.mapper.AgentToolCallMapper;
 import com.itxiang.evidence.service.AgentMemoryService;
+import com.itxiang.evidence.service.AgentCacheRepairService;
 import com.itxiang.evidence.service.AgentRuntimeStateAdapter;
 import com.itxiang.evidence.service.Impl.AgentServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -93,6 +94,9 @@ class AgentServiceImplTests {
     private AgentRuntimeStateAdapter agentRuntimeStateAdapter;
 
     @Mock
+    private AgentCacheRepairService agentCacheRepairService;
+
+    @Mock
     private PythonAgentClient pythonAgentClient;
 
     @Mock
@@ -119,6 +123,7 @@ class AgentServiceImplTests {
                 agentOperationSnapshotMapper,
                 agentMemoryService,
                 agentRuntimeStateAdapter,
+                agentCacheRepairService,
                 pythonAgentClient,
                 agentProperties,
                 new ObjectMapper(),
@@ -539,8 +544,7 @@ class AgentServiceImplTests {
         var result = service.saveConversationSummary("agent-task-1", dto);
 
         assertThat(result.getId()).isEqualTo("agent-summary-redis");
-        verify(agentRuntimeStateAdapter).updateSummary(eq("7"), eq("agent-task-1"), any(), eq(false));
-        verify(agentRuntimeStateAdapter).updateMessage(eq("7"), eq("agent-task-1"), any(), eq(false));
+        verify(agentCacheRepairService).requestAfterCommit("7", "agent-task-1");
     }
 
     @Test

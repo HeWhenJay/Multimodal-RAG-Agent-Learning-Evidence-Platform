@@ -17,8 +17,10 @@ import com.itxiang.evidence.service.command.RagUploadFinalizeCommand;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -45,6 +47,7 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      * 为已保存资料创建索引任务和 Outbox 请求。
      */
     @Override
+    @Transactional
     public void publishStoredMaterialIndex(LearningMaterial material, String userId, Boolean highPrecision, String operation) {
         if (shouldFallbackToHttp()) {
             fallbackTaskDispatcher.publishStoredMaterialIndex(material, userId, highPrecision, operation);
@@ -72,6 +75,7 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      * 为手动文本资料创建 Kafka 索引任务。
      */
     @Override
+    @Transactional
     public void publishTextIndex(LearningMaterial material, String userId, RagIndexTextDTO dto) {
         if (shouldFallbackToHttp()) {
             fallbackTaskDispatcher.publishTextIndex(material, userId, dto);
@@ -92,6 +96,7 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      * 为分片上传创建 Kafka 收尾任务。
      */
     @Override
+    @Transactional
     public void publishUploadFinalize(RagUploadFinalizeCommand command) {
         if (shouldFallbackToHttp()) {
             fallbackTaskDispatcher.publishUploadFinalize(command);
@@ -194,7 +199,7 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
         event.setPayloadJson(payloadJson);
         event.setStatus("NEW");
         event.setAttempt(0);
-        event.setNextAttemptAt(LocalDateTime.now());
+        event.setNextAttemptAt(OffsetDateTime.now(ZoneOffset.UTC));
         ragOutboxEventMapper.insert(event);
     }
 

@@ -16,6 +16,7 @@ public class RagKafkaProperties {
     private String internalToken = "";
     private String internalTokenFile = "";
     private Fallback fallback = new Fallback();
+    private Consumer consumer = new Consumer();
     private Topics topics = new Topics();
     private Groups groups = new Groups();
     private Outbox outbox = new Outbox();
@@ -25,6 +26,12 @@ public class RagKafkaProperties {
         private boolean enabled = true;
         private long healthCheckTimeoutMs = 1500L;
         private long publishTimeoutMs = 3000L;
+    }
+
+    @Data
+    public static class Consumer {
+        private int maxAttempts = 3;
+        private long retryDelayMs = 1000L;
     }
 
     @Data

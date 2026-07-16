@@ -12,7 +12,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.net.InetAddress;
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -34,10 +35,10 @@ public class RagOutboxPublisher {
     @Scheduled(fixedDelayString = "${evidence.rag.kafka.outbox.publish-fixed-delay-ms:1000}")
     @Transactional
     public void publishDueEvents() {
-        LocalDateTime now = LocalDateTime.now();
+        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         List<RagOutboxEvent> events = ragOutboxEventMapper.findDueForPublish(now, properties.getOutbox().getBatchSize());
         for (RagOutboxEvent event : events) {
-            LocalDateTime leaseUntil = now.plusSeconds(properties.getOutbox().getLeaseSeconds());
+            OffsetDateTime leaseUntil = now.plusSeconds(properties.getOutbox().getLeaseSeconds());
             if (ragOutboxEventMapper.lease(event.getId(), publisherId, leaseUntil) <= 0) {
                 continue;
             }
@@ -54,7 +55,7 @@ public class RagOutboxPublisher {
                     .get(publishTimeoutMs(), TimeUnit.MILLISECONDS);
             ragOutboxEventMapper.markPublished(event.getId());
         } catch (Exception e) {
-            LocalDateTime nextAttempt = LocalDateTime.now().plusSeconds(backoffSeconds(event.getAttempt()));
+            OffsetDateTime nextAttempt = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(backoffSeconds(event.getAttempt()));
             ragOutboxEventMapper.markFailed(event.getId(), truncate(e.getMessage(), 1000), nextAttempt);
             log.warn("RAG Outbox 发布失败: id={}, topic={}, reason={}", event.getId(), event.getTopic(), e.getMessage());
         }

@@ -72,6 +72,9 @@ evidence:
         enabled: ${EVIDENCE_RAG_KAFKA_FALLBACK_ENABLED:true}
         health-check-timeout-ms: ${EVIDENCE_RAG_KAFKA_HEALTH_CHECK_TIMEOUT_MS:1500}
         publish-timeout-ms: ${EVIDENCE_RAG_KAFKA_PUBLISH_TIMEOUT_MS:3000}
+      consumer:
+        max-attempts: ${EVIDENCE_RAG_KAFKA_CONSUMER_MAX_ATTEMPTS:3}
+        retry-delay-ms: ${EVIDENCE_RAG_KAFKA_CONSUMER_RETRY_DELAY_MS:1000}
       topics:
         index-request: rag.material.index.request.v1
         upload-finalize-request: rag.upload.finalize.request.v1

@@ -2,7 +2,9 @@ package com.itxiang.evidence;
 
 import com.itxiang.evidence.service.RagIndexTaskPublisher;
 import com.itxiang.evidence.service.RagKafkaAvailabilityProbe;
+import com.itxiang.evidence.service.AgentRuntimeStateAdapter;
 import com.itxiang.evidence.service.Impl.KafkaRagIndexTaskPublisher;
+import com.itxiang.evidence.service.Impl.RedisAgentRuntimeStateAdapter;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -46,9 +48,13 @@ class KafkaEnabledApplicationIntegrationTests {
     @Autowired
     private RagKafkaAvailabilityProbe kafkaAvailabilityProbe;
 
+    @Autowired
+    private AgentRuntimeStateAdapter agentRuntimeStateAdapter;
+
     @Test
     void kafkaModeUsesKafkaPublisherAndDetectsEmbeddedBroker() {
         assertThat(ragIndexTaskPublisher).isInstanceOf(KafkaRagIndexTaskPublisher.class);
         assertThat(kafkaAvailabilityProbe.isAvailable()).isTrue();
+        assertThat(agentRuntimeStateAdapter).isInstanceOf(RedisAgentRuntimeStateAdapter.class);
     }
 }

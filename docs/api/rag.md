@@ -4,7 +4,7 @@
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段将上传/重建触发后的 RAG 索引请求、进度、结果、promote 与终态同步接入 Kafka；长视频分片收尾仍本机 `@Async`，合并后才进入 Kafka 索引；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段只把上传、重建、视频分片收尾和索引终态同步接入 Kafka；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。
 
 边界约定：
 
@@ -15,7 +15,7 @@
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
 - RAG 进度事件复用 `log_event` 表，`event_type=rag_progress`，不新增独立进度表；Python 方法级控制面板日志使用 `event_type=rag_process`，错误仍写入 `log_error`。
 - RAG 询问历史由 Java 写入 `rag_query_history`，只保存业务查询快照、问题、回答、证据 JSON 和状态；Python 查询任务仍是进程内短期进度快照，不承担长期历史存储。
-- Kafka 默认关闭。关闭时 Java 保留现有 `@Async + HTTP` 后台索引链路；开启后才使用 `rag_index_job`、`rag_outbox_event`、`rag_consumed_event`、Kafka request/progress/result/promote topics 和 Python Kafka worker。
+- Kafka 通过 Java `EVIDENCE_RAG_KAFKA_ENABLED` 与 Python `RAG_KAFKA_ENABLED` 独立开启。开启后优先使用 Kafka；Broker 在任务提交前不可达时，Java 自动退回现有 `@Async + HTTP` 后台索引链路，已确认或发送结果不确定的 Outbox 事件继续重试，避免重复索引。
 - Git 提交时同步维护 `infra/sql/init.sql` 和 `infra/sql/alter-database/` 下对应增量迁移。
 
 鉴权约定：
@@ -39,7 +39,15 @@
 
 ## Kafka 高吞吐索引流水线
 
-Kafka 仅用于上传/重建触发后的高吞吐索引、进度、结果、promote 与索引终态同步，不改变查询默认路径。开启条件为 Java `evidence.rag.kafka.enabled=true` 且 Python `RAG_KAFKA_ENABLED=true`；任一侧未开启时，旧 HTTP 索引链路必须保持可用。
+Kafka 仅用于高吞吐索引、视频分片收尾和索引终态同步，不改变查询默认路径。开启条件为 Java `evidence.rag.kafka.enabled=true` 且 Python `RAG_KAFKA_ENABLED=true`；任一侧未开启时，旧 HTTP 索引链路必须保持可用。
+
+### Kafka 可用性与降级
+
+- Java 在创建 Kafka 索引任务前使用有限超时探测 Broker。探测失败且 `EVIDENCE_RAG_KAFKA_FALLBACK_ENABLED=true` 时，上传、重建、文本资料和分片收尾直接复用既有 HTTP / 本机异步链路，不创建 Kafka job 与 Outbox 事件。
+- 已写入 Outbox 的事件先按正常 Kafka 语义发布。发布成功后标记 `PUBLISHED`；发布失败时保留 `FAILED` 并按指数退避重试，不将发送结果不确定的事件改投 HTTP，避免 Kafka staging 与 HTTP canonical 双写。
+- Kafka 在任务创建后故障时，已入队任务不会丢失；Broker 恢复后 Outbox 自动继续发布。故障期间新提交的任务会在健康探测失败后直接走 HTTP fallback。
+- Python Kafka worker 连接或消费失败后按 `RAG_KAFKA_RECONNECT_INITIAL_SECONDS` 至 `RAG_KAFKA_RECONNECT_MAX_SECONDS` 指数退避重连；FastAPI 查询接口不依赖 worker，Kafka 不可用时仍保持 HTTP 查询和 HTTP fallback 可用。
+- Kafka 降级与恢复仅记录资料 ID、job ID、topic 和错误摘要，不记录资料正文、内部 token 或密钥。
 
 ### 核心不变量
 
@@ -57,7 +65,7 @@ Kafka 仅用于上传/重建触发后的高吞吐索引、进度、结果、prom
 | Topic | 生产者 | 消费者组 | Key | 用途 |
 | --- | --- | --- | --- | --- |
 | `rag.material.index.request.v1` | Java Outbox | `rag-python-index-workers` | `canonicalDocumentId` | 触发 Python 索引 staging |
-| `rag.upload.finalize.request.v1` | 预留，默认不由 Java Outbox 发布 | `rag-java-upload-finalizers` | `uploadId` | 未来共享 chunkRoot 或 host affinity 模式下触发 Java 分片合并；第一阶段当前默认不发布 |
+| `rag.upload.finalize.request.v1` | Java Outbox | `rag-java-upload-finalizers` | `uploadId` | 触发 Java 分片合并与后续索引 |
 | `rag.material.index.progress.v1` | Python | `rag-java-progress-writers` | `canonicalDocumentId` | 写入用户可见进度 |
 | `rag.material.index.result.v1` | Python | `rag-java-result-writers` | `canonicalDocumentId` | Java 校验 active job 后发布 promote |
 | `rag.material.index.promote.request.v1` | Java | `rag-python-promote-workers` | `canonicalDocumentId` | 触发 staging 提升为 canonical |
@@ -121,7 +129,8 @@ Kafka 没有原生延迟消息。retry scheduler 消费 retry topic 后，如果
 - `rag_outbox_event(topic,idempotency_key)` 唯一，发布器多实例抢占 `NEW/FAILED` 到期事件，状态改为 `PUBLISHING` 并设置 `lease_until` 和 `locked_by`，成功后标记 `PUBLISHED`，失败后标记 `FAILED` 并设置 `next_attempt_at`。
 - `rag_consumed_event(consumer_name,message_id)` 与 `rag_consumed_event(consumer_name,message_type,idempotency_key)` 唯一，保证每个消费者幂等。progress 的幂等键包含 `progressSequence`，100 条不同进度不得被去重成 1 条。
 - Python worker manual commit：staging 写入成功且 result/retry/DLQ 发送 ack/flush 成功后，才提交原 offset。result/retry/DLQ 发送失败时不提交，等待 Kafka redelivery。
-- DLQ payload 和日志上下文只能保存资料 ID、文件名、错误码、错误摘要、attempt、topic、jobId 和 requestVersion，不得包含文档正文、简历全文、API key 或 OSS secret。
+- DLQ payload 和日志上下文只能保存资料 ID、文件名、错误码、错误摘要、attempt、源 topic、partition、offset、消息摘要哈希、jobId 和 requestVersion，不得包含文档正文、简历全文、API key 或 OSS secret。
+- `log_error` 的 DLQ 记录使用脱敏定位摘要参与去重：同一 Kafka 消息重投只累加 `occurrenceCount`，不同 offset、job 或消息哈希必须保留为独立记录，便于人工处理。
 
 ### Java 内部 Source API
 

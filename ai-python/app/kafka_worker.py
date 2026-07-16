@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import signal
 import time
+import hashlib
 from typing import Callable
 
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.schemas.kafka import KafkaEnvelope
+from rag.kafka.producer import KafkaJsonProducer, build_envelope
 from rag.kafka.worker import RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady
 
 
@@ -76,6 +78,7 @@ def run_consumer_loop(handlers: dict[str, Callable[[KafkaEnvelope], object]]) ->
         )
     except KafkaException as exc:
         raise KafkaWorkerConnectionError(str(exc)) from exc
+    dead_letter_producer = KafkaJsonProducer()
     consumer.subscribe(list(handlers))
     try:
         while running:
@@ -88,13 +91,16 @@ def run_consumer_loop(handlers: dict[str, Callable[[KafkaEnvelope], object]]) ->
             if message.error():
                 if is_reconnectable_error(message.error(), KafkaError):
                     raise KafkaWorkerConnectionError(str(message.error()))
-                raise RuntimeError(str(message.error()))
+                if message.error().code() == getattr(KafkaError, "_PARTITION_EOF", None):
+                    continue
+                raise KafkaWorkerConnectionError(str(message.error()))
             topic = message.topic()
             handler = handlers.get(topic)
             if handler is None:
                 continue
-            envelope = KafkaEnvelope.model_validate_json(message.value())
+            envelope: KafkaEnvelope | None = None
             try:
+                envelope = KafkaEnvelope.model_validate_json(message.value())
                 handler(envelope)
             except RetryNotReady as exc:
                 topic_partition = TopicPartition(topic, message.partition(), message.offset())
@@ -103,6 +109,13 @@ def run_consumer_loop(handlers: dict[str, Callable[[KafkaEnvelope], object]]) ->
                 consumer.seek(topic_partition)
                 consumer.resume([TopicPartition(topic, message.partition())])
                 continue
+            except Exception as exc:
+                if is_connection_exception(exc):
+                    raise KafkaWorkerConnectionError(str(exc)) from exc
+                try:
+                    publish_consumer_dlq(dead_letter_producer, message, exc, envelope)
+                except Exception as dlq_error:
+                    raise KafkaWorkerConnectionError(str(dlq_error)) from dlq_error
             try:
                 consumer.commit(message=message)
             except KafkaException as exc:
@@ -144,6 +157,78 @@ def is_reconnectable_error(error: object, kafka_error_type: object) -> bool:
         if code is not None
     }
     return error_code in reconnectable_codes
+
+
+def is_connection_exception(error: Exception) -> bool:
+    """识别 producer / handler 透出的 Broker 连接故障，交给外层重连循环处理。"""
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "all brokers down",
+            "broker transport failure",
+            "connection refused",
+            "network is unreachable",
+            "local: timed out",
+            "message timed out",
+            "_all_brokers_down",
+            "_transport",
+            "kafka 消息发送超时",
+            "消息未投递",
+        )
+    )
+
+
+def publish_consumer_dlq(producer: KafkaJsonProducer, message, error: Exception, envelope: KafkaEnvelope | None) -> None:
+    """将无法交给业务 handler 的消息转为脱敏 DLQ envelope，成功后 caller 才提交原 offset。"""
+    source_payload = envelope.payload if envelope is not None and envelope.payload is not None else {}
+    payload: dict[str, object] = {
+        "topic": message.topic(),
+        "sourceTopic": message.topic(),
+        "partition": message.partition(),
+        "offset": message.offset(),
+        "attempt": envelope.attempt if envelope is not None else 0,
+        "errorCode": "RAG_KAFKA_ENVELOPE_INVALID" if envelope is None else "RAG_KAFKA_CONSUMER_FAILED",
+        "errorMessage": safe_consumer_error_summary(error),
+        "messageHash": message_hash(message.value()),
+    }
+    if envelope is not None:
+        payload["sourceMessageId"] = envelope.messageId
+        payload["sourceMessageType"] = envelope.messageType
+        payload["sourceIdempotencyKey"] = envelope.idempotencyKey
+    for key in ("jobId", "materialId", "canonicalDocumentId", "stagingDocumentId", "requestVersion", "uploadId"):
+        if key in source_payload:
+            payload[key] = source_payload[key]
+    partition_key = str(payload.get("canonicalDocumentId") or payload.get("jobId") or f"{message.topic()}-{message.partition()}")
+    out = build_envelope(
+        message_type="RAG_KAFKA_CONSUMER_DLQ",
+        partition_key=partition_key,
+        idempotency_key=f"RAG_CONSUMER_DLQ:{message.topic()}:{message.partition()}:{message.offset()}:v1",
+        payload=payload,
+        attempt=int(payload["attempt"] or 0),
+        original_message_id=(envelope.originalMessageId or envelope.messageId) if envelope is not None else None,
+    )
+    producer.send(
+        os.getenv("RAG_KAFKA_TOPIC_INDEX_DLQ", "rag.material.index.dlq.v1"),
+        partition_key,
+        out,
+    )
+
+
+def message_hash(value: object) -> str:
+    """仅保存原消息哈希用于定位，禁止把可能含正文的原始 value 写入 DLQ。"""
+    if isinstance(value, bytes):
+        raw = value
+    else:
+        raw = str(value if value is not None else "").encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def safe_consumer_error_summary(error: Exception) -> str:
+    """DLQ 只保留异常类别，Pydantic/Jackson 等错误文本可能回显原始资料正文。"""
+    if error.__class__.__name__ == "ValidationError":
+        return "Kafka envelope 格式或字段校验失败"
+    return f"Kafka 消费处理失败：{error.__class__.__name__}"
 
 
 if __name__ == "__main__":

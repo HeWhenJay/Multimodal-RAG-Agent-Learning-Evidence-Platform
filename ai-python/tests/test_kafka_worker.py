@@ -7,7 +7,15 @@ import pytest
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope
-from app.kafka_worker import KafkaWorkerConnectionError, is_reconnectable_error, reconnect_max_seconds, run_consumer_forever
+from app.kafka_worker import (
+    KafkaWorkerConnectionError,
+    is_connection_exception,
+    is_reconnectable_error,
+    message_hash,
+    publish_consumer_dlq,
+    reconnect_max_seconds,
+    run_consumer_forever,
+)
 from rag.kafka.producer import KafkaJsonProducer, KafkaProgressThrottler, redacted_json
 from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, download_java_source
 from rag.observability.progress import RagProgressReporter
@@ -63,6 +71,40 @@ def test_kafka_worker_error_classifier_ignores_unknown_error_code():
 
     assert is_reconnectable_error(Error(), KafkaErrorType) is False
     assert reconnect_max_seconds(2.0) >= 2.0
+
+
+def test_unhandled_consumer_message_is_redacted_into_dlq():
+    producer = FakeProducer()
+
+    class Message:
+        def topic(self):
+            return "rag.material.index.request.v1"
+
+        def partition(self):
+            return 2
+
+        def offset(self):
+            return 17
+
+        def value(self):
+            return b'{"text":"SECRET_BODY_SHOULD_NOT_LEAK"}'
+
+    with pytest.raises(Exception) as exc_info:
+        KafkaEnvelope.model_validate_json(Message().value())
+    publish_consumer_dlq(producer, Message(), exc_info.value, None)
+
+    topic, key, event = producer.sent[0]
+    assert topic == "rag.material.index.dlq.v1"
+    assert key == "rag.material.index.request.v1-2"
+    assert event.messageType == "RAG_KAFKA_CONSUMER_DLQ"
+    assert event.payload["offset"] == 17
+    assert "SECRET_BODY_SHOULD_NOT_LEAK" not in str(event.payload)
+    assert event.payload["errorMessage"] == "Kafka envelope 格式或字段校验失败"
+    assert event.payload["messageHash"] == message_hash(Message().value())
+
+
+def test_kafka_connection_classifier_recognizes_producer_timeout():
+    assert is_connection_exception(RuntimeError("KafkaError{code=_MSG_TIMED_OUT,str=Local: Message timed out}")) is True
 
 
 def envelope(message_type, payload):

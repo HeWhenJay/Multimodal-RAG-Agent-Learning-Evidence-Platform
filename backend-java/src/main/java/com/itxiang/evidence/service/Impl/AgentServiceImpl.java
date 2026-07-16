@@ -31,6 +31,7 @@ import com.itxiang.evidence.mapper.AgentOperationSnapshotMapper;
 import com.itxiang.evidence.mapper.AgentTaskMapper;
 import com.itxiang.evidence.mapper.AgentToolCallMapper;
 import com.itxiang.evidence.service.AgentRuntimeStateAdapter;
+import com.itxiang.evidence.service.AgentCacheRepairService;
 import com.itxiang.evidence.service.AgentService;
 import com.itxiang.evidence.vo.AgentChatMessageVO;
 import com.itxiang.evidence.vo.AgentConversationFolderVO;
@@ -84,6 +85,7 @@ public class AgentServiceImpl implements AgentService {
     private final AgentOperationSnapshotMapper agentOperationSnapshotMapper;
     private final AgentMemoryService agentMemoryService;
     private final AgentRuntimeStateAdapter agentRuntimeStateAdapter;
+    private final AgentCacheRepairService agentCacheRepairService;
     private final PythonAgentClient pythonAgentClient;
     private final AgentProperties agentProperties;
     private final ObjectMapper objectMapper;
@@ -392,8 +394,11 @@ public class AgentServiceImpl implements AgentService {
         createReviewIfPresent(task, event);
         appendEventMessages(task, event, status);
         boolean terminal = terminalStatus(status);
-        agentRuntimeStateAdapter.appendSseEvent(task.getId(), streamEventPayload(task, event, status));
-        agentRuntimeStateAdapter.refreshTaskTtl(task.getUserId(), task.getId(), terminal);
+        Map<String, Object> streamPayload = streamEventPayload(task, event, status);
+        runAfterCommit(() -> {
+            agentRuntimeStateAdapter.appendSseEvent(task.getId(), streamPayload);
+            agentRuntimeStateAdapter.refreshTaskTtl(task.getUserId(), task.getId(), terminal);
+        });
         return Map.of("taskId", task.getId(), "accepted", true, "status", status);
     }
 
@@ -514,7 +519,6 @@ public class AgentServiceImpl implements AgentService {
                 summary.getId(),
                 "context_summary_" + summary.getId()
         );
-        agentRuntimeStateAdapter.updateSummary(task.getUserId(), task.getId(), saved, terminalStatus(task.getStatus()));
         return saved;
     }
 
@@ -1196,8 +1200,10 @@ public class AgentServiceImpl implements AgentService {
         message.setSourceEventType(sourceEventType);
         message.setSourceId(sourceId);
         message.setDedupeKey(safeDedupeKey);
-        runInMessageTransaction(() -> persistChatMessage(task, safeDedupeKey, message));
-        agentRuntimeStateAdapter.updateMessage(task.getUserId(), task.getId(), toChatMessageVO(message), terminalStatus(task.getStatus()));
+        runInMessageTransaction(() -> {
+            persistChatMessage(task, safeDedupeKey, message);
+            agentCacheRepairService.requestAfterCommit(task.getUserId(), task.getId());
+        });
     }
 
     /**
@@ -1226,6 +1232,23 @@ public class AgentServiceImpl implements AgentService {
             return;
         }
         new TransactionTemplate(transactionManager).executeWithoutResult(status -> action.run());
+    }
+
+    /**
+     * 事务提交后再写 Redis，避免数据库回滚时留下无法追溯的热缓存数据。
+     */
+    private void runAfterCommit(Runnable task) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()
+                || !TransactionSynchronizationManager.isActualTransactionActive()) {
+            task.run();
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                task.run();
+            }
+        });
     }
 
     /**

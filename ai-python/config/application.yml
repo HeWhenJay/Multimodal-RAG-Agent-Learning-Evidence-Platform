@@ -45,6 +45,9 @@ rag:
     worker:
       reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
       reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
+    producer:
+      flush-seconds: ${RAG_KAFKA_PRODUCER_FLUSH_SECONDS:5}
+      message-timeout-ms: ${RAG_KAFKA_PRODUCER_MESSAGE_TIMEOUT_MS:5000}
     topics:
       index-request: ${RAG_KAFKA_TOPIC_INDEX_REQUEST:rag.material.index.request.v1}
       index-result: ${RAG_KAFKA_TOPIC_INDEX_RESULT:rag.material.index.result.v1}
