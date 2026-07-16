@@ -8,9 +8,13 @@ spring:
     name: learning-evidence-backend
   kafka:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    admin:
+      fail-fast: false
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        max.block.ms: ${EVIDENCE_RAG_KAFKA_PRODUCER_MAX_BLOCK_MS:3000}
     consumer:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -64,6 +68,10 @@ evidence:
       internal-base-url: ${EVIDENCE_RAG_INTERNAL_BASE_URL:http://127.0.0.1:7080}
       internal-token: ${EVIDENCE_RAG_INTERNAL_TOKEN:}
       internal-token-file: ${EVIDENCE_RAG_INTERNAL_TOKEN_FILE:}
+      fallback:
+        enabled: ${EVIDENCE_RAG_KAFKA_FALLBACK_ENABLED:true}
+        health-check-timeout-ms: ${EVIDENCE_RAG_KAFKA_HEALTH_CHECK_TIMEOUT_MS:1500}
+        publish-timeout-ms: ${EVIDENCE_RAG_KAFKA_PUBLISH_TIMEOUT_MS:3000}
       topics:
         index-request: rag.material.index.request.v1
         upload-finalize-request: rag.upload.finalize.request.v1

@@ -7,6 +7,7 @@ import pytest
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope
+from app.kafka_worker import KafkaWorkerConnectionError, is_reconnectable_error, reconnect_max_seconds, run_consumer_forever
 from rag.kafka.producer import KafkaJsonProducer, KafkaProgressThrottler, redacted_json
 from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, download_java_source
 from rag.observability.progress import RagProgressReporter
@@ -28,6 +29,40 @@ class FakeProgressProducer:
 
     def send_progress(self, **kwargs):
         self.events.append(kwargs)
+
+
+def test_kafka_worker_reconnects_after_broker_connection_error(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def fake_consumer_loop(_handlers):
+        calls.append(True)
+        if len(calls) == 1:
+            raise KafkaWorkerConnectionError("Broker 不可达")
+
+    monkeypatch.setenv("RAG_KAFKA_RECONNECT_INITIAL_SECONDS", "0.1")
+    monkeypatch.setenv("RAG_KAFKA_RECONNECT_MAX_SECONDS", "0.2")
+    monkeypatch.setattr("app.kafka_worker.run_consumer_loop", fake_consumer_loop)
+    monkeypatch.setattr("app.kafka_worker.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    run_consumer_forever({})
+
+    assert len(calls) == 2
+    assert sleeps == [0.1]
+
+
+def test_kafka_worker_error_classifier_ignores_unknown_error_code():
+    class Error:
+        def code(self):
+            return None
+
+    class KafkaErrorType:
+        _ALL_BROKERS_DOWN = -187
+        _TRANSPORT = -195
+        _TIMED_OUT = -185
+
+    assert is_reconnectable_error(Error(), KafkaErrorType) is False
+    assert reconnect_max_seconds(2.0) >= 2.0
 
 
 def envelope(message_type, payload):

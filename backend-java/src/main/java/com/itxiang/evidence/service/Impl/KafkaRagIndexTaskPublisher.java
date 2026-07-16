@@ -11,6 +11,7 @@ import com.itxiang.evidence.kafka.RagKafkaMessageFactory;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.mapper.RagIndexJobMapper;
 import com.itxiang.evidence.mapper.RagOutboxEventMapper;
+import com.itxiang.evidence.service.RagKafkaAvailabilityProbe;
 import com.itxiang.evidence.service.RagIndexTaskPublisher;
 import com.itxiang.evidence.service.command.RagUploadFinalizeCommand;
 import lombok.RequiredArgsConstructor;
@@ -32,6 +33,8 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
     private final RagIndexJobMapper ragIndexJobMapper;
     private final RagOutboxEventMapper ragOutboxEventMapper;
     private final ObjectMapper objectMapper;
+    private final RagKafkaAvailabilityProbe availabilityProbe;
+    private final RagHttpFallbackTaskDispatcher fallbackTaskDispatcher;
 
     @Override
     public boolean kafkaEnabled() {
@@ -43,6 +46,10 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      */
     @Override
     public void publishStoredMaterialIndex(LearningMaterial material, String userId, Boolean highPrecision, String operation) {
+        if (shouldFallbackToHttp()) {
+            fallbackTaskDispatcher.publishStoredMaterialIndex(material, userId, highPrecision, operation);
+            return;
+        }
         String jobId = newJobId();
         String canonicalDocumentId = canonicalDocumentId(material.getId());
         Integer requestVersion = nextRequestVersion(material);
@@ -66,6 +73,10 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      */
     @Override
     public void publishTextIndex(LearningMaterial material, String userId, RagIndexTextDTO dto) {
+        if (shouldFallbackToHttp()) {
+            fallbackTaskDispatcher.publishTextIndex(material, userId, dto);
+            return;
+        }
         String jobId = newJobId();
         String canonicalDocumentId = canonicalDocumentId(material.getId());
         Integer requestVersion = nextRequestVersion(material);
@@ -82,6 +93,10 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
      */
     @Override
     public void publishUploadFinalize(RagUploadFinalizeCommand command) {
+        if (shouldFallbackToHttp()) {
+            fallbackTaskDispatcher.publishUploadFinalize(command);
+            return;
+        }
         String idempotencyKey = RagKafkaMessageFactory.uploadFinalizeIdempotencyKey(command.uploadId(), command.materialId());
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("materialId", command.materialId());
@@ -189,6 +204,13 @@ public class KafkaRagIndexTaskPublisher implements RagIndexTaskPublisher {
         } catch (Exception e) {
             throw new IllegalStateException("RAG Kafka 消息序列化失败: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * 仅在 Kafka 尚未接收任务前降级，已进入 Outbox 的任务由发布器重试以避免双写。
+     */
+    private boolean shouldFallbackToHttp() {
+        return properties.getFallback().isEnabled() && !availabilityProbe.isAvailable();
     }
 
     private Integer nextRequestVersion(LearningMaterial material) {

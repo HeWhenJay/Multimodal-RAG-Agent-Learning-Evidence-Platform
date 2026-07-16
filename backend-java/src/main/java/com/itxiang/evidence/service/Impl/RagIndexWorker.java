@@ -1,6 +1,7 @@
 package com.itxiang.evidence.service.Impl;
 
 import com.itxiang.evidence.client.PythonRagClient;
+import com.itxiang.evidence.dto.RagIndexTextDTO;
 import com.itxiang.evidence.entity.LearningMaterial;
 import com.itxiang.evidence.mapper.LearningMaterialMapper;
 import com.itxiang.evidence.service.LogService;
@@ -41,6 +42,25 @@ public class RagIndexWorker {
     @Async
     public void reindexStoredMaterial(Long materialId, String userId, Boolean highPrecision) {
         executeIndex(materialId, userId, highPrecision, "reindex", "material_reindex_async_result", "学习资料后台重建索引完成");
+    }
+
+    /**
+     * Kafka 不可用时后台索引手工文本资料，复用现有 Python HTTP 接口和状态回写逻辑。
+     */
+    @Async
+    public void indexTextMaterial(Long materialId, String userId, RagIndexTextDTO dto) {
+        LearningMaterial material = learningMaterialMapper.findByIdAndUserId(materialId, userId);
+        if (material == null) {
+            log.warn("后台文本索引跳过，资料不存在或用户不匹配: materialId={}, userId={}", materialId, userId);
+            return;
+        }
+        try {
+            log.info("RAG后台文本索引开始: materialId={}, documentId=material-{}", material.getId(), material.getId());
+            PythonRagClient.IndexResult result = pythonRagClient.indexText(material.getId(), userId, dto);
+            completeIndex(material, result, "index", "material_text_index_async_result", "文本学习资料 HTTP fallback 索引完成");
+        } catch (Exception e) {
+            handleIndexFailure(material, e, "index", "material_text_index_async_failed");
+        }
     }
 
     /**
@@ -92,40 +112,58 @@ public class RagIndexWorker {
                         Boolean.TRUE.equals(highPrecision)
                 );
             }
-            transactionTemplate.executeWithoutResult(status -> {
-                recordIndexResultAnomalies(material, result);
-                recordReturnedProgressEvents(material, result);
-                applyIndexResult(material, result);
-                logService.recordRagEvent(
-                        "material",
-                        stage,
-                        successAction,
-                        successMessage,
-                        indexResultContext(material, result)
-                );
-            });
-            log.info("RAG后台索引完成: materialId={}, documentId=material-{}, status={}, parser={}, chunkCount={}",
-                    material.getId(), material.getId(), result.status(), result.parser(), result.chunkCount());
+            completeIndex(material, result, stage, successAction, successMessage);
         } catch (Exception e) {
-            log.warn("后台资料索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
-            boolean timeout = isPythonTimeout(e);
-            if (timeout) {
-                recordTimeoutProgress(material, e);
-            } else {
-                recordFailureProgress(material, e);
-            }
-            logService.recordRagError(
+            handleIndexFailure(material, e, stage, "reindex".equals(stage) ? "material_reindex_async_failed" : "material_index_async_failed");
+        }
+    }
+
+    /**
+     * 统一回写 Python 索引成功结果，保证 Kafka fallback 与普通 HTTP 索引状态一致。
+     */
+    private void completeIndex(LearningMaterial material,
+                               PythonRagClient.IndexResult result,
+                               String stage,
+                               String successAction,
+                               String successMessage) {
+        transactionTemplate.executeWithoutResult(status -> {
+            recordIndexResultAnomalies(material, result);
+            recordReturnedProgressEvents(material, result);
+            applyIndexResult(material, result);
+            logService.recordRagEvent(
                     "material",
                     stage,
-                    "reindex".equals(stage) ? "material_reindex_async_failed" : "material_index_async_failed",
-                    resolveRagErrorCode(e),
-                    "后台学习资料索引失败",
-                    e,
-                    errorContext(material, e)
+                    successAction,
+                    successMessage,
+                    indexResultContext(material, result)
             );
-            if (!timeout) {
-                transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
-            }
+        });
+        log.info("RAG后台索引完成: materialId={}, documentId=material-{}, status={}, parser={}, chunkCount={}",
+                material.getId(), material.getId(), result.status(), result.parser(), result.chunkCount());
+    }
+
+    /**
+     * 统一处理 Python HTTP 索引失败，长任务超时仍保留运行状态等待回调。
+     */
+    private void handleIndexFailure(LearningMaterial material, Exception e, String stage, String failedAction) {
+        log.warn("后台资料索引失败: materialId={}, reason={}", material.getId(), e.getMessage());
+        boolean timeout = isPythonTimeout(e);
+        if (timeout) {
+            recordTimeoutProgress(material, e);
+        } else {
+            recordFailureProgress(material, e);
+        }
+        logService.recordRagError(
+                "material",
+                stage,
+                failedAction,
+                resolveRagErrorCode(e),
+                "后台学习资料索引失败",
+                e,
+                errorContext(material, e)
+        );
+        if (!timeout) {
+            transactionTemplate.executeWithoutResult(status -> markFailed(material, e.getMessage()));
         }
     }
 

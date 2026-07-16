@@ -42,6 +42,9 @@ rag:
     bootstrap-servers: ${RAG_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
     java-base-url: ${RAG_JAVA_BASE_URL:http://127.0.0.1:7080}
     java-internal-token: ${RAG_JAVA_INTERNAL_TOKEN:}
+    worker:
+      reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
+      reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
     topics:
       index-request: ${RAG_KAFKA_TOPIC_INDEX_REQUEST:rag.material.index.request.v1}
       index-result: ${RAG_KAFKA_TOPIC_INDEX_RESULT:rag.material.index.result.v1}

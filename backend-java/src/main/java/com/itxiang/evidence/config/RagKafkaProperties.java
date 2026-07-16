@@ -15,9 +15,17 @@ public class RagKafkaProperties {
     private String internalBaseUrl = "http://127.0.0.1:7080";
     private String internalToken = "";
     private String internalTokenFile = "";
+    private Fallback fallback = new Fallback();
     private Topics topics = new Topics();
     private Groups groups = new Groups();
     private Outbox outbox = new Outbox();
+
+    @Data
+    public static class Fallback {
+        private boolean enabled = true;
+        private long healthCheckTimeoutMs = 1500L;
+        private long publishTimeoutMs = 3000L;
+    }
 
     @Data
     public static class Topics {

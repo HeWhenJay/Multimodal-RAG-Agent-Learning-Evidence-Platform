@@ -50,7 +50,8 @@ public class RagOutboxPublisher {
      */
     private void publishOne(RagOutboxEvent event) {
         try {
-            kafkaTemplate.send(event.getTopic(), event.getMessageKey(), event.getPayloadJson()).get(10, TimeUnit.SECONDS);
+            kafkaTemplate.send(event.getTopic(), event.getMessageKey(), event.getPayloadJson())
+                    .get(publishTimeoutMs(), TimeUnit.MILLISECONDS);
             ragOutboxEventMapper.markPublished(event.getId());
         } catch (Exception e) {
             LocalDateTime nextAttempt = LocalDateTime.now().plusSeconds(backoffSeconds(event.getAttempt()));
@@ -62,6 +63,10 @@ public class RagOutboxPublisher {
     private long backoffSeconds(Integer attempt) {
         int safeAttempt = attempt == null ? 1 : Math.max(1, attempt);
         return Math.min(3600, (long) Math.pow(2, Math.min(safeAttempt, properties.getOutbox().getMaxAttempts())));
+    }
+
+    private long publishTimeoutMs() {
+        return Math.max(100L, properties.getFallback().getPublishTimeoutMs());
     }
 
     private String buildPublisherId() {
