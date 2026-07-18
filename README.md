@@ -1,8 +1,36 @@
-# 学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统
+# Agent + RAG 全栈学习项目：学迹智配多模态学习证据库
 
-英文标识：Multimodal RAG Agent Learning Evidence Platform
+**学迹智配 Agent（Multimodal RAG Agent Learning Evidence Platform）** 是一个面向 AI Agent、Agentic RAG 和多模态 RAG 技术学习者的全栈实战项目。它不是只包装一次 LLM 调用的问答 Demo，而是完整覆盖资料解析、递归切块、混合检索、融合重排、evidence 引用、LangGraph Agent 编排、长期记忆、Human-in-the-Loop 审批，以及 Java/Python 服务协作。
 
-技术栈：React + Java Spring Boot + Python FastAPI + RAG。系统覆盖 RAG、视频证据、JD 适配、Agent 编排和记忆管理；MCP、自主长任务调度和多 Agent 协作不纳入项目能力范围。
+A production-oriented AI Agent and Multimodal RAG learning project for studying retrieval-augmented generation, LangGraph orchestration, hybrid search, evidence citation, agent memory, and full-stack Java/Python integration.
+
+![React](https://img.shields.io/badge/React-18-149ECA?logo=react&logoColor=white)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-Java-6DB33F?logo=springboot&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-Python-009688?logo=fastapi&logoColor=white)
+![LangGraph](https://img.shields.io/badge/Agent-LangGraph-1C3C3C)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
+![RAG](https://img.shields.io/badge/RAG-Hybrid%20Search-EA4335)
+
+**核心技术 / Keywords：** AI Agent · Agentic RAG · Multimodal RAG · Retrieval-Augmented Generation · LangGraph · PAE / ReAct · Hybrid Search · BM25 · pgvector · RAG-Fusion / RRF · Reranker · MinerU · OCR / ASR · Human-in-the-Loop · React · Spring Boot · FastAPI
+
+## 为什么适合作为 Agent / RAG 学习项目
+
+- **端到端而非单点 Demo：** 从 PDF、Office 文档、图片和视频入库，一直走到检索、回答、引用、Agent 工具调用、人工审批与结果撤销。
+- **RAG 链路可拆解学习：** 递归切块、父子索引、摘要索引、Multi-Query、BM25 + pgvector 向量召回、RRF/RAG-Fusion、rerank、检索诊断和严格证据准入均有独立实现。
+- **Agent 工程边界清晰：** Python 使用 LangGraph 实现 PAE + ReAct 编排、任务路由、基于稳定 `threadId` 与 Java 权威状态的审批恢复、工具观察和记忆；所有业务工具统一通过 Java Tool Gateway 执行。持久 LangGraph checkpointer 尚未接入。
+- **多模态证据可追溯：** MinerU、OCR、ASR、PPT 翻页检测和视频时间戳共同生成 evidence，回答保留资料标题、章节、片段、来源和分数。
+- **接近真实工程架构：** React 负责交互，Spring Boot 负责权限、状态、审计和幂等，FastAPI 负责 AI/RAG，PostgreSQL/pgvector、Redis 与可选 Kafka 分别承担检索、运行态和索引流水线。
+- **包含学习材料：** 仓库提供架构说明、静态 API 契约、SQL、示例资料、Python/Java 测试和 RAGAS 小规模评估入口，便于按模块阅读和复现。
+
+## 可以学到什么
+
+| 学习方向 | 项目中的对应实现 | 建议入口 |
+| --- | --- | --- |
+| RAG 基础与进阶检索 | 结构化解析、递归切块、摘要索引、Multi-Query、BM25、pgvector、RRF/RAG-Fusion、rerank、evidence 引用 | [RAG 架构](docs/architecture/rag-architecture.md) · [Python RAG 代码](ai-python/rag) |
+| AI Agent / Agentic RAG | LangGraph、PAE + ReAct、任务路由、工具调用、Human-in-the-Loop、稳定 threadId 审批恢复、长期记忆 | [Agent 设计](docs/agent/agent-development-plan.md) · [Agent 编排代码](ai-python/agents) |
+| 多模态 RAG | PDF/Office/Markdown 解析、MinerU、图片 OCR、视频 ASR、关键帧 OCR、时间戳证据 | [RAG 接口契约](docs/api/rag.md) |
+| Java + Python AI 架构 | React -> Spring Boot -> FastAPI 分层、统一鉴权、Tool Gateway、错误映射、幂等与审计 | [Agent 接口契约](docs/api/agent.md) · [Java 后端](backend-java) |
+| RAG 工程化与评估 | PostgreSQL/pgvector、Redis、Kafka + Outbox、索引 staging/promote、RAGAS 测试 | [pgvector 建库说明](docs/database/postgresql-pgvector.md) · [评估计划](docs/testing/ragas-small-evaluation-plan.md) |
 
 ## 项目速览
 
@@ -32,10 +60,11 @@
 
 ## 阅读导航
 
-1. 先看“项目定位”“RAG 业务流程”和下方几张说明图，快速理解系统大致内容。
-2. 再看“Agent 能力与边界”，确认哪些事情交给 Agent，哪些必须走 Java 审批和撤销。
-3. 本地运行时再跳到“本地启动”“本地 Redis”和“需要补全的环境变量”。
-4. API 细节见 [Agent 接口契约](docs/api/agent.md)、[RAG 接口契约](docs/api/rag.md) 和 [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)。
+1. **先理解整体：** 阅读“项目定位”“RAG 业务流程”和“分域业务边界图”，建立 React、Java、Python 与数据层的完整视图。
+2. **学习 RAG：** 按 [RAG 架构](docs/architecture/rag-architecture.md) -> [Python RAG 代码](ai-python/rag) -> [RAG 接口契约](docs/api/rag.md) -> [Python 测试](ai-python/tests) 的顺序阅读。
+3. **学习 Agent：** 按“Agent 能力与边界” -> [Agent 设计](docs/agent/agent-development-plan.md) -> [LangGraph 编排代码](ai-python/agents/orchestration) -> [Agent 接口契约](docs/api/agent.md) 的顺序阅读。
+4. **学习工程集成：** 对照 [Java 后端](backend-java) 与 [React 前端](frontend-react)，重点关注 Tool Gateway、统一鉴权、业务状态、审批、幂等、审计和前端任务工作台。
+5. **本地复现：** 跳到“本地启动”“本地 Redis”“需要补全的环境变量”和“验证命令”。
 
 ## 项目定位
 
@@ -571,7 +600,11 @@ Agent 工作台本地联调不需要分别为 Java 和 Python 手工设置内部
 | `SPRING_KAFKA_BOOTSTRAP_SERVERS` / `RAG_KAFKA_BOOTSTRAP_SERVERS` | Kafka 模式必填 | Kafka broker 地址 | `127.0.0.1:9092` |
 | `EVIDENCE_RAG_INTERNAL_TOKEN` / `RAG_JAVA_INTERNAL_TOKEN` | Kafka `JAVA_SOURCE_API` 必填 | Python worker 调 Java Source API 的共享内部令牌 | 自定义随机字符串 |
 | `EVIDENCE_RAG_INTERNAL_BASE_URL` / `RAG_JAVA_BASE_URL` | Kafka 模式可选 | Java 内部 Source API 基础地址 | `http://127.0.0.1:7080` |
+| `EVIDENCE_RAG_KAFKA_FALLBACK_ENABLED` | 可选 | Kafka 在接收新任务前不可达时是否退回 HTTP / 本机异步索引 | `true` |
+| `EVIDENCE_RAG_KAFKA_HEALTH_CHECK_TIMEOUT_MS` / `EVIDENCE_RAG_KAFKA_PUBLISH_TIMEOUT_MS` | 可选 | Java Broker 探测与单次 Outbox 发布的最大等待时间 | `1500` / `3000` 毫秒 |
+| `EVIDENCE_RAG_KAFKA_PRODUCER_MAX_BLOCK_MS` | 可选 | Kafka Producer 等待 Broker 元数据的最大阻塞时间 | `3000` 毫秒 |
 | `RAG_KAFKA_PROGRESS_CHUNK_INTERVAL` / `RAG_KAFKA_PROGRESS_MIN_SECONDS` | 可选 | Python Kafka progress 节流参数 | `10` / `2` |
+| `RAG_KAFKA_RECONNECT_INITIAL_SECONDS` / `RAG_KAFKA_RECONNECT_MAX_SECONDS` | 可选 | Python Kafka Worker Broker 断连后的指数退避重连范围 | `1` / `30` 秒 |
 | `RAG_STAGING_RETENTION_HOURS` | 可选 | 成功 staging 索引保留小时数 | `24` |
 | `RAG_STAGING_FAILED_RETENTION_HOURS` | 可选 | 失败、DLQ 或 stale staging 索引保留小时数 | `168` |
 
