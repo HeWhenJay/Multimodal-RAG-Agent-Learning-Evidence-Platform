@@ -24,6 +24,7 @@ DEFAULT_RAGAS_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-m
 DEFAULT_RAGAS_LLM_MODEL = "qwen-plus"
 DEFAULT_RAGAS_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_RAGAS_TEST_TABLE_PREFIX = "Ragas_Test_"
+DEFAULT_RETRIEVAL_CUTOFFS = (1, 3, 5)
 RAG_PROFILE_ENV = "RAGAS_EVAL_RAG_PROFILE"
 RAGAS_METRICS_ENV = "RAGAS_EVAL_METRICS"
 RAGAS_TEST_PREFIX_ENV = "RAGAS_TEST_TABLE_PREFIX"
@@ -306,6 +307,43 @@ def calculate_document_hit(expected_ids: list[str], retrieved_ids: list[str]) ->
     return {"top1_hit": False, "top3_hit": False, "hit_rank": None}
 
 
+def calculate_retrieval_metrics(
+    expected_ids: list[str],
+    retrieved_ids: list[str],
+    *,
+    cutoffs: tuple[int, ...] = DEFAULT_RETRIEVAL_CUTOFFS,
+) -> dict[str, float | None]:
+    """按文档级二元 qrels 计算 MRR、Recall@K 和 NDCG@K。"""
+    expected = list(dict.fromkeys(item for item in expected_ids if item))
+    retrieved = list(dict.fromkeys(item for item in retrieved_ids if item))
+    metrics: dict[str, float | None] = {"reciprocal_rank": None}
+    for cutoff in cutoffs:
+        metrics[f"recall_at_{cutoff}"] = None
+        metrics[f"ndcg_at_{cutoff}"] = None
+    if not expected:
+        return metrics
+
+    relevant = set(expected)
+    first_relevant_rank = next(
+        (rank for rank, document_id in enumerate(retrieved, start=1) if document_id in relevant),
+        None,
+    )
+    metrics["reciprocal_rank"] = round(1.0 / first_relevant_rank, 6) if first_relevant_rank else 0.0
+    for cutoff in cutoffs:
+        retrieved_at_k = retrieved[:cutoff]
+        relevant_count = sum(1 for document_id in retrieved_at_k if document_id in relevant)
+        metrics[f"recall_at_{cutoff}"] = round(relevant_count / len(relevant), 6)
+        dcg = sum(
+            1.0 / math.log2(rank + 1)
+            for rank, document_id in enumerate(retrieved_at_k, start=1)
+            if document_id in relevant
+        )
+        ideal_count = min(len(relevant), cutoff)
+        ideal_dcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
+        metrics[f"ndcg_at_{cutoff}"] = round(dcg / ideal_dcg, 6) if ideal_dcg else 0.0
+    return metrics
+
+
 def calculate_answer_point_coverage(answer: str, points: list[str]) -> dict[str, Any]:
     """用关键点文本包含关系计算粗粒度回答覆盖率。"""
     if not points:
@@ -343,26 +381,45 @@ def evaluate_boundary_case(
     *,
     boundary_score_threshold: float = DEFAULT_BOUNDARY_SCORE_THRESHOLD,
 ) -> dict[str, Any]:
-    """评估边界样本是否遵守无证据拒答和 metadataFilter 约束。"""
+    """按样本声明评估结构化拒答、evidence 上限和过滤隔离。"""
     evidences = list(response.get("evidences") or [])
     retrieved_ids = evidence_document_ids(evidences)
     max_score = max((float(item.get("score") or 0) for item in evidences), default=0.0)
-    expected_ids = list(case.get("expected_document_ids") or [])
     answer = str(response.get("answer") or "")
     answer_status = normalized_answer_status(response)
     refusal_reason = normalized_refusal_reason(response)
     expected_refusal_reasons = {str(item) for item in case.get("expected_refusal_reasons") or []}
     no_effective_evidence = not evidences or max_score < boundary_score_threshold
-    no_unexpected_document = not expected_ids and not retrieved_ids if case["case_id"] == "B02" else True
     refusal_text = has_refusal_intent(answer)
-    structured_refusal = answer_status == "REFUSED"
-    refusal_reason_ok = not expected_refusal_reasons or refusal_reason in expected_refusal_reasons
-    if structured_refusal:
-        passed = not evidences and no_unexpected_document and refusal_reason_ok
-    elif case["case_id"] == "B02":
-        passed = not evidences and no_unexpected_document
+    expected_answer_status = str(case.get("expected_answer_status") or "REFUSED").strip().upper()
+    requires_structured_response = bool(case.get("requires_structured_response"))
+    require_no_unexpected_documents = bool(case.get("require_no_unexpected_documents"))
+    raw_max_evidence_count = case.get("max_evidence_count", 0)
+    max_evidence_count = int(raw_max_evidence_count) if raw_max_evidence_count is not None else None
+    failed_checks: list[str] = []
+
+    if answer_status:
+        if expected_answer_status and answer_status != expected_answer_status:
+            failed_checks.append(f"answerStatus 期望 {expected_answer_status}，实际 {answer_status}")
+        if expected_refusal_reasons and refusal_reason not in expected_refusal_reasons:
+            expected_reasons = "、".join(sorted(expected_refusal_reasons))
+            failed_checks.append(f"refusalReason 期望 {expected_reasons}，实际 {refusal_reason or '空'}")
+        if max_evidence_count is not None and len(evidences) > max_evidence_count:
+            failed_checks.append(f"evidences 期望不超过 {max_evidence_count} 条，实际 {len(evidences)} 条")
+        if require_no_unexpected_documents and retrieved_ids:
+            failed_checks.append(f"返回了非预期文档：{'、'.join(retrieved_ids)}")
+        passed = not failed_checks
+    elif requires_structured_response:
+        failed_checks.append("响应缺少可核验的 answerStatus")
+        passed = False
     else:
+        # 旧响应没有结构化状态时，只保留低分或明确拒答文案的兼容判定。
         passed = no_effective_evidence or refusal_text
+        if require_no_unexpected_documents and retrieved_ids:
+            passed = False
+            failed_checks.append(f"返回了非预期文档：{'、'.join(retrieved_ids)}")
+        if not passed and not failed_checks:
+            failed_checks.append("旧响应既没有低分/空 evidence，也没有明确拒答文案")
     return {
         "case_id": case["case_id"],
         "passed": passed,
@@ -371,7 +428,8 @@ def evaluate_boundary_case(
         "retrieved_document_ids": retrieved_ids,
         "answer_status": answer_status,
         "refusal_reason": refusal_reason,
-        "reason": "边界样本通过" if passed else "边界样本返回了有效证据、拒答原因不匹配或未拒答",
+        "failed_checks": failed_checks,
+        "reason": "边界样本通过" if passed else "；".join(failed_checks),
     }
 
 
@@ -446,6 +504,7 @@ def evaluate_case_offline(case: dict[str, Any], response: dict[str, Any]) -> dic
     retrieved_ids = evidence_document_ids(evidences)
     expected_ids = list(case.get("expected_document_ids") or [])
     hit = calculate_document_hit(expected_ids, retrieved_ids)
+    retrieval_metrics = calculate_retrieval_metrics(expected_ids, retrieved_ids)
     coverage = calculate_answer_point_coverage(answer, list(case.get("expected_answer_points") or []))
     reference_ok = has_valid_evidence_reference(answer, evidences)
     if case.get("case_type") == "manual_boundary":
@@ -465,11 +524,16 @@ def evaluate_case_offline(case: dict[str, Any], response: dict[str, Any]) -> dic
         "top1_hit": hit["top1_hit"],
         "top3_hit": hit["top3_hit"],
         "hit_rank": hit["hit_rank"],
+        **retrieval_metrics,
         "answer_point_coverage": coverage["coverage"],
         "matched_points": coverage["matched_points"],
         "missing_points": coverage["missing_points"],
         "evidence_reference_ok": reference_ok,
         "boundary_passed": boundary.get("passed"),
+        "answer_status": boundary.get("answer_status") or normalized_answer_status(response),
+        "refusal_reason": boundary.get("refusal_reason") or normalized_refusal_reason(response),
+        "boundary_reason": boundary.get("reason"),
+        "boundary_failed_checks": boundary.get("failed_checks") or [],
         "passed": passed,
         "answer": answer,
     }
@@ -484,7 +548,19 @@ def summarize_offline(rows: list[dict[str, Any]]) -> dict[str, Any]:
     reference_ok = sum(1 for row in ragas_rows if row["evidence_reference_ok"])
     empty_evidence = sum(1 for row in ragas_rows if row["evidence_count"] == 0)
     boundary_passed = sum(1 for row in boundary_rows if row["boundary_passed"])
-    passed = top3_hits >= 9 and reference_ok == len(ragas_rows) and boundary_passed == len(boundary_rows) and empty_evidence <= 2
+    required_top3_hits = math.ceil(len(ragas_rows) * 0.9)
+    passed = (
+        top3_hits >= required_top3_hits
+        and reference_ok == len(ragas_rows)
+        and boundary_passed == len(boundary_rows)
+        and empty_evidence <= 2
+    )
+
+    def average_metric(key: str) -> float | None:
+        """只汇总具有 qrels 的主样本，避免把边界样本当作零分。"""
+        values = [float(row[key]) for row in ragas_rows if row.get(key) is not None]
+        return round(sum(values) / len(values), 6) if values else None
+
     return {
         "main_case_count": len(ragas_rows),
         "boundary_case_count": len(boundary_rows),
@@ -493,15 +569,20 @@ def summarize_offline(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "evidence_reference_ok_count": reference_ok,
         "empty_evidence_main_count": empty_evidence,
         "boundary_passed_count": boundary_passed,
+        "mrr": average_metric("reciprocal_rank"),
+        "recall_at_1": average_metric("recall_at_1"),
+        "recall_at_3": average_metric("recall_at_3"),
+        "recall_at_5": average_metric("recall_at_5"),
+        "ndcg_at_5": average_metric("ndcg_at_5"),
         "average_answer_point_coverage": round(
             sum(float(row["answer_point_coverage"]) for row in ragas_rows) / max(len(ragas_rows), 1),
             4,
         ),
         "offline_passed": passed,
         "thresholds": {
-            "top3_hit": ">= 9 / 10",
-            "evidence_reference_ok": "10 / 10",
-            "boundary_passed": "2 / 2",
+            "top3_hit": f">= {required_top3_hits} / {len(ragas_rows)}",
+            "evidence_reference_ok": f"{len(ragas_rows)} / {len(ragas_rows)}",
+            "boundary_passed": f"{len(boundary_rows)} / {len(boundary_rows)}",
             "empty_evidence_main": "<= 2",
         },
     }
@@ -581,9 +662,18 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "top1_hit",
         "top3_hit",
         "hit_rank",
+        "reciprocal_rank",
+        "recall_at_1",
+        "recall_at_3",
+        "recall_at_5",
+        "ndcg_at_5",
         "answer_point_coverage",
         "evidence_reference_ok",
         "boundary_passed",
+        "answer_status",
+        "refusal_reason",
+        "boundary_reason",
+        "boundary_failed_checks",
         "passed",
         "expected_document_ids",
         "retrieved_document_ids",
@@ -595,7 +685,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             normalized = dict(row)
-            for key in ("expected_document_ids", "retrieved_document_ids", "missing_points"):
+            for key in ("expected_document_ids", "retrieved_document_ids", "missing_points", "boundary_failed_checks"):
                 normalized[key] = json.dumps(normalized.get(key, []), ensure_ascii=False)
             writer.writerow(normalized)
 
@@ -628,6 +718,24 @@ def write_run_config(
             "RAG_LLM_MODEL": os.getenv("RAG_LLM_MODEL"),
             "RAG_RERANK_PROVIDER": os.getenv("RAG_RERANK_PROVIDER"),
             "RAG_RERANK_MODEL": os.getenv("RAG_RERANK_MODEL"),
+            "RAG_FUSION_STRATEGY": os.getenv("RAG_FUSION_STRATEGY"),
+            "RAG_FUSION_RRF_K": os.getenv("RAG_FUSION_RRF_K"),
+            "RAG_FUSION_BM25_WEIGHT": os.getenv("RAG_FUSION_BM25_WEIGHT"),
+            "RAG_FUSION_VECTOR_WEIGHT": os.getenv("RAG_FUSION_VECTOR_WEIGHT"),
+            "RAG_FUSION_ORIGINAL_QUERY_WEIGHT": os.getenv("RAG_FUSION_ORIGINAL_QUERY_WEIGHT"),
+            "RAG_FUSION_EXPANDED_QUERY_WEIGHT": os.getenv("RAG_FUSION_EXPANDED_QUERY_WEIGHT"),
+            "RAG_FUSION_SCORE_BLEND": os.getenv("RAG_FUSION_SCORE_BLEND"),
+            "RAG_FUSION_DIAGNOSTIC_LIMIT": os.getenv("RAG_FUSION_DIAGNOSTIC_LIMIT"),
+            "RAG_LOCAL_RERANK_FUSION_WEIGHT": os.getenv("RAG_LOCAL_RERANK_FUSION_WEIGHT"),
+            "RAG_LOCAL_RERANK_LEXICAL_WEIGHT": os.getenv("RAG_LOCAL_RERANK_LEXICAL_WEIGHT"),
+            "RAG_LOCAL_RERANK_TITLE_WEIGHT": os.getenv("RAG_LOCAL_RERANK_TITLE_WEIGHT"),
+            "RAG_LOCAL_RERANK_RANK_WEIGHT": os.getenv("RAG_LOCAL_RERANK_RANK_WEIGHT"),
+            "RAG_ANSWER_MIN_ANSWERABLE_SCORE": os.getenv("RAG_ANSWER_MIN_ANSWERABLE_SCORE"),
+            "RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE": os.getenv("RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE"),
+            "RAG_ANSWER_MIN_TOP_SCORE_LOCAL": os.getenv("RAG_ANSWER_MIN_TOP_SCORE_LOCAL"),
+            "RAG_ANSWER_MIN_KEYWORD_COVERAGE": os.getenv("RAG_ANSWER_MIN_KEYWORD_COVERAGE"),
+            "RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT": os.getenv("RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT"),
+            "RAG_ANSWER_STRICT_MODE": os.getenv("RAG_ANSWER_STRICT_MODE"),
         },
         "ragas": {
             "version": ragas_version,
@@ -679,6 +787,9 @@ def write_manual_review(
         "## 汇总",
         "",
         f"- 主样本 top3 命中：{summary.get('top3_hit_count')} / {summary.get('main_case_count')}",
+        f"- 文档级 MRR：{summary.get('mrr')}",
+        f"- 文档级 Recall@1 / @3 / @5：{summary.get('recall_at_1')} / {summary.get('recall_at_3')} / {summary.get('recall_at_5')}",
+        f"- 文档级 NDCG@5：{summary.get('ndcg_at_5')}",
         f"- 引用结构合格：{summary.get('evidence_reference_ok_count')} / {summary.get('main_case_count')}",
         f"- 边界样本通过：{summary.get('boundary_passed_count')} / {summary.get('boundary_case_count')}",
         f"- 主样本空 evidence：{summary.get('empty_evidence_main_count')}",
@@ -717,21 +828,44 @@ def write_manual_review(
             "",
             "## 样本明细",
             "",
-            "| 用例 | 类型 | 通过 | top3 | 引用 | evidence | 缺失关键点 |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| 用例 | 通过 | 命中排名 | RR | Recall@5 | NDCG@5 | 引用 | evidence | 缺失关键点 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
-    for row in rows:
+    for row in (item for item in rows if item["case_type"] == "ragas"):
         missing = "、".join(row.get("missing_points") or [])
         lines.append(
-            "| {case_id} | {case_type} | {passed} | {top3_hit} | {reference_ok} | {evidence_count} | {missing} |".format(
+            "| {case_id} | {passed} | {hit_rank} | {reciprocal_rank} | {recall_at_5} | {ndcg_at_5} | {reference_ok} | {evidence_count} | {missing} |".format(
                 case_id=row["case_id"],
-                case_type=row["case_type"],
                 passed="是" if row["passed"] else "否",
-                top3_hit="是" if row["top3_hit"] else "否",
+                hit_rank=row.get("hit_rank") or "-",
+                reciprocal_rank=row.get("reciprocal_rank"),
+                recall_at_5=row.get("recall_at_5"),
+                ndcg_at_5=row.get("ndcg_at_5"),
                 reference_ok="是" if row["evidence_reference_ok"] else "否",
                 evidence_count=row["evidence_count"],
                 missing=missing or "-",
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## 边界样本明细",
+            "",
+            "| 用例 | 通过 | answerStatus | refusalReason | evidence | 失败检查 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in (item for item in rows if item["case_type"] == "manual_boundary"):
+        failed_checks = "；".join(row.get("boundary_failed_checks") or []) or "-"
+        lines.append(
+            "| {case_id} | {passed} | {answer_status} | {refusal_reason} | {evidence_count} | {failed_checks} |".format(
+                case_id=row["case_id"],
+                passed="是" if row["passed"] else "否",
+                answer_status=row.get("answer_status") or "-",
+                refusal_reason=row.get("refusal_reason") or "-",
+                evidence_count=row["evidence_count"],
+                failed_checks=failed_checks,
             )
         )
     lines.extend(

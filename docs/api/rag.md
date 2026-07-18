@@ -1,10 +1,10 @@
 # RAG 接口文档
 
-更新日期：2026-07-04
+更新日期：2026-07-18
 
 ## 变更摘要
 
-本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段只把上传、重建、视频分片收尾和索引终态同步接入 Kafka；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。
+本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段只把上传、重建、视频分片收尾和索引终态同步接入 Kafka；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。2026-07-18 将查询融合升级为可配置的确定性 weighted RRF，保留非法配置回退等权 RRF；本地 rerank 升级为可解释的融合分、词覆盖、标题章节覆盖和排名先验特征，并在 diagnostics 中返回选择原因、逐路 raw score/rank 与贡献值。
 
 边界约定：
 
@@ -556,7 +556,7 @@ Multi-Query 生成契约：
 | 字段 | 规则 |
 | --- | --- |
 | `topK` | 最终 evidence 数，默认 `5`，Java 和 Python 均限制在 `1-20`。 |
-| `candidateMultiplier` | RRF/RAG-Fusion 后进入 rerank 前的候选倍率，默认 `4`，限制在 `2-10`。候选预算为 `max(topK * candidateMultiplier, 20)`；默认仍保持旧行为 `max(topK * 4, 20)`。 |
+| `candidateMultiplier` | 确定性 RRF/RAG-Fusion 后进入 rerank 前的候选倍率，默认 `4`，限制在 `2-10`。候选预算为 `max(topK * candidateMultiplier, 20)`；默认仍保持旧行为 `max(topK * 4, 20)`。融合策略和权重只能由服务端环境变量配置，客户端不能覆盖。 |
 | `metadataFilter` | 只接收白名单字段；空字符串、空数组、`null` 和未知字段会被删除，并记录到诊断字段 `ignoredMetadataFilterKeys`。字符串数组表示 `IN`，单值表示精确匹配。 |
 
 `metadataFilter` 白名单：
@@ -620,11 +620,13 @@ Multi-Query 生成契约：
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RAG_ANSWER_MIN_ANSWERABLE_SCORE` | `0.45` | 综合可回答分最低门槛。 |
-| `RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE` | `0.35` | 百炼 rerank 归一化 Top 分门槛。 |
+| `RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE` | `0.55` | 百炼 rerank 归一化 Top 分门槛；默认按严格拒答策略校准，可通过评测集覆盖。 |
 | `RAG_ANSWER_MIN_TOP_SCORE_LOCAL` | `0.25` | 本地 rerank fallback 归一化 Top 分门槛。 |
 | `RAG_ANSWER_MIN_KEYWORD_COVERAGE` | `0.08` | 问题关键词和扩展查询关键词在候选标题、章节、snippet 中的最低覆盖率。 |
 | `RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT` | `1` | 第一版最小支持证据数量。 |
 | `RAG_ANSWER_STRICT_MODE` | `true` | 默认开启严格准入。 |
+
+上述回答准入参数可通过 `config/application.yml` 的 `rag.answer-guard` 配置。2026-07-18 的 `current` 小样本校准中，10 条相关主样本的 Top rerank 分最低为 `0.8904`，跨域边界样本 B03 为 `0.4587`；因此将百炼默认门槛从 `0.35` 调整为 `0.55`，优先避免弱相关候选触发回答。每次评估的 `run_config.json` 必须同时记录融合、本地重排和回答准入参数，便于复现与回滚。
 
 `diagnostics.answerGuard` 结构示例：
 
@@ -825,7 +827,48 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
   },
   "ignoredMetadataFilterKeys": ["unknownKey", "emptyKey"],
   "candidateBudget": 20,
+  "fusionRequestedStrategy": "weighted_rrf",
+  "fusionStrategy": "weighted_rrf",
+  "fusionRrfK": 60,
+  "fusionConfig": {
+    "bm25Weight": 1.0,
+    "vectorWeight": 1.0,
+    "originalQueryWeight": 1.2,
+    "expandedQueryWeight": 1.0,
+    "scoreBlend": 0.15
+  },
+  "fusionInputRuns": [
+    {
+      "queryIndex": 0,
+      "queryKind": "original",
+      "retrievalSource": "bm25",
+      "hitCount": 20,
+      "runWeight": 1.2,
+      "rawScoreMin": 0.42,
+      "rawScoreMax": 8.31
+    }
+  ],
+  "fusionCandidateDetails": [
+    {
+      "chunkId": "material-2-11",
+      "fusedScore": 0.091234,
+      "bestRank": 1,
+      "contributions": [
+        {
+          "queryIndex": 0,
+          "queryKind": "original",
+          "retrievalSource": "bm25",
+          "rank": 1,
+          "rawScore": 8.31,
+          "normalizedScore": 1.0,
+          "runWeight": 1.2,
+          "contribution": 0.022623
+        }
+      ]
+    }
+  ],
   "rerankedCandidateCount": 12,
+  "rerankSelectionReason": "RAG_RERANK_PROVIDER=auto 且 DASHSCOPE_API_KEY 可用",
   "dedupRemovedCount": 3,
   "dedupGroupCount": 2,
   "diversityPolicy": "video_duplicate_group_and_time_window",
@@ -837,7 +880,7 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
     "supportingEvidenceIds": ["material-2-parent-text-0001"],
     "thresholds": {
       "minAnswerableScore": 0.45,
-      "minTopScore": 0.35,
+      "minTopScore": 0.55,
       "minKeywordCoverage": 0.08,
       "minSupportingEvidenceCount": 1,
       "strictMode": true
@@ -863,7 +906,9 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
 }
 ```
 
-其中 `totalCandidateChunkCount` 表示当前用户权限范围内的总候选切块数，`filteredChunkCount` 表示业务过滤后的候选切块数，`effectiveMetadataFilter` 表示真正生效的业务过滤项，`systemMetadataFilter` 只展示非敏感系统范围，`ignoredMetadataFilterKeys` 表示被删除的未知或空过滤字段。`candidateBudget` 表示 RRF/RAG-Fusion 后进入 rerank 的候选证据预算；`parentAggregation`、`matchedChildIds`、`expandedParentIds` 用于说明子块命中后是否展开到父段上下文；`prerequisiteAddedIds` 现阶段固定为空，Stage 2 前置知识扩展默认关闭；`dedupRemovedCount`、`dedupGroupCount` 和 `diversityPolicy` 用于说明查询阶段是否移除了视频近重复 evidence。
+其中 `totalCandidateChunkCount` 表示当前用户权限范围内的总候选切块数，`filteredChunkCount` 表示业务过滤后的候选切块数，`effectiveMetadataFilter` 表示真正生效的业务过滤项，`systemMetadataFilter` 只展示非敏感系统范围，`ignoredMetadataFilterKeys` 表示被删除的未知或空过滤字段。`candidateBudget` 表示 RRF/RAG-Fusion 后进入 rerank 的候选证据预算；`fusionRequestedStrategy/fusionStrategy` 分别表示请求配置和实际执行策略，非法策略、非法权重或全部通道权重为 `0` 时实际策略回退为 `rrf`，并额外返回 `fusionFallbackReason`；`fusionInputRuns` 汇总每个查询变体和召回通道的命中数、原始分数范围与实际权重；`fusionCandidateDetails` 最多保留服务端配置数量的融合前候选，只记录 chunk ID、原始 score、rank、归一化分和贡献值，不记录正文或 snippet。`parentAggregation`、`matchedChildIds`、`expandedParentIds` 用于说明子块命中后是否展开到父段上下文；`prerequisiteAddedIds` 现阶段固定为空，Stage 2 前置知识扩展默认关闭；`dedupRemovedCount`、`dedupGroupCount` 和 `diversityPolicy` 用于说明查询阶段是否移除了视频近重复 evidence。
+
+当实际使用本地重排时，`diagnostics` 还会返回 `localRerankStrategy/localRerankWeights/localRerankCandidateDetails`。每个候选详情包含输入分、归一化融合分、问题词覆盖率、标题章节覆盖率、原始排名先验和最终分；同一分数按原始候选顺序和 evidenceId 稳定排序。相同分解也写入 Python `Evidence.metadata.localRerank`，供 Python 内部诊断使用。Java 仍只透传既有 evidence 固定字段，因此前端无需依赖该 metadata。
 
 `RagQueryVO` 响应示例：
 
@@ -1410,23 +1455,35 @@ Python 在入库前对 `evidenceChannel=frame_ocr` 的画面 OCR 块做保守聚
 
 ## 百炼 LLM 回答与 rerank
 
-查询阶段在 RAG-Fusion 后增加后检索重排，再进入回答生成：
+查询阶段在确定性 RAG-Fusion 后增加后检索重排，再进入回答生成：
 
 ```text
-Multi-Query -> BM25 + 向量召回 -> RRF/RAG-Fusion -> 百炼 qwen3-rerank -> 百炼 qwen-plus 生成带引用回答
+Multi-Query -> BM25 + 向量召回 -> weighted RRF/RAG-Fusion（可回退等权 RRF） -> 百炼 qwen3-rerank 或本地确定性特征重排 -> 百炼 qwen-plus 生成带引用回答
 ```
 
 配置：
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
+| `RAG_FUSION_STRATEGY` | `weighted_rrf` | `weighted_rrf/rrf`。`weighted_rrf` 在 RRF 排名贡献上叠加可解释的通道权重、查询权重和列表内归一化原始分；非法值回退 `rrf`。 |
+| `RAG_FUSION_RRF_K` | `60` | RRF 平滑常数，限制在 `1-10000`；非法值回退默认值。 |
+| `RAG_FUSION_BM25_WEIGHT` | `1.0` | BM25 召回列表权重，限制在 `0-10`。 |
+| `RAG_FUSION_VECTOR_WEIGHT` | `1.0` | 向量召回列表权重，限制在 `0-10`。 |
+| `RAG_FUSION_ORIGINAL_QUERY_WEIGHT` | `1.2` | 原始问题召回列表权重，限制在 `0-10`，避免多个扩展查询稀释原始意图。 |
+| `RAG_FUSION_EXPANDED_QUERY_WEIGHT` | `1.0` | 扩展查询召回列表权重，限制在 `0-10`。 |
+| `RAG_FUSION_SCORE_BLEND` | `0.15` | 列表内 min-max 原始分对 RRF 贡献的校准强度，限制在 `0-1`；`0` 表示只使用加权排名。 |
+| `RAG_FUSION_DIAGNOSTIC_LIMIT` | `20` | `fusionCandidateDetails` 最大候选数，限制在 `1-100`。 |
 | `RAG_RERANK_PROVIDER` | `auto` | `auto/local/dashscope` |
 | `RAG_RERANK_MODEL` | `qwen3-rerank` | 百炼重排模型 |
+| `RAG_LOCAL_RERANK_FUSION_WEIGHT` | `0.40` | 本地重排的归一化融合分权重，限制在 `0-10`。 |
+| `RAG_LOCAL_RERANK_LEXICAL_WEIGHT` | `0.35` | 问题词在完整候选文本中的覆盖率权重，限制在 `0-10`。 |
+| `RAG_LOCAL_RERANK_TITLE_WEIGHT` | `0.15` | 问题词在资料标题和章节位置中的覆盖率权重，限制在 `0-10`。 |
+| `RAG_LOCAL_RERANK_RANK_WEIGHT` | `0.10` | 原始融合候选排名先验权重，限制在 `0-10`。四项权重会归一化；全部为 `0` 或非法时回退默认权重。 |
 | `RAG_LLM_PROVIDER` / `RAG_ANSWER_PROVIDER` | `auto` | `auto/local/dashscope`，当前实现读取 `RAG_ANSWER_PROVIDER` |
 | `RAG_LLM_MODEL` | `qwen-plus` | 百炼回答生成模型 |
 | `RAG_LLM_TEMPERATURE` | `0.2` | 回答生成温度 |
 
-无 evidence 时直接拒答并提示上传资料；有 evidence 时，Prompt 要求回答只能基于 evidence，且关键结论保留 `[evidenceId]` 引用。回答生成后会程序化追加“证据引用”摘要，包含 evidenceId、资料标题、章节或视频时间、来源和分数，避免完全依赖模型自觉保留引用字段。章节位置需要先清洗 Markdown 链接和加粗标记，只保留可读标题文本；如果 evidence 的 `sourcePath` 是可由浏览器直接访问的 `http(s)` OSS/CDN URL，则位置应渲染为新标签页链接，链接目标为 `sourcePath`，并尽量拼接原 Markdown 目录中的 `#...` fragment。裸 `#...` 或当前 React 应用根路径 hash 不能作为目标，应映射到来源文件 URL 后再展示。测试环境默认走本地确定性回答和重排，避免消耗百炼额度。
+无 evidence 时直接拒答并提示上传资料；有 evidence 时，Prompt 要求回答只能基于 evidence，且关键结论保留 `[evidenceId]` 引用。回答生成后会程序化追加“证据引用”摘要，包含 evidenceId、资料标题、章节或视频时间、来源和分数，避免完全依赖模型自觉保留引用字段。章节位置需要先清洗 Markdown 链接和加粗标记，只保留可读标题文本；如果 evidence 的 `sourcePath` 是可由浏览器直接访问的 `http(s)` OSS/CDN URL，则位置应渲染为新标签页链接，链接目标为 `sourcePath`，并尽量拼接原 Markdown 目录中的 `#...` fragment。裸 `#...` 或当前 React 应用根路径 hash 不能作为目标，应映射到来源文件 URL 后再展示。测试环境默认走本地确定性回答和重排，避免消耗百炼额度。`auto` 未配置 Key、显式 `local`、未知 provider 或百炼调用失败时，`rerankSelectionReason` 必须说明选择原因；只有未知配置、强制百炼但缺 Key 或百炼调用失败才写 `rerankFallbackReason`，避免把正常的本地配置误报为模型故障。
 
 ## 多格式解析策略
 

@@ -986,10 +986,11 @@ def _make_event(
    - 用户审批后 Java 调 /resume，Python 以 plan_approved=True 再次 invoke
    - 同理 reviewer 产出 CRUD 审批 → WAITING_CRUD_REVIEW → 审批后再次 invoke
 
-3. Checkpoint 支持（持久化状态）：
+3. Checkpoint 状态与后续扩展：
 
-   LangGraph 自带 SqliteSaver / PostgresSaver checkpoint 能力，
-   PAE 图可配置 checkpointer，实现：
+   当前运行实现直接 workflow.compile()，没有传入持久 checkpointer；审批恢复使用
+   同一 thread_id，并根据 Java 权威任务状态和恢复请求重建确定性状态。
+   后续可利用 LangGraph 的 SqliteSaver / PostgresSaver 配置 checkpointer，实现：
    - 审批中断后恢复（thread_id 不变）
    - 异常重试
    - 审计追溯（每个节点执行前后的 state 快照）

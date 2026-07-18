@@ -1,6 +1,6 @@
 # Agent 开发计划
 
-更新日期：2026-06-21
+更新日期：2026-07-18
 
 ## 1. 背景输入
 
@@ -94,7 +94,7 @@ flowchart TD
 | `plan_json` | 当前计划 |
 | `draft_json` | 草稿输出 |
 | `final_json` | 最终输出 |
-| `python_thread_id` | LangGraph checkpoint `thread_id` |
+| `python_thread_id` | Agent 恢复使用的稳定 `threadId`；当前尚未接入持久 LangGraph checkpoint |
 | `error_message` | 失败摘要，不存模型密钥或简历全文 |
 | `created_at/updated_at` | 时间戳 |
 
@@ -219,7 +219,7 @@ flowchart TD
 | --- | --- | --- |
 | `POST` | `/internal/agent/tasks` | 启动 LangGraph 任务 |
 | `POST` | `/internal/agent/tasks/{taskId}/resume` | 根据用户审批结果恢复图执行 |
-| `GET` | `/internal/agent/tasks/{taskId}` | 调试读取 Python 侧 checkpoint 摘要 |
+| `GET` | `/internal/agent/tasks/{taskId}` | 后续接入持久 checkpoint 后可开放脱敏状态摘要；当前未实现 |
 
 安全要求：
 
@@ -301,8 +301,8 @@ Python Agent 统一放在 `ai-python/agents/`：
 ai-python/agents/
   __init__.py
   gateway/              # Java Tool Gateway client，不直连 Python RAG
-  read_only/            # pure_read_query 只读图
-  jd_learning_plan/     # planning_task 规划图
+  llm/                  # Agent 使用的模型客户端
+  orchestration/        # 统一 PAE/ReAct 图及只读、规划辅助函数
   memory/               # Agent 记忆提炼、冲突判断和检索
   resume_adapter/       # 简历模板兼容填充能力
   note_writer/          # 后续笔记生成 Agent 预留目录
@@ -318,36 +318,40 @@ mutationProposal, draft, finalAnswer,
 retryCount, status, diagnostics
 ```
 
-三条主路径：
+当前统一图的职责流如下，节点均位于 `orchestration/pae_react_graph.py`：
 
 ```text
+所有任务
+-> conversation_title
+-> context_restore
+-> task_router
+
 pure_read_query
--> scope_guard
--> tool_router
--> read_tool_node
--> evidence_policy_guard
--> finalizer
+-> memory_prefetch_before_planner
+-> planner（免计划审批）
+-> memory_prefetch_after_planner
+-> executor <-> tool_adapter / repair / acceptance
+-> answer_writer
+-> post_answer_memory
 
-planning_task
+planning_task（未审批）
 -> planner
--> human_plan_review(interrupt)
--> tool_router
--> read_tool_node / mutation_proposal_builder
--> evidence_quality_auditor
--> human_output_review(interrupt)
--> finalizer
+-> plan_review
+-> END（向 Java 发布 WAITING_PLAN_REVIEW）
 
-mutation_task
--> mutation_proposal_builder
--> human_crud_review(interrupt)
--> mutation_tool_node
--> undo_window_observation
--> finalizer
+planning_task（审批后恢复）
+-> 使用同一 threadId 重建状态
+-> planner
+-> resume_rewrite 子流程（按需）
+-> executor <-> tool_adapter / repair / acceptance
+-> answer_writer
+-> post_answer_memory
 ```
 
-HITL 必须使用 checkpoint 和稳定 `thread_id`，本地初版使用 `langgraph-checkpoint-sqlite`。配置项建议为：
+HITL 必须使用稳定 `thread_id`。当前实现由 Java 保存任务和审批权威状态，Python 恢复接口根据同一 `threadId`、任务输入和审批结果重建确定性状态；`pae_react_graph.py` 当前直接调用 `workflow.compile()`，尚未传入持久 checkpointer。下面的 SQLite 路径仅是后续接入 `SqliteSaver` 时的预留配置，不是当前有效配置：
 
 ```text
+# 预留：接入 SqliteSaver 后再启用
 AGENT_CHECKPOINT_DB_PATH=tmp/agent-checkpoints.sqlite
 EVIDENCE_AGENT_INTERNAL_TOKEN=
 AGENT_JAVA_BASE_URL=http://127.0.0.1:7080
@@ -508,7 +512,7 @@ npm run build
 
 新增测试建议：
 
-- Python：LangGraph 路由、checkpoint resume、只读工具调用、审批恢复、evidence guard。
+- Python：LangGraph 路由、基于 Java 权威状态的确定性恢复、只读工具调用、审批恢复、evidence guard；接入持久 checkpointer 后再补充节点级 checkpoint resume 测试。
 - Java：Tool Gateway 权限隔离、`rag_query_probe_non_persistent` 不写历史、CRUD 审批、撤销窗口。
 - 前端：构建通过，审批按钮、取消、撤销、轮询状态可用。
 - 集成：启动 Java + Python，创建任务、审批、恢复、完成。
@@ -517,7 +521,7 @@ npm run build
 
 | 风险 | 处理 |
 | --- | --- |
-| Python checkpoint 丢失导致 HITL 无法恢复 | 初版使用 SQLite 文件持久化；后续可替换 PostgreSQL checkpoint |
+| Python 进程退出后没有持久 checkpoint | 当前根据 Java 权威任务状态和恢复请求重建确定性状态；需要节点级断点续跑前，应先接入并测试 SQLite 或 PostgreSQL checkpointer |
 | Agent 误读跨用户资源 | Java 从 `taskId` 推导 userId，不信任 Python 入参；所有 read/mutation 工具二次归属校验 |
 | 只读 RAG 探针写入查询历史 | 新增非持久化查询路径，只写脱敏审计日志 |
 | 外部搜索污染 evidence | Tavily 输出只作为参考上下文，不自动入库 |

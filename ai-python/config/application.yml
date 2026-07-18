@@ -24,6 +24,27 @@ rag:
     model: ${RAG_RERANK_MODEL:qwen3-rerank}
     base-url: ${RAG_RERANK_BASE_URL:https://dashscope.aliyuncs.com}
     timeout-seconds: ${RAG_RERANK_TIMEOUT_SECONDS:30}
+  fusion:
+    strategy: ${RAG_FUSION_STRATEGY:weighted_rrf}
+    rrf-k: ${RAG_FUSION_RRF_K:60}
+    bm25-weight: ${RAG_FUSION_BM25_WEIGHT:1.0}
+    vector-weight: ${RAG_FUSION_VECTOR_WEIGHT:1.0}
+    original-query-weight: ${RAG_FUSION_ORIGINAL_QUERY_WEIGHT:1.2}
+    expanded-query-weight: ${RAG_FUSION_EXPANDED_QUERY_WEIGHT:1.0}
+    score-blend: ${RAG_FUSION_SCORE_BLEND:0.15}
+    diagnostic-limit: ${RAG_FUSION_DIAGNOSTIC_LIMIT:20}
+  local-rerank:
+    fusion-weight: ${RAG_LOCAL_RERANK_FUSION_WEIGHT:0.40}
+    lexical-weight: ${RAG_LOCAL_RERANK_LEXICAL_WEIGHT:0.35}
+    title-weight: ${RAG_LOCAL_RERANK_TITLE_WEIGHT:0.15}
+    rank-weight: ${RAG_LOCAL_RERANK_RANK_WEIGHT:0.10}
+  answer-guard:
+    min-answerable-score: ${RAG_ANSWER_MIN_ANSWERABLE_SCORE:0.45}
+    min-top-score-dashscope: ${RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE:0.55}
+    min-top-score-local: ${RAG_ANSWER_MIN_TOP_SCORE_LOCAL:0.25}
+    min-keyword-coverage: ${RAG_ANSWER_MIN_KEYWORD_COVERAGE:0.08}
+    min-supporting-evidence-count: ${RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT:1}
+    strict-mode: ${RAG_ANSWER_STRICT_MODE:true}
   llm:
     provider: ${RAG_ANSWER_PROVIDER:auto}
     model: ${RAG_LLM_MODEL:qwen-plus}

@@ -25,13 +25,14 @@ from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_
 from rag.retrievers.query_expansion import expand_queries_with_diagnostics, format_query_expansion_detail
 from rag.retrievers.retrieval import (
     DEFAULT_EMBEDDING_DIMENSIONS,
+    RankedRetrievalRun,
     build_playback_url,
     chunk_percent,
     embed_text,
     embedding_model_name,
+    fuse_ranked_runs,
     format_evidence_titles,
     format_ranked_hits,
-    reciprocal_rank_fusion,
     tokenize,
 )
 from rag.indexes.summary_index import SummaryIndex
@@ -453,7 +454,7 @@ class PgVectorRagStore:
             detail=format_metadata_filter_plan(filter_plan, total_count=len(scoped_chunks), filtered_count=len(filtered_chunks)),
         )
         chunk_by_id = {row["chunk_id"]: row for row in filtered_chunks}
-        ranked_lists: list[list[tuple[str, float]]] = []
+        ranked_runs: list[RankedRetrievalRun] = []
         diagnostics: dict[str, Any] = {
             "expandedQueries": expanded_queries,
             **query_expansion.diagnostics(),
@@ -463,11 +464,11 @@ class PgVectorRagStore:
         }
 
         candidate_budget = max(request.topK * request.candidateMultiplier, 20)
-        for query_text in expanded_queries:
+        for query_index, query_text in enumerate(expanded_queries):
             limit = candidate_budget
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=8, percent=30)
             bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=limit)
-            ranked_lists.append(bm25_hits)
+            ranked_runs.append(RankedRetrievalRun(query_index, "bm25", bm25_hits))
             progress_reporter.emit(
                 "query.bm25",
                 f"BM25 召回完成：{query_text}，命中 {len(bm25_hits)} 条",
@@ -484,7 +485,7 @@ class PgVectorRagStore:
             )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=8, percent=45)
             vector_hits = self._vector_search(query_text, filter_plan.effective_filter(), limit=limit)
-            ranked_lists.append(vector_hits)
+            ranked_runs.append(RankedRetrievalRun(query_index, "vector", vector_hits))
             progress_reporter.emit(
                 "query.vector",
                 f"向量召回完成：{query_text}，命中 {len(vector_hits)} 条",
@@ -500,12 +501,13 @@ class PgVectorRagStore:
                 ),
             )
 
-        progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=8, percent=62)
-        fused = reciprocal_rank_fusion(ranked_lists)
+        progress_reporter.emit("query.fusion", "正在执行可配置的确定性 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=8, percent=62)
+        fusion_result = fuse_ranked_runs(ranked_runs)
+        diagnostics.update(fusion_result.diagnostics())
         diagnostics["candidateBudget"] = candidate_budget
         candidates = [
             (chunk_id, score)
-            for chunk_id, score in fused[:candidate_budget]
+            for chunk_id, score in fusion_result.ranked_hits[:candidate_budget]
             if chunk_id in chunk_by_id
         ]
         candidate_evidences = [
@@ -529,7 +531,7 @@ class PgVectorRagStore:
         diagnostics.update(parent_aggregated.diagnostics())
         progress_reporter.emit(
             "query.fusion",
-            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
+            f"RAG-Fusion 完成：策略 {fusion_result.config.strategy}，融合 {len(ranked_runs)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
             status="COMPLETED",
             current_step=5,
             total_steps=8,

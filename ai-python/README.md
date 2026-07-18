@@ -99,7 +99,11 @@ python run.py
 - `app/api/`：FastAPI 内部接口路由。
 - `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
 - `app/schemas/`：Java 与 Python 之间共享的 Pydantic 请求/响应模型。
-- `agents/`：按职责拆分的 Agent 编排实现，包括 `gateway/`、`read_only/`、`jd_learning_plan/`、`memory/` 和 `resume_adapter/`。
+- `agents/gateway/`：Python Agent 调用 Java Tool Gateway 和任务事件回调的客户端。
+- `agents/llm/`：Agent 规划、执行和回答使用的模型客户端。
+- `agents/orchestration/`：统一 PAE/ReAct 状态图及只读、规划辅助函数。
+- `agents/memory/`：长期记忆候选、冲突判断、索引和检索服务。
+- `agents/resume_adapter/`：简历模板填充适配；`agents/note_writer/` 当前仅为预留目录。
 - `rag/core/`：RAG 通用模型、元数据过滤和文本清洗。
 - `rag/observability/`：RAG 进度上报、过程日志、模型调用日志和 Java 日志回调。
 - `rag/generation/`：百炼 LLM 回答生成和 evidence 引用摘要。
@@ -107,6 +111,20 @@ python run.py
 - `rag/evaluation/`：Ragas 小样本评估脚本和兼容层。
 - `video/`：视频 ASR、抽帧、OCR、去重和分片证据处理。
 - `tests/`：Python 单元测试和接口回归测试。
+
+### Agent 状态恢复现状
+
+统一 Agent 图当前在 `agents/orchestration/pae_react_graph.py` 中直接调用 `workflow.compile()`，没有传入 LangGraph checkpointer。`POST /internal/agent/tasks/{taskId}/resume` 会沿用同一 `threadId`，根据 Java 保存的任务、审批结果和恢复请求重建确定性状态后继续执行。`langgraph-checkpoint` 和 `langgraph-checkpoint-sqlite` 依赖是后续持久化扩展预留，当前不能把 `AGENT_CHECKPOINT_DB_PATH` 或 SQLite checkpoint 视为已生效能力。
+
+## 开发验证
+
+Python 测试必须在 `learning-evidence-rag` Conda 环境中执行：
+
+```powershell
+conda run -n learning-evidence-rag python -B -m pytest ai-python/tests -q
+```
+
+GitHub Actions 同样根据 `ai-python/environment.yml` 创建该环境，并与 Java `mvn test`、React `npm run build` 分别在独立 job 中验证。
 
 ## RAG 评估
 

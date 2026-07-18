@@ -2,6 +2,70 @@ from run import build_env_defaults
 from app.core.agent_internal_token import resolve_agent_internal_token
 
 
+def test_fusion_and_local_rerank_config_env_mapping_is_effective():
+    """校验融合与本地重排配置能从 YAML 映射为运行环境变量。"""
+    env_defaults = build_env_defaults(
+        {
+            "rag": {
+                "fusion": {
+                    "strategy": "rrf",
+                    "rrf-k": 42,
+                    "bm25-weight": 1.1,
+                    "vector-weight": 0.9,
+                    "original-query-weight": 1.3,
+                    "expanded-query-weight": 0.8,
+                    "score-blend": 0.2,
+                    "diagnostic-limit": 12,
+                },
+                "local-rerank": {
+                    "fusion-weight": 0.3,
+                    "lexical-weight": 0.4,
+                    "title-weight": 0.2,
+                    "rank-weight": 0.1,
+                },
+            }
+        }
+    )
+
+    assert env_defaults["RAG_FUSION_STRATEGY"] == "rrf"
+    assert env_defaults["RAG_FUSION_RRF_K"] == "42"
+    assert env_defaults["RAG_FUSION_BM25_WEIGHT"] == "1.1"
+    assert env_defaults["RAG_FUSION_VECTOR_WEIGHT"] == "0.9"
+    assert env_defaults["RAG_FUSION_ORIGINAL_QUERY_WEIGHT"] == "1.3"
+    assert env_defaults["RAG_FUSION_EXPANDED_QUERY_WEIGHT"] == "0.8"
+    assert env_defaults["RAG_FUSION_SCORE_BLEND"] == "0.2"
+    assert env_defaults["RAG_FUSION_DIAGNOSTIC_LIMIT"] == "12"
+    assert env_defaults["RAG_LOCAL_RERANK_FUSION_WEIGHT"] == "0.3"
+    assert env_defaults["RAG_LOCAL_RERANK_LEXICAL_WEIGHT"] == "0.4"
+    assert env_defaults["RAG_LOCAL_RERANK_TITLE_WEIGHT"] == "0.2"
+    assert env_defaults["RAG_LOCAL_RERANK_RANK_WEIGHT"] == "0.1"
+
+
+def test_answer_guard_config_env_mapping_is_effective():
+    """校验回答准入阈值能从 YAML 映射为运行环境变量。"""
+    env_defaults = build_env_defaults(
+        {
+            "rag": {
+                "answer-guard": {
+                    "min-answerable-score": 0.5,
+                    "min-top-score-dashscope": 0.55,
+                    "min-top-score-local": 0.3,
+                    "min-keyword-coverage": 0.1,
+                    "min-supporting-evidence-count": 2,
+                    "strict-mode": True,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["RAG_ANSWER_MIN_ANSWERABLE_SCORE"] == "0.5"
+    assert env_defaults["RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE"] == "0.55"
+    assert env_defaults["RAG_ANSWER_MIN_TOP_SCORE_LOCAL"] == "0.3"
+    assert env_defaults["RAG_ANSWER_MIN_KEYWORD_COVERAGE"] == "0.1"
+    assert env_defaults["RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT"] == "2"
+    assert env_defaults["RAG_ANSWER_STRICT_MODE"] == "true"
+
+
 def test_video_v6_config_env_mapping_is_effective():
     """校验 V6 视频 OCR 新配置能从 YAML 映射为运行环境变量。"""
     env_defaults = build_env_defaults(

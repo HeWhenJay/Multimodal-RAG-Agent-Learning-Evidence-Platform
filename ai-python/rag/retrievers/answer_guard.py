@@ -172,7 +172,7 @@ def guard_thresholds(diagnostics: dict[str, Any]) -> dict[str, Any]:
     """读取可校准阈值，并按 rerank provider 选择 Top 分门槛。"""
     provider = str(diagnostics.get("rerankProvider") or "local").lower()
     min_top_env = "RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE" if provider == "dashscope" else "RAG_ANSWER_MIN_TOP_SCORE_LOCAL"
-    min_top_default = "0.35" if provider == "dashscope" else "0.25"
+    min_top_default = "0.55" if provider == "dashscope" else "0.25"
     return {
         "minAnswerableScore": float(os.getenv("RAG_ANSWER_MIN_ANSWERABLE_SCORE", "0.45")),
         "minTopScore": float(os.getenv(min_top_env, min_top_default)),

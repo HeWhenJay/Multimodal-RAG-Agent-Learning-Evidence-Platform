@@ -1,0 +1,81 @@
+name: 持续集成
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python 测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      PYTHONPATH: ${{ github.workspace }}/ai-python
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 创建 Conda 环境
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: learning-evidence-rag
+          environment-file: ai-python/environment.yml
+          auto-activate-base: false
+
+      - name: 运行 Python 测试
+        run: python -B -m pytest ai-python/tests -q
+
+  java-tests:
+    name: Java 测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: 运行 Maven 测试
+        working-directory: backend-java
+        run: mvn -B -ntp test
+
+  frontend-build:
+    name: React 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend-react/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: frontend-react
+        run: npm ci --no-audit --no-fund
+
+      - name: 构建 React 前端
+        working-directory: frontend-react
+        run: npm run build

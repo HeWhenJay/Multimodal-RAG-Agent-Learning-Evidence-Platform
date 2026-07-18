@@ -1,5 +1,13 @@
+import pytest
+
 from rag.retrievers.retrieval import cached_embedding, embed_text, embedding_provider_name
-from rag.retrievers.retrieval import InMemoryRagStore
+from rag.retrievers.retrieval import (
+    FusionConfig,
+    InMemoryRagStore,
+    RankedRetrievalRun,
+    fuse_ranked_runs,
+    reciprocal_rank_fusion,
+)
 from rag.retrievers.answer_guard import evaluate_answer_guard
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.evidence_diversity import dedupe_evidences_for_context
@@ -7,7 +15,12 @@ from rag.retrievers.parent_aggregation import ParentAggregationChunk, aggregate_
 from rag.retrievers.query_expansion import expand_queries_with_diagnostics
 from rag.generation.bailian_llm import append_evidence_reference_summary, build_evidence_location_link, clean_evidence_location, deterministic_grounded_answer
 from rag.indexes.pgvector_store import build_filter_clause, vector_literal
-from rag.rerankers.reranking import local_rerank
+from rag.rerankers.reranking import (
+    BailianRerankClient,
+    LocalRerankConfig,
+    local_rerank,
+    local_rerank_with_diagnostics,
+)
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from app.schemas.rag import DocumentBlock, Evidence, IndexTextRequest, QueryRequest
 
@@ -73,6 +86,13 @@ def test_rag_store_indexes_and_queries_with_evidence():
     assert response.diagnostics["answerProvider"] == "local"
     assert response.diagnostics["rerankProvider"] == "local"
     assert response.diagnostics["queryExpansionProvider"] == "local"
+    assert response.diagnostics["fusionStrategy"] == "weighted_rrf"
+    assert response.diagnostics["fusionInputRuns"]
+    assert response.diagnostics["fusionCandidateDetails"]
+    first_contribution = response.diagnostics["fusionCandidateDetails"][0]["contributions"][0]
+    assert {"rank", "rawScore", "normalizedScore", "contribution"} <= first_contribution.keys()
+    assert response.diagnostics["localRerankStrategy"] == "deterministic-feature-reranker-v2"
+    assert response.diagnostics["localRerankCandidateDetails"]
     assert response.diagnostics["answerGuard"]["answerStatus"] == "ANSWERED"
     assert len(response.expandedQueries) >= 3
 
@@ -144,6 +164,53 @@ def test_answer_guard_refuses_low_confidence_candidates():
     assert decision.answerStatus == "REFUSED"
     assert decision.refusalReason == "LOW_CONFIDENCE"
     assert decision.supportingEvidenceIds == []
+
+
+def test_answer_guard_refuses_borderline_dashscope_score_despite_expansion_coverage(monkeypatch):
+    """百炼弱相关候选即使被查询扩展抬高词覆盖，也不得绕过 Top 分门槛。"""
+    monkeypatch.delenv("RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE", raising=False)
+    decision = evaluate_answer_guard(
+        question="RAG 学习笔记能否给出法棍二次发酵的温度和湿度曲线？",
+        expanded_queries=[
+            "法棍二次发酵温湿度控制参数标准是多少？",
+            "法棍二次发酵失败原因与温湿度偏差关系分析",
+        ],
+        evidences=[
+            make_evidence(
+                "doc-guard-baguette-1",
+                "RAG 学习笔记介绍二次检索、参数调优和评估曲线，但不包含烘焙或发酵工艺。",
+                score=0.48,
+            )
+        ],
+        diagnostics={"totalCandidateChunkCount": 20, "filteredChunkCount": 20, "rerankProvider": "dashscope"},
+    )
+
+    assert decision.thresholds["minTopScore"] == 0.55
+    assert decision.signals["keywordCoverage"] > decision.thresholds["minKeywordCoverage"]
+    assert decision.answerStatus == "REFUSED"
+    assert decision.refusalReason == "LOW_CONFIDENCE"
+    assert decision.supportingEvidenceIds == []
+
+
+def test_answer_guard_accepts_strong_dashscope_relevance_after_threshold_calibration(monkeypatch):
+    """百炼高相关候选在严格门槛调整后仍可正常进入回答生成。"""
+    monkeypatch.delenv("RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE", raising=False)
+    decision = evaluate_answer_guard(
+        question="RAG-Fusion 如何融合 BM25 和向量召回？",
+        expanded_queries=["RRF 如何合并 BM25 与向量检索结果"],
+        evidences=[
+            make_evidence(
+                "doc-guard-fusion-1",
+                "RAG-Fusion 使用 RRF 对 BM25 与向量召回列表按排名贡献进行融合。",
+                score=0.89,
+            )
+        ],
+        diagnostics={"totalCandidateChunkCount": 20, "filteredChunkCount": 20, "rerankProvider": "dashscope"},
+    )
+
+    assert decision.answerStatus == "ANSWERED"
+    assert decision.refusalReason is None
+    assert decision.supportingEvidenceIds == ["doc-guard-fusion-1"]
 
 
 def test_answer_guard_refuses_weak_snippet_candidate():
@@ -362,6 +429,154 @@ def test_dashscope_embedding_request_uses_1024_dimensions(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["json"]["model"] == "text-embedding-v4"
     assert captured["json"]["dimensions"] == 1024
+
+
+def test_weighted_rrf_uses_channel_weights_and_exposes_raw_rank_details():
+    """加权 RRF 应保留通道差异，并输出可复核的原始分与排名。"""
+    config = FusionConfig(
+        requested_strategy="weighted_rrf",
+        strategy="weighted_rrf",
+        rrf_k=60,
+        bm25_weight=1.0,
+        vector_weight=2.0,
+        original_query_weight=1.0,
+        expanded_query_weight=1.0,
+        score_blend=0.2,
+        diagnostic_limit=10,
+    )
+    result = fuse_ranked_runs(
+        [
+            RankedRetrievalRun(0, "bm25", [("bm25-first", 12.0), ("vector-first", 11.0)]),
+            RankedRetrievalRun(0, "vector", [("vector-first", 0.9), ("bm25-first", 0.8)]),
+        ],
+        config,
+    )
+
+    assert result.ranked_hits[0][0] == "vector-first"
+    assert result.input_runs[1]["runWeight"] == 2.0
+    detail = result.candidate_details[0]
+    assert detail["chunkId"] == "vector-first"
+    assert detail["bestRank"] == 1
+    assert detail["contributions"][0]["rawScore"] == 11.0
+    assert detail["contributions"][1]["rank"] == 1
+
+
+def test_invalid_fusion_weight_falls_back_to_equal_rrf(monkeypatch):
+    """非法融合权重不得中断查询，应显式回退到旧等权 RRF。"""
+    monkeypatch.setenv("RAG_FUSION_STRATEGY", "weighted_rrf")
+    monkeypatch.setenv("RAG_FUSION_BM25_WEIGHT", "not-a-number")
+    runs = [
+        RankedRetrievalRun(0, "bm25", [("a", 9.0), ("b", 8.0)]),
+        RankedRetrievalRun(0, "vector", [("b", 0.9), ("a", 0.8)]),
+    ]
+
+    result = fuse_ranked_runs(runs)
+    expected = reciprocal_rank_fusion([run.hits for run in runs])
+
+    assert result.config.strategy == "rrf"
+    assert "融合权重配置非法" in str(result.config.fallback_reason)
+    assert [item[0] for item in result.ranked_hits] == [item[0] for item in expected]
+    assert result.ranked_hits[0][1] == pytest.approx(expected[0][1])
+
+
+def test_zero_weight_channel_does_not_add_zero_contribution_candidate():
+    """单个通道权重为 0 时，该通道独有候选不应混入融合结果。"""
+    config = FusionConfig(
+        requested_strategy="weighted_rrf",
+        strategy="weighted_rrf",
+        rrf_k=60,
+        bm25_weight=0.0,
+        vector_weight=1.0,
+        original_query_weight=1.0,
+        expanded_query_weight=1.0,
+        score_blend=0.15,
+        diagnostic_limit=10,
+    )
+    result = fuse_ranked_runs(
+        [
+            RankedRetrievalRun(0, "bm25", [("bm25-only", 9.0)]),
+            RankedRetrievalRun(0, "vector", [("vector-only", 0.8)]),
+        ],
+        config,
+    )
+
+    assert [chunk_id for chunk_id, _score in result.ranked_hits] == ["vector-only"]
+
+
+def test_local_rerank_can_correct_input_order_and_explain_score():
+    """本地重排应允许强问题覆盖纠正仅靠融合分形成的错误顺序。"""
+    irrelevant = make_evidence("irrelevant", "这段只讨论数据库连接池和事务传播。", score=0.9)
+    relevant = make_evidence(
+        "relevant",
+        "RAG-Fusion 通过倒数排名融合合并 BM25 和向量召回结果。",
+        score=0.2,
+    )
+    outcome = local_rerank_with_diagnostics(
+        "RAG-Fusion 如何融合 BM25 和向量召回？",
+        [irrelevant, relevant],
+        2,
+        config=LocalRerankConfig(0.10, 0.65, 0.15, 0.10),
+    )
+
+    assert outcome.evidences[0].evidenceId == "relevant"
+    assert outcome.evidences[0].metadata["localRerank"]["originalRank"] == 2
+    assert outcome.evidences[0].metadata["localRerank"]["lexicalCoverage"] > 0
+    assert outcome.diagnostics["localRerankWeights"]["lexical"] == 0.65
+    assert outcome.diagnostics["localRerankCandidateDetails"][0]["finalRank"] == 1
+
+
+def test_auto_rerank_without_api_key_explains_local_selection(monkeypatch):
+    """auto 未配置 Key 属于正常本地选择，应说明原因但不误报调用故障。"""
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    result = BailianRerankClient(provider="auto").rerank(
+        "什么是 RAG-Fusion？",
+        [make_evidence("local-only", "RAG-Fusion 使用 RRF 融合多路召回。")],
+        1,
+    )
+    diagnostics = result.diagnostics()
+
+    assert result.provider == "local"
+    assert "DASHSCOPE_API_KEY 未配置" in diagnostics["rerankSelectionReason"]
+    assert "rerankFallbackReason" not in diagnostics
+    assert diagnostics["localRerankStrategy"] == "deterministic-feature-reranker-v2"
+    assert diagnostics["rerankedCandidateCount"] == 1
+
+
+def test_dashscope_rerank_preserves_zero_relevance_score(monkeypatch):
+    """百炼返回零相关分时不得回退为融合候选原分。"""
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"output": {"results": [{"index": 0, "relevance_score": 0.0}]}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        @staticmethod
+        def post(*args, **kwargs):
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    result = BailianRerankClient(api_key="test-key", provider="dashscope").rerank(
+        "当前资料是否相关？",
+        [make_evidence("zero-score", "候选原分不应覆盖模型返回的零分。", score=0.88)],
+        1,
+    )
+
+    assert result.provider == "dashscope"
+    assert result.evidences[0].score == 0.0
 
 
 def test_local_rerank_keeps_evidence_id_and_scores():

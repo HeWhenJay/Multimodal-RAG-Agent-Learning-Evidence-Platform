@@ -13,9 +13,11 @@ from rag.evaluation.ragas_eval_common import (
     build_ragas_input_row,
     build_ragas_model_adapter,
     calculate_document_hit,
+    calculate_retrieval_metrics,
     configure_current_rag_environment,
     ensure_ragas_eval_config,
     evaluate_boundary_case,
+    evaluate_case_offline,
     filter_eval_cases,
     has_refusal_intent,
     has_valid_evidence_reference,
@@ -28,11 +30,47 @@ from rag.evaluation.ragas_eval_common import (
     ragas_result_to_rows,
     require_ragas_core_dependencies,
     snake_case_query_to_project_request,
+    summarize_offline,
     validate_ragas_test_table_prefix,
+    write_csv,
+    write_manual_review,
+    write_run_config,
     write_ragas_scores_csv,
     _build_run_config,
     _call_ragas_evaluate,
 )
+
+
+def test_write_run_config_records_retrieval_and_guard_calibration(monkeypatch, tmp_path):
+    """评测运行配置必须完整记录融合、重排和回答准入参数。"""
+    expected = {
+        "RAG_FUSION_STRATEGY": "weighted_rrf",
+        "RAG_FUSION_RRF_K": "60",
+        "RAG_FUSION_BM25_WEIGHT": "1.0",
+        "RAG_FUSION_VECTOR_WEIGHT": "1.0",
+        "RAG_FUSION_ORIGINAL_QUERY_WEIGHT": "1.2",
+        "RAG_FUSION_EXPANDED_QUERY_WEIGHT": "1.0",
+        "RAG_FUSION_SCORE_BLEND": "0.15",
+        "RAG_FUSION_DIAGNOSTIC_LIMIT": "20",
+        "RAG_LOCAL_RERANK_FUSION_WEIGHT": "0.40",
+        "RAG_LOCAL_RERANK_LEXICAL_WEIGHT": "0.35",
+        "RAG_LOCAL_RERANK_TITLE_WEIGHT": "0.15",
+        "RAG_LOCAL_RERANK_RANK_WEIGHT": "0.10",
+        "RAG_ANSWER_MIN_ANSWERABLE_SCORE": "0.45",
+        "RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE": "0.55",
+        "RAG_ANSWER_MIN_TOP_SCORE_LOCAL": "0.25",
+        "RAG_ANSWER_MIN_KEYWORD_COVERAGE": "0.08",
+        "RAG_ANSWER_MIN_SUPPORTING_EVIDENCE_COUNT": "1",
+        "RAG_ANSWER_STRICT_MODE": "true",
+    }
+    for name, value in expected.items():
+        monkeypatch.setenv(name, value)
+
+    output_path = tmp_path / "run_config.json"
+    write_run_config(output_path, mode="offline", summary={}, output_paths={})
+    rag_config = json.loads(output_path.read_text(encoding="utf-8"))["rag"]
+
+    assert {name: rag_config[name] for name in expected} == expected
 
 
 def test_load_eval_cases_and_documents():
@@ -43,6 +81,8 @@ def test_load_eval_cases_and_documents():
     assert len(cases) == 15
     assert len(documents) == 10
     assert cases[0]["expected_document_ids"] == ["llm-ragas-d01"]
+    assert all(case["requires_structured_response"] for case in cases if case["case_type"] == "manual_boundary")
+    assert all(case["max_evidence_count"] == 0 for case in cases if case["case_type"] == "manual_boundary")
     assert documents[0]["documentId"] == "llm-ragas-d01"
 
 
@@ -163,6 +203,30 @@ def test_calculate_document_hit_top1_and_top3():
     assert not calculate_document_hit(["llm-ragas-d04"], ["llm-ragas-d01", "llm-ragas-d02", "llm-ragas-d03"])["top3_hit"]
 
 
+def test_calculate_retrieval_metrics_supports_multiple_binary_qrels():
+    """确认文档级 MRR、Recall@K 和 NDCG@K 使用去重后的二元 qrels。"""
+    metrics = calculate_retrieval_metrics(
+        ["doc-2", "doc-4"],
+        ["doc-1", "doc-2", "doc-2", "doc-3", "doc-4"],
+    )
+
+    assert metrics["reciprocal_rank"] == 0.5
+    assert metrics["recall_at_1"] == 0.0
+    assert metrics["recall_at_3"] == 0.5
+    assert metrics["recall_at_5"] == 1.0
+    expected_ndcg = (1 / 1.584962500721156 + 1 / 2.321928094887362) / (1 + 1 / 1.584962500721156)
+    assert metrics["ndcg_at_5"] == pytest.approx(expected_ndcg, abs=1e-6)
+
+
+def test_calculate_retrieval_metrics_marks_missing_qrels_as_not_applicable():
+    """确认无期望文档的边界样本不会被错误汇总为检索零分。"""
+    metrics = calculate_retrieval_metrics([], ["doc-1"])
+
+    assert metrics["reciprocal_rank"] is None
+    assert metrics["recall_at_5"] is None
+    assert metrics["ndcg_at_5"] is None
+
+
 def test_has_valid_evidence_reference_requires_project_reference_fields():
     """确认引用结构必须能追踪到 evidenceId 和来源字段。"""
     evidence = {
@@ -208,6 +272,194 @@ def test_boundary_case_prefers_structured_refusal_reason():
     assert result["passed"]
     assert result["answer_status"] == "REFUSED"
     assert result["refusal_reason"] == "LOW_CONFIDENCE"
+
+
+def test_boundary_case_does_not_accept_refusal_text_when_structured_response_answered():
+    """确认 ANSWERED 响应不能再靠回答中的拒答措辞掩盖无关 evidence。"""
+    case = {
+        "case_id": "B03",
+        "expected_answer_status": "REFUSED",
+        "requires_structured_response": True,
+        "expected_refusal_reasons": ["LOW_CONFIDENCE", "INSUFFICIENT_COVERAGE"],
+        "max_evidence_count": 0,
+        "require_no_unexpected_documents": True,
+    }
+    response = {
+        "answerStatus": "ANSWERED",
+        "refusalReason": None,
+        "answer": "无法提供法棍发酵曲线，现有 RAG evidence 不涉及烘焙。",
+        "evidences": [{"documentId": "llm-ragas-d02", "score": 0.47}],
+    }
+
+    result = evaluate_boundary_case(case, response)
+
+    assert not result["passed"]
+    assert any("answerStatus" in item for item in result["failed_checks"])
+    assert any("evidences" in item for item in result["failed_checks"])
+    assert any("非预期文档" in item for item in result["failed_checks"])
+
+
+def test_boundary_case_accepts_filtered_out_when_filter_has_no_matching_chunks():
+    """确认弱片段筛选没有候选时，FILTERED_OUT 是有效的保守拒答。"""
+    case = {
+        "case_id": "B04",
+        "expected_answer_status": "REFUSED",
+        "requires_structured_response": True,
+        "expected_refusal_reasons": ["FILTERED_OUT", "WEAK_SNIPPET", "INSUFFICIENT_COVERAGE"],
+        "max_evidence_count": 0,
+        "require_no_unexpected_documents": True,
+    }
+    response = {
+        "answerStatus": "REFUSED",
+        "refusalReason": "FILTERED_OUT",
+        "answer": "当前筛选条件下没有可用证据。",
+        "evidences": [],
+    }
+
+    result = evaluate_boundary_case(case, response)
+
+    assert result["passed"]
+    assert result["failed_checks"] == []
+
+
+def test_evaluate_case_offline_preserves_boundary_failure_details():
+    """确认 CSV 和人工报告可以追溯结构化拒答失败原因。"""
+    case = {
+        "case_id": "B03",
+        "case_type": "manual_boundary",
+        "question": "能否回答无关问题？",
+        "expected_document_ids": [],
+        "expected_answer_status": "REFUSED",
+        "requires_structured_response": True,
+        "expected_refusal_reasons": ["LOW_CONFIDENCE"],
+        "max_evidence_count": 0,
+    }
+    response = {
+        "answerStatus": "ANSWERED",
+        "answer": "证据不足，但仍给出回答。",
+        "evidences": [{"documentId": "doc-1", "score": 0.8}],
+    }
+
+    row = evaluate_case_offline(case, response)
+
+    assert not row["passed"]
+    assert row["answer_status"] == "ANSWERED"
+    assert row["boundary_failed_checks"]
+    assert "answerStatus" in row["boundary_reason"]
+
+
+def test_summarize_offline_reports_ranking_metrics_and_dynamic_boundary_threshold():
+    """确认汇总输出检索指标，并按实际边界样本数生成门槛。"""
+    main_rows = [
+        {
+            "case_type": "ragas",
+            "top1_hit": True,
+            "top3_hit": True,
+            "evidence_reference_ok": True,
+            "evidence_count": 1,
+            "boundary_passed": None,
+            "reciprocal_rank": 1.0,
+            "recall_at_1": 1.0,
+            "recall_at_3": 1.0,
+            "recall_at_5": 1.0,
+            "ndcg_at_5": 1.0,
+            "answer_point_coverage": 1.0,
+        },
+        {
+            "case_type": "ragas",
+            "top1_hit": False,
+            "top3_hit": True,
+            "evidence_reference_ok": True,
+            "evidence_count": 1,
+            "boundary_passed": None,
+            "reciprocal_rank": 0.5,
+            "recall_at_1": 0.0,
+            "recall_at_3": 1.0,
+            "recall_at_5": 1.0,
+            "ndcg_at_5": 0.63093,
+            "answer_point_coverage": 0.5,
+        },
+    ]
+    boundary_row = {
+        "case_type": "manual_boundary",
+        "top1_hit": False,
+        "top3_hit": False,
+        "evidence_reference_ok": False,
+        "evidence_count": 0,
+        "boundary_passed": True,
+        "answer_point_coverage": 0.0,
+    }
+
+    summary = summarize_offline([*main_rows, boundary_row])
+
+    assert summary["mrr"] == 0.75
+    assert summary["recall_at_1"] == 0.5
+    assert summary["recall_at_5"] == 1.0
+    assert summary["ndcg_at_5"] == pytest.approx(0.815465)
+    assert summary["thresholds"]["boundary_passed"] == "1 / 1"
+    assert summary["offline_passed"]
+
+
+def test_offline_outputs_keep_ranking_metrics_and_boundary_diagnostics(tmp_path):
+    """确认离线 CSV 与人工报告不会再次丢失结构化边界诊断。"""
+    main_row = evaluate_case_offline(
+        {
+            "case_id": "R01",
+            "case_type": "ragas",
+            "question": "RAG 是什么？",
+            "expected_document_ids": ["doc-1"],
+            "expected_answer_points": ["检索增强"],
+        },
+        {
+            "answerStatus": "ANSWERED",
+            "answer": "RAG 是检索增强生成。[chunk-1]",
+            "evidences": [
+                {
+                    "evidenceId": "chunk-1",
+                    "documentId": "doc-1",
+                    "title": "RAG 笔记",
+                    "sectionName": "定义",
+                    "source": "unit-test",
+                    "sourcePath": "notes/rag.md",
+                    "score": 0.9,
+                }
+            ],
+        },
+    )
+    boundary_row = evaluate_case_offline(
+        {
+            "case_id": "B02",
+            "case_type": "manual_boundary",
+            "question": "筛选后能否回答？",
+            "expected_document_ids": [],
+            "expected_answer_status": "REFUSED",
+            "requires_structured_response": True,
+            "expected_refusal_reasons": ["FILTERED_OUT"],
+            "max_evidence_count": 0,
+        },
+        {
+            "answerStatus": "REFUSED",
+            "refusalReason": "FILTERED_OUT",
+            "answer": "当前筛选条件下没有可用证据。",
+            "evidences": [],
+        },
+    )
+    rows = [main_row, boundary_row]
+    summary = summarize_offline(rows)
+    csv_path = tmp_path / "offline_scores.csv"
+    review_path = tmp_path / "manual_review.md"
+
+    write_csv(csv_path, rows)
+    write_manual_review(review_path, rows, summary)
+
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    review_text = review_path.read_text(encoding="utf-8")
+    assert "reciprocal_rank" in csv_text
+    assert "refusal_reason" in csv_text
+    assert "FILTERED_OUT" in csv_text
+    assert "文档级 MRR：1.0" in review_text
+    assert "## 边界样本明细" in review_text
+    assert "| B02 | 是 | REFUSED | FILTERED_OUT | 0 | - |" in review_text
 
 
 def test_boundary_case_treats_low_score_as_insufficient_evidence():

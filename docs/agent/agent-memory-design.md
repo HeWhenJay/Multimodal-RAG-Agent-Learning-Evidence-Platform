@@ -1,6 +1,6 @@
 # Agent 记忆方案
 
-更新日期：2026-06-24
+更新日期：2026-07-18
 
 ## 1. 设计目标
 
@@ -44,7 +44,7 @@
 
 这些能力不能直接替代 Agent 记忆：
 
-- `python_thread_id` 和 LangGraph checkpoint 只用于任务恢复，不是长期记忆库。
+- `python_thread_id` 当前是任务恢复使用的稳定标识；持久 LangGraph checkpoint 尚未接入。后续即使接入 checkpoint，也只用于任务恢复，不是长期记忆库。
 - `agent_task.input_json/draft_json/final_json` 是任务快照，不适合跨任务检索和冲突管理。
 - `agent_tool_call.response_json` 是脱敏 Observation 摘要，不应被无脑注入新任务上下文。
 - `rag_query_history` 是用户问答历史，不等同于 Agent 记忆；它可作为情景记忆候选来源，但不能直接作为记忆使用。
@@ -65,7 +65,7 @@
 
 | 类型 | 项目内含义 | 生命周期 | 存储建议 |
 | --- | --- | --- | --- |
-| 工作记忆 | 当前任务目标、计划、工具观察、草稿、中间状态、最近几轮对话 | 单任务或单会话 | Python Agent state、`agent_task`、LangGraph checkpoint |
+| 工作记忆 | 当前任务目标、计划、工具观察、草稿、中间状态、最近几轮对话 | 单任务或单会话 | Python Agent state、`agent_task`；LangGraph checkpoint 为后续持久化扩展 |
 | 情景记忆 | 某次任务发生的事实，例如一次 JD 适配暴露 Redis 证据不足、一次模板填充用户拒绝某种表达 | 跨任务，可衰减 | `agent_memory_item` + 来源任务引用 |
 | 语义记忆 | 从多次任务中提炼出的稳定偏好、长期目标、能力画像、资料使用习惯 | 长期，需版本化 | `agent_memory_item` + `agent_memory_embedding` |
 | 程序记忆 | Agent 学到的稳定流程和工具策略，例如 JD 适配固定先查本地 evidence，再按缺口生成计划 | 长期，系统作用域 | 配置化 SOP、`agent_memory_item` 的 `PROCEDURAL` 类型 |

@@ -1,12 +1,12 @@
 # Ragas 小样本 RAG 效果评估方案
 
-更新日期：2026-06-24
+更新日期：2026-07-18
 
 ## 目标
 
 本方案用于验证当前项目的 RAG 闭环：资料入库、递归切块、Multi-Query、BM25 与向量召回、RRF/RAG-Fusion、重排、回答生成和 evidence 引用。评估数据来自本机笔记库 `C:\Users\WhenJayHe\notes\study\八股\llm相关`，首轮规模控制在人工 30 分钟内可核验。
 
-评估不覆盖 Agent 编排、长任务调度、自主规划或工具调用。当前阶段只评估 RAG 管道本身。本轮评估集切换只更新评估数据、评估脚本和 Python 侧测试隔离能力，不修改 Java、前端或生产 RAG 检索算法。
+评估不覆盖 Agent 编排、长任务调度、自主规划或工具调用。当前阶段只评估 RAG 管道本身。2026-07-18 的缺口修复同时调整了确定性融合、本地降级重排和回答准入阈值，因此必须使用 `current` 档真实复验，不能只依赖评估器单元测试。
 
 ## 数据范围
 
@@ -86,7 +86,7 @@ Ragas 测评数据必须写入同一个 PostgreSQL 数据库中带 `Ragas_Test` 
 | `evidences[].snippet` | `retrieved_contexts` | 用于评估的检索上下文，保持原排序 |
 | `reference` | `reference` | 人工参考答案 |
 
-导出的 `ragas_input.jsonl` 还会保留项目辅助字段：`case_id`、`retrieved_context_ids`、`retrieved_document_ids`、`expected_document_ids`。这些字段用于人工核验和离线文档级命中评估，不依赖 Ragas 内置 schema 接收。
+导出的 `ragas_input.jsonl` 还会保留项目辅助字段：`case_id`、`retrieved_context_ids`、`retrieved_document_ids`、`expected_document_ids`。其中 `expected_document_ids` 作为文档级二元 qrels，`retrieved_document_ids` 按 evidence 首次出现顺序去重；这些字段用于人工核验和离线检索排序评估，不依赖 Ragas 内置 schema 接收。
 
 ## 指标选择
 
@@ -95,16 +95,48 @@ Ragas 测评数据必须写入同一个 PostgreSQL 数据库中带 `Ragas_Test` 
 | 指标 | 说明 |
 | --- | --- |
 | 文档级 top1/top3 命中 | 用 `expected_document_ids` 对比返回 evidence 的 `documentId` |
+| 文档级 MRR | 取首个相关文档排名的倒数，再对具有 qrels 的主样本求平均 |
+| 文档级 Recall@1/@3/@5 | 计算 Top-K 中已召回期望文档数占全部期望文档数的比例 |
+| 文档级 NDCG@5 | 按 `expected_document_ids` 的二元相关性计算折损累计增益，衡量相关文档是否排在前面 |
 | 关键点覆盖率 | 用 `expected_answer_points` 与回答文本做粗粒度包含检查 |
 | evidence 引用结构 | 检查回答是否保留可追踪 evidence 引用，且 evidence 有标题、章节、来源和分数 |
 | 边界样本契约 | 检查无关问题、不存在 `documentType` 过滤、低相关误召回、弱 snippet 和 summary child 候选不应返回顶层有效证据 |
 
 边界样本判定规则：
 
-- 新响应优先读取 `answerStatus/refusalReason`。`answerStatus=REFUSED` 且 `evidences=[]` 视为通过，再核对 `refusalReason` 是否落在样本期望范围。
-- 旧响应缺少 `answerStatus` 时，继续按 evidence 数量、最高分和拒答文案做兼容判断。
+- 每条边界样本显式声明 `expected_answer_status`、`expected_refusal_reasons`、`max_evidence_count` 和 `require_no_unexpected_documents`，评估器不再按 `case_id` 硬编码特例。
+- 当前 5 条边界样本都要求 `answerStatus=REFUSED`、`evidences=[]`，并核对 `refusalReason` 是否落在样本允许范围。回答正文即使出现“无法回答”“证据不足”等措辞，也不能覆盖结构化 `ANSWERED` 状态或顶层 evidence 泄漏。
+- 旧响应只有在样本未设置 `requires_structured_response=true` 时，才按 evidence 数量、最高分和拒答文案走兼容判定。
 - `REFUSED` 时弱候选只能出现在 `diagnostics.answerGuard.candidateEvidenceSummaries`，不得出现在顶层 `evidences`。
-- `B02` 仍额外校验 metadataFilter 不泄漏其它 `documentType` 文档。
+- `B02` 要求 `FILTERED_OUT`；`B04/B05` 的目标过滤范围当前可能没有匹配 chunk，因此 `FILTERED_OUT` 是比 `WEAK_SNIPPET` 或 `ONLY_DIAGNOSTIC_CANDIDATES` 更早、也更保守的合法拒答分支。
+
+### 2026-07-18 边界结果复盘
+
+`tmp/ragas-refusal-eval` 中记录的“边界样本通过 3 / 5”混合了一个误放行和两个误拒绝，不能解释为只有 `B04/B05` 存在产品缺陷：
+
+- `B03` 返回了 5 条与烘焙问题无关的 RAG evidence，并调用回答模型生成了带引用的正文。旧评估器仅因正文包含“无法提供”“缺少”等拒答片段而判为通过，掩盖了顶层 evidence 泄漏。
+- `B04/B05` 都返回“当前筛选条件下没有可用证据”，该正文由 `FILTERED_OUT` 分支生成。样本此前未把 `FILTERED_OUT` 列入允许原因，因此两个保守拒答被误判失败。
+- 旧 `offline_scores.csv` 没有保存 `answerStatus`、`refusalReason` 和具体失败检查，且 `run_config.json` 仍显示过期门槛 `boundary_passed: 2 / 2`。新输出会保留这些字段，并按实际样本数显示 `5 / 5`。
+- 10 条主样本在旧输出中都是期望文档排名第 1，因此按新增文档级口径可重建出 MRR、Recall@1/@3/@5、NDCG@5 均为 `1.0`。这主要反映当前“一问对应一篇目标笔记”的简单 qrels，不能替代后续多相关文档和 hard negative 样本。
+
+修复评估口径后，`B03` 必须由 RAG 回答准入链路真正返回结构化拒答才能通过；评测器不再用模糊文案替系统掩盖该问题。
+
+### 2026-07-18 最终 current 复验
+
+使用生产同款 `pgvector + text-embedding-v4 + qwen3-rerank + qwen-plus` 重新索引 10 篇隔离资料并执行 15 条用例，输出目录为本地临时路径 `tmp/ragas-gap-fixes-20260718-final`，结果如下：
+
+| 指标 | 结果 |
+| --- | --- |
+| 主样本 Top-1 / Top-3 | `10 / 10`、`10 / 10` |
+| MRR / Recall@1 / Recall@3 / Recall@5 / NDCG@5 | 全部 `1.0` |
+| evidence 引用结构 | `10 / 10` |
+| 边界样本 | `5 / 5` |
+| 主样本空 evidence | `0` |
+| 离线总门禁 | `offline_passed=true` |
+
+`B03` 的 DashScope rerank Top 分在复验中低于严格准入门槛 `0.55`，最终返回 `answerStatus=REFUSED`、`refusalReason=LOW_CONFIDENCE`、`evidences=[]`。`run_config.json` 同时记录 weighted RRF、通道与查询权重、本地重排权重和回答准入阈值，后续对比必须以这些参数为准。
+
+当前中文关键词覆盖仍使用单字切分并合并 Multi-Query 扩展词，跨域问题可能出现覆盖率虚高；本轮依靠 rerank 绝对分门槛保守拒答。后续扩充 hard negative 和多相关文档 qrels 后，应重新校准 `0.55`，再决定是否升级中文关键词覆盖算法。
 
 真实 Ragas 模式不运行离线命中率、关键点覆盖率或边界样本门槛，只使用生产同款 RAG 输出的回答与上下文执行 4 个 LLM 指标：
 
@@ -248,7 +280,7 @@ PyCharm 的 Parameters 可直接使用：
 | 文件 | 内容 |
 | --- | --- |
 | `ragas_input.jsonl` | Ragas 实际输入，包含问题、回答、上下文、参考答案和项目辅助字段 |
-| `offline_scores.csv` | 仅 `--mode offline` 生成，包含离线文档级命中、引用结构、边界契约和关键点覆盖结果 |
+| `offline_scores.csv` | 仅 `--mode offline` 生成，包含文档级 MRR/Recall/NDCG、命中排名、引用结构、边界状态/原因/失败检查和关键点覆盖结果 |
 | `ragas_scores.csv` | 真实 Ragas LLM 指标结果，仅 `--mode ragas` 生成 |
 | `manual_review.md` | 仅 `--mode offline` 生成，作为人工复核入口、失败原因和下一步建议 |
 | `run_config.json` | 本次 RAG 配置、Ragas 版本、评估模型和汇总结果 |
@@ -265,6 +297,8 @@ PyCharm 的 Parameters 可直接使用：
 | 主样本引用结构合格 | `10 / 10` |
 | 边界样本 | `5 / 5` |
 | 主样本 evidence 为空 | `<= 2` |
+
+MRR、Recall@1/@3/@5 和 NDCG@5 首轮作为可观测基线写入 `offline_scores.csv`、`manual_review.md` 与 `run_config.json`，暂不单独设阻断阈值。当前主样本每条通常只有一个期望文档，样本量也只有 10 条；待扩充多相关文档 qrels 后，再用固定基线差异设置门槛，避免在小样本上制造虚假的高精度结论。
 
 真实 Ragas 模式建议门槛：
 

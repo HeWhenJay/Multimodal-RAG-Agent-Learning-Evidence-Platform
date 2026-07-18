@@ -6,6 +6,21 @@ server:
   port: ${AI_SERVICE_PORT:8090}
   reload: ${AI_SERVICE_RELOAD:true}
 
+rag:
+  # 可按本机数据分布覆盖融合和无百炼时的本地重排权重。
+  fusion:
+    strategy: ${RAG_FUSION_STRATEGY:weighted_rrf}
+    original-query-weight: ${RAG_FUSION_ORIGINAL_QUERY_WEIGHT:1.2}
+    score-blend: ${RAG_FUSION_SCORE_BLEND:0.15}
+  local-rerank:
+    fusion-weight: ${RAG_LOCAL_RERANK_FUSION_WEIGHT:0.40}
+    lexical-weight: ${RAG_LOCAL_RERANK_LEXICAL_WEIGHT:0.35}
+    title-weight: ${RAG_LOCAL_RERANK_TITLE_WEIGHT:0.15}
+    rank-weight: ${RAG_LOCAL_RERANK_RANK_WEIGHT:0.10}
+  # 回答准入默认偏保守；只有评测集证明召回损失可接受时再下调。
+  answer-guard:
+    min-top-score-dashscope: ${RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE:0.55}
+
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}
 

@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import re
+from dataclasses import dataclass
 from urllib.parse import quote, urlencode
 from collections import Counter, defaultdict
 from functools import lru_cache
@@ -56,6 +57,147 @@ TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_DASHSCOPE_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_DASHSCOPE_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_FUSION_STRATEGY = "weighted_rrf"
+DEFAULT_FUSION_RRF_K = 60
+DEFAULT_FUSION_DIAGNOSTIC_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class RankedRetrievalRun:
+    """描述一个查询变体在单个召回通道中的有序结果。"""
+
+    query_index: int
+    retrieval_source: str
+    hits: list[tuple[str, float]]
+
+    @property
+    def query_kind(self) -> str:
+        """区分原始问题和 Multi-Query 扩展问题。"""
+        return "original" if self.query_index == 0 else "expanded"
+
+
+@dataclass(frozen=True)
+class FusionConfig:
+    """保存可解释的确定性融合配置和安全回退信息。"""
+
+    requested_strategy: str
+    strategy: str
+    rrf_k: int
+    bm25_weight: float
+    vector_weight: float
+    original_query_weight: float
+    expanded_query_weight: float
+    score_blend: float
+    diagnostic_limit: int
+    fallback_reason: str | None = None
+    configuration_warnings: tuple[str, ...] = ()
+
+    @classmethod
+    def from_env(cls) -> "FusionConfig":
+        """读取融合环境变量，非法排序权重统一回退到等权 RRF。"""
+        requested_strategy = (os.getenv("RAG_FUSION_STRATEGY") or DEFAULT_FUSION_STRATEGY).strip().lower()
+        warnings: list[str] = []
+        fallback_reasons: list[str] = []
+        strategy = requested_strategy
+        if requested_strategy not in {"weighted_rrf", "rrf"}:
+            strategy = "rrf"
+            fallback_reasons.append(f"未知 RAG_FUSION_STRATEGY: {requested_strategy}")
+
+        rrf_k = read_bounded_int_env(
+            "RAG_FUSION_RRF_K",
+            DEFAULT_FUSION_RRF_K,
+            minimum=1,
+            maximum=10000,
+            warnings=warnings,
+        )
+        diagnostic_limit = read_bounded_int_env(
+            "RAG_FUSION_DIAGNOSTIC_LIMIT",
+            DEFAULT_FUSION_DIAGNOSTIC_LIMIT,
+            minimum=1,
+            maximum=100,
+            warnings=warnings,
+        )
+        weight_warnings: list[str] = []
+        bm25_weight = read_bounded_float_env(
+            "RAG_FUSION_BM25_WEIGHT", 1.0, minimum=0.0, maximum=10.0, warnings=weight_warnings
+        )
+        vector_weight = read_bounded_float_env(
+            "RAG_FUSION_VECTOR_WEIGHT", 1.0, minimum=0.0, maximum=10.0, warnings=weight_warnings
+        )
+        original_query_weight = read_bounded_float_env(
+            "RAG_FUSION_ORIGINAL_QUERY_WEIGHT", 1.2, minimum=0.0, maximum=10.0, warnings=weight_warnings
+        )
+        expanded_query_weight = read_bounded_float_env(
+            "RAG_FUSION_EXPANDED_QUERY_WEIGHT", 1.0, minimum=0.0, maximum=10.0, warnings=weight_warnings
+        )
+        score_blend = read_bounded_float_env(
+            "RAG_FUSION_SCORE_BLEND", 0.15, minimum=0.0, maximum=1.0, warnings=weight_warnings
+        )
+        warnings.extend(weight_warnings)
+        if strategy == "weighted_rrf" and weight_warnings:
+            strategy = "rrf"
+            fallback_reasons.append("融合权重配置非法，已回退等权 RRF")
+        if strategy == "weighted_rrf" and (bm25_weight + vector_weight <= 0 or original_query_weight + expanded_query_weight <= 0):
+            strategy = "rrf"
+            fallback_reasons.append("融合通道权重或查询权重全部为 0，已回退等权 RRF")
+
+        return cls(
+            requested_strategy=requested_strategy,
+            strategy=strategy,
+            rrf_k=rrf_k,
+            bm25_weight=bm25_weight,
+            vector_weight=vector_weight,
+            original_query_weight=original_query_weight,
+            expanded_query_weight=expanded_query_weight,
+            score_blend=score_blend,
+            diagnostic_limit=diagnostic_limit,
+            fallback_reason="；".join(fallback_reasons) or None,
+            configuration_warnings=tuple(warnings),
+        )
+
+    def run_weight(self, run: RankedRetrievalRun) -> float:
+        """计算召回通道权重和查询类型权重的乘积。"""
+        if self.strategy == "rrf":
+            return 1.0
+        channel_weight = self.bm25_weight if run.retrieval_source == "bm25" else self.vector_weight
+        query_weight = self.original_query_weight if run.query_index == 0 else self.expanded_query_weight
+        return channel_weight * query_weight
+
+    def public_config(self) -> dict[str, float]:
+        """返回可写入查询诊断的融合权重。"""
+        return {
+            "bm25Weight": round(self.bm25_weight, 6),
+            "vectorWeight": round(self.vector_weight, 6),
+            "originalQueryWeight": round(self.original_query_weight, 6),
+            "expandedQueryWeight": round(self.expanded_query_weight, 6),
+            "scoreBlend": round(self.score_blend, 6),
+        }
+
+
+@dataclass(frozen=True)
+class FusionResult:
+    """保存融合排序结果和不含正文的可观测诊断。"""
+
+    ranked_hits: list[tuple[str, float]]
+    config: FusionConfig
+    input_runs: list[dict[str, Any]]
+    candidate_details: list[dict[str, Any]]
+
+    def diagnostics(self) -> dict[str, Any]:
+        """返回可直接合并到 QueryResponse.diagnostics 的字段。"""
+        result: dict[str, Any] = {
+            "fusionRequestedStrategy": self.config.requested_strategy,
+            "fusionStrategy": self.config.strategy,
+            "fusionRrfK": self.config.rrf_k,
+            "fusionConfig": self.config.public_config(),
+            "fusionInputRuns": self.input_runs,
+            "fusionCandidateDetails": self.candidate_details,
+        }
+        if self.config.fallback_reason:
+            result["fusionFallbackReason"] = self.config.fallback_reason
+        if self.config.configuration_warnings:
+            result["fusionConfigurationWarnings"] = list(self.config.configuration_warnings)
+        return result
 
 
 class InMemoryRagStore:
@@ -302,7 +444,7 @@ class InMemoryRagStore:
             percent=24,
             detail=format_metadata_filter_plan(filter_plan, total_count=len(scoped_chunks), filtered_count=len(filtered_chunks)),
         )
-        ranked_lists: list[list[tuple[str, float]]] = []
+        ranked_runs: list[RankedRetrievalRun] = []
         diagnostics: dict[str, Any] = {
             "expandedQueries": expanded_queries,
             **query_expansion.diagnostics(),
@@ -312,10 +454,10 @@ class InMemoryRagStore:
         }
 
         candidate_budget = max(request.topK * request.candidateMultiplier, 20)
-        for query_text in expanded_queries:
+        for query_index, query_text in enumerate(expanded_queries):
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=8, percent=30)
             bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=candidate_budget)
-            ranked_lists.append(bm25_hits)
+            ranked_runs.append(RankedRetrievalRun(query_index, "bm25", bm25_hits))
             progress_reporter.emit(
                 "query.bm25",
                 f"BM25 召回完成：{query_text}，命中 {len(bm25_hits)} 条",
@@ -327,7 +469,7 @@ class InMemoryRagStore:
             )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=8, percent=45)
             vector_hits = self._vector_search(query_text, filtered_chunks, limit=candidate_budget)
-            ranked_lists.append(vector_hits)
+            ranked_runs.append(RankedRetrievalRun(query_index, "vector", vector_hits))
             progress_reporter.emit(
                 "query.vector",
                 f"向量召回完成：{query_text}，命中 {len(vector_hits)} 条",
@@ -338,10 +480,11 @@ class InMemoryRagStore:
                 detail=format_ranked_hits(vector_hits, lambda chunk_id: self._to_evidence(chunk_id, 0.0, retrieval_source="vector")),
             )
 
-        progress_reporter.emit("query.fusion", "正在执行 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=8, percent=62)
-        fused = reciprocal_rank_fusion(ranked_lists)
+        progress_reporter.emit("query.fusion", "正在执行可配置的确定性 RRF/RAG-Fusion 融合排序", current_step=5, total_steps=8, percent=62)
+        fusion_result = fuse_ranked_runs(ranked_runs)
+        diagnostics.update(fusion_result.diagnostics())
         diagnostics["candidateBudget"] = candidate_budget
-        candidates = fused[:candidate_budget]
+        candidates = fusion_result.ranked_hits[:candidate_budget]
         candidate_evidences = [
             self._to_evidence(chunk_id, score, retrieval_source="fusion")
             for chunk_id, score in candidates
@@ -363,7 +506,7 @@ class InMemoryRagStore:
         diagnostics.update(parent_aggregated.diagnostics())
         progress_reporter.emit(
             "query.fusion",
-            f"RAG-Fusion 完成：融合 {len(ranked_lists)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
+            f"RAG-Fusion 完成：策略 {fusion_result.config.strategy}，融合 {len(ranked_runs)} 个召回列表，父段聚合后得到 {len(candidate_evidences)} 个候选",
             status="COMPLETED",
             current_step=5,
             total_steps=8,
@@ -903,12 +1046,160 @@ def format_evidence_titles(evidences: list[Evidence], *, limit: int = 5) -> str:
     return "；".join(lines)
 
 
+def fuse_ranked_runs(
+    runs: list[RankedRetrievalRun],
+    config: FusionConfig | None = None,
+) -> FusionResult:
+    """融合带通道信息的召回列表，并保留原始 score/rank 贡献。"""
+    resolved_config = config or FusionConfig.from_env()
+    fused_scores: dict[str, float] = defaultdict(float)
+    best_ranks: dict[str, int] = {}
+    contributions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    input_runs: list[dict[str, Any]] = []
+
+    for run in runs:
+        raw_scores = [finite_score(score) for _chunk_id, score in run.hits]
+        normalized_scores = normalize_run_scores(raw_scores)
+        run_weight = resolved_config.run_weight(run)
+        input_runs.append(
+            {
+                "queryIndex": run.query_index,
+                "queryKind": run.query_kind,
+                "retrievalSource": run.retrieval_source,
+                "hitCount": len(run.hits),
+                "runWeight": round(run_weight, 6),
+                "rawScoreMin": round(min(raw_scores), 6) if raw_scores else 0.0,
+                "rawScoreMax": round(max(raw_scores), 6) if raw_scores else 0.0,
+            }
+        )
+        for rank, ((chunk_id, raw_score), normalized_score) in enumerate(
+            zip(run.hits, normalized_scores),
+            start=1,
+        ):
+            rank_contribution = 1.0 / (resolved_config.rrf_k + rank)
+            if resolved_config.strategy == "weighted_rrf":
+                contribution = run_weight * rank_contribution * (1.0 + resolved_config.score_blend * normalized_score)
+            else:
+                contribution = rank_contribution
+            contributions[chunk_id].append(
+                {
+                    "queryIndex": run.query_index,
+                    "queryKind": run.query_kind,
+                    "retrievalSource": run.retrieval_source,
+                    "rank": rank,
+                    "rawScore": round(finite_score(raw_score), 6),
+                    "normalizedScore": round(normalized_score, 6),
+                    "runWeight": round(run_weight, 6),
+                    "contribution": round(contribution, 6),
+                }
+            )
+            if contribution <= 0:
+                continue
+            fused_scores[chunk_id] += contribution
+            best_ranks[chunk_id] = min(best_ranks.get(chunk_id, rank), rank)
+
+    ranked_hits = sorted(
+        ((chunk_id, score) for chunk_id, score in fused_scores.items()),
+        key=lambda item: (-item[1], best_ranks.get(item[0], 10**9), item[0]),
+    )
+    candidate_details = [
+        {
+            "chunkId": chunk_id,
+            "fusedScore": round(score, 6),
+            "bestRank": best_ranks.get(chunk_id),
+            "contributions": contributions[chunk_id],
+        }
+        for chunk_id, score in ranked_hits[: resolved_config.diagnostic_limit]
+    ]
+    return FusionResult(
+        ranked_hits=[(chunk_id, round(score, 12)) for chunk_id, score in ranked_hits],
+        config=resolved_config,
+        input_runs=input_runs,
+        candidate_details=candidate_details,
+    )
+
+
 def reciprocal_rank_fusion(ranked_lists: list[list[tuple[str, float]]], k: int = 60) -> list[tuple[str, float]]:
+    """保留旧等权 RRF 契约，供 Agent Memory 和融合降级路径使用。"""
+    safe_k = max(1, int(k or DEFAULT_FUSION_RRF_K))
     scores: dict[str, float] = defaultdict(float)
+    best_ranks: dict[str, int] = {}
     for ranked in ranked_lists:
         for rank, (chunk_id, _score) in enumerate(ranked, start=1):
-            scores[chunk_id] += 1.0 / (k + rank)
-    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            scores[chunk_id] += 1.0 / (safe_k + rank)
+            best_ranks[chunk_id] = min(best_ranks.get(chunk_id, rank), rank)
+    return sorted(
+        scores.items(),
+        key=lambda item: (-item[1], best_ranks.get(item[0], 10**9), item[0]),
+    )
+
+
+def normalize_run_scores(scores: list[float]) -> list[float]:
+    """在单个召回列表内归一化原始分，避免 BM25 和向量量纲互相污染。"""
+    if not scores:
+        return []
+    minimum = min(scores)
+    maximum = max(scores)
+    if maximum > minimum:
+        return [(score - minimum) / (maximum - minimum) for score in scores]
+    if maximum > 0:
+        return [1.0 for _score in scores]
+    return [0.0 for _score in scores]
+
+
+def finite_score(value: Any) -> float:
+    """把召回分安全转换为有限浮点数。"""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
+def read_bounded_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+    warnings: list[str],
+) -> float:
+    """读取有界浮点环境变量，非法值使用默认值并保留诊断。"""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        warnings.append(f"{name} 不是有效数字，已使用默认值 {default}")
+        return default
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        warnings.append(f"{name} 超出范围 {minimum}-{maximum}，已使用默认值 {default}")
+        return default
+    return value
+
+
+def read_bounded_int_env(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+    warnings: list[str],
+) -> int:
+    """读取有界整数环境变量，非法值使用默认值并保留诊断。"""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        warnings.append(f"{name} 不是有效整数，已使用默认值 {default}")
+        return default
+    if value < minimum or value > maximum:
+        warnings.append(f"{name} 超出范围 {minimum}-{maximum}，已使用默认值 {default}")
+        return default
+    return value
 
 
 def chunk_percent(index: int, total: int, start: int, end: int) -> int:
