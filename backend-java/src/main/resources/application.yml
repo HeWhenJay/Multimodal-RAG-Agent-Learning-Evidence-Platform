@@ -90,9 +90,9 @@ evidence:
         result-writers: rag-java-result-writers
         promote-result-writers: rag-java-promote-result-writers
         dlq-writers: rag-java-dlq-writers
-        outbox:
-          publisher-enabled: ${EVIDENCE_RAG_KAFKA_OUTBOX_PUBLISHER_ENABLED:true}
-          batch-size: ${EVIDENCE_RAG_OUTBOX_BATCH_SIZE:50}
+      outbox:
+        publisher-enabled: ${EVIDENCE_RAG_KAFKA_OUTBOX_PUBLISHER_ENABLED:true}
+        batch-size: ${EVIDENCE_RAG_OUTBOX_BATCH_SIZE:50}
         lease-seconds: ${EVIDENCE_RAG_OUTBOX_LEASE_SECONDS:60}
         publish-fixed-delay-ms: ${EVIDENCE_RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS:1000}
         max-attempts: ${EVIDENCE_RAG_OUTBOX_MAX_ATTEMPTS:8}
