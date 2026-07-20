@@ -1,5 +1,8 @@
+import os
+
 from run import (
     agent_worker_enabled,
+    apply_runtime_mode_overrides,
     build_env_defaults,
     cron_enabled,
     kafka_enabled,
@@ -177,6 +180,22 @@ def test_kafka_and_agent_worker_switches_follow_cli_then_configuration(monkeypat
     assert kafka_enabled(parse_args(["--without-kafka"])) is False
     assert agent_worker_enabled(parse_args(["--with-agent-worker"])) is True
     assert agent_worker_enabled(parse_args(["--without-agent-worker"])) is False
+
+
+def test_kafka_cli_switch_also_overrides_rag_delivery_mode(monkeypatch):
+    """避免关闭 Kafka worker 后仍创建无人消费的 KAFKA 索引任务。"""
+    monkeypatch.setenv("RAG_KAFKA_ENABLED", "true")
+    monkeypatch.setenv("AI_KAFKA_WORKER_ENABLED", "true")
+
+    apply_runtime_mode_overrides(parse_args(["--without-kafka"]))
+
+    assert os.getenv("RAG_KAFKA_ENABLED") == "false"
+    assert os.getenv("AI_KAFKA_WORKER_ENABLED") == "false"
+
+    apply_runtime_mode_overrides(parse_args(["--with-kafka"]))
+
+    assert os.getenv("RAG_KAFKA_ENABLED") == "true"
+    assert os.getenv("AI_KAFKA_WORKER_ENABLED") == "true"
 
 
 def test_rag_task_worker_switches_follow_cli_then_configuration(monkeypatch):

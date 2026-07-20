@@ -463,6 +463,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     """启动 FastAPI，并监督已启用的 Python 耐久 worker。"""
     args = parse_args(argv)
     load_runtime_config(args)
+    apply_runtime_mode_overrides(args)
     if args.bootstrap_database:
         from app.core.database_bootstrap import bootstrap_database
 
@@ -517,6 +518,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     finally:
         for process in reversed(managed_processes):
             process.stop()
+
+
+def apply_runtime_mode_overrides(args: argparse.Namespace) -> None:
+    """让 Kafka 命令行开关同时约束任务投递模式与消费 worker。"""
+    if args.with_kafka:
+        os.environ["RAG_KAFKA_ENABLED"] = "true"
+        os.environ["AI_KAFKA_WORKER_ENABLED"] = "true"
+    elif args.without_kafka:
+        os.environ["RAG_KAFKA_ENABLED"] = "false"
+        os.environ["AI_KAFKA_WORKER_ENABLED"] = "false"
 
 
 def cron_enabled(args: argparse.Namespace) -> bool:

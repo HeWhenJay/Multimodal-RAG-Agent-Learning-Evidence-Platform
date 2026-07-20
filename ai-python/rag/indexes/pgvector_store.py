@@ -798,7 +798,7 @@ class PgVectorRagStore:
                             document["language"],
                             document["parser"],
                             document["document_summary"],
-                            document["section_summaries"],
+                            Json(ensure_dict(document["section_summaries"])),
                             staging_count,
                         ),
                     )

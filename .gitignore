@@ -17,6 +17,9 @@ GEMINI.md
 # Logs
 *.log
 logs/
+# `ai-python/app/logs` 是 Python 业务源码，不是运行日志目录。
+!ai-python/app/logs/
+!ai-python/app/logs/**
 
 # Java
 target/

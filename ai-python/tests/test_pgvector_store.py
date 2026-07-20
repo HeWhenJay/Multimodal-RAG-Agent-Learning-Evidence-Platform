@@ -243,6 +243,57 @@ def test_pgvector_promote_rejects_lower_request_version(monkeypatch):
         )
 
 
+def test_pgvector_promote_adapts_section_summaries_to_jsonb(monkeypatch):
+    """staging 读出的 JSONB 字典必须适配后才能重新写入 canonical。"""
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+
+    class PromoteCursor(FakeCursor):
+        def fetchone(self):
+            return {
+                "title": "提升资料",
+                "document_type": "markdown",
+                "source": "unit-test",
+                "user_id": "unit-user",
+                "language": "zh-CN",
+                "parser": "unit-parser",
+                "document_summary": "摘要",
+                "section_summaries": {"全文": "章节摘要"},
+            }
+
+    cursor = PromoteCursor(
+        rows=[
+            {
+                "chunk_id": "material-1__job-job-1-0",
+                "chunk_position": 0,
+                "section_name": "全文",
+                "text": "用于验证 JSONB 适配的切块。",
+                "metadata": {"chunkPosition": 0},
+                "term_counts": {"验证": 1},
+                "token_count": 5,
+                "embedding": "[0.1,0.2]",
+            }
+        ]
+    )
+    connection = FakeConnection(cursor)
+    counts = iter([1, 0, 1])
+    monkeypatch.setattr(store, "_connect", lambda: connection)
+    monkeypatch.setattr(store, "_count_document_chunks", lambda _document_id: next(counts))
+    monkeypatch.setattr(store, "_first_chunk_metadata", lambda _document_id: {})
+    monkeypatch.setattr(store, "_json_adapter", lambda: (lambda value: {"adapted": value}))
+
+    result = store.promote_staged_index(
+        canonical_document_id="material-1",
+        staging_document_id="material-1__job-job-1",
+        job_id="job-1",
+        request_version=1,
+        expected_chunk_count=1,
+    )
+
+    document_insert = next(params for sql, params in cursor.executed if "INSERT INTO" in sql and "rag_document" in sql)
+    assert document_insert[8] == {"adapted": {"全文": "章节摘要"}}
+    assert result == {"alreadyPromoted": False, "canonicalChunkCount": 1, "stagingChunkCount": 1}
+
+
 def test_pgvector_cleanup_staging_indexes_uses_retention_windows(monkeypatch):
     """过期 staging 清理只处理 job staging 文档，并区分成功和失败保留期。"""
     store = PgVectorRagStore("postgresql://unused", ensure_schema=False)

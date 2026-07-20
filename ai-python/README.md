@@ -110,7 +110,7 @@ $env:AI_KAFKA_WORKER_ENABLED='true'
 conda run -n learning-evidence-rag python -B ai-python/run.py
 ```
 
-可使用 `--without-cron`、`--without-kafka`、`--without-agent-worker` 或 `--without-rag-worker` 做本地排障；`--with-*` 参数可以临时覆盖 YAML 开关。`app.workers.kafka_worker` 是正式 Kafka 入口，`ai-python/run_kafka_worker.py` 仅保留兼容转发。
+可使用 `--without-cron`、`--without-kafka`、`--without-agent-worker` 或 `--without-rag-worker` 做本地排障；`--with-*` 参数可以临时覆盖 YAML 开关。`--without-kafka` 会同时关闭 Kafka 投递模式，资料任务自动改由 PostgreSQL `LOCAL` durable worker 执行；`--with-kafka` 会同时启用 Kafka 投递和 worker。`app.workers.kafka_worker` 是正式 Kafka 入口，`ai-python/run_kafka_worker.py` 仅保留兼容转发。
 
 ## 目录结构
 

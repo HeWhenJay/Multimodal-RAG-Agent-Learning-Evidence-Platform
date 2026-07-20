@@ -24,6 +24,10 @@
   worker 消费 request、progress、result、promote result 和 DLQ，并把终态回写 PostgreSQL。
   `RAG_KAFKA_ENABLED=false` 时，`app.workers.rag_task_worker` 从 PostgreSQL 抢占 `LOCAL` 索引任务，
   执行同一 staging/promote 状态机。两种模式都不依赖 Java HTTP、Java source API 或 Java callback。
+- `python run.py --without-kafka` 是一次启动期的完整 local-mode 覆盖：它会同时将
+  `RAG_KAFKA_ENABLED` 与 `AI_KAFKA_WORKER_ENABLED` 置为 `false`，使 API 创建 `LOCAL` 任务并由
+  `rag_task_worker` 消费，不能出现“任务投递到 Kafka 但 Kafka worker 未启动”的悬挂状态。相反，
+  `--with-kafka` 会同时启用 Kafka 投递模式和 Kafka worker。
 - `POST /api/rag/query/tasks` 在同一事务内写入 `rag_query_history` 和 `rag_query_task`，返回
   `RUNNING`。查询 worker 使用租约抢占任务，进程异常后由租约过期重试；每个阶段事件、最终回答、
   evidence、answer guard 和失败摘要均回写 PostgreSQL。`GET /api/rag/query/tasks/{taskId}` 只读取
