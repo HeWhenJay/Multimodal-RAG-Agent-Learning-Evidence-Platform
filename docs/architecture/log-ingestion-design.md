@@ -2,6 +2,16 @@
 
 更新日期：2026-06-16
 
+> 当前运行契约：日志由 Python FastAPI `/api/logs/*` 接收、脱敏并写入 PostgreSQL；React 直接通过 Vite 代理访问 Python 8090。本文其余 Java Controller、Java callback 和 H2 内容是迁移前历史设计，仅供追溯，不是当前启动依赖。
+
+## 当前纯 Python 实现
+
+- 单条、批量事件和错误接口位于 `ai-python/app/api/logs.py`，统一返回 `{code,msg,data}`。
+- RAG、Agent 和前端日志均通过进程内 `LogService`/repository 写入 `learning_evidence.log_event` 与 `log_error`，不发 HTTP callback。
+- PostgreSQL 是日志查询和 fingerprint 聚合的权威来源；写入失败只记录本地告警，不遮蔽主业务响应。
+
+## 迁移前历史设计
+
 ## 1. 设计目标
 
 本设计面向“学迹智配 Agent：基于 RAG 的多模态学习证据库与岗位适配系统”的当前阶段。当前阶段只完成 RAG 闭环，不引入 Agent 编排、长任务调度、自主规划或工具调用。

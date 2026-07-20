@@ -58,7 +58,7 @@ python -m pip install -r ai-python/requirements.txt
 | --- | --- | --- |
 | 当前项目链路 | `--rag-profile current` | 默认且唯一档位。加载 `ai-python/config/application.yml`，并强制使用生产同款 PostgreSQL/pgvector、DashScope `text-embedding-v4`、`qwen3-rerank` 和 `qwen-plus` |
 
-脚本使用 FastAPI `TestClient` 直接调用 Python 内部接口，不启动 Java、前端或真实 `uvicorn`。索引使用 `/internal/rag/documents/index-text`，查询使用 `/internal/rag/query`。
+脚本使用独立的 FastAPI `TestClient` 评估应用直接调用历史评估路由，不启动 Java、前端或真实 `uvicorn`；这些 `/internal/rag/*` 路径不会注册到生产 `app.main`，也不是公开运行契约。索引使用 `/internal/rag/documents/index-text`，查询使用 `/internal/rag/query`。
 
 `current` 档位在导入 FastAPI app 前完成测试隔离配置：
 

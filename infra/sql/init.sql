@@ -12,6 +12,7 @@ DROP TABLE IF EXISTS learning_evidence.rag_document;
 DROP TABLE IF EXISTS learning_evidence.rag_consumed_event;
 DROP TABLE IF EXISTS learning_evidence.rag_outbox_event;
 DROP TABLE IF EXISTS learning_evidence.rag_index_job;
+DROP TABLE IF EXISTS learning_evidence.rag_query_task;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_audit;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_version;
 DROP TABLE IF EXISTS learning_evidence.agent_memory_embedding;
@@ -168,6 +169,10 @@ CREATE TABLE learning_evidence.rag_index_job (
     attempt INTEGER NOT NULL DEFAULT 0,
     request_json TEXT NOT NULL DEFAULT '{}',
     result_json TEXT NOT NULL DEFAULT '{}',
+    delivery_mode VARCHAR(16) NOT NULL DEFAULT 'KAFKA',
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lease_until TIMESTAMPTZ,
+    locked_by VARCHAR(120),
     error_code VARCHAR(120),
     error_message VARCHAR(1000),
     requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -185,6 +190,9 @@ CREATE INDEX idx_rag_index_job_material_status
 
 CREATE INDEX idx_rag_index_job_document
     ON learning_evidence.rag_index_job(canonical_document_id, request_version);
+
+CREATE INDEX idx_rag_index_job_local_claim
+    ON learning_evidence.rag_index_job(delivery_mode, status, next_attempt_at, lease_until, requested_at);
 
 CREATE TABLE learning_evidence.rag_outbox_event (
     id BIGSERIAL PRIMARY KEY,
@@ -259,6 +267,31 @@ CREATE INDEX idx_rag_query_history_user_created
 
 CREATE INDEX idx_rag_query_history_status
     ON learning_evidence.rag_query_history(status);
+
+CREATE TABLE learning_evidence.rag_query_task (
+    id VARCHAR(120) PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    query_history_id BIGINT NOT NULL REFERENCES learning_evidence.rag_query_history(id) ON DELETE CASCADE,
+    status VARCHAR(30) NOT NULL DEFAULT 'REQUESTED',
+    request_json TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lease_until TIMESTAMPTZ,
+    locked_by VARCHAR(120),
+    expires_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    error_message VARCHAR(1000),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_rag_query_task_history UNIQUE (query_history_id)
+);
+
+CREATE INDEX idx_rag_query_task_claim
+    ON learning_evidence.rag_query_task(status, next_attempt_at, lease_until, expires_at, created_at);
+
+CREATE INDEX idx_rag_query_task_user
+    ON learning_evidence.rag_query_task(user_id, created_at DESC);
 
 CREATE TABLE learning_evidence.log_event (
     id BIGSERIAL PRIMARY KEY,

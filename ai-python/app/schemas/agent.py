@@ -7,11 +7,11 @@ AgentTaskType = Literal["pure_read_query", "planning_task", "mutation_task"]
 
 
 class AgentTaskStartRequest(BaseModel):
+    """Worker 提交给统一图的本地任务快照，不包含跨服务地址或内部令牌。"""
+
     taskId: str = Field(..., min_length=1)
     taskType: AgentTaskType
     input: dict[str, Any] = Field(default_factory=dict)
-    callbackUrl: str = Field(..., min_length=1)
-    javaToolGatewayBaseUrl: str = Field(..., min_length=1)
     threadId: str | None = None
 
 
@@ -25,11 +25,11 @@ class AgentTaskStartResponse(BaseModel):
 
 
 class AgentTaskResumeRequest(BaseModel):
+    """Worker 从持久化审批恢复统一图所需的最小数据。"""
+
     taskId: str = Field(..., min_length=1)
     taskType: AgentTaskType
     input: dict[str, Any] = Field(default_factory=dict)
-    callbackUrl: str = Field(..., min_length=1)
-    javaToolGatewayBaseUrl: str = Field(..., min_length=1)
     threadId: str | None = None
     reviewType: str
     decision: str

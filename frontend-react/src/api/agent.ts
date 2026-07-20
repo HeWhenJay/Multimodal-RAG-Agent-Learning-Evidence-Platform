@@ -188,7 +188,7 @@ export function createAgentMemory(payload: AgentMemoryCreatePayload): Promise<Ag
   });
 }
 
-// 二次确认待审记忆，成功后由 Java 触发 Python 索引。
+// 二次确认待审记忆，成功后由 Python 后端进入索引流程。
 export function confirmAgentMemory(memoryId: string): Promise<AgentMemory> {
   return request<AgentMemory>(`/api/agent/memories/${memoryId}/confirm`, {
     method: 'POST'

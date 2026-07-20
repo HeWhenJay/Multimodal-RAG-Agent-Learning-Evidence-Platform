@@ -38,6 +38,35 @@ Get-Content infra\sql\init.sql -Encoding UTF8 |
   psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 ```
 
+## 纯 Python 非破坏性初始化
+
+`infra/sql/init.sql` 是可审计的重建快照，直接执行会先 `DROP TABLE`，只适合明确
+允许清空数据的临时环境。纯 Python 后端提供了安全 bootstrap 入口：它运行时读取
+同一份 `init.sql`，跳过全部 `DROP`，并把 `CREATE TABLE/INDEX` 转换为
+`IF NOT EXISTS`；默认管理员种子在账号已存在时使用 `DO NOTHING`，不会覆盖已有密码。
+
+在仓库根目录执行 dry-run（不连接数据库）：
+
+```powershell
+$env:PYTHONPATH='ai-python'
+conda run -n learning-evidence-rag python -B -m app.core.database_bootstrap --dry-run
+```
+
+确认输出后，对空 PostgreSQL/pgvector 数据库执行：
+
+```powershell
+$env:PYTHONPATH='ai-python'
+$env:RAG_DATABASE_URL='postgresql://postgres:123456@127.0.0.1:5433/postgres?options=-csearch_path%3Dlearning_evidence%2Cpublic'
+conda run -n learning-evidence-rag python -B -m app.core.database_bootstrap
+```
+
+初始化事务失败会回滚；初始化完成后默认会调用 Python 的非破坏性增量迁移记录。
+已有数据库不会执行删除操作，但 bootstrap 不是通用 schema 升级器：旧库仍应先按
+`infra/sql/alter-database/` 的迁移记录升级，生产环境不要直接执行破坏性快照。
+
+如需审计转换后的 SQL，可附加 `--print-sql`；如需跳过增量迁移，使用
+`--skip-incremental-migrations`。
+
 Python RAG 启动环境变量：
 
 ```powershell

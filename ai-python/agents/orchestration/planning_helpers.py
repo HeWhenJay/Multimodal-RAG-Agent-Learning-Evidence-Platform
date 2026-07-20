@@ -4,17 +4,17 @@ import re
 import uuid
 from typing import Any
 
-from agents.gateway.java_gateway import JavaAgentGatewayClient
+from agents.gateway.local_gateway import AgentGateway
 from agents.orchestration.read_only_helpers import text_value, tool_observation_summary
 from app.schemas.agent import AgentTaskEvent, AgentTaskResumeRequest, AgentTaskStartResponse, AgentToolCallEvent
 
 
 def execute_approved_mutation(
     request: AgentTaskResumeRequest,
-    client: JavaAgentGatewayClient,
+    client: AgentGateway,
     thread_id: str,
 ) -> AgentTaskStartResponse:
-    """CRUD 审批通过后调用 Java 变更网关执行保存类操作。"""
+    """CRUD 审批通过后调用本地变更网关执行保存类操作。"""
     payload = build_mutation_payload(request)
     result = client.execute_mutation_tool(payload)
     status = str(result.get("status") or "FAILED")
@@ -81,7 +81,7 @@ def should_request_crud_review(task_input: dict[str, Any]) -> bool:
 
 
 def build_mutation_payload(request: AgentTaskResumeRequest) -> dict[str, Any]:
-    """根据 CRUD 审批决策构造 Java mutation gateway 请求。"""
+    """根据 CRUD 审批决策构造本地 mutation gateway 请求。"""
     tool_name = text_value(request.decisionPayload.get("toolName")) or mutation_tool_name(request.input)
     review_id = text_value(request.decisionPayload.get("reviewId")) or f"review-crud-{request.taskId}"
     idempotency_key = text_value(request.decisionPayload.get("idempotencyKey")) or mutation_idempotency_key(request, tool_name)

@@ -33,3 +33,4 @@ psycopg[binary]>=3.2,<4.0
 PyYAML>=6.0,<7.0
 ragas>=0.4,<0.5
 confluent-kafka>=2.5,<3.0
+oss2>=2.18,<3.0

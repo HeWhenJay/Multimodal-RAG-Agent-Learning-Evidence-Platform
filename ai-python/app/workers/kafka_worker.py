@@ -9,7 +9,9 @@ import hashlib
 from typing import Callable
 
 from app.core.runtime_config import load_runtime_config, parse_args
+from app.repositories.rag_job import RagJobRepository
 from app.schemas.kafka import KafkaEnvelope
+from app.workers.rag_kafka_state import RagKafkaStateWriter
 from rag.kafka.producer import KafkaJsonProducer, build_envelope
 from rag.kafka.worker import RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady
 
@@ -19,11 +21,13 @@ class KafkaWorkerConnectionError(RuntimeError):
 
 
 def main() -> None:
-    """启动 RAG Kafka worker，默认同时处理 index 和 promote 请求。"""
+    """启动 Python-only RAG Kafka worker，处理索引及全部 PostgreSQL 状态回写。"""
     load_runtime_config(parse_args(None))
     if os.getenv("RAG_KAFKA_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         raise RuntimeError("RAG_KAFKA_ENABLED 未开启，已拒绝启动 Kafka worker")
-    index_worker = RagKafkaIndexWorker()
+    job_repository = RagJobRepository()
+    state_writer = RagKafkaStateWriter(repository=job_repository)
+    index_worker = RagKafkaIndexWorker(job_repository=job_repository)
     promote_worker = RagKafkaPromoteWorker(producer=index_worker.producer)
     retry_scheduler = RagKafkaRetryScheduler(producer=index_worker.producer)
     run_consumer_forever(
@@ -33,6 +37,10 @@ def main() -> None:
             os.getenv("RAG_KAFKA_TOPIC_INDEX_RETRY_1M", "rag.material.index.retry.1m.v1"): retry_scheduler.handle_envelope,
             os.getenv("RAG_KAFKA_TOPIC_INDEX_RETRY_10M", "rag.material.index.retry.10m.v1"): retry_scheduler.handle_envelope,
             os.getenv("RAG_KAFKA_TOPIC_INDEX_RETRY_1H", "rag.material.index.retry.1h.v1"): retry_scheduler.handle_envelope,
+            os.getenv("RAG_KAFKA_TOPIC_PROGRESS", "rag.material.index.progress.v1"): state_writer.handle_progress,
+            os.getenv("RAG_KAFKA_TOPIC_INDEX_RESULT", "rag.material.index.result.v1"): state_writer.handle_index_result,
+            os.getenv("RAG_KAFKA_TOPIC_PROMOTE_RESULT", "rag.material.index.promote.result.v1"): state_writer.handle_promote_result,
+            os.getenv("RAG_KAFKA_TOPIC_INDEX_DLQ", "rag.material.index.dlq.v1"): state_writer.handle_dlq,
         }
     )
 
@@ -113,6 +121,9 @@ def run_consumer_loop(handlers: dict[str, Callable[[KafkaEnvelope], object]]) ->
                 continue
             except Exception as exc:
                 if is_connection_exception(exc):
+                    raise KafkaWorkerConnectionError(str(exc)) from exc
+                if topic == os.getenv("RAG_KAFKA_TOPIC_INDEX_DLQ", "rag.material.index.dlq.v1"):
+                    # DLQ 写回失败不能再投递回同一 DLQ，保留原 offset 等待数据库恢复。
                     raise KafkaWorkerConnectionError(str(exc)) from exc
                 try:
                     publish_consumer_dlq(dead_letter_producer, message, exc, envelope)

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
-
+from app.repositories.rag_job import RagJobRepository
 from app.schemas.kafka import (
     IndexRequestPayload,
     KafkaEnvelope,
     PromoteRequestPayload,
+)
+from app.storage.object_storage import (
+    OpenedStorageObject,
+    RagObjectStorage,
+    download_storage_source,
 )
 from app.schemas.rag import IndexResponse
 from rag.loaders.document_parsers import DocumentParserRouter
@@ -31,6 +34,8 @@ class RagKafkaIndexWorker:
         parser_router: DocumentParserRouter | None = None,
         producer: KafkaJsonProducer | None = None,
         progress_producer: KafkaProgressProducer | None = None,
+        job_repository: RagJobRepository | None = None,
+        object_storage: RagObjectStorage | None = None,
     ) -> None:
         if parser_router is None:
             from rag.loaders.mineru_loader import MineruDocumentLoader
@@ -40,6 +45,8 @@ class RagKafkaIndexWorker:
         self.parser_router = parser_router
         self.producer = producer or KafkaJsonProducer()
         self.progress_producer = progress_producer or KafkaProgressProducer(self.producer)
+        self.job_repository = job_repository
+        self.object_storage = object_storage
         self.result_topic = os.getenv("RAG_KAFKA_TOPIC_INDEX_RESULT", "rag.material.index.result.v1")
         self.dlq_topic = os.getenv("RAG_KAFKA_TOPIC_INDEX_DLQ", "rag.material.index.dlq.v1")
         self.retry_topics = {
@@ -57,6 +64,13 @@ class RagKafkaIndexWorker:
     def handle_envelope(self, envelope: KafkaEnvelope) -> IndexResponse | dict[str, Any]:
         """处理一条索引请求，发送成功或失败结果后再允许 caller 提交 offset。"""
         payload = IndexRequestPayload.model_validate(envelope.payload)
+        if self.job_repository is not None and not self.job_repository.mark_index_processing(
+            payload.materialId,
+            payload.jobId,
+            payload.requestVersion,
+        ):
+            # active job 已改变时不写 staging，offset 可以安全提交。
+            return {"status": "STALE_IGNORED", "jobId": payload.jobId}
         try:
             result = self._index_to_staging(payload)
             self._send_result(envelope, payload, result)
@@ -103,7 +117,11 @@ class RagKafkaIndexWorker:
             )
             source_path = None
         else:
-            downloaded = download_java_source(payload.sourceRef, payload.jobId, payload.requestVersion)
+            downloaded = open_storage_source(
+                payload.sourceRef,
+                user_id=payload.userId,
+                object_storage=self.object_storage,
+            )
             source_path = downloaded.source_path
             try:
                 filename = downloaded.filename or payload.title
@@ -122,14 +140,14 @@ class RagKafkaIndexWorker:
                         progress_reporter=progress,
                     )
                 else:
-                    parsed = self.parser_router.parse_bytes(
-                        content=downloaded.path.read_bytes(),
+                    parsed = self.parser_router.parse_file(
+                        source_path=str(downloaded.path),
                         filename=filename,
                         document_id=payload.stagingDocumentId,
                         source_title=payload.title,
                         document_type=payload.documentType,
                         content_type=downloaded.content_type,
-                        source_path=downloaded.source_path,
+                        source_reference=downloaded.source_path,
                         high_precision=payload.highPrecision,
                         progress_reporter=progress,
                     )
@@ -361,7 +379,7 @@ class RagKafkaPromoteWorker:
     ) -> None:
         self.store = store or create_rag_store()
         self.producer = producer or KafkaJsonProducer()
-        self.active_checker = active_checker or assert_java_active_job
+        self.active_checker = active_checker or assert_active_job
         self.result_topic = os.getenv("RAG_KAFKA_TOPIC_PROMOTE_RESULT", "rag.material.index.promote.result.v1")
 
     def handle_envelope(self, envelope: KafkaEnvelope) -> dict[str, Any]:
@@ -411,72 +429,33 @@ class RagKafkaPromoteWorker:
         return out_payload
 
 
-def assert_java_active_job(payload: PromoteRequestPayload) -> None:
-    """向 Java 内部接口确认 promote 请求仍属于当前 active job。"""
-    base_url = os.getenv("RAG_JAVA_BASE_URL", "http://127.0.0.1:7080").rstrip("/")
-    url = f"{base_url}/api/internal/rag/materials/{payload.materialId}/index-jobs/{payload.jobId}/active"
-    token = os.getenv("RAG_JAVA_INTERNAL_TOKEN", "")
-    headers = {"X-RAG-Internal-Token": token} if token else {}
+def assert_active_job(payload: PromoteRequestPayload) -> None:
+    """从 PostgreSQL 当前资料状态判断 promote 是否仍对应活跃索引任务。"""
+    repository = RagJobRepository()
+    if not repository.is_active(payload.materialId, payload.jobId, payload.requestVersion):
+        raise StalePromoteRequestError("索引提升请求已过期")
+
+
+OpenedStorageSource = OpenedStorageObject
+
+
+def open_storage_source(
+    source_ref,
+    *,
+    user_id: str | None = None,
+    object_storage: RagObjectStorage | None = None,
+) -> OpenedStorageSource:
+    """打开受控本地原文件，或把当前用户所属 OSS 对象下载到临时文件。"""
     try:
-        with httpx.Client(timeout=float(os.getenv("RAG_JAVA_ACTIVE_CHECK_TIMEOUT_SECONDS", "10"))) as client:
-            response = client.get(url, params={"requestVersion": payload.requestVersion}, headers=headers)
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Java active-check 调用失败: {exc}") from exc
-    if response.status_code in {403, 404, 410}:
-        raise StalePromoteRequestError(f"Java active-check 判定 promote 已过期: status={response.status_code}")
-    response.raise_for_status()
-    body = response.json()
-    data = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(data, dict) or data.get("active") is not True:
-        raise StalePromoteRequestError("Java active-check 返回非 active 状态")
-
-
-@dataclass
-class DownloadedJavaSource:
-    """保存 Java Source API 流式下载后的临时文件信息。"""
-
-    path: Path
-    filename: str | None
-    content_type: str | None
-    source_path: str | None
-
-    def cleanup(self) -> None:
-        """清理临时文件。"""
-        self.path.unlink(missing_ok=True)
-
-
-def download_java_source(source_ref, job_id: str, request_version: int) -> DownloadedJavaSource:
-    """从 Java Source API 流式下载资料到临时文件。"""
-    base_url = source_ref.javaBaseUrl.rstrip("/")
-    url = base_url + source_ref.downloadPath
-    token = os.getenv("RAG_JAVA_INTERNAL_TOKEN", "")
-    headers = {"X-RAG-Internal-Token": token} if token else {}
-    temp_path: Path | None = None
-    with httpx.Client(timeout=float(os.getenv("RAG_JAVA_SOURCE_TIMEOUT_SECONDS", "60"))) as client:
-        with client.stream("GET", url, headers=headers) as response:
-            if response.status_code in {404, 410}:
-                response.read()
-                raise PermanentSourceError(f"Java Source API 返回 {response.status_code}")
-            response.raise_for_status()
-            suffix = Path(source_ref.filename or "material.bin").suffix
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as file:
-                temp_path = Path(file.name)
-                for chunk in response.iter_bytes():
-                    file.write(chunk)
-            return DownloadedJavaSource(
-                path=temp_path,
-                filename=source_ref.filename or guess_filename(response),
-                content_type=response.headers.get("content-type") or source_ref.contentType,
-                source_path=source_ref.sourcePath,
-            )
-
-
-def guess_filename(response: httpx.Response) -> str | None:
-    """从响应头中尽量读取文件名。"""
-    disposition = response.headers.get("content-disposition") or ""
-    if "filename=" not in disposition:
-        return None
-    return disposition.split("filename=", 1)[1].strip('" ')
+        return download_storage_source(
+            source_ref,
+            user_id=str(user_id or ""),
+            object_storage=object_storage,
+        )
+    except Exception as exc:
+        if isinstance(exc, PermanentSourceError):
+            raise
+        raise PermanentSourceError(str(exc)) from exc
 
 
 def is_video_source(filename: str, document_type: str | None, content_type: str | None) -> bool:
@@ -490,7 +469,7 @@ def is_video_source(filename: str, document_type: str | None, content_type: str 
 
 
 class PermanentSourceError(RuntimeError):
-    """表示 404/410 等无需继续重试的 Java source 错误。"""
+    """表示受控原文件缺失或非法等无需继续重试的错误。"""
 
 
 class StalePromoteRequestError(RuntimeError):
@@ -500,13 +479,9 @@ class StalePromoteRequestError(RuntimeError):
 def safe_error_summary(exc: Exception) -> str:
     """Kafka 失败结果和 DLQ 不回显异常文本，避免第三方响应或原始资料进入消息系统。"""
     if isinstance(exc, PermanentSourceError):
-        return "Java Source API 返回不可恢复错误"
+        return "原始资料不可读取或已不存在"
     if isinstance(exc, StalePromoteRequestError):
         return "索引提升请求已过期"
-    if isinstance(exc, httpx.TimeoutException):
-        return "下游 HTTP 调用超时"
-    if isinstance(exc, httpx.HTTPError):
-        return "下游 HTTP 调用失败"
     if isinstance(exc, ValueError):
         return "消息字段校验失败"
     return f"RAG Kafka 处理失败：{exc.__class__.__name__}"

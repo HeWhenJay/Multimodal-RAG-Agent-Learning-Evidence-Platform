@@ -60,6 +60,38 @@ class DocumentParserRouter:
         self.ocr_client = ocr_client or BailianOcrClient.from_env()
         self.summary_index = SummaryIndex()
 
+    @logged_rag_method("parse.route", "parse_file", "解析受控文件路径")
+    def parse_file(
+        self,
+        *,
+        source_path: str,
+        source_reference: str | None = None,
+        filename: str,
+        document_id: str,
+        source_title: str,
+        document_type: str | None = None,
+        content_type: str | None = None,
+        high_precision: bool = False,
+        progress_reporter: RagProgressReporter | None = None,
+    ) -> ParsedBlockDocument:
+        """从 worker 的受控文件路径进入统一解析路由，避免 worker 直接读取完整文件。"""
+        path = Path(source_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"受控解析文件不存在：{path}")
+        with path.open("rb") as handle:
+            content = handle.read()
+        return self.parse_bytes(
+            content=content,
+            filename=filename,
+            document_id=document_id,
+            source_title=source_title,
+            document_type=document_type,
+            content_type=content_type,
+            source_path=source_reference or str(path),
+            high_precision=high_precision,
+            progress_reporter=progress_reporter,
+        )
+
     @logged_rag_method("parse.route", "parse_bytes", "解析上传文件字节")
     def parse_bytes(
         self,

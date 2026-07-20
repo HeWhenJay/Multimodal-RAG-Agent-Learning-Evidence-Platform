@@ -1,3 +1,9 @@
+"""历史 RAG 评估兼容路由。
+
+该模块不由 `app.main` 注册，只由 `rag.evaluation` 创建隔离 TestClient 时使用。
+生产公开接口统一位于 `app.api.rag_control`，不得把本路由重新加入生产 OpenAPI。
+"""
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from rag.loaders.document_parsers import DocumentParserRouter

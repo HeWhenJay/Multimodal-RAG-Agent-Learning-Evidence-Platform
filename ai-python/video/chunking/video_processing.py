@@ -2098,7 +2098,7 @@ def prepend_video_url_header(transcript_text: str, source_path: str) -> str:
 
 
 def resolve_local_video_path(source_path: str) -> Path:
-    """解析 Java 传来的本地视频路径，兼容 Python 从仓库根或 ai-python 目录启动。"""
+    """解析 Python 控制面保存的本地视频路径，兼容不同启动工作目录。"""
     raw_path = Path(source_path)
     if raw_path.is_absolute():
         return raw_path.resolve()
@@ -2106,8 +2106,6 @@ def resolve_local_video_path(source_path: str) -> Path:
     candidates = [
         cwd / source_path,
         cwd.parent / source_path,
-        cwd / "backend-java" / source_path,
-        cwd.parent / "backend-java" / source_path,
     ]
     return next((candidate.resolve() for candidate in candidates if candidate.exists()), candidates[0].resolve())
 

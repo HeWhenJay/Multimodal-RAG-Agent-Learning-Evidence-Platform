@@ -2,6 +2,8 @@
 
 更新日期：2026-07-18
 
+> 当前运行形态已经切换为纯 Python：`ai-python/app/api/agent.py`、`LocalAgentGateway`、PostgreSQL durable worker 和 Python SSE 是唯一生效实现。本文后续 Java API、Java Tool Gateway、内部 Token 和 Spring 任务编排内容保留为迁移前规划历史，不是当前启动或联调依赖。
+
 ## 1. 背景输入
 
 本计划综合了 Codex 对话 `019ee61f-2662-7eb0-b046-ce7ebfe630ce` 与 OpenCode 会话 `ses_119a1169fffeJAkQ4qOeqkAikT`、`ses_119ac8a5cffeWi92d5VE6X8igI` 的结论；当前 README 已按代码实现更新为“第二阶段 Agent 能力现状与后续边界”，本文件保留阶段性设计背景和后续扩展清单。

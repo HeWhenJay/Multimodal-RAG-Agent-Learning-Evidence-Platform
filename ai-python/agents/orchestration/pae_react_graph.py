@@ -8,7 +8,7 @@ from typing import Any, Literal, TypedDict
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
-from agents.gateway.java_gateway import JavaAgentGatewayClient
+from agents.gateway.local_gateway import AgentGateway
 from agents.llm.qwen_client import agent_qwen_model, get_agent_qwen_client
 from agents.orchestration.planning_helpers import (
     build_alignment,
@@ -124,7 +124,7 @@ class UnifiedAgentState(TypedDict, total=False):
     idempotency_keys: list[str]
 
 
-def start_unified_agent(request: AgentTaskStartRequest, client: JavaAgentGatewayClient) -> AgentTaskStartResponse:
+def start_unified_agent(request: AgentTaskStartRequest, client: AgentGateway) -> AgentTaskStartResponse:
     """启动统一 Agent 图；规划类任务会先停在计划审批。"""
     thread_id = request.threadId or request.taskId
     client.publish_event(
@@ -147,7 +147,7 @@ def start_unified_agent(request: AgentTaskStartRequest, client: JavaAgentGateway
     )
 
 
-def resume_unified_agent(request: AgentTaskResumeRequest, client: JavaAgentGatewayClient) -> AgentTaskStartResponse:
+def resume_unified_agent(request: AgentTaskResumeRequest, client: AgentGateway) -> AgentTaskStartResponse:
     """根据人工审批结果恢复统一 Agent 图。"""
     thread_id = request.threadId or request.taskId
     if request.decision == "CHANGES_REQUESTED":
@@ -197,7 +197,7 @@ def resume_unified_agent(request: AgentTaskResumeRequest, client: JavaAgentGatew
 
 def resume_output_review(
     request: AgentTaskResumeRequest,
-    client: JavaAgentGatewayClient,
+    client: AgentGateway,
     thread_id: str,
 ) -> AgentTaskStartResponse:
     """输出审批通过后，按保存意图进入 CRUD 审批或直接完成。"""
@@ -226,7 +226,7 @@ def resume_output_review(
     return AgentTaskStartResponse(taskId=request.taskId, threadId=thread_id, accepted=True, status="COMPLETED")
 
 
-def invoke_unified_graph_with_limit(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
+def invoke_unified_graph_with_limit(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
     """调用统一图并限制最大递归深度，防止 ReAct 循环空转。"""
     try:
         return build_unified_graph(client).invoke(state, {"recursion_limit": AGENT_GRAPH_RECURSION_LIMIT})
@@ -333,7 +333,7 @@ def initial_state(
     }
 
 
-def build_unified_graph(client: JavaAgentGatewayClient):
+def build_unified_graph(client: AgentGateway):
     """构建统一 PAE + ReAct LangGraph。"""
     workflow = StateGraph(UnifiedAgentState)
     workflow.add_node("conversation_title", lambda state: conversation_title_node(state, client))
@@ -434,8 +434,8 @@ def build_unified_graph(client: JavaAgentGatewayClient):
     return workflow.compile()
 
 
-def conversation_title_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
-    """根据用户首句生成会话主题标题，并回写 Java 作为侧边栏展示值。
+def conversation_title_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
+    """根据用户首句生成会话主题标题，并回写任务记录作为侧边栏展示值。
 
     该节点只读取当前用户首句和 fallback 标题，不打包历史消息、工具观察或恢复摘要，因此不触发上下文压缩。
     """
@@ -473,8 +473,8 @@ def conversation_title_node(state: UnifiedAgentState, client: JavaAgentGatewayCl
     return state
 
 
-def context_restore_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
-    """从 Java 内部接口恢复 L3 摘要段和最近原文窗口，Redis miss 时仍可重建上下文。"""
+def context_restore_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
+    """从 PostgreSQL 恢复 L3 摘要段和最近原文窗口，缓存 miss 时仍可重建上下文。"""
     query = text_value(state.get("user_goal")) or task_query(state.get("task_input") or {}, state.get("task_type"))
     try:
         context = client.restore_context(
@@ -485,7 +485,7 @@ def context_restore_node(state: UnifiedAgentState, client: JavaAgentGatewayClien
             best_window_tokens=best_window_tokens(),
         )
     except Exception as exc:
-        record_llm_diagnostic(state, "context_restore", "java-internal-context", f"fallback: {exc}")
+        record_llm_diagnostic(state, "context_restore", "python-postgresql-context", f"fallback: {exc}")
         context = {
             "messageWindow": [],
             "compressionCandidateMessages": [],
@@ -543,7 +543,7 @@ def task_router_node(state: UnifiedAgentState) -> UnifiedAgentState:
 
 
 def publish_progress_event(
-    client: JavaAgentGatewayClient | None,
+    client: AgentGateway | None,
     state: UnifiedAgentState,
     *,
     node: str,
@@ -577,7 +577,7 @@ def publish_progress_event(
         return
 
 
-def memory_prefetch_before_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
+def memory_prefetch_before_planner(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
     """只读子图规划前读取偏好、历史约束和近期任务记忆。"""
     if state.get("status") == "FAILED":
         return state
@@ -599,7 +599,7 @@ def memory_prefetch_before_planner(state: UnifiedAgentState, client: JavaAgentGa
     return {**state, "memory_context_pre": memory_context}
 
 
-def planner_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def planner_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """PAE 规划器，输出执行计划和验收标准。"""
     if state.get("status") == "FAILED":
         return state
@@ -639,8 +639,8 @@ def planner_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None
     }
 
 
-def plan_review_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
-    """发布计划审批请求，等待 Java 和前端恢复同一任务。"""
+def plan_review_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
+    """发布计划审批请求，等待 Python worker 和前端恢复同一任务。"""
     plan = state.get("plan") or {}
     client.publish_event(
         AgentTaskEvent(
@@ -669,7 +669,7 @@ def resume_rewrite_decision_node(state: UnifiedAgentState) -> UnifiedAgentState:
     return {**state, "resume_rewrite_required": required}
 
 
-def resume_rewrite_planner_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def resume_rewrite_planner_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """生成简历修改子图的局部计划。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
@@ -697,7 +697,7 @@ def resume_rewrite_planner_node(state: UnifiedAgentState, client: JavaAgentGatew
     return {**state, "resume_rewrite_plan": rewrite_plan}
 
 
-def resume_rewrite_generator_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def resume_rewrite_generator_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """生成简历修改候选片段，供最终 OUTPUT 审批展示。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
@@ -721,7 +721,7 @@ def resume_rewrite_generator_node(state: UnifiedAgentState, client: JavaAgentGat
     return {**state, "resume_rewrite_draft": draft}
 
 
-def resume_rewrite_acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def resume_rewrite_acceptance_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """验收简历修改子图候选是否可并入规划草稿。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
@@ -743,7 +743,7 @@ def resume_rewrite_acceptance_node(state: UnifiedAgentState, client: JavaAgentGa
     return {**state, "resume_rewrite_result": result}
 
 
-def memory_prefetch_after_planner(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
+def memory_prefetch_after_planner(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
     """规划后基于计划步骤重新读取任务相关记忆。"""
     if state.get("status") == "FAILED":
         return state
@@ -770,7 +770,7 @@ def memory_prefetch_after_planner(state: UnifiedAgentState, client: JavaAgentGat
     return {**state, "memory_context_task": memory_context}
 
 
-def executor_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def executor_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """ReAct 执行器，根据计划选择当前步骤的行动。"""
     if state.get("status") == "FAILED":
         return state
@@ -796,8 +796,8 @@ def executor_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | Non
     return {**state, "current_action": action, "react_trace": trace}
 
 
-def tool_adapter_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
-    """统一工具节点，只通过 Java Gateway 调用只读或变更工具。"""
+def tool_adapter_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
+    """统一工具节点，只通过 Python 本地 Gateway 调用只读或变更工具。"""
     action = state.get("current_action") or {}
     tool_name = text_value(action.get("toolName"))
     if not tool_name:
@@ -809,7 +809,7 @@ def tool_adapter_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) 
         state,
         node="tool_adapter",
         phase="started",
-        message=f"正在通过 Java Tool Gateway 调用工具：{tool_name}。",
+        message=f"正在通过 Python 本地 Gateway 调用工具：{tool_name}。",
         status="WAITING_TOOL_RESULT",
         extra={"toolName": tool_name, "toolType": tool_type, "toolCallId": tool_call_id},
     )
@@ -893,7 +893,7 @@ def tool_adapter_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) 
                 "toolName": tool_name,
                 "status": "FAILED",
                 "errorCode": "AGENT_TOOL_DOWNSTREAM_FAILED",
-                "errorMessage": f"Java 工具调用失败：{exc}",
+                "errorMessage": f"本地工具调用失败：{exc}",
                 "retryable": True,
             }
     status = str(result.get("status") or "FAILED")
@@ -952,7 +952,7 @@ def tool_adapter_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) 
     }
 
 
-def repair_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def repair_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """修补节点，判断重试、跳过、重规划或汇报无法完成。"""
     llm_state = apply_llm_repair_decision(state, client)
     if llm_state is not state:
@@ -966,7 +966,6 @@ def repair_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None 
         "AGENT_RESOURCE_FORBIDDEN",
         "AGENT_MEMORY_FORBIDDEN",
         "AGENT_MEMORY_SCOPE_ESCALATION",
-        "AGENT_INTERNAL_TOKEN_INVALID",
     }
     if error_code in hard_stop_codes:
         return {**state, "repair_decision": "REPORT_UNABLE", "status": "FAILED"}
@@ -979,7 +978,7 @@ def repair_node(state: UnifiedAgentState, client: JavaAgentGatewayClient | None 
     return {**state, "repair_decision": "REPORT_UNABLE", "status": "FAILED"}
 
 
-def acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
+def acceptance_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
     """验收器，判断计划是否完成、是否回到执行器或进入回答节点。"""
     publish_progress_event(
         client,
@@ -1040,8 +1039,8 @@ def acceptance_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) ->
     }
 
 
-def answer_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
-    """回答节点，组织中文结果并回写 Java。"""
+def answer_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
+    """回答节点，组织中文结果并回写任务投影。"""
     state = apply_llm_answer_writer(state, client)
     if state.get("status") == "WAITING_OUTPUT_REVIEW":
         draft = state.get("draft_result") or {}
@@ -1102,7 +1101,7 @@ def answer_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> Uni
     return {**state, "status": "COMPLETED"}
 
 
-def post_answer_memory_node(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> UnifiedAgentState:
+def post_answer_memory_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
     """回答后整理长期记忆候选；默认只在显式开启或用户表达记住时运行。"""
     task_input = state.get("task_input") or {}
     if state.get("status") != "COMPLETED" or not should_run_post_answer_memory(task_input):
@@ -1216,7 +1215,7 @@ def build_read_plan(task_input: dict[str, Any]) -> dict[str, Any]:
 def build_llm_planning_plan(
     state: UnifiedAgentState,
     fallback_plan: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助生成计划，失败或越权时回退确定性计划。"""
     task_input = state.get("task_input") or {}
@@ -1261,7 +1260,7 @@ def prepare_llm_payload(
     state: UnifiedAgentState,
     node: str,
     payload: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """统一为长 prompt 节点注入恢复上下文和预算诊断，必要时先压缩早期上下文。"""
     guarded = context_budget_guard(state, node, client)
@@ -1280,9 +1279,9 @@ def prepare_llm_payload(
 def maybe_recall_summary_context(
     state: UnifiedAgentState,
     node: str,
-    client: JavaAgentGatewayClient | None,
+    client: AgentGateway | None,
 ) -> UnifiedAgentState:
-    """按摘要段回捞覆盖范围附近少量原文，只通过 Java 内部接口访问。"""
+    """按摘要段回捞覆盖范围附近少量原文，只从 Python 持久化层访问。"""
     if client is None:
         return state
     summaries = [item for item in list(state.get("context_summaries") or []) if isinstance(item, dict)]
@@ -1310,11 +1309,11 @@ def maybe_recall_summary_context(
         recalled = client.recall_context_messages(text_value(state.get("task_id")), params)
         if recalled:
             state["recalled_context_messages"] = [item for item in recalled if isinstance(item, dict)][:6]
-            record_llm_diagnostic(state, "context_recall", "java-internal", f"recalled:{node}")
+            record_llm_diagnostic(state, "context_recall", "python-postgresql", f"recalled:{node}")
         else:
-            record_llm_diagnostic(state, "context_recall", "java-internal", f"empty:{node}")
+            record_llm_diagnostic(state, "context_recall", "python-postgresql", f"empty:{node}")
     except Exception as exc:
-        record_llm_diagnostic(state, "context_recall", "java-internal", f"recall_failed:{node}:{exc}")
+        record_llm_diagnostic(state, "context_recall", "python-postgresql", f"recall_failed:{node}:{exc}")
     return state
 
 
@@ -1341,15 +1340,15 @@ def summary_recall_text(summary: dict[str, Any]) -> str:
     for key in ["keyFacts", "evidenceRefs"]:
         value = summary.get(key)
         if isinstance(value, list):
-            parts.extend(json.dumps(item, ensure_ascii=False) for item in value if isinstance(item, dict))
-    parts.append(json.dumps(summary.get("summary") or {}, ensure_ascii=False) if isinstance(summary.get("summary"), dict) else "")
+            parts.extend(json.dumps(item, ensure_ascii=False, default=str) for item in value if isinstance(item, dict))
+    parts.append(json.dumps(summary.get("summary") or {}, ensure_ascii=False, default=str) if isinstance(summary.get("summary"), dict) else "")
     return " ".join(parts).lower()
 
 
 def context_budget_guard(
     state: UnifiedAgentState,
     node: str,
-    client: JavaAgentGatewayClient | None,
+    client: AgentGateway | None,
 ) -> UnifiedAgentState:
     """检查上下文估算 token，超过 best window 时压缩早期窗口并保存摘要段。"""
     budget = dict(state.get("context_budget") or {})
@@ -1405,7 +1404,7 @@ def context_budget_guard(
         except Exception as exc:
             record_llm_diagnostic(state, "conversation_compression", text_value(summary.get("compressionModel")), f"save_failed: {exc}")
     else:
-        state["context_budget"] = {**dict(state.get("context_budget") or {}), "persistenceStatus": "SKIPPED_NO_JAVA_CLIENT"}
+        state["context_budget"] = {**dict(state.get("context_budget") or {}), "persistenceStatus": "SKIPPED_NO_GATEWAY"}
     return state
 
 
@@ -1498,7 +1497,7 @@ def deterministic_context_summary(
         "coveredMessageRange": {"startId": first_message_id(messages), "endId": last_message_id(messages)},
         "compressionVersion": 1,
         "confidence": 0.62 if summaries else 0.58,
-        "lossRisk": "MEDIUM" if estimate_tokens(json.dumps(messages, ensure_ascii=False)) > best_window_tokens() else "LOW",
+        "lossRisk": "MEDIUM" if estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str)) > best_window_tokens() else "LOW",
     }
     return {"summary": summary, "summaryText": rolling}
 
@@ -1537,12 +1536,12 @@ def estimate_state_tokens(state: UnifiedAgentState) -> int:
         "draft": summarize_result(state.get("draft_result") or {}),
         "final": summarize_result(state.get("final_result") or {}),
     }
-    return estimate_tokens(json.dumps(payload, ensure_ascii=False))
+    return estimate_tokens(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 def estimate_tokens(value: Any) -> int:
     """中文场景用字符数近似 token，作为预算保护的保守估计。"""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return 0 if not text else max(1, len(text) // 2)
 
 
@@ -1711,7 +1710,7 @@ def conversation_compression_system_prompt() -> str:
 
 def conversation_compression_user_prompt(payload: dict[str, Any]) -> str:
     """上下文压缩用户提示。"""
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
@@ -1747,7 +1746,7 @@ def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
         "requiresOutputReview": True,
         "riskLevel": "MEDIUM" if use_web_search else "LOW",
         "guardrails": [
-            "只通过 Java Tool Gateway 调用工具",
+            "只通过 Python 本地 Gateway 调用工具",
             "自由探索默认优先使用 web_search_probe；RAG 只作为本地 evidence 补充或联网失败降级",
             "计划审批只确认路线，不授权写操作",
             "输出后若保存草稿或记忆，必须再次进入 CRUD / MEMORY_WRITE 审批",
@@ -1799,7 +1798,7 @@ def build_llm_action_for_step(
     state: UnifiedAgentState,
     step: dict[str, Any],
     fallback_action: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助选择下一步只读行动，非法工具或 mutation 自动回退。"""
     if not fallback_action:
@@ -1849,7 +1848,7 @@ def has_approved_mutation(action: dict[str, Any]) -> bool:
 
 
 def mutation_fields_from_action(action: dict[str, Any]) -> dict[str, Any]:
-    """从 action 中提取 Java mutation gateway 需要的审批字段。"""
+    """从 action 中提取本地 mutation gateway 需要的审批字段。"""
     fields = {}
     for key in ["approvalId", "operationId", "idempotencyKey"]:
         value = text_value(action.get(key))
@@ -1892,7 +1891,7 @@ def build_question_for_state(state: UnifiedAgentState) -> str:
     return text_value(task_input.get("question")) or text_value(task_input.get("goal")) or "查询学习证据"
 
 
-def apply_llm_repair_decision(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def apply_llm_repair_decision(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """调用千问辅助修补决策；权限类错误仍由确定性规则硬停止。"""
     if state.get("status") != "TOOL_FAILED":
         return state
@@ -1901,7 +1900,6 @@ def apply_llm_repair_decision(state: UnifiedAgentState, client: JavaAgentGateway
         "AGENT_RESOURCE_FORBIDDEN",
         "AGENT_MEMORY_FORBIDDEN",
         "AGENT_MEMORY_SCOPE_ESCALATION",
-        "AGENT_INTERNAL_TOKEN_INVALID",
         "AGENT_TOOL_FORBIDDEN",
     }
     if text_value(failure.get("errorCode")) in hard_stop_codes:
@@ -1939,7 +1937,7 @@ def apply_llm_repair_decision(state: UnifiedAgentState, client: JavaAgentGateway
     return state
 
 
-def apply_llm_acceptance_result(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def apply_llm_acceptance_result(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """调用千问辅助验收；只接受继续、修补或完成三类安全决策。"""
     if state.get("status") not in {"RUNNING", "FAILED"}:
         return state
@@ -1983,7 +1981,7 @@ def apply_llm_acceptance_result(state: UnifiedAgentState, client: JavaAgentGatew
     return state
 
 
-def apply_llm_answer_writer(state: UnifiedAgentState, client: JavaAgentGatewayClient | None = None) -> UnifiedAgentState:
+def apply_llm_answer_writer(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
     """调用千问辅助输出摘要，只允许改写已有 summary/answer，不新增事实。"""
     if state.get("status") not in {"WAITING_OUTPUT_REVIEW", "COMPLETED", "FAILED"}:
         return state
@@ -2037,7 +2035,7 @@ def synthesize_read_final(state: UnifiedAgentState) -> dict[str, Any]:
     }
 
 
-def synthesize_planning_draft(state: UnifiedAgentState, client: JavaAgentGatewayClient) -> dict[str, Any]:
+def synthesize_planning_draft(state: UnifiedAgentState, client: AgentGateway) -> dict[str, Any]:
     """从工具观察生成规划类草稿和待确认记忆候选。"""
     task_input = state.get("task_input") or {}
     jd_text = text_value(task_input.get("jobDescription"))
@@ -2142,7 +2140,7 @@ def build_resume_rewrite_patches(content_map: dict[str, str], gaps: list[dict[st
 def build_llm_resume_rewrite_plan(
     state: UnifiedAgentState,
     fallback_plan: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助生成简历改写局部计划。"""
     task_input = state.get("task_input") or {}
@@ -2180,7 +2178,7 @@ def build_llm_resume_rewrite_plan(
 def build_llm_resume_rewrite_draft(
     state: UnifiedAgentState,
     fallback_draft: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助生成简历改写候选，仍保持 PENDING_REVIEW。"""
     task_input = state.get("task_input") or {}
@@ -2222,7 +2220,7 @@ def build_llm_resume_rewrite_draft(
 def build_llm_resume_rewrite_acceptance(
     state: UnifiedAgentState,
     fallback_result: dict[str, Any],
-    client: JavaAgentGatewayClient | None = None,
+    client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助验收简历候选，只接受结构化布尔结果。"""
     prompt = {
@@ -2288,7 +2286,7 @@ def build_resume_template_fill_candidate(
         "contentMap": content_map,
         "requiresApproval": True,
         "approvalType": "OUTPUT",
-        "message": "已生成简历模板填充值候选；Agent 不直接写 DOCX，需用户确认后由 Java/模板导出链路执行。",
+        "message": "已生成简历模板填充值候选；Agent 不直接写 DOCX，需用户确认后由受控模板导出链路执行。",
     }
 
 
@@ -2338,9 +2336,9 @@ def request_memory_candidates(
     draft: dict[str, Any],
     final: dict[str, Any],
     tool_observations: list[dict[str, Any]],
-    client: JavaAgentGatewayClient,
+    client: AgentGateway,
 ) -> list[dict[str, Any]]:
-    """请求 Java Tool Gateway 生成记忆候选，不直接保存或激活。"""
+    """请求 Python 本地 Gateway 生成记忆候选，不直接保存或激活。"""
     payload = {
         "taskId": task_id,
         "toolCallId": f"tool-call-memory-candidate-{uuid.uuid4().hex}",
@@ -2370,7 +2368,7 @@ def publish_post_answer_memory_candidates(
     thread_id: str,
     task_input: dict[str, Any],
     final: dict[str, Any],
-    client: JavaAgentGatewayClient,
+    client: AgentGateway,
 ) -> None:
     """输出完成后按显式开关提炼记忆候选。"""
     if not should_run_post_answer_memory(task_input):
@@ -2488,7 +2486,7 @@ def build_memory_aware_crud_review_request(request: AgentTaskResumeRequest) -> d
             "riskLevel": "MEDIUM",
             "undoable": True,
             "undoWindowMinutes": 30,
-            "summary": "该操作属于数据库变更，需用户确认后由 Java Tool Gateway 校验并执行。",
+            "summary": "该操作属于数据库变更，需用户确认后由 Python 本地 Gateway 校验并执行。",
         },
     }
 
@@ -2685,7 +2683,7 @@ def truncate_text(value: str, limit: int) -> str:
 
 def json_prompt(payload: dict[str, Any]) -> str:
     """把提示词输入序列化为中文 JSON。"""
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
 def fallback_conversation_title(goal: str) -> str:
@@ -2734,7 +2732,7 @@ def planner_system_prompt() -> str:
     """Planner 节点专用提示词。"""
     return (
         "你是学迹智配 Agent 的 LangGraph 规划节点。你只生成可审批计划，不执行工具、不保存数据、不生成最终答案。"
-        "所有工具必须通过 Java Tool Gateway。PLAN 审批只确认路线，不授权写操作。任何保存、修改、删除、写入记忆或导出文件"
+        "所有工具必须通过 Python 本地 Gateway。PLAN 审批只确认路线，不授权写操作。任何保存、修改、删除、写入记忆或导出文件"
         "都必须在 OUTPUT 审批后再进入 CRUD 审批。只允许从 allowedTools 和 allowedSubgraphs 选择。"
         "若 taskInputSummary.workspaceMode=free_explore，必须把 web_search_probe 作为第一步，把 rag_query_probe_non_persistent 作为第二步补充或降级路径。"
         "若目标涉及优化简历、修改简历、生成投递简历、简历改写，必须设置 resumeRewriteIntent=true 并加入 internalSubgraphs=[\"resume_rewrite_subgraph\"]。"
@@ -2751,7 +2749,7 @@ def executor_system_prompt() -> str:
     """Executor 节点专用提示词。"""
     return (
         "你是学迹智配 Agent 的 ReAct 执行节点。你只能根据已批准计划选择下一步只读工具或判断无需工具。"
-        "不能发明工具名，不能选择 mutation 工具，不能绕过 Java Tool Gateway。只输出 JSON action。"
+        "不能发明工具名，不能选择 mutation 工具，不能绕过 Python 本地 Gateway。只输出 JSON action。"
     )
 
 

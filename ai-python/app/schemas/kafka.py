@@ -24,10 +24,10 @@ class KafkaEnvelope(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class JavaSourceRef(BaseModel):
-    type: Literal["JAVA_SOURCE_API"] = "JAVA_SOURCE_API"
-    javaBaseUrl: str
-    downloadPath: str
+class StorageSourceRef(BaseModel):
+    """Python 存储层可直接打开的受控原文件引用。"""
+
+    type: Literal["STORAGE"] = "STORAGE"
     filename: str | None = None
     contentType: str | None = None
     storageType: str | None = None
@@ -38,7 +38,7 @@ class JavaSourceRef(BaseModel):
 
 class InlineTextSourceRef(BaseModel):
     type: Literal["INLINE_TEXT"] = "INLINE_TEXT"
-    parser: str = "java-manual-text"
+    parser: str = "python-manual-text"
 
 
 class IndexRequestPayload(BaseModel):
@@ -55,7 +55,7 @@ class IndexRequestPayload(BaseModel):
     stagingVisibilityScope: str = "staging"
     highPrecision: bool = False
     requestVersion: int
-    sourceRef: JavaSourceRef | InlineTextSourceRef
+    sourceRef: StorageSourceRef | InlineTextSourceRef
     text: str | None = None
 
 

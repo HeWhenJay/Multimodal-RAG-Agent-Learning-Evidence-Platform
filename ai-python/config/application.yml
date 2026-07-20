@@ -1,5 +1,5 @@
 # Python AI 服务本地联调配置。
-# 规则对齐 Java application.yml：可暴露配置写默认值，敏感配置只通过 ${环境变量:默认值} 注入。
+# 可暴露配置写默认值，敏感配置只通过 ${环境变量:默认值} 注入。
 
 server:
   host: ${AI_SERVICE_HOST:127.0.0.1}
@@ -55,14 +55,9 @@ rag:
     console-enabled: ${RAG_CONSOLE_PROGRESS_ENABLED:true}
   process-log:
     console-enabled: ${RAG_CONSOLE_PROCESS_ENABLED:true}
-  callbacks:
-    event-url: ${RAG_EVENT_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/events}
-    error-url: ${RAG_ERROR_CALLBACK_URL:http://127.0.0.1:7080/api/logs/internal/errors}
   kafka:
     enabled: ${RAG_KAFKA_ENABLED:false}
     bootstrap-servers: ${RAG_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
-    java-base-url: ${RAG_JAVA_BASE_URL:http://127.0.0.1:7080}
-    java-internal-token: ${RAG_JAVA_INTERNAL_TOKEN:}
     worker:
       reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
       reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
@@ -92,12 +87,12 @@ rag:
   staging-failed-retention-hours: ${RAG_STAGING_FAILED_RETENTION_HOURS:168}
 
 workers:
-  # run.py 只监督独立 cron 进程；各任务仍需单独开启，避免迁移期与 Java 重复发布。
+  # run.py 统一监督 API、cron、RAG、Agent 和 Kafka worker；worker 均不在 Web 进程内执行。
   cron:
     enabled: ${AI_CRON_ENABLED:true}
     poll-interval-seconds: ${AI_CRON_POLL_INTERVAL_SECONDS:0.5}
   outbox:
-    enabled: ${RAG_OUTBOX_PUBLISHER_ENABLED:false}
+    enabled: ${RAG_OUTBOX_PUBLISHER_ENABLED:true}
     batch-size: ${RAG_OUTBOX_BATCH_SIZE:50}
     lease-seconds: ${RAG_OUTBOX_LEASE_SECONDS:60}
     publish-fixed-delay-ms: ${RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS:1000}
@@ -106,6 +101,43 @@ workers:
   staging-cleanup:
     enabled: ${RAG_STAGING_CLEANUP_ENABLED:false}
     fixed-delay-seconds: ${RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS:3600}
+  kafka:
+    # 留空时跟随 RAG_KAFKA_ENABLED；可显式设为 false 只发布不在本进程消费。
+    enabled: ${AI_KAFKA_WORKER_ENABLED:}
+  agent:
+    enabled: ${AI_AGENT_WORKER_ENABLED:true}
+    poll-interval-seconds: ${AI_AGENT_WORKER_POLL_INTERVAL_SECONDS:0.5}
+  rag-task:
+    enabled: ${RAG_TASK_WORKER_ENABLED:true}
+    poll-interval-seconds: ${RAG_TASK_WORKER_POLL_SECONDS:1}
+    batch-size: ${RAG_TASK_WORKER_BATCH_SIZE:4}
+    lease-seconds: ${RAG_TASK_WORKER_LEASE_SECONDS:120}
+    query-task-ttl-seconds: ${RAG_QUERY_TASK_TTL_SECONDS:1800}
+    local-index-enabled: ${RAG_LOCAL_INDEX_WORKER_ENABLED:true}
+
+auth:
+  database-url: ${AUTH_DATABASE_URL:}
+
+logs:
+  enabled: ${EVIDENCE_LOGS_ENABLED:true}
+  max-batch-size: ${EVIDENCE_LOGS_MAX_BATCH_SIZE:100}
+  max-context-bytes: ${EVIDENCE_LOGS_MAX_CONTEXT_BYTES:20000}
+  max-stack-trace-bytes: ${EVIDENCE_LOGS_MAX_STACK_TRACE_BYTES:20000}
+
+storage:
+  provider: ${EVIDENCE_STORAGE_PROVIDER:local}
+  local-root: ${EVIDENCE_UPLOAD_ROOT:uploads/rag}
+  oss:
+    endpoint: ${ALIYUN_OSS_ENDPOINT:}
+    bucket: ${ALIYUN_OSS_BUCKET:}
+    access-key-id: ${ALIYUN_OSS_ACCESS_KEY_ID:}
+    access-key-secret: ${ALIYUN_OSS_ACCESS_KEY_SECRET:}
+    object-prefix: ${ALIYUN_OSS_OBJECT_PREFIX:learning-evidence}
+    public-base-url: ${ALIYUN_OSS_PUBLIC_BASE_URL:}
+
+database:
+  # 仅执行 Python 的幂等增量迁移；空库先运行 app.core.database_bootstrap。
+  migrations-enabled: ${AI_DATABASE_MIGRATIONS_ENABLED:true}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}
@@ -172,14 +204,7 @@ document:
     libreoffice-command: ${LIBREOFFICE_COMMAND:}
     soffice-command: ${SOFFICE_COMMAND:}
 
-agent:
-  # 本地未显式配置时，Java 和 Python 会自动共用仓库根目录 .local/agent-internal-token。
-  internal-token: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
-  internal-token-file: ${EVIDENCE_AGENT_INTERNAL_TOKEN_FILE:}
-
 environment:
-  EVIDENCE_AGENT_INTERNAL_TOKEN: ${EVIDENCE_AGENT_INTERNAL_TOKEN:}
-  EVIDENCE_AGENT_INTERNAL_TOKEN_FILE: ${EVIDENCE_AGENT_INTERNAL_TOKEN_FILE:}
   DATABASE_URL: ${DATABASE_URL:}
   DASHSCOPE_EMBEDDING_MODEL: ${DASHSCOPE_EMBEDDING_MODEL:text-embedding-v4}
   DASHSCOPE_EMBEDDING_BASE_URL: ${DASHSCOPE_EMBEDDING_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}

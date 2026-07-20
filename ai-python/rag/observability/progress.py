@@ -4,12 +4,10 @@ import json
 import logging
 import os
 import re
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.schemas.rag import ProgressEvent
-from rag.observability.log_callback import post_log_event
 
 
 logger = logging.getLogger(__name__)
@@ -72,7 +70,7 @@ class RagProgressReporter:
         self.persist = (
             persist
             and bool(self.database_url)
-            and self.delivery_mode in {"http", "database"}
+            and self.delivery_mode == "database"
             and progress_persist_enabled()
         )
         self.material_id = parse_material_id(document_id)
@@ -98,7 +96,7 @@ class RagProgressReporter:
         parser: str | None = None,
         extra_context: dict[str, Any] | None = None,
     ) -> ProgressEvent:
-        """追加一次进度事件，并尽量写入 Java 侧 log_event 表供前端轮询。"""
+        """追加一次进度事件，并直接写入 PostgreSQL 供前端轮询。"""
         safe_percent = normalize_percent(percent, current_step, total_steps)
         event = ProgressEvent(
             stageCode=stage_code,
@@ -126,8 +124,6 @@ class RagProgressReporter:
             return event
         if self.delivery_mode == "kafka":
             self._publish_kafka(event, parser=parser, extra_context=extra_context)
-            return event
-        if self.delivery_mode == "http" and self._post_callback(event, parser=parser, extra_context=extra_context):
             return event
         if self.persist:
             self._persist(event, parser=parser, extra_context=extra_context)
@@ -176,33 +172,6 @@ class RagProgressReporter:
         text = "RAG进度 | " + " | ".join(parts)
         logger.info(text)
         print(text, flush=True)
-
-    def _post_callback(self, event: ProgressEvent, *, parser: str | None, extra_context: dict[str, Any] | None) -> bool:
-        """优先回调 Java 日志接口，让前端无需等待 Python 请求结束即可轮询进度。"""
-        context = event.model_dump(mode="json")
-        context["documentId"] = self.document_id
-        context["materialId"] = self.material_id
-        if extra_context:
-            context.update(extra_context)
-        action = "rag_progress_" + re.sub(r"[^a-zA-Z0-9_]+", "_", event.stageCode).strip("_")
-        payload = {
-            "traceId": "py_" + uuid.uuid4().hex,
-            "userId": truncate(self.user_id, 120),
-            "source": "python",
-            "domain": "rag",
-            "level": "INFO",
-            "module": "material",
-            "stage": truncate(event.stageCode, 80),
-            "eventType": "rag_progress",
-            "action": truncate(action, 120),
-            "message": truncate(event.message, 500),
-            "success": event.status != "FAILED",
-            "materialId": self.material_id,
-            "documentId": truncate(self.document_id, 120),
-            "parser": truncate(parser, 80),
-            "context": context,
-        }
-        return post_log_event(payload)
 
     def _persist(self, event: ProgressEvent, *, parser: str | None, extra_context: dict[str, Any] | None) -> None:
         try:
@@ -300,7 +269,7 @@ def normalize_delivery_mode(delivery_mode: str | None, *, persist: bool, on_emit
     elif on_emit is not None and not persist:
         mode = "memory"
     else:
-        mode = os.getenv("RAG_PROGRESS_DELIVERY_MODE", "http").strip().lower()
-    if mode not in {"http", "database", "kafka", "memory", "none"}:
-        return "http"
+        mode = os.getenv("RAG_PROGRESS_DELIVERY_MODE", "database").strip().lower()
+    if mode not in {"database", "kafka", "memory", "none"}:
+        return "database"
     return mode

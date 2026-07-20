@@ -1,1 +1,1 @@
-"""Agent 与 Java Tool Gateway 的通信适配。"""
+"""Agent 的本地受控工具调用适配。"""

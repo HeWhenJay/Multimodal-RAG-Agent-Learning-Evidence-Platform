@@ -1,5 +1,14 @@
-from run import build_env_defaults, cron_enabled, main, parse_args, worker_config_args
-from app.core.agent_internal_token import resolve_agent_internal_token
+from run import (
+    agent_worker_enabled,
+    build_env_defaults,
+    cron_enabled,
+    kafka_enabled,
+    main,
+    parse_args,
+    rag_task_worker_enabled,
+    worker_config_args,
+)
+from app.workers.supervisor import build_worker_command
 
 
 def test_fusion_and_local_rerank_config_env_mapping_is_effective():
@@ -105,21 +114,6 @@ def test_video_v6_config_env_mapping_is_effective():
     assert env_defaults["RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP"] == "2"
 
 
-def test_agent_internal_token_falls_back_to_local_shared_file(monkeypatch, tmp_path):
-    """未显式配置内部令牌时，Python 使用本地共享文件自动生成并复用令牌。"""
-    token_file = tmp_path / "agent-internal-token"
-    monkeypatch.delenv("EVIDENCE_AGENT_INTERNAL_TOKEN", raising=False)
-    monkeypatch.setenv("EVIDENCE_AGENT_INTERNAL_TOKEN_FILE", str(token_file))
-
-    first = resolve_agent_internal_token()
-    monkeypatch.delenv("EVIDENCE_AGENT_INTERNAL_TOKEN", raising=False)
-    second = resolve_agent_internal_token()
-
-    assert first
-    assert second == first
-    assert token_file.read_text(encoding="utf-8").strip() == first
-
-
 def test_worker_cron_config_env_mapping_is_effective():
     """校验 Python worker cron 配置可由 YAML 统一映射到运行环境变量。"""
     env_defaults = build_env_defaults(
@@ -135,6 +129,7 @@ def test_worker_cron_config_env_mapping_is_effective():
                     "publish-timeout-ms": 2500,
                 },
                 "staging-cleanup": {"enabled": False, "fixed-delay-seconds": 600},
+                "rag-task": {"enabled": True, "poll-interval-seconds": 0.2},
             }
         }
     )
@@ -149,6 +144,8 @@ def test_worker_cron_config_env_mapping_is_effective():
     assert env_defaults["RAG_KAFKA_PUBLISH_TIMEOUT_MS"] == "2500"
     assert env_defaults["RAG_STAGING_CLEANUP_ENABLED"] == "false"
     assert env_defaults["RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS"] == "600"
+    assert env_defaults["RAG_TASK_WORKER_ENABLED"] == "true"
+    assert env_defaults["RAG_TASK_WORKER_POLL_SECONDS"] == "0.2"
 
 
 def test_cron_cli_override_and_worker_config_forwarding(monkeypatch):
@@ -158,6 +155,45 @@ def test_cron_cli_override_and_worker_config_forwarding(monkeypatch):
 
     assert cron_enabled(args) is True
     assert worker_config_args(args) == ["--skip-default-config", "--config", "config/test.yml"]
+
+
+def test_bootstrap_database_flag_is_explicit() -> None:
+    """空库初始化只能由明确启动参数触发。"""
+    assert parse_args([]).bootstrap_database is False
+    assert parse_args(["--bootstrap-database"]).bootstrap_database is True
+
+
+def test_kafka_and_agent_worker_switches_follow_cli_then_configuration(monkeypatch):
+    """Kafka 与 Agent worker 开关不会误随 cron 配置启动。"""
+    monkeypatch.setenv("RAG_KAFKA_ENABLED", "true")
+    monkeypatch.setenv("AI_KAFKA_WORKER_ENABLED", "false")
+    monkeypatch.setenv("AI_AGENT_WORKER_ENABLED", "false")
+    args = parse_args([])
+
+    assert kafka_enabled(args) is False
+    assert agent_worker_enabled(args) is False
+
+    assert kafka_enabled(parse_args(["--with-kafka"])) is True
+    assert kafka_enabled(parse_args(["--without-kafka"])) is False
+    assert agent_worker_enabled(parse_args(["--with-agent-worker"])) is True
+    assert agent_worker_enabled(parse_args(["--without-agent-worker"])) is False
+
+
+def test_rag_task_worker_switches_follow_cli_then_configuration(monkeypatch):
+    """RAG 耐久任务 worker 仅由自身开关或明确命令行启动。"""
+    monkeypatch.setenv("RAG_TASK_WORKER_ENABLED", "false")
+
+    assert rag_task_worker_enabled(parse_args([])) is False
+    assert rag_task_worker_enabled(parse_args(["--with-rag-worker"])) is True
+    assert rag_task_worker_enabled(parse_args(["--without-rag-worker"])) is False
+
+
+def test_generic_worker_command_reuses_current_interpreter_and_config_arguments():
+    """所有受监督 worker 均以当前 Conda 解释器和同一配置启动。"""
+    command = build_worker_command("app.workers.agent_task_worker", ["--config", "config/local.yml"])
+
+    assert command[1:3] == ["-m", "app.workers.agent_task_worker"]
+    assert command[3:] == ["--config", "config/local.yml"]
 
 
 def test_run_entry_starts_and_stops_cron_subprocess(monkeypatch):

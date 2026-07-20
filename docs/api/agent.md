@@ -1,10 +1,131 @@
 # Agent 接口文档
 
-更新日期：2026-06-30
+更新日期：2026-07-21
 
-## 变更摘要
+> 迁移状态：本文开头的“纯 Python 对外契约”是唯一生效契约。文末保留的旧 Gateway、内部 callback 和 Java Redis 章节仅为历史迁移背景；当前代码、配置和启动流程不得读取这些地址或令牌。
 
-阶段 0 新增 Agent 第二阶段契约和表结构说明。阶段 1 已实现 Java `agent_task` 创建/查询、HTTP 级 `/api/internal/agent/tools/read` 只读 Tool Gateway、`RagService.queryNonPersistent()` 和严格 `X-Agent-Internal-Token` 校验。阶段 2 已实现 Python LangGraph 只读闭环、Java 调 Python Agent client、Python 回写 Java events，以及前端 `/agent` 最小页面。阶段 3 新增规划类 `planning_task` 的计划审批、只读 evidence 对齐、能力缺口分析和输出审批闭环。阶段 4 新增 Agent 自身范围内的 CRUD 审批、before/after snapshot、幂等键和撤销窗口。阶段 5 新增 `web_search_probe` 联网参考工具。阶段 7 新增 Agent 记忆最小闭环，详细接口见 `docs/api/agent-memory.md`。2026-06-28 统一为 `pae_react_graph` 任务路由器：所有 Agent 工作台任务先进入统一 LangGraph，再路由到 ReadOnly 子图或 Planning 子图；旧 `read_only_graph` / `planning_graph` 不再作为运行主图或 helper 容器；当前仍未实现 MCP 或 `web_page_fetcher`，简历修改已在统一图内建模为 Planning 子图下的 `resume_rewrite_*` 节点族。Agent 工作台选择 `workspaceMode=free_explore` 时默认以 `web_search_probe` 作为第一数据来源，RAG 只作为本地 evidence 补充或联网不可用时的降级路径；只读问答 `workspaceMode=read` 才以 RAG 检索为主。2026-06-29 起，Java 创建任务和审批恢复都不再阻塞等待 Python LangGraph 完成，Python `/internal/agent/tasks` 与 `/resume` 接收后立即返回 `RUNNING` 并在后台执行；2026-06-30 起前端通过 `GET /api/agent/tasks/{taskId}/stream` 订阅 Java SSE，同时接收 `agent_event` 节点级流式事件，逐步展示 Planner、工具节点、上下文压缩和验收节点进度，最终状态仍以 Java 任务快照的 `messages/final/draft/errorMessage` 为准。2026-06-29 新增 `agent_chat_message` 任务消息投影表，Agent 工作台历史会话不再由前端硬编码拼接，而是展示 Java 根据用户输入、Python 事件、工具观测、审批决策、最终回答和错误状态持久化后的消息流。同日新增侧边栏会话树：`agent_conversation_folder` 保存用户自定义分类，`agent_task.folder_id` 保存会话归属；Python 统一图入口新增 `conversation_title` 节点，使用 `qwen-turbo` 根据首句生成 `conversationTitle` 并通过 Java 事件更新 `agent_task.title`，前端只展示后端返回的标题。
+## 纯 Python 对外契约
+
+### 服务边界
+
+- FastAPI（`ai-python`）是 Agent、会话、审批、操作审计和 Agent 记忆的业务权威服务，对外提供全部 `/api/agent/*` 路径。
+- PostgreSQL `learning_evidence.agent_*` 表是唯一持久事实源；任务、消息、审批、操作、文件夹和记忆均由 Python 事务写入，不通过 Java 回调同步。
+- Bearer Token 由 Python `AuthService.current_user()` 解析。服务端从登录会话得到 `userId`，忽略请求体、查询参数或图状态中的任何 `userId`。
+- 统一图通过进程内 `LocalAgentGateway` 访问受控只读能力、记忆检索与任务事件写入；不允许调用 Java URL、`X-Agent-Internal-Token`、Java Tool Gateway 或 Java callback URL。
+- Worker 只接收已落库的 `agent_task`，从 PostgreSQL 读取任务并回写状态、消息、工具观测与审批；HTTP 创建接口不等待 LangGraph 完成。
+- Redis 仅可作为 SSE 或运行态加速缓存。Redis 不可用时，SSE 重连与任务详情必须从 PostgreSQL 恢复。
+
+### 通用约定
+
+- 所有 JSON 接口返回 `Result<T>`：成功为 `{"code":1,"data":...}`，受控业务失败为 `{"code":0,"msg":"中文错误说明","data":null}`。
+- 除 SSE 外，所有路径要求 `Authorization: Bearer <token>`。缺失、过期或被撤销的令牌返回 `登录状态已失效`。
+- 当前用户无权访问的任务、审批、操作、文件夹或记忆统一按“不存在或不属于当前用户”处理，不泄露其他用户资源。
+- 任务状态：`CREATED`、`RUNNING`、`WAITING_PLAN_REVIEW`、`WAITING_OUTPUT_REVIEW`、`WAITING_CRUD_REVIEW`、`COMPLETED`、`CANCELED`、`FAILED`。终态为 `COMPLETED`、`CANCELED`、`FAILED`；三个 `WAITING_*` 状态均表示等待当前用户审批。
+
+### 公开路径
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/agent/tasks` | 创建任务并入队执行 |
+| `GET` | `/api/agent/tasks?limit=20` | 查询当前用户最近任务 |
+| `GET` | `/api/agent/tasks/{taskId}` | 查询任务详情、消息、审批与操作 |
+| `GET` | `/api/agent/tasks/{taskId}/messages` | 按 `beforeSequenceNo` / `afterSequenceNo` 分页消息 |
+| `GET` | `/api/agent/tasks/{taskId}/stream?token=...` | 订阅 `task`、`agent_event`、`done` SSE 事件 |
+| `POST` | `/api/agent/tasks/{taskId}/folder` | 移动会话，`folderId=null` 表示未分类 |
+| `POST` | `/api/agent/tasks/{taskId}/reviews/{reviewId}/decide` | 提交 `APPROVED`、`REJECTED` 或 `CHANGES_REQUESTED` |
+| `POST` | `/api/agent/operations/{operationId}/undo` | 在撤销窗口内按幂等键撤销操作 |
+| `GET` | `/api/agent/conversations/tree` | 查询会话树 |
+| `POST` | `/api/agent/conversation-folders` | 创建会话文件夹 |
+| `PUT` | `/api/agent/conversation-folders/{folderId}` | 更新文件夹名称和排序 |
+| `DELETE` | `/api/agent/conversation-folders/{folderId}` | 删除文件夹并将会话移回未分类 |
+| `GET` | `/api/agent/tools` | 查询当前阶段开放的受控工具定义 |
+| `GET` | `/api/agent/memories` | 按状态、类型、命名空间和作用域查询当前用户记忆 |
+| `POST` | `/api/agent/memories` | 创建当前用户显式授权的记忆 |
+| `GET` | `/api/agent/memories/{memoryId}` | 查询当前用户的一条记忆 |
+| `PATCH` | `/api/agent/memories/{memoryId}` | 修改记忆并生成收窄作用域的新版本 |
+| `POST` | `/api/agent/memories/{memoryId}/confirm` | 确认待审记忆并激活索引 |
+| `POST` | `/api/agent/memories/{memoryId}/reject` | 拒绝待审记忆 |
+| `POST` | `/api/agent/memories/{memoryId}/archive` | 归档记忆 |
+| `DELETE` | `/api/agent/memories/{memoryId}` | 擦除正文并保留审计链 |
+
+### 任务请求与异步状态
+
+`POST /api/agent/tasks` 请求体：
+
+```json
+{
+  "taskType": "pure_read_query",
+  "folderId": null,
+  "title": "Redis 缓存策略",
+  "input": {
+    "goal": "说明 Redis 缓存策略并引用资料证据",
+    "workspaceMode": "read",
+    "topK": 5,
+    "metadataFilter": {}
+  }
+}
+```
+
+服务端写入 `agent_task` 和首条 `agent_chat_message` 后返回 `CREATED`。Worker 将其更新为 `RUNNING`，并持续写入 `agent_event` 与消息投影。只读任务可使用进程内 RAG/记忆 gateway；规划或变更任务需要写入 `agent_human_review` 后进入 `WAITING_REVIEW`。审批恢复也由 Python Worker 完成，前端以详情轮询或 SSE 获取最终快照。
+
+失败示例：
+
+```json
+{
+  "code": 0,
+  "msg": "AGENT_VALIDATION_FAILED: 任务目标不能为空",
+  "data": null
+}
+```
+
+### 请求与响应边界
+
+- `POST /api/agent/tasks/{taskId}/folder` 请求体为 `{"folderId":"agent-folder-..."}`；`folderId=null` 表示移入未分类。服务端必须验证该文件夹归属于当前登录用户。
+- `POST /api/agent/tasks/{taskId}/reviews/{reviewId}/decide` 请求体为 `{"decision":"APPROVED","comment":"可继续","changes":{}}`。`decision` 仅允许 `APPROVED`、`REJECTED`、`CHANGES_REQUESTED`；接口只持久化决策并把可恢复任务置为 `RUNNING`，不在 HTTP 请求内执行 Agent 图。
+- `POST /api/agent/operations/{operationId}/undo` 请求体必须包含非空 `idempotencyKey`，可选 `reason`。重复撤销已完成操作返回同一操作快照；过期、非当前用户或不可撤销操作返回受控业务错误。
+- 会话文件夹创建或更新请求为 `{"name":"RAG 学习","sortOrder":0}`；名称不能为空且最长 80 个字符。
+- 记忆创建请求至少包含 `memoryType`、`namespace`、`scopeType`、`subjectKey`、`content`，可选 `summary`、`scopeId`、`evidenceRefs`、`importance`。`PATCH` 只接受正文、摘要、命名空间、主题和收窄后的作用域字段；服务端忽略任何客户端提供的 `userId`、来源任务所有者或审计字段。
+- 任务详情返回任务摘要以及 `toolCalls`、`reviews`、`operations`、最近消息窗口；消息分页返回 `taskId`、`messages`、`oldestSequenceNo`、`newestSequenceNo`、`hasMoreBefore`、`hasMoreAfter`。所有时间字段均为 ISO-8601 时间戳。
+
+### SSE
+
+SSE 路径为了兼容浏览器 `EventSource`，允许令牌置于 `token` 查询参数；服务端仍按 `AuthService.current_user()` 校验，且不记录令牌原文。事件名称与负载如下：
+
+- `task`：完整任务快照。
+- `agent_event`：节点、工具、审批或状态的增量事件，至少包含 `taskId`、`eventType`、`status`、`createdAt`。
+- `done`：终态完整任务快照，客户端应关闭连接。
+
+SSE 首先推送一次 `task` 当前快照。随后服务端从 PostgreSQL 轮询任务及新增消息投影，派生 `agent_event`；不依赖 Redis 或 Java 缓冲。任务进入 `COMPLETED`、`CANCELED` 或 `FAILED` 后推送 `done` 并关闭连接。连接中断后，客户端可用同一路径重新订阅，或通过任务详情和消息分页恢复。
+
+### Worker 执行与恢复
+
+- `app.workers.agent_task_worker` 是单独监督的 Python 耐久 worker。它读取 PostgreSQL 中 `CREATED`、`RUNNING` 的任务；终态和 `WAITING_REVIEW` 任务不会被再次执行。
+- Worker 通过进程内 `LocalAgentGateway` 读取当前用户记忆、调用 Python RAG 控制面或执行已审批的最小变更投影。它绝不创建 Java HTTP 客户端、不会读取 Java URL，也不会发送 Java callback。
+- 无模型或 RAG 依赖不可用时，worker 使用确定性降级答案并记录工具观测与错误诊断，避免任务永久停在 `RUNNING`。规划和变更任务在需要用户确认时写入 `agent_human_review` 并转为对应的 `WAITING_*_REVIEW` 状态；审批后下一轮轮询从 PostgreSQL 恢复。
+
+### 当前实现落点
+
+- 公开 API 实现在 `ai-python/app/api/agent.py`，所有非 SSE 路径复用 Python `Result<T>` 信封；非对象请求体、任务目标、审批决定和所有权错误均返回 `code=0`，而不是 HTTP callback 错误。
+- 统一图的 gateway 实现在 `ai-python/agents/gateway/local_gateway.py`。它从任务记录派生用户身份，直接调用 `AgentRuntimeService`、Python RAG 控制面和记忆服务，不创建网络客户端。
+- 耐久 worker 入口为 `python -m app.workers.agent_task_worker`。启动配置开启 `AI_AGENT_WORKER_ENABLED` 后，worker 顺序读取 `CREATED` / 可恢复的 `RUNNING` 任务；审批接口只把任务置为 `RUNNING`，下一轮 worker 决定恢复图，不在 HTTP 请求内执行。
+- PostgreSQL worker 领取时持有按 schema 和 task ID 构造的 session advisory lock；意外启动多个 worker 时，同一任务只会由获得锁的一个进程运行，锁随连接关闭自动释放，下一轮可从持久化状态恢复。
+- 当前无可用 RAG、embedding 或模型依赖时，gateway 返回带空 `evidences` 的确定性结果并记录 `deterministic-fallback` 诊断。任务仍会进入受控终态，不会因依赖缺失永久停留在 `RUNNING`。
+
+### 工具与审批安全边界
+
+`GET /api/agent/tools` 只返回白名单工具。只读工具可由统一图直接通过 Python 进程内 gateway 调用；变更工具必须创建 `agent_human_review` 和 `agent_operation`，只有当前任务所有者审批后才可执行。`undo` 必须校验操作所有者、状态、截止时间与 `idempotencyKey`。Python 不接受模型、浏览器或请求体提供的资源所有者字段。
+
+### 前端影响
+
+React `frontend-react/src/api/agent.ts` 无需改变路径或 `Result<T>` 类型。Vite 代理切换至 FastAPI 后，`/agent` 页面只需运行 React 与 Python 服务，不再启动 Java 7080。
+
+## 当前实现变更摘要
+
+2026-07-21 起，Agent 任务、消息、审批、操作、会话文件夹、记忆和 SSE 全部由 Python FastAPI 与耐久 worker 提供。HTTP 请求只写入 PostgreSQL 事实表，`app.workers.agent_task_worker` 负责从 `CREATED` 或可恢复的 `RUNNING` 状态执行统一图；前端只需要 FastAPI 和 React。统一图通过 `LocalAgentGateway` 进程内调用 RAG、记忆和审计服务，不使用 Java URL、内部回调或共享令牌。
+
+## 历史迁移记录（仅供追溯，不是运行依赖）
+
+以下章节保留迁移前的 Java Gateway、Redis 和内部 HTTP 契约，用于理解旧数据和回滚差异；不得据此配置启动参数、前端代理或服务间调用。
 
 历史聊天记录和上下文压缩摘要存储选择 PostgreSQL，不使用 Redis 作为主存储。原因是 Agent 历史会话需要长期保留、按用户隔离查询、支持审计和刷新恢复，并且已经和 `agent_task`、`agent_chat_message`、`agent_conversation_summary`、`agent_tool_call`、`agent_human_review`、`agent_operation` 同属业务事实记录；PostgreSQL 的事务、唯一约束和级联删除更适合这类 durable history。2026-06-30 起 Java 已真实接入 Redis adapter，但 Redis 只做 L2 短期热态上下文和 SSE 重连缓冲，不作为可追溯聊天历史、摘要段或恢复索引的唯一来源；Redis 未配置、关闭或连接异常时，任务详情、上下文恢复和 SSE 仍回退到 PostgreSQL 消息/摘要和数据库轮询快照。
 

@@ -1,15 +1,97 @@
 # RAG 接口文档
 
+> 当前运行时只使用本文件中的 Python FastAPI 公开控制面和 Python durable worker。后文如出现 Java Source API、7080、callback 或旧 `/internal/rag/*`，均为迁移前历史契约，不得用于启动或联调。
+
+## Python 公开控制面（阶段 3）
+
+更新日期：2026-07-21
+
+### 变更摘要
+
+`/api/rag/*` 由 Python FastAPI 提供，保持 React 既有的 `Result<T>` 信封：成功返回
+`{"code": 1, "data": ...}`，业务失败返回 HTTP `200` 与
+`{"code": 0, "msg": "中文错误说明", "data": null}`。请求校验失败同样转换为该信封。
+
+本控制面不调用 Java HTTP 接口。资料、查询历史、索引状态和对象来源直接使用 PostgreSQL
+`learning_evidence` schema；解析、递归切块、检索、证据引用继续复用 Python `rag/` 模块。
+
+### 耐久任务与 Worker
+
+- `POST /api/rag/materials/text`、上传完成、分片合并完成和重建索引不在 FastAPI 请求进程中执行
+  解析或 embedding。它们在同一 PostgreSQL 事务内创建资料状态、`rag_index_job` 与任务投递记录，
+  然后快速返回资料的 `PENDING`、`PARSING` 或 `REINDEXING` 状态。
+- `RAG_KAFKA_ENABLED=true` 时，索引任务通过 Python 写入的 `rag_outbox_event` 发布到 Kafka；Python
+  worker 消费 request、progress、result、promote result 和 DLQ，并把终态回写 PostgreSQL。
+  `RAG_KAFKA_ENABLED=false` 时，`app.workers.rag_task_worker` 从 PostgreSQL 抢占 `LOCAL` 索引任务，
+  执行同一 staging/promote 状态机。两种模式都不依赖 Java HTTP、Java source API 或 Java callback。
+- `POST /api/rag/query/tasks` 在同一事务内写入 `rag_query_history` 和 `rag_query_task`，返回
+  `RUNNING`。查询 worker 使用租约抢占任务，进程异常后由租约过期重试；每个阶段事件、最终回答、
+  evidence、answer guard 和失败摘要均回写 PostgreSQL。`GET /api/rag/query/tasks/{taskId}` 只读取
+  持久化快照，状态为 `RUNNING`、`COMPLETED`、`FAILED` 或 `EXPIRED`。
+- durable worker 的任何错误只保存异常类别和受控中文摘要，不保存原始资料正文、问题、Token、
+  OSS 密钥或数据库连接串。Kafka 消息按 `rag_consumed_event` 的 consumer/message/idempotency 三元组去重。
+
+### 鉴权与所有权
+
+- 除健康检查外，所有 `/api/rag/*` 路由必须携带 `Authorization: Bearer <token>`。
+- Python `AuthService` 从 `auth_session` 推导当前用户；请求体、multipart 字段和
+  `metadataFilter` 中的 `userId` 均不可信，服务端始终覆盖为当前用户 ID。
+- 所有资料、evidence、预览、重建、查询历史和查询任务均按 `learning_material.user_id` 或
+  `rag_query_history.user_id` 校验。用户 A 访问用户 B 的资源统一返回“资料不存在”或“查询任务不存在”。
+- 查询固定注入 `metadataFilter.userId=<当前用户>` 与
+  `metadataFilter.visibilityScope=private`，不允许查询 staging 索引。
+
+### 公开端点
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/rag/overview` | 当前用户资料、切块与最后索引标题概览 |
+| GET | `/api/rag/materials` | 当前用户最近资料列表 |
+| GET | `/api/rag/materials/{id}` | 资料状态与进度 |
+| GET | `/api/rag/materials/{id}/evidences?limit=20` | 当前资料的 evidence |
+| GET | `/api/rag/materials/{id}/preview?source=` | 文本类原文件预览 |
+| POST | `/api/rag/materials/text` | 创建并索引手工文本资料 |
+| POST | `/api/rag/materials/upload` | 保存并索引单个文件 |
+| POST | `/api/rag/materials/upload/chunk` | 0-based 分片上传、合并并索引 |
+| POST | `/api/rag/materials/{id}/reindex?highPrecision=false` | 从受控原文件重建索引 |
+| POST | `/api/rag/query` | 同步 RAG 查询并保存历史 |
+| GET | `/api/rag/query/history?startDate=&endDate=&limit=5` | 当前用户查询历史 |
+| POST | `/api/rag/query/tasks` | 创建带进度的查询任务 |
+| GET | `/api/rag/query/tasks/{taskId}` | 读取当前用户查询任务 |
+
+上传字段保持前端既有名称：单文件为 `file`、`highPrecision`；分片为 `file`、`filename`、
+`uploadId`、`chunkIndex`、`totalChunks`、`totalSize`、`highPrecision`。`chunkIndex` 从 0 开始。
+
+### 状态与失败规则
+
+- 资料状态为 `PENDING`、`PARSING`、`READY`、`PARTIAL`、`FAILED`、`REINDEXING`。
+- 查询任务状态为 `RUNNING`、`COMPLETED`、`FAILED`、`EXPIRED`。任务历史持久化到
+  `rag_query_history`，任务读取必须校验 user ID。
+- 空文件、非法分片、越出资料目录的预览来源、非文本预览、手工文本资料重建均返回稳定中文业务错误。
+- 解析或索引失败只记录异常类别和受控摘要，不能返回原文、Token、OSS 密钥或数据库连接信息。
+
+### 运行边界
+
+公开控制面仅依赖 Python 认证、PostgreSQL、对象存储和 `rag/` 算法模块。Kafka 启用时，
+后续 worker 通过 Python repository 处理 job、Outbox、progress、result、promote 与 DLQ；
+不得使用 `RAG_JAVA_BASE_URL`、Java internal token、Java Source API 或 Java 日志 callback。
+
+---
+
+## 迁移前历史记录（仅供追溯，不是运行依赖）
+
+下列内容记录 Java 业务后端尚未下线时的 Source API、Kafka 协作和回调契约。当前公开 RAG 控制面、任务状态和 worker 均以本文顶部的 Python 契约为准；不要按历史章节配置 Java 地址、内部 token 或 callback。
+
 更新日期：2026-07-20
 
-## 变更摘要
+## 变更摘要（历史）
 
 本次补齐“多格式文档解析到 RAG 入库”接口契约，并接入登录用户隔离、1024 维百炼 embedding、视频字幕/OCR 提取修复、视频画面 OCR 近重复治理、RAG 进度事件、长视频分片上传后台收尾、查询链路进度返回、RAG 询问历史筛选、前端 Markdown 回答渲染、资料 Markdown 预览页、视频 evidence 内部播放器定位，以及 Stage 1 父子索引、summary child、OCR occurrence、父段聚合诊断和 `STRICT_EVIDENCE_GUARD_V1` 回答准入。2026-07-04 新增 Kafka 驱动高吞吐索引流水线契约：Java 通过事务内资料记录、索引任务和 Outbox 事件发布索引请求，Python Kafka worker 只写 staging 索引，Java 校验 active job 与 requestVersion 后再发布 promote 请求，Python 完成 staging 到 canonical 的提升。第一阶段只把上传、重建、视频分片收尾和索引终态同步接入 Kafka；低延迟 `/api/rag/query` 默认仍走 HTTP，不改变 evidence 结构。2026-07-18 将查询融合升级为可配置的确定性 weighted RRF，保留非法配置回退等权 RRF；本地 rerank 升级为可解释的融合分、词覆盖、标题章节覆盖和排名先验特征，并在 diagnostics 中返回选择原因、逐路 raw score/rank 与贡献值。2026-07-20 将 Java `RagOutboxPublisher` 迁入 Python：Java 在过渡期仍负责同事务写入资料、索引任务和 Outbox，Python `app.workers.outbox_publisher` 成为唯一发布者；`run.py` 负责按配置监督独立 cron 进程，避免 Uvicorn reload 产生重复定时任务。
 
 边界约定：
 
-- React 只调用 Java Spring Boot。
-- Java 负责资料记录、文件上传、阿里 OSS 对象存储、原始文件路径、解析状态、登录用户边界、统一 `Result<T>` 响应和调用 Python。
+- React 只调用 Python FastAPI（默认 `http://127.0.0.1:8090`），不再依赖 Java Spring Boot。
+- Python 负责资料记录、文件上传、对象存储、本地/OSS 原始文件路径、解析状态、登录用户边界、统一 `Result<T>` 响应和 RAG worker；Java 章节仅保留为迁移追溯。
 - Python FastAPI 负责多格式解析路由、原始视频处理、MinerU/OCR 降级、`DocumentBlock` 统一模型、解析质量评分、递归切块、BM25、百炼 `text-embedding-v4` 1024 维向量索引、RRF/RAG-Fusion、百炼 rerank、百炼 LLM 回答生成和 evidence 引用。
 - RAG 查询回答准入由 Python `query.guard` 统一判定。Java 只透传 `answerStatus/refusalReason/refusalPolicy/confidence/supportingEvidenceIds/refusalMessage`，并在历史和日志中保存结构化结果；前端只展示状态，不自行判断是否可回答。
 - 数据库初始化脚本位于 `infra/sql/init.sql`，增量迁移位于 `infra/sql/alter-database/`。
@@ -1114,7 +1196,7 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
 | `source_path` | string | 否 | Java 保存的原始文件路径 |
 | `high_precision` | bool | 否 | 强制补跑 PDF + MinerU/OCR |
 
-`source_path` 在 OSS 模式下优先传入可访问的 OSS/CDN URL；如果未配置公开访问地址，则传入 `oss://bucket/objectKey`，用于 evidence 来源追踪。真实视频播放需要 `ALIYUN_OSS_PUBLIC_BASE_URL` 指向可被浏览器访问的公开域名或后续补充签名 URL 服务。
+`source_path` 在 OSS 模式下优先保存公开 CDN URL；如果未配置公开访问地址，则保存 `oss://bucket/objectKey`，仅用于 evidence 来源追踪。Python worker 通过 `objectKey` 和用户隔离校验读取私有 OSS 对象；真实视频浏览器播放仍需要 `ALIYUN_OSS_PUBLIC_BASE_URL` 或签名 URL 服务。
 
 ### 按视频源索引
 
@@ -1133,7 +1215,7 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
 | `contentType` | string | 否 | MIME 类型 |
 | `highPrecision` | bool | 否 | 预留字段，视频当前主要控制 ASR/OCR 补跑 |
 
-`sourcePath` 为本地路径时，Python 直接从文件系统读取；为公开视频 URL 时，Python 优先走百炼异步 filetrans，并用 FFmpeg 从 URL 抽取关键帧。`oss://` 且无公开 URL 时，当前只作为来源追踪，Python 无法直接读取对象内容，Java 需配置 `ALIYUN_OSS_PUBLIC_BASE_URL` 或后续补充签名 URL 服务。
+`sourcePath` 为本地路径时，Python 直接从受控上传目录读取；`storageType=oss` 时，Python worker 使用 `objectKey` 从 OSS 下载到临时文件并在解析结束后清理。仅当需要浏览器直接播放视频时才要求配置 `ALIYUN_OSS_PUBLIC_BASE_URL` 或签名 URL 服务。
 
 ### 索引文本
 
@@ -1911,9 +1993,9 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 - RAG 查询提交后立即展示 `query.expand -> query.filter -> query.bm25 -> query.vector -> query.fusion -> query.rerank -> query.guard -> query.answer` 阶段面板；响应返回后使用 `RagQueryVO.progressEvents` 中的真实阶段、百分比、模型事件和完成/失败状态覆盖前端占位状态。
 - Agent 非持久化探针结果需要返回 `answerStatus/refusalReason/confidence`；工具结果中的 evidenceIds 只取 `supportingEvidenceIds`，拒答时为空。
 
-## 阿里 OSS 上传配置
+## Python 对象存储与大文件上传配置
 
-生产环境上传文件建议进入阿里 OSS，Java 仍会把文件字节转发给 Python 完成当前请求的解析入库，Python 不直接持有 OSS 密钥。
+生产环境上传文件可进入阿里 OSS；Python FastAPI 直接使用 `oss2` 上传，Kafka worker 也使用同一适配器下载。公开上传接口按固定缓冲区把 `UploadFile` 写入受控临时目录，不执行 `await file.read()` 整体读取；分片合并按文件流复制，不执行 `merged.read_bytes()`。
 
 | 配置项 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -1925,6 +2007,10 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 | `evidence.storage.oss.access-key-secret` | `ALIYUN_OSS_ACCESS_KEY_SECRET` | 空 | OSS AccessKey Secret |
 | `evidence.storage.oss.object-prefix` | `ALIYUN_OSS_OBJECT_PREFIX` | `learning-evidence` | OSS 对象 key 前缀 |
 | `evidence.storage.oss.public-base-url` | `ALIYUN_OSS_PUBLIC_BASE_URL` | 空 | 可选公开访问域名或 CDN 域名，用于视频播放和 evidence 跳转 |
+
+对象 key 固定为 `prefix/{userId}/{documentType}/{yyyyMMdd}/{uuid}-{filename}`。用户 ID、资料类型和文件名均先经过单路径段清理；Kafka worker 读取 OSS 前还会校验 bucket、前缀和用户段，拒绝 `..`、绝对路径、反斜杠及跨用户 key。未配置 `ALIYUN_OSS_PUBLIC_BASE_URL` 时，数据库只保存 `oss://bucket/key` 来源追踪地址，worker 仍可用密钥下载私有对象。
+
+`EVIDENCE_STORAGE_PROVIDER=local` 使用 `EVIDENCE_UPLOAD_ROOT`；`EVIDENCE_STORAGE_PROVIDER=oss` 必须配置 Endpoint、Bucket、AccessKey ID 和 Secret，否则 Python 启动或首次构造存储适配器时返回中文配置错误。OSS 下载只写入 `EVIDENCE_UPLOAD_TEMP_ROOT` 下的临时文件，解析结束后在 `finally` 中删除，原始对象不会被 worker 删除。
 
 OSS 模式写入 `learning_material.original_file_path` 的优先级：
 

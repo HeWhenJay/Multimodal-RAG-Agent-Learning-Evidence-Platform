@@ -1313,7 +1313,7 @@ function buildBackendNotice(task: AgentTask) {
     }
     return '\u5de5\u5177\u89c2\u5bdf\u5df2\u56de\u5199\uff0cAgent \u6b63\u5728\u6574\u5408\u7ed3\u679c\u3002';
   }
-  if (task.status === 'WAITING_TOOL_RESULT') return '\u5de5\u5177\u8bf7\u6c42\u5df2\u53d1\u8d77\uff0c\u6b63\u5728\u7b49\u5f85 Java Tool Gateway \u56de\u5199\u89c2\u5bdf\u7ed3\u679c\u3002';
+  if (task.status === 'WAITING_TOOL_RESULT') return '\u5de5\u5177\u8bf7\u6c42\u5df2\u53d1\u8d77\uff0c\u6b63\u5728\u7b49\u5f85 Python \u672c\u5730\u5de5\u5177\u7f51\u5173\u8fd4\u56de\u89c2\u5bdf\u7ed3\u679c\u3002';
   if (task.status === 'WAITING_PLAN_REVIEW') return '\u89c4\u5212\u5668\u5df2\u751f\u6210\u6267\u884c\u8def\u7ebf\uff0c\u7b49\u5f85\u4f60\u6279\u51c6\u6216\u8981\u6c42\u4fee\u6539\u3002';
   if (task.status === 'WAITING_OUTPUT_REVIEW') return '\u8f93\u51fa\u8349\u7a3f\u5df2\u751f\u6210\uff0c\u7b49\u5f85\u4f60\u786e\u8ba4\u540e\u518d\u5b8c\u6210\u4efb\u52a1\u3002';
   if (task.status === 'WAITING_CRUD_REVIEW') return '\u68c0\u6d4b\u5230\u53d8\u66f4\u610f\u56fe\uff0c\u6b63\u7b49\u5f85\u4f60\u5ba1\u6279\u5177\u4f53\u5199\u64cd\u4f5c\u3002';
@@ -1493,7 +1493,7 @@ function streamDedupeKey(event: AgentStreamEvent, draft: Record<string, unknown>
   if (event.eventType === 'TASK_COMPLETED') return 'final_answer';
   if (event.eventType === 'TASK_FAILED') return 'task_failed';
   const source = streamSourceKey(event, draft);
-  return `event_${event.eventType.toLowerCase()}_${javaStringHashHex(`${source}|${message}`)}`;
+  return `event_${event.eventType.toLowerCase()}_${stableStringHashHex(`${source}|${message}`)}`;
 }
 
 function streamSourceKey(event: AgentStreamEvent, draft: Record<string, unknown>) {
@@ -1509,7 +1509,7 @@ function streamSourceKey(event: AgentStreamEvent, draft: Record<string, unknown>
   ].join(':');
 }
 
-function javaStringHashHex(value: string) {
+function stableStringHashHex(value: string) {
   let hash = 0;
   for (let index = 0; index < value.length; index += 1) {
     hash = ((hash * 31) + value.charCodeAt(index)) | 0;

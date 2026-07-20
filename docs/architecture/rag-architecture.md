@@ -2,36 +2,28 @@
 
 ## 当前边界
 
-当前项目已经同时提供确定性 RAG 链路和 Agent 任务编排。本文聚焦资料索引与查询架构；普通上传、分片上传、重建索引和视频处理仍由 React -> Java -> Python RAG 的确定性接口完成，不交给 Agent 自主调度。
+当前运行形态为 `React -> FastAPI -> PostgreSQL/pgvector`。普通上传、分片上传、重建索引、视频处理、查询、Agent、记忆、日志和 SSE 均由 Python 公开控制面或 Python durable worker 完成，不依赖 Spring Boot、Java Tool Gateway、7080 callback 或 Java 内部 Token。具体公开契约见 `docs/api/rag.md` 与 `docs/api/agent.md`。
 
-Agent 由 Python `ai-python/agents/orchestration/pae_react_graph.py` 统一编排 PAE/ReAct 流程，并通过 Java Tool Gateway 执行资料读取、RAG 探针或经过审批的业务操作。Java 仍是用户权限、任务状态、审批、幂等和审计的权威边界。当前 LangGraph 使用 `workflow.compile()`，尚未接入持久 checkpointer；审批后的恢复使用同一 `threadId`，并根据 Java 保存的任务状态和恢复请求重建确定性状态。具体契约见 `docs/api/agent.md`。
+Agent 由 Python `ai-python/agents/orchestration/pae_react_graph.py` 统一编排 PAE/ReAct 流程，并通过进程内 `LocalAgentGateway` 访问受控资料、RAG、记忆和任务状态。PostgreSQL 是权威持久化来源，Redis 只做可丢失运行态加速；任务恢复、审批和 SSE 重连均从 Python 持久记录重建。
 
 ```mermaid
 flowchart LR
-    A["React 前端"] --> B["Java Spring Boot API"]
-    B --> C["MyBatis Mapper / H2 或 PostgreSQL"]
-    B --> D{"Kafka 是否开启"}
-    D -->|"否"| E["旧 @Async + HTTP 索引<br/>本地开发默认路径"]
-    D -->|"是"| O["rag_index_job + rag_outbox_event<br/>事务内创建索引任务"]
-    O --> OUTBOX["Java 或 Python 唯一 Outbox Publisher"]
-    OUTBOX --> KAFKA["Kafka request/progress/result/promote topics"]
-    KAFKA --> PYW["Python Kafka Index Worker"]
-    E --> PYHTTP["Python FastAPI RAG 服务"]
-    PYW --> PYPIPE["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
-    PYHTTP --> PYPIPE
-    PYPIPE --> F["DocumentBlock 统一模型"]
-    F --> V["视频画面 OCR 近重复治理<br/>frame_ocr 聚合与时间范围保留"]
-    V --> G["递归切块"]
-    G --> H["摘要索引"]
-    H --> S["staging pgvector 文档<br/>visibility_scope=staging"]
-    S --> PR["Java 校验 active job + requestVersion"]
-    PR --> PM["Python Promote Worker<br/>staging 提升 canonical"]
-    PM --> I["BM25 + PostgreSQL/pgvector private 检索"]
-    I --> J["RRF / RAG-Fusion"]
-    J --> R["证据引用回答"]
+    A["React 前端"] --> B["Python FastAPI 公开 API"]
+    B --> C["Auth / PageData / Logs / RAG / Agent"]
+    C --> DB[("PostgreSQL / pgvector")]
+    C --> W["Python durable workers + cron"]
+    W --> KAFKA{"可选 Kafka"}
+    KAFKA -->|"开启"| K["Outbox / Index / Progress / Result / DLQ"]
+    KAFKA -->|"关闭"| L["本地 PostgreSQL 任务队列"]
+    K --> P["多格式解析、递归切块、摘要索引"]
+    L --> P
+    P --> V["BM25 + 向量召回 + RRF/RAG-Fusion"]
+    V --> R["evidence 引用回答"]
 ```
 
-Kafka 是高吞吐索引通道，不是查询通道。`/api/rag/query` 和查询任务继续由 Java 通过 HTTP 调 Python，并由 Java 强制当前用户与 `visibilityScope='private'` 过滤。Kafka 关闭时，架构退回旧的 `@Async + HTTP` 索引路径，资料状态、进度和最终结果保持兼容。
+Kafka 是可选的高吞吐索引通道，不是公开查询依赖。`/api/rag/query` 和查询任务由 Python 控制面创建并由 Python worker 执行；关闭 Kafka 时使用 PostgreSQL 本地 durable worker，资料状态、进度和最终结果仍保持一致。
+
+## 迁移前历史设计（仅供追溯）
 
 ## Kafka 索引流水线
 

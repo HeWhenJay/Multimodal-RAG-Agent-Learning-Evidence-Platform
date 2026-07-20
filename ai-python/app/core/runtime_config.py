@@ -10,8 +10,6 @@ from typing import Any
 
 import uvicorn
 
-from app.core.agent_internal_token import resolve_agent_internal_token
-
 
 AI_PYTHON_DIR = Path(__file__).resolve().parents[2]
 if str(AI_PYTHON_DIR) not in sys.path:
@@ -87,12 +85,8 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "llm", "temperature"): "RAG_LLM_TEMPERATURE",
     ("rag", "progress", "console-enabled"): "RAG_CONSOLE_PROGRESS_ENABLED",
     ("rag", "process-log", "console-enabled"): "RAG_CONSOLE_PROCESS_ENABLED",
-    ("rag", "callbacks", "event-url"): "RAG_EVENT_CALLBACK_URL",
-    ("rag", "callbacks", "error-url"): "RAG_ERROR_CALLBACK_URL",
     ("rag", "kafka", "enabled"): "RAG_KAFKA_ENABLED",
     ("rag", "kafka", "bootstrap-servers"): "RAG_KAFKA_BOOTSTRAP_SERVERS",
-    ("rag", "kafka", "java-base-url"): "RAG_JAVA_BASE_URL",
-    ("rag", "kafka", "java-internal-token"): "RAG_JAVA_INTERNAL_TOKEN",
     ("rag", "kafka", "worker", "reconnect-initial-seconds"): "RAG_KAFKA_RECONNECT_INITIAL_SECONDS",
     ("rag", "kafka", "worker", "reconnect-max-seconds"): "RAG_KAFKA_RECONNECT_MAX_SECONDS",
     ("rag", "kafka", "producer", "flush-seconds"): "RAG_KAFKA_PRODUCER_FLUSH_SECONDS",
@@ -125,6 +119,33 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "kafka", "progress", "min-seconds"): "RAG_KAFKA_PROGRESS_MIN_SECONDS",
     ("rag", "staging-retention-hours"): "RAG_STAGING_RETENTION_HOURS",
     ("rag", "staging-failed-retention-hours"): "RAG_STAGING_FAILED_RETENTION_HOURS",
+    ("database", "url"): "DATABASE_URL",
+    ("database", "schema"): "RAG_DATABASE_SCHEMA",
+    ("database", "migrations-enabled"): "AI_DATABASE_MIGRATIONS_ENABLED",
+    ("auth", "database-url"): "AUTH_DATABASE_URL",
+    ("logs", "enabled"): "EVIDENCE_LOGS_ENABLED",
+    ("logs", "internal-token"): "EVIDENCE_INTERNAL_LOG_TOKEN",
+    ("logs", "max-batch-size"): "EVIDENCE_LOGS_MAX_BATCH_SIZE",
+    ("logs", "max-context-bytes"): "EVIDENCE_LOGS_MAX_CONTEXT_BYTES",
+    ("logs", "max-stack-trace-bytes"): "EVIDENCE_LOGS_MAX_STACK_TRACE_BYTES",
+    ("storage", "provider"): "EVIDENCE_STORAGE_PROVIDER",
+    ("storage", "local-root"): "EVIDENCE_UPLOAD_ROOT",
+    ("storage", "oss", "endpoint"): "ALIYUN_OSS_ENDPOINT",
+    ("storage", "oss", "bucket"): "ALIYUN_OSS_BUCKET",
+    ("storage", "oss", "access-key-id"): "ALIYUN_OSS_ACCESS_KEY_ID",
+    ("storage", "oss", "access-key-secret"): "ALIYUN_OSS_ACCESS_KEY_SECRET",
+    ("storage", "oss", "object-prefix"): "ALIYUN_OSS_OBJECT_PREFIX",
+    ("storage", "oss", "public-base-url"): "ALIYUN_OSS_PUBLIC_BASE_URL",
+    ("redis", "url"): "REDIS_URL",
+    ("workers", "kafka", "enabled"): "AI_KAFKA_WORKER_ENABLED",
+    ("workers", "agent", "enabled"): "AI_AGENT_WORKER_ENABLED",
+    ("workers", "agent", "poll-interval-seconds"): "AI_AGENT_WORKER_POLL_INTERVAL_SECONDS",
+    ("workers", "rag-task", "enabled"): "RAG_TASK_WORKER_ENABLED",
+    ("workers", "rag-task", "poll-interval-seconds"): "RAG_TASK_WORKER_POLL_SECONDS",
+    ("workers", "rag-task", "batch-size"): "RAG_TASK_WORKER_BATCH_SIZE",
+    ("workers", "rag-task", "lease-seconds"): "RAG_TASK_WORKER_LEASE_SECONDS",
+    ("workers", "rag-task", "query-task-ttl-seconds"): "RAG_QUERY_TASK_TTL_SECONDS",
+    ("workers", "rag-task", "local-index-enabled"): "RAG_LOCAL_INDEX_WORKER_ENABLED",
     ("dashscope", "api-key"): "DASHSCOPE_API_KEY",
     ("mineru", "command"): "MINERU_COMMAND",
     ("mineru", "token"): "MINERU_TOKEN",
@@ -179,8 +200,6 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("video", "segment-max-cues"): "RAG_VIDEO_SEGMENT_MAX_CUES",
     ("document", "convert", "libreoffice-command"): "LIBREOFFICE_COMMAND",
     ("document", "convert", "soffice-command"): "SOFFICE_COMMAND",
-    ("agent", "internal-token"): "EVIDENCE_AGENT_INTERNAL_TOKEN",
-    ("agent", "internal-token-file"): "EVIDENCE_AGENT_INTERNAL_TOKEN_FILE",
 }
 
 
@@ -199,6 +218,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="跳过默认的 config/application.yml 和 config/application.local.yml。",
     )
     parser.add_argument(
+        "--bootstrap-database",
+        action="store_true",
+        help="启动前对空 PostgreSQL 执行非破坏性 bootstrap；默认不执行。",
+    )
+    parser.add_argument(
         "--with-cron",
         action="store_true",
         help="本次启动强制拉起已启用的 Python cron worker。",
@@ -208,9 +232,45 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="本次启动不拉起 Python cron worker。",
     )
+    parser.add_argument(
+        "--with-kafka",
+        action="store_true",
+        help="本次启动强制拉起已启用的 Python Kafka worker。",
+    )
+    parser.add_argument(
+        "--without-kafka",
+        action="store_true",
+        help="本次启动不拉起 Python Kafka worker。",
+    )
+    parser.add_argument(
+        "--with-agent-worker",
+        action="store_true",
+        help="本次启动强制拉起已启用的 Agent 耐久任务 worker。",
+    )
+    parser.add_argument(
+        "--without-agent-worker",
+        action="store_true",
+        help="本次启动不拉起 Agent 耐久任务 worker。",
+    )
+    parser.add_argument(
+        "--with-rag-worker",
+        action="store_true",
+        help="本次启动强制拉起 RAG 耐久任务 worker。",
+    )
+    parser.add_argument(
+        "--without-rag-worker",
+        action="store_true",
+        help="本次启动不拉起 RAG 耐久任务 worker。",
+    )
     args = parser.parse_args(argv)
     if args.with_cron and args.without_cron:
         parser.error("--with-cron 与 --without-cron 不能同时使用")
+    if args.with_kafka and args.without_kafka:
+        parser.error("--with-kafka 与 --without-kafka 不能同时使用")
+    if args.with_agent_worker and args.without_agent_worker:
+        parser.error("--with-agent-worker 与 --without-agent-worker 不能同时使用")
+    if args.with_rag_worker and args.without_rag_worker:
+        parser.error("--with-rag-worker 与 --without-rag-worker 不能同时使用")
     return args
 
 
@@ -229,7 +289,6 @@ def load_runtime_config(args: argparse.Namespace) -> None:
     env_defaults = build_env_defaults(merged_config)
     for name, value in env_defaults.items():
         os.environ.setdefault(name, value)
-    os.environ.setdefault("EVIDENCE_AGENT_INTERNAL_TOKEN", resolve_agent_internal_token())
 
     if loaded_paths:
         joined_paths = ", ".join(str(path) for path in loaded_paths)
@@ -298,7 +357,7 @@ def read_simple_yaml_mapping(path: Path) -> dict[str, Any]:
 
 
 def resolve_placeholders(value: Any) -> Any:
-    """解析配置中的 ${ENV:默认值} 占位符，风格对齐 Spring Boot 配置。"""
+    """解析配置中的 ${ENV:默认值} 占位符。"""
     if isinstance(value, dict):
         return {key: resolve_placeholders(child) for key, child in value.items()}
     if isinstance(value, list):
@@ -392,7 +451,7 @@ def read_bool_env(name: str, default: bool) -> bool:
 
 
 def read_port() -> int:
-    """读取 Python AI 服务端口，默认对齐 Java 配置中的 8090。"""
+    """读取 Python 服务端口，默认使用项目约定的 8090。"""
     value = os.getenv("AI_SERVICE_PORT") or os.getenv("PORT") or "8090"
     try:
         return int(value)
@@ -401,18 +460,51 @@ def read_port() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """启动本地 Python RAG FastAPI 服务。"""
+    """启动 FastAPI，并监督已启用的 Python 耐久 worker。"""
     args = parse_args(argv)
     load_runtime_config(args)
+    if args.bootstrap_database:
+        from app.core.database_bootstrap import bootstrap_database
+
+        result = bootstrap_database(apply_incremental_migrations=False)
+        print(
+            f"已完成数据库安全初始化：执行 {result.executed_statements} 条语句，"
+            f"跳过 {result.skipped_statements} 条 DROP 语句。"
+        )
+    from app.core.database_migrations import apply_python_schema_migrations
+
+    applied_migrations = apply_python_schema_migrations()
+    if applied_migrations:
+        print("已应用 Python 数据库增量迁移: " + ", ".join(applied_migrations))
     host = os.getenv("AI_SERVICE_HOST", "127.0.0.1")
     port = read_port()
     reload_enabled = read_bool_env("AI_SERVICE_RELOAD", True)
-    cron_process = None
+    managed_processes = []
     if cron_enabled(args):
-        # 延迟导入避免 cron 模块反向读取运行配置时形成循环依赖。
+        # 延迟导入避免 worker 模块反向读取运行配置时形成循环依赖。
         from app.workers.supervisor import start_cron_process
 
         cron_process = start_cron_process(worker_config_args(args))
+        if cron_process is not None:
+            managed_processes.append(cron_process)
+    if kafka_enabled(args):
+        from app.workers.supervisor import start_worker_process
+
+        kafka_process = start_worker_process("app.workers.kafka_worker", worker_config_args(args))
+        if kafka_process is not None:
+            managed_processes.append(kafka_process)
+    if agent_worker_enabled(args):
+        from app.workers.supervisor import start_worker_process
+
+        agent_process = start_worker_process("app.workers.agent_task_worker", worker_config_args(args))
+        if agent_process is not None:
+            managed_processes.append(agent_process)
+    if rag_task_worker_enabled(args):
+        from app.workers.supervisor import start_worker_process
+
+        rag_task_process = start_worker_process("app.workers.rag_task_worker", worker_config_args(args))
+        if rag_task_process is not None:
+            managed_processes.append(rag_task_process)
     try:
         uvicorn.run(
             "app.main:app",
@@ -423,8 +515,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             app_dir=str(AI_PYTHON_DIR),
         )
     finally:
-        if cron_process is not None:
-            cron_process.stop()
+        for process in reversed(managed_processes):
+            process.stop()
 
 
 def cron_enabled(args: argparse.Namespace) -> bool:
@@ -444,6 +536,33 @@ def worker_config_args(args: argparse.Namespace) -> list[str]:
     for path in args.config:
         result.extend(["--config", path])
     return result
+
+
+def kafka_enabled(args: argparse.Namespace) -> bool:
+    """按命令行优先、配置次之判断是否启动 Kafka 消费 worker。"""
+    if args.with_kafka:
+        return True
+    if args.without_kafka:
+        return False
+    return read_bool_env("AI_KAFKA_WORKER_ENABLED", read_bool_env("RAG_KAFKA_ENABLED", False))
+
+
+def agent_worker_enabled(args: argparse.Namespace) -> bool:
+    """按命令行优先、配置次之判断是否启动 Agent 耐久任务 worker。"""
+    if args.with_agent_worker:
+        return True
+    if args.without_agent_worker:
+        return False
+    return read_bool_env("AI_AGENT_WORKER_ENABLED", False)
+
+
+def rag_task_worker_enabled(args: argparse.Namespace) -> bool:
+    """按命令行优先、配置次之判断是否启动 RAG 耐久任务 worker。"""
+    if args.with_rag_worker:
+        return True
+    if args.without_rag_worker:
+        return False
+    return read_bool_env("RAG_TASK_WORKER_ENABLED", False)
 
 
 if __name__ == "__main__":

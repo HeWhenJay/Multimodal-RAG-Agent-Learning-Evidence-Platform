@@ -43,7 +43,7 @@ export function useMaterialUpload({ highPrecision = false, onUploaded }: UseMate
     }
   }, []);
 
-  // 上传完成后继续轮询 Java 资料状态，让上传提示显示真实 RAG 阶段。
+  // 上传完成后继续轮询 Python 资料状态，让上传提示显示真实 RAG 阶段。
   const startProgressPolling = useCallback((materialId: number, filename: string) => {
     stopProgressPolling();
     const poll = async () => {

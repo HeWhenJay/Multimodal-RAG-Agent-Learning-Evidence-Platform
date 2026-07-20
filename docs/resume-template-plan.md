@@ -2,6 +2,8 @@
 
 更新日期：2026-06-24
 
+> 当前状态：简历模板解析、补丁生成和 DOCX 确定性应用代码仍由 Python `ai-python/rag/resume_template/` 提供，但本文原先设计的 Java 持久化与 `/api/rag/resume-templates/*` 外部接口尚未纳入当前公开 47 个 `/api/*` 契约。文中 Java 调用链和 `/internal/rag/resume/templates/*` 仅作历史规划，不能作为当前启动依赖。
+
 ## 目标
 
 实现“模板上传与确认 + Agent 发起字段级内容补丁 + 人工确认 + 确定性 DOCX 应用”的简历模板能力：用户上传受控 DOCX 简历后，系统解析出内部可修改字段；模板页只负责历史模板选择、图片预览确认和区域约束保存，不在前端展示 Agent/Python 提取出的字段原文、定位和样式指纹；岗位 JD 与简历修改任务放在 Agent 工作台发起。模型只生成严格 JSON Schema 约束的内容补丁；用户确认后由 Python 按 `LayoutChangeContract` 执行和审计，不覆盖原文件，不允许模型直接接触或修改 DOCX 排版结构。

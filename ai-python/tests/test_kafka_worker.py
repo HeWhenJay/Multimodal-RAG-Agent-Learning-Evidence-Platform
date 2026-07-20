@@ -1,12 +1,11 @@
 import os
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import pytest
 
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
-from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope
+from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope, StorageSourceRef
 from app.workers.kafka_worker import (
     KafkaWorkerConnectionError,
     is_connection_exception,
@@ -17,7 +16,7 @@ from app.workers.kafka_worker import (
     run_consumer_forever,
 )
 from rag.kafka.producer import KafkaJsonProducer, KafkaProgressThrottler, redacted_json
-from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, download_java_source
+from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, open_storage_source
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import InMemoryRagStore
 from app.schemas.rag import QueryRequest
@@ -129,19 +128,15 @@ def test_index_request_schema_accepts_inline_text():
     assert parsed.stagingVisibilityScope == "staging"
 
 
-def test_progress_delivery_mode_memory_skips_http_and_persist(monkeypatch):
-    called = []
-    monkeypatch.setattr("rag.observability.progress.post_log_event", lambda payload: called.append(payload) or True)
+def test_progress_delivery_mode_memory_skips_persistence():
+    """内存任务进度不依赖已删除的内部 HTTP callback。"""
     reporter = RagProgressReporter(document_id="query", persist=False, on_emit=lambda event: None)
 
     reporter.emit("query.expand", "查询任务内存进度")
 
-    assert called == []
 
-
-def test_kafka_progress_delivery_mode_uses_only_kafka(monkeypatch):
-    callback_payloads = []
-    monkeypatch.setattr("rag.observability.progress.post_log_event", lambda payload: callback_payloads.append(payload) or True)
+def test_kafka_progress_delivery_mode_uses_only_kafka():
+    """Kafka 模式只发送 Kafka progress，不回调内部 HTTP。"""
     progress_producer = FakeProgressProducer()
     reporter = RagProgressReporter(
         document_id="material-1__job-job-1",
@@ -159,7 +154,6 @@ def test_kafka_progress_delivery_mode_uses_only_kafka(monkeypatch):
 
     reporter.emit("index.request", "Kafka 进度")
 
-    assert callback_payloads == []
     assert progress_producer.events
 
 
@@ -312,10 +306,10 @@ def test_permanent_failure_sends_failed_result_and_dlq_without_throwing():
     fake_producer = FakeProducer()
 
     class PermanentFailingWorker(RagKafkaIndexWorker):
-        """用于模拟 Java Source API 永久失败的 worker。"""
+        """用于模拟受控原文件永久不可读取的 worker。"""
 
         def _index_to_staging(self, payload):
-            raise PermanentSourceError("Java Source API 返回 404: 文件不存在")
+            raise PermanentSourceError("受控原文件不存在")
 
     worker = PermanentFailingWorker(store=InMemoryRagStore(), producer=fake_producer, progress_producer=FakeProgressProducer())
 
@@ -388,57 +382,25 @@ def test_kafka_json_producer_sends_serialized_payload_without_reencoding():
     assert values == [("material-1", payload_json)]
 
 
-def test_download_java_source_streams_to_temp_file(monkeypatch):
-    class FakeResponse:
-        status_code = 200
-        headers = {"content-type": "text/markdown", "content-disposition": 'attachment; filename="note.md"'}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_bytes(self):
-            yield b"Kafka "
-            yield b"stream"
-
-    class FakeClient:
-        def __init__(self, timeout):
-            self.timeout = timeout
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return False
-
-        def stream(self, method, url, headers):
-            assert method == "GET"
-            assert url == "http://java/api/internal/rag/source"
-            return FakeResponse()
-
-    monkeypatch.setattr("rag.kafka.worker.httpx.Client", FakeClient)
-    source_ref = SimpleNamespace(
-        javaBaseUrl="http://java",
-        downloadPath="/api/internal/rag/source",
-        filename=None,
-        contentType=None,
-        sourcePath="oss://bucket/note.md",
+def test_open_storage_source_reads_controlled_local_file_without_java_http(monkeypatch, tmp_path):
+    root = tmp_path / "uploads"
+    source = root / "7" / "markdown" / "note.md"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"Kafka stream")
+    monkeypatch.setenv("EVIDENCE_UPLOAD_ROOT", str(root))
+    source_ref = StorageSourceRef(
+        storageType="local",
+        sourcePath=str(source),
+        filename="note.md",
+        contentType="text/markdown",
     )
 
-    downloaded = download_java_source(source_ref, "job-1", 1)
+    opened = open_storage_source(source_ref)
 
-    try:
-        assert downloaded.path.read_bytes() == b"Kafka stream"
-        assert downloaded.filename == "note.md"
-        assert downloaded.content_type == "text/markdown"
-    finally:
-        downloaded.cleanup()
-    assert not downloaded.path.exists()
+    opened.cleanup()
+    assert opened.path.read_bytes() == b"Kafka stream"
+    assert opened.filename == "note.md"
+    assert opened.content_type == "text/markdown"
 
 
 def test_kafka_progress_throttler_keeps_first_last_and_completed():

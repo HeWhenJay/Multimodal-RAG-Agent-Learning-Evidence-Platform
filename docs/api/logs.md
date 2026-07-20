@@ -1,6 +1,6 @@
 # 日志接口文档
 
-更新日期：2026-06-16
+更新日期：2026-07-21
 
 ## 变更摘要
 
@@ -12,6 +12,16 @@
 - `action`：具体动作，如 `material_index_file_failed`。
 - `errorCode`：可检索的错误码，如 `RAG_PYTHON_TIMEOUT`。
 - `context`：脱敏后的 JSON 上下文，数据库以 JSON 字符串文本保存。
+
+## Python FastAPI 接管
+
+日志接口由 Python FastAPI 接管，不依赖其他后端进程。路径、`Result<T>` 信封、`log_event` / `log_error` 表结构和内部令牌语义保持兼容。
+
+- PostgreSQL 连接串按 `LOG_DATABASE_URL`、`RAG_DATABASE_URL`、`DATABASE_URL` 的顺序读取，schema 使用 `RAG_DATABASE_SCHEMA`，默认 `learning_evidence`。
+- `EVIDENCE_LOGS_ENABLED=false` 时写入接口保留成功响应但不落库；`EVIDENCE_LOGS_MAX_BATCH_SIZE`、`EVIDENCE_LOGS_MAX_CONTEXT_BYTES`、`EVIDENCE_LOGS_MAX_STACK_TRACE_BYTES` 分别覆盖 50、20480、20480 的默认上限。
+- 内部接口继续使用 `X-Internal-Log-Token`，仅在 `EVIDENCE_INTERNAL_LOG_TOKEN` 已配置时强制校验；未配置时本地开发默认放行。
+- RAG 处理日志当前直接写入 PostgreSQL；`RAG_EVENT_CALLBACK_URL` 和 `RAG_ERROR_CALLBACK_URL` 已移除，不应再配置。
+- `rag_progress` 事件会在同一数据库事务中更新 `learning_material`：运行中为 `PARSING`，成功为 `READY` 或 `PARTIAL`，失败为 `FAILED`。`index.completed` 但尚未确认 promote 的 staging 事件继续保持 `PARSING`。
 
 ## 接口列表
 
@@ -35,6 +45,18 @@
   "data": {}
 }
 ```
+
+参数缺失、非法查询参数和内部令牌校验失败同样返回 HTTP `200` 的业务信封。例如：
+
+```json
+{
+  "code": 0,
+  "msg": "模块不能为空",
+  "data": null
+}
+```
+
+`/events`、`/events/batch`、`/errors` 保持原有开放写入契约；内部 worker 必须调用 `/internal/*` 并在配置令牌时携带 `X-Internal-Log-Token`。
 
 ## 普通日志接收
 
@@ -153,8 +175,8 @@ Python 运行配置：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_EVENT_CALLBACK_URL` | `http://127.0.0.1:7080/api/logs/internal/events` | Python 实时上报进度和处理日志的 Java 地址 |
-| `RAG_ERROR_CALLBACK_URL` | `http://127.0.0.1:7080/api/logs/internal/errors` | Python 实时上报错误日志的 Java 地址 |
+| `RAG_EVENT_CALLBACK_URL` | `http://127.0.0.1:8090/api/logs/internal/events` | Python worker 实时上报进度和处理日志的 Python 地址 |
+| `RAG_ERROR_CALLBACK_URL` | `http://127.0.0.1:8090/api/logs/internal/errors` | Python worker 实时上报错误日志的 Python 地址 |
 | `RAG_CONSOLE_PROGRESS_ENABLED` | `true` | 是否在 Python 控制台打印 `RAG进度` |
 | `RAG_CONSOLE_PROCESS_ENABLED` | `true` | 是否在 Python 控制台打印 `RAG处理` |
 

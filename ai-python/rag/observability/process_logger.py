@@ -11,7 +11,6 @@ from functools import wraps
 from time import perf_counter
 from typing import Any
 
-from rag.observability.log_callback import post_log_error, post_log_event
 from rag.observability.progress import parse_material_id, truncate
 
 
@@ -133,8 +132,6 @@ class RagProcessLogger:
             logger.info(log_message, self.document_id, stage, action, message)
         self._console(stage, action, message, normalized_level, success, duration_ms, safe_context)
 
-        if self._post_event_callback(stage, action, message, safe_context, level, success, duration_ms, parser):
-            return
         if not self.persist:
             return
         self._persist(stage, action, message, safe_context, level, success, duration_ms, parser)
@@ -178,38 +175,6 @@ class RagProcessLogger:
             parts.append(f"highPrecision={context.get('highPrecision')}")
         parts.append(f"message={message}")
         print("RAG处理 | " + " | ".join(parts), flush=True)
-
-    def _post_event_callback(
-        self,
-        stage: str,
-        action: str,
-        message: str,
-        context: dict[str, Any],
-        level: str,
-        success: bool,
-        duration_ms: int | None,
-        parser: str | None,
-    ) -> bool:
-        """优先把方法级处理日志回调给 Java 控制面板。"""
-        payload = {
-            "traceId": self.trace_id,
-            "userId": truncate(self.user_id, 120),
-            "source": "python",
-            "domain": "rag",
-            "level": truncate(level.upper(), 20),
-            "module": truncate(self.module, 80),
-            "stage": truncate(stage, 80),
-            "eventType": "rag_process",
-            "action": truncate(action, 120),
-            "message": truncate(message, 500),
-            "success": success,
-            "durationMs": duration_ms,
-            "materialId": self.material_id,
-            "documentId": truncate(self.document_id, 120),
-            "parser": truncate(parser, 80),
-            "context": context,
-        }
-        return post_log_event(payload)
 
     def _persist(
         self,
@@ -312,18 +277,6 @@ class RagProcessLogger:
                 truncate(str(throwable), 500) or "",
             ]),
         ).hex
-        if self._post_error_callback(
-            stage=stage,
-            action=action,
-            error_code=error_code,
-            message=message,
-            throwable=throwable,
-            context=safe_context,
-            stack_trace=stack_trace,
-            fingerprint=fingerprint,
-            parser=parser,
-        ):
-            return
         try:
             with psycopg.connect(self.database_url) as conn:
                 with conn.cursor() as cursor:
@@ -376,41 +329,6 @@ class RagProcessLogger:
                     )
         except Exception:
             return
-
-    def _post_error_callback(
-        self,
-        *,
-        stage: str,
-        action: str,
-        error_code: str,
-        message: str,
-        throwable: Exception,
-        context: dict[str, Any],
-        stack_trace: str | None,
-        fingerprint: str,
-        parser: str | None,
-    ) -> bool:
-        """优先把 Python 错误回调给 Java 错误面板。"""
-        payload = {
-            "traceId": self.trace_id,
-            "userId": truncate(self.user_id, 120),
-            "source": "python",
-            "domain": "rag",
-            "severity": "ERROR",
-            "module": truncate(self.module, 80),
-            "stage": truncate(stage, 80),
-            "action": truncate(action, 120),
-            "errorType": truncate(throwable.__class__.__name__, 120),
-            "errorCode": truncate(error_code, 120),
-            "message": truncate(message, 1000),
-            "stackTrace": stack_trace,
-            "fingerprint": fingerprint,
-            "materialId": self.material_id,
-            "documentId": truncate(self.document_id, 120),
-            "parser": truncate(parser, 80),
-            "context": context,
-        }
-        return post_log_error(payload)
 
 
 @contextmanager

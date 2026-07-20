@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from agents.gateway.java_gateway import JavaAgentGatewayClient
+from agents.gateway.local_gateway import AgentGateway
 
 
 def utc_time_provider() -> dict[str, str]:
@@ -13,7 +13,7 @@ def utc_time_provider() -> dict[str, str]:
 
 
 def tool_observation_summary(result: dict[str, Any]) -> dict[str, Any]:
-    """回写给 Java 的 Observation 只保留摘要，避免保存正文。"""
+    """持久化 Observation 只保留摘要，避免保存正文。"""
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     evidences = data.get("evidences") if isinstance(data.get("evidences"), list) else []
     diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else result.get("diagnostics")
@@ -35,9 +35,9 @@ def prefetch_memory_context(
     thread_id: str,
     task_input: dict[str, Any],
     query: str,
-    client: JavaAgentGatewayClient,
+    client: AgentGateway,
 ) -> list[dict[str, Any]]:
-    """通过 Java Tool Gateway 预取可注入记忆，Python 不自行判断用户权限。"""
+    """通过 Python 本地 Gateway 预取可注入记忆，Python 不自行判断用户权限。"""
     if not query:
         return []
     payload = {

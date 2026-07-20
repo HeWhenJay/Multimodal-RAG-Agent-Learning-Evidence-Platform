@@ -224,20 +224,22 @@ def build_index_request(document: dict[str, Any], content: str) -> dict[str, Any
 
 
 def create_test_client(rag_profile: str = "current"):
-    """创建 Python RAG 内部接口测试客户端，必须在环境变量设置后导入 app。"""
+    """创建仅供 Ragas 评估使用的隔离客户端，不把历史内部路由注册到生产 app。"""
     ensure_ai_python_path()
     profile = normalize_rag_profile(rag_profile)
     os.environ[RAG_PROFILE_ENV] = profile
     configure_current_rag_environment()
+    from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from app.main import app
     from app.api import rag as rag_api
     from rag.retrievers.retrieval import create_rag_store
 
     rag_api.store = create_rag_store()
     clear_in_memory_store(rag_api.store)
-    return TestClient(app)
+    evaluation_app = FastAPI(title="RAG 评估隔离应用")
+    evaluation_app.include_router(rag_api.router)
+    return TestClient(evaluation_app)
 
 
 def clear_in_memory_store(store: Any) -> None:

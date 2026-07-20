@@ -1,10 +1,76 @@
 # Agent 记忆接口文档
 
-更新日期：2026-07-03
+更新日期：2026-07-20
 
-## 变更摘要
+> 迁移状态：本节“纯 Python 对外契约”自 2026-07-20 起为唯一生效契约。下文中 Java Controller、Java Tool Gateway、`/internal/agent/memory/*` 和 Java 调用 Python 索引的描述为历史记录，不能作为当前运行时依赖。
 
-新增 Agent 记忆最小可运行版本接口契约。该契约只覆盖当前用户记忆的查看、创建、确认、拒绝、编辑、归档、删除，以及 Java Tool Gateway 到 Python Memory Service 的候选提炼、冲突判断、索引和检索闭环。
+## 纯 Python 对外契约
+
+### 服务边界
+
+- FastAPI 是 `agent_memory_item`、`agent_memory_version`、`agent_memory_audit` 与 `agent_memory_embedding` 的业务权威，直接处理公开 `/api/agent/memories*` 请求。
+- 当前用户仅由 Bearer Token 经 `AuthService.current_user()` 得出；请求中的 `userId`、来源任务用户或索引参数均不可信。
+- PostgreSQL 是记忆元数据、版本链、审计和检索索引的事实源。无数据库的内存仓储只用于测试或本地演示，不能作为生产持久化后端。
+- 统一 Agent 图通过进程内 gateway 调用同一 Python 记忆服务；不存在 Java Gateway、Java 回调、`X-Agent-Internal-Token` 或跨服务索引回调。
+- 记忆元数据操作始终由 Python 服务完成。当前 `AgentRuntimeService` 在未接入 embedding 时使用确定性文本降级检索，并保持 `PENDING_INDEX`、`ACTIVE`、`INDEX_FAILED` 状态边界；后续接入 RAG 索引时可复用 Multi-Query、BM25、向量召回与 RRF，不改变公开接口。
+
+### 公开路径
+
+所有接口除 SSE 外均返回 `Result<T>`，并要求 `Authorization: Bearer <token>`。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/agent/memories` | 按 `status`、`memoryType`、`namespace`、`scopeType` 查询当前用户记忆 |
+| `POST` | `/api/agent/memories` | 创建当前用户显式授权记忆 |
+| `GET` | `/api/agent/memories/{memoryId}` | 查询当前用户单条记忆及可见版本/审计摘要 |
+| `PATCH` | `/api/agent/memories/{memoryId}` | 修改正文或收窄作用域，生成新版本 |
+| `POST` | `/api/agent/memories/{memoryId}/confirm` | 确认待审记忆并进入索引 |
+| `POST` | `/api/agent/memories/{memoryId}/reject` | 拒绝待审记忆 |
+| `POST` | `/api/agent/memories/{memoryId}/archive` | 归档并停用检索索引 |
+| `DELETE` | `/api/agent/memories/{memoryId}` | 删除正文、停用索引并保留审计链 |
+
+### 创建、状态与检索
+
+创建请求：
+
+```json
+{
+  "memoryType": "PREFERENCE",
+  "namespace": "resume_style",
+  "scopeType": "USER",
+  "subjectKey": "preferred_resume_tone",
+  "content": "以后简历项目描述优先强调可追溯 evidence。",
+  "summary": "简历描述偏好：强调可追溯 evidence。",
+  "importance": 0.82
+}
+```
+
+显式创建先写入 `PENDING_INDEX`，Python 索引成功后转为 `ACTIVE`，失败时转为 `INDEX_FAILED`。候选记忆由 Agent 产生时先写 `PENDING_REVIEW`，只有当前用户调用 `confirm` 后才可检索。默认列表不返回 `DELETED`；默认注入 Agent 上下文必须同时满足 `ACTIVE`、未删除、未过期且非 `HIGH` 敏感级别。
+
+### 所有权、版本与错误
+
+- 查询、确认、拒绝、归档、修改和删除均强制 `memory.user_id == currentUserId`；不属于当前用户时返回 `AGENT_MEMORY_NOT_FOUND`，不暴露资源存在性。
+- `PATCH` 只能收窄作用域：`USER -> PROJECT -> MATERIAL -> TASK / SESSION`，禁止扩大为更宽范围；正文变化生成新版本，旧版本标记为 `SUPERSEDED`。
+- 删除会将 `content` 与 `summary` 替换为不可逆删除标记，并写入 `agent_memory_audit`；后续检索不会返回该记忆。
+- 常见业务错误使用中文 `Result.code=0`：`AGENT_MEMORY_VALIDATION_FAILED`、`AGENT_MEMORY_SCOPE_ESCALATION`、`AGENT_MEMORY_REVIEW_REQUIRED`、`AGENT_MEMORY_DELETED`、`AGENT_MEMORY_INDEX_FAILED`。
+
+### 前端影响
+
+React 继续调用现有 `/api/agent/memories*` 路径与 `Result<T>` 契约。前端不传、也不依赖 `userId`；切换 Vite 代理到 FastAPI 后，记忆 CRUD 与任务中的记忆检索均不再依赖 Java 7080。
+
+### 当前实现落点
+
+- 公开路径统一由 `ai-python/app/api/agent.py` 提供；`app/api/agent_memory.py` 仅保留空导入兼容模块，不再暴露内部令牌接口。
+- `ai-python/app/agent_runtime/service.py` 负责所有权、版本链、作用域收窄、状态流转和正文擦除；`ai-python/app/agent_runtime/repository.py` 提供 PostgreSQL 与测试内存仓储。
+- 图内的记忆读取通过 `LocalAgentGateway` 直接调用当前用户的 `memory_context`，候选记忆保持 `PENDING_REVIEW`，不会被自动写入或激活。
+
+## 当前实现变更摘要
+
+Agent 记忆的查看、创建、确认、拒绝、编辑、归档和删除均由 Python FastAPI 直接处理。统一图通过进程内 `LocalAgentGateway` 调用记忆服务；PostgreSQL 保存元数据、版本链、审计和索引状态，未配置 embedding 时使用确定性文本检索降级。
+
+## 历史迁移记录（仅供追溯，不是运行依赖）
+
+以下章节保留迁移前 Java Controller、Tool Gateway 和 Python Memory Service 的拆分契约，仅用于理解旧数据或回滚差异；当前启动和联调不得使用其中的内部 URL、令牌或回调。
 
 2026-07-03 更新：PostgreSQL 后端的记忆索引写入改为复用 RAG 主链路 `embed_text` 生成真实 1024 维语义向量；记忆查询改为 BM25 与 PostgreSQL/pgvector `<=>` 向量召回共同参与 RRF 融合，并对只由向量召回命中的记忆回填元数据后再返回。
 
