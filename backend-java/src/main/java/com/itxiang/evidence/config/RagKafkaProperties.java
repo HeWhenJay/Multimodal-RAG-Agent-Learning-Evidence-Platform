@@ -57,6 +57,10 @@ public class RagKafkaProperties {
 
     @Data
     public static class Outbox {
+        /**
+         * 是否由 Java 进程发布 Outbox；切换 Python cron 时需显式关闭。
+         */
+        private boolean publisherEnabled = true;
         private int batchSize = 50;
         private int leaseSeconds = 60;
         private long publishFixedDelayMs = 1000L;

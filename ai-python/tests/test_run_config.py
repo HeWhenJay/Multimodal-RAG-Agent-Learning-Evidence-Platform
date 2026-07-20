@@ -1,4 +1,4 @@
-from run import build_env_defaults
+from run import build_env_defaults, cron_enabled, main, parse_args, worker_config_args
 from app.core.agent_internal_token import resolve_agent_internal_token
 
 
@@ -118,3 +118,59 @@ def test_agent_internal_token_falls_back_to_local_shared_file(monkeypatch, tmp_p
     assert first
     assert second == first
     assert token_file.read_text(encoding="utf-8").strip() == first
+
+
+def test_worker_cron_config_env_mapping_is_effective():
+    """校验 Python worker cron 配置可由 YAML 统一映射到运行环境变量。"""
+    env_defaults = build_env_defaults(
+        {
+            "workers": {
+                "cron": {"enabled": True, "poll-interval-seconds": 0.25},
+                "outbox": {
+                    "enabled": True,
+                    "batch-size": 20,
+                    "lease-seconds": 45,
+                    "publish-fixed-delay-ms": 750,
+                    "max-attempts": 6,
+                    "publish-timeout-ms": 2500,
+                },
+                "staging-cleanup": {"enabled": False, "fixed-delay-seconds": 600},
+            }
+        }
+    )
+
+    assert env_defaults["AI_CRON_ENABLED"] == "true"
+    assert env_defaults["AI_CRON_POLL_INTERVAL_SECONDS"] == "0.25"
+    assert env_defaults["RAG_OUTBOX_PUBLISHER_ENABLED"] == "true"
+    assert env_defaults["RAG_OUTBOX_BATCH_SIZE"] == "20"
+    assert env_defaults["RAG_OUTBOX_LEASE_SECONDS"] == "45"
+    assert env_defaults["RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS"] == "750"
+    assert env_defaults["RAG_OUTBOX_MAX_ATTEMPTS"] == "6"
+    assert env_defaults["RAG_KAFKA_PUBLISH_TIMEOUT_MS"] == "2500"
+    assert env_defaults["RAG_STAGING_CLEANUP_ENABLED"] == "false"
+    assert env_defaults["RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS"] == "600"
+
+
+def test_cron_cli_override_and_worker_config_forwarding(monkeypatch):
+    """命令行可覆盖 cron 开关，子进程只继承配置文件参数而不递归启动。"""
+    monkeypatch.setenv("AI_CRON_ENABLED", "false")
+    args = parse_args(["--with-cron", "--config", "config/test.yml", "--skip-default-config"])
+
+    assert cron_enabled(args) is True
+    assert worker_config_args(args) == ["--skip-default-config", "--config", "config/test.yml"]
+
+
+def test_run_entry_starts_and_stops_cron_subprocess(monkeypatch):
+    """run.py 启动 API 时监督 cron，Uvicorn 退出后必须回收子进程。"""
+    calls = []
+
+    class FakeCronProcess:
+        def stop(self):
+            calls.append("cron-stop")
+
+    monkeypatch.setattr("app.workers.supervisor.start_cron_process", lambda config_args: calls.append(config_args) or FakeCronProcess())
+    monkeypatch.setattr("app.core.runtime_config.uvicorn.run", lambda *args, **kwargs: calls.append("uvicorn"))
+
+    main(["--with-cron", "--config", "config/worker-test.yml"])
+
+    assert calls == [["--config", "config/worker-test.yml"], "uvicorn", "cron-stop"]

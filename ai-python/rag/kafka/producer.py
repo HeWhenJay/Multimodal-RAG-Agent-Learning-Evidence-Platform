@@ -66,6 +66,10 @@ class KafkaJsonProducer:
 
     def send(self, topic: str, key: str, envelope: KafkaEnvelope) -> None:
         """发送消息并等待本地 flush，失败抛异常供 caller 决定是否提交 offset。"""
+        self.send_serialized(topic, key, envelope.model_dump_json())
+
+    def send_serialized(self, topic: str, key: str, payload_json: str, *, flush_seconds: float | None = None) -> None:
+        """原样发送已序列化的 Outbox payload，避免重编码改变持久化消息。"""
         error_holder: list[Exception] = []
 
         def callback(error, _message) -> None:
@@ -75,10 +79,11 @@ class KafkaJsonProducer:
         self.producer.produce(
             topic,
             key=key,
-            value=envelope.model_dump_json(),
+            value=payload_json,
             callback=callback,
         )
-        remaining = self.producer.flush(positive_float("RAG_KAFKA_PRODUCER_FLUSH_SECONDS", 5.0))
+        timeout_seconds = flush_seconds if flush_seconds is not None else positive_float("RAG_KAFKA_PRODUCER_FLUSH_SECONDS", 5.0)
+        remaining = self.producer.flush(timeout_seconds)
         if remaining and remaining > 0:
             raise RuntimeError(f"Kafka 消息发送超时，仍有 {remaining} 条消息未投递")
         if error_holder:

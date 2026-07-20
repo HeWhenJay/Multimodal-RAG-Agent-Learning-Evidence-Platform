@@ -91,6 +91,22 @@ rag:
   staging-retention-hours: ${RAG_STAGING_RETENTION_HOURS:24}
   staging-failed-retention-hours: ${RAG_STAGING_FAILED_RETENTION_HOURS:168}
 
+workers:
+  # run.py 只监督独立 cron 进程；各任务仍需单独开启，避免迁移期与 Java 重复发布。
+  cron:
+    enabled: ${AI_CRON_ENABLED:true}
+    poll-interval-seconds: ${AI_CRON_POLL_INTERVAL_SECONDS:0.5}
+  outbox:
+    enabled: ${RAG_OUTBOX_PUBLISHER_ENABLED:false}
+    batch-size: ${RAG_OUTBOX_BATCH_SIZE:50}
+    lease-seconds: ${RAG_OUTBOX_LEASE_SECONDS:60}
+    publish-fixed-delay-ms: ${RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS:1000}
+    max-attempts: ${RAG_OUTBOX_MAX_ATTEMPTS:8}
+    publish-timeout-ms: ${RAG_KAFKA_PUBLISH_TIMEOUT_MS:3000}
+  staging-cleanup:
+    enabled: ${RAG_STAGING_CLEANUP_ENABLED:false}
+    fixed-delay-seconds: ${RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS:3600}
+
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}
 

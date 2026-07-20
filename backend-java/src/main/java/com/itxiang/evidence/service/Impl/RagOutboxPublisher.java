@@ -21,7 +21,11 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 @Service
 @RequiredArgsConstructor
-@ConditionalOnProperty(prefix = "evidence.rag.kafka", name = "enabled", havingValue = "true")
+@ConditionalOnProperty(
+        prefix = "evidence.rag.kafka",
+        name = {"enabled", "outbox.publisher-enabled"},
+        havingValue = "true"
+)
 public class RagOutboxPublisher {
 
     private final RagKafkaProperties properties;

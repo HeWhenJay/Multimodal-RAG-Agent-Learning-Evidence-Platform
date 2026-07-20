@@ -97,6 +97,16 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "kafka", "worker", "reconnect-max-seconds"): "RAG_KAFKA_RECONNECT_MAX_SECONDS",
     ("rag", "kafka", "producer", "flush-seconds"): "RAG_KAFKA_PRODUCER_FLUSH_SECONDS",
     ("rag", "kafka", "producer", "message-timeout-ms"): "RAG_KAFKA_PRODUCER_MESSAGE_TIMEOUT_MS",
+    ("workers", "cron", "enabled"): "AI_CRON_ENABLED",
+    ("workers", "cron", "poll-interval-seconds"): "AI_CRON_POLL_INTERVAL_SECONDS",
+    ("workers", "outbox", "enabled"): "RAG_OUTBOX_PUBLISHER_ENABLED",
+    ("workers", "outbox", "batch-size"): "RAG_OUTBOX_BATCH_SIZE",
+    ("workers", "outbox", "lease-seconds"): "RAG_OUTBOX_LEASE_SECONDS",
+    ("workers", "outbox", "publish-fixed-delay-ms"): "RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS",
+    ("workers", "outbox", "max-attempts"): "RAG_OUTBOX_MAX_ATTEMPTS",
+    ("workers", "outbox", "publish-timeout-ms"): "RAG_KAFKA_PUBLISH_TIMEOUT_MS",
+    ("workers", "staging-cleanup", "enabled"): "RAG_STAGING_CLEANUP_ENABLED",
+    ("workers", "staging-cleanup", "fixed-delay-seconds"): "RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS",
     ("rag", "kafka", "topics", "index-request"): "RAG_KAFKA_TOPIC_INDEX_REQUEST",
     ("rag", "kafka", "topics", "index-result"): "RAG_KAFKA_TOPIC_INDEX_RESULT",
     ("rag", "kafka", "topics", "progress"): "RAG_KAFKA_TOPIC_PROGRESS",
@@ -188,7 +198,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="跳过默认的 config/application.yml 和 config/application.local.yml。",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--with-cron",
+        action="store_true",
+        help="本次启动强制拉起已启用的 Python cron worker。",
+    )
+    parser.add_argument(
+        "--without-cron",
+        action="store_true",
+        help="本次启动不拉起 Python cron worker。",
+    )
+    args = parser.parse_args(argv)
+    if args.with_cron and args.without_cron:
+        parser.error("--with-cron 与 --without-cron 不能同时使用")
+    return args
 
 
 def load_runtime_config(args: argparse.Namespace) -> None:
@@ -379,18 +402,48 @@ def read_port() -> int:
 
 def main(argv: Sequence[str] | None = None) -> None:
     """启动本地 Python RAG FastAPI 服务。"""
-    load_runtime_config(parse_args(argv))
+    args = parse_args(argv)
+    load_runtime_config(args)
     host = os.getenv("AI_SERVICE_HOST", "127.0.0.1")
     port = read_port()
     reload_enabled = read_bool_env("AI_SERVICE_RELOAD", True)
-    uvicorn.run(
-        "app.main:app",
-        host=host,
-        port=port,
-        reload=reload_enabled,
-        reload_dirs=[str(AI_PYTHON_DIR)] if reload_enabled else None,
-        app_dir=str(AI_PYTHON_DIR),
-    )
+    cron_process = None
+    if cron_enabled(args):
+        # 延迟导入避免 cron 模块反向读取运行配置时形成循环依赖。
+        from app.workers.supervisor import start_cron_process
+
+        cron_process = start_cron_process(worker_config_args(args))
+    try:
+        uvicorn.run(
+            "app.main:app",
+            host=host,
+            port=port,
+            reload=reload_enabled,
+            reload_dirs=[str(AI_PYTHON_DIR)] if reload_enabled else None,
+            app_dir=str(AI_PYTHON_DIR),
+        )
+    finally:
+        if cron_process is not None:
+            cron_process.stop()
+
+
+def cron_enabled(args: argparse.Namespace) -> bool:
+    """按命令行优先、YAML/环境变量次之的顺序决定是否启动 cron。"""
+    if args.with_cron:
+        return True
+    if args.without_cron:
+        return False
+    return read_bool_env("AI_CRON_ENABLED", True)
+
+
+def worker_config_args(args: argparse.Namespace) -> list[str]:
+    """将启动入口已接收的配置文件参数转交给独立 cron 子进程。"""
+    result: list[str] = []
+    if args.skip_default_config:
+        result.append("--skip-default-config")
+    for path in args.config:
+        result.extend(["--config", path])
+    return result
 
 
 if __name__ == "__main__":

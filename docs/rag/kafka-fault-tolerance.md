@@ -6,10 +6,10 @@
 
 ## 投递与恢复
 
-- Java 在业务事务内同时写入资料状态、索引任务和 `rag_outbox_event`。事务成功后由 Outbox 发布 Kafka 消息。
+- Java 在业务事务内同时写入资料状态、索引任务和 `rag_outbox_event`。事务成功后由唯一的 Outbox 发布者发送 Kafka 消息；迁移期可选择 Java 或 Python cron，不能双开。
 - Broker 在任务提交前不可达时，且 `EVIDENCE_RAG_KAFKA_FALLBACK_ENABLED=true`，新任务直接回退到 HTTP / 本机异步索引。
 - 已进入 Outbox 的任务不会改投 HTTP。Broker 暂时不可用时保留并指数退避重试；服务或 Broker 重启后，过期 `PUBLISHING` 租约会重新投递。
-- Kafka 采用至少一次投递。Java 使用 `rag_consumed_event` 去重，Python 的 staging / promote 以 jobId、requestVersion 和幂等键防止旧消息覆盖新索引。
+- Kafka 采用至少一次投递。Java 使用 `rag_consumed_event` 去重，Python 的 staging / promote 以 jobId、requestVersion 和幂等键防止旧消息覆盖新索引。Python `app.workers.outbox_publisher` 对到期 `NEW/FAILED` 和租约过期 `PUBLISHING` 记录使用 `FOR UPDATE SKIP LOCKED` 抢占，Kafka 确认成功后才写 `PUBLISHED`。
 
 ## 死信规则
 
@@ -36,3 +36,10 @@
 | `RAG_KAFKA_RECONNECT_INITIAL_SECONDS` | `1` | Python worker 首次重连等待时间 |
 | `RAG_KAFKA_RECONNECT_MAX_SECONDS` | `30` | Python worker 最大重连等待时间 |
 | `RAG_KAFKA_PRODUCER_FLUSH_SECONDS` | `5` | Python producer 等待投递确认的最长时间 |
+| `EVIDENCE_RAG_KAFKA_OUTBOX_PUBLISHER_ENABLED` | `true` | Java Outbox 发布器所有权开关；切到 Python 时设为 `false` |
+| `RAG_OUTBOX_PUBLISHER_ENABLED` | `false` | Python Outbox 发布器所有权开关；仅在 Java 发布器关闭后设为 `true` |
+| `RAG_OUTBOX_BATCH_SIZE` | `50` | Python 单轮抢占的最大 Outbox 事件数 |
+| `RAG_OUTBOX_LEASE_SECONDS` | `60` | Python 领取 Outbox 事件后的租约时长 |
+| `RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS` | `1000` | Python Outbox 单轮完成后的固定等待时间 |
+| `RAG_OUTBOX_MAX_ATTEMPTS` | `8` | Python 指数退避最大指数，不限制最终重试次数 |
+| `RAG_KAFKA_PUBLISH_TIMEOUT_MS` | `3000` | Python 单条 Outbox 等待 Kafka 确认的最长时间，最小 100ms |

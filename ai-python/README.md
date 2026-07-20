@@ -94,11 +94,39 @@ python run.py
 
 未配置 `RAG_DATABASE_URL` 时会退回内存后端，主要用于本地单元测试。正式运行使用 PostgreSQL/pgvector，建库和建表语句见 `docs/database/postgresql-pgvector.md` 与 `infra/sql/init.sql`。
 
+### Python cron 与 Kafka worker
+
+`run.py` 会在 API 进程外监督已启用的 cron 子进程。它使用固定延迟而非壁钟表达式，API 热重载不会复制 cron；没有启用的任务时不会启动子进程。默认不接管 Outbox，以避免迁移期间和 Java 发布器重复投递。
+
+切换 RAG Outbox 发布职责到 Python 时，在 Java 与 Python 的运行环境分别设置：
+
+```powershell
+# Java：保留业务事务内 Outbox 写入，关闭 Java 定时发布器。
+$env:EVIDENCE_RAG_KAFKA_OUTBOX_PUBLISHER_ENABLED='false'
+
+# Python：由 python ai-python/run.py 一次启动 API 与 cron。
+$env:RAG_KAFKA_ENABLED='true'
+$env:RAG_OUTBOX_PUBLISHER_ENABLED='true'
+$env:AI_CRON_ENABLED='true'
+python ai-python/run.py
+```
+
+不要同时开启 `EVIDENCE_RAG_KAFKA_OUTBOX_PUBLISHER_ENABLED` 与 `RAG_OUTBOX_PUBLISHER_ENABLED`。Python Outbox 可通过 `RAG_OUTBOX_BATCH_SIZE`、`RAG_OUTBOX_LEASE_SECONDS`、`RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS`、`RAG_OUTBOX_MAX_ATTEMPTS` 和 `RAG_KAFKA_PUBLISH_TIMEOUT_MS` 调整，默认值与 Java 原实现对齐。
+
+Kafka 消费 worker 的正式路径为 `app/workers/kafka_worker.py`，可独立运行：
+
+```powershell
+conda run -n learning-evidence-rag python -B -m app.workers.kafka_worker
+```
+
+原 `ai-python/run_kafka_worker.py` 与 `app/kafka_worker.py` 仍保留兼容转发，已有本地脚本无需立即改动。
+
 ## 目录结构
 
 - `app/api/`：FastAPI 内部接口路由。
 - `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
 - `app/schemas/`：Java 与 Python 之间共享的 Pydantic 请求/响应模型。
+- `app/workers/`：Kafka 消费、Outbox 发布、staging 清理与独立 cron 调度。
 - `agents/gateway/`：Python Agent 调用 Java Tool Gateway 和任务事件回调的客户端。
 - `agents/llm/`：Agent 规划、执行和回答使用的模型客户端。
 - `agents/orchestration/`：统一 PAE/ReAct 状态图及只读、规划辅助函数。

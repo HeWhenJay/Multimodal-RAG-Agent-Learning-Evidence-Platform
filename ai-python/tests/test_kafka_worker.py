@@ -7,7 +7,7 @@ import pytest
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope
-from app.kafka_worker import (
+from app.workers.kafka_worker import (
     KafkaWorkerConnectionError,
     is_connection_exception,
     is_reconnectable_error,
@@ -50,8 +50,8 @@ def test_kafka_worker_reconnects_after_broker_connection_error(monkeypatch):
 
     monkeypatch.setenv("RAG_KAFKA_RECONNECT_INITIAL_SECONDS", "0.1")
     monkeypatch.setenv("RAG_KAFKA_RECONNECT_MAX_SECONDS", "0.2")
-    monkeypatch.setattr("app.kafka_worker.run_consumer_loop", fake_consumer_loop)
-    monkeypatch.setattr("app.kafka_worker.time.sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr("app.workers.kafka_worker.run_consumer_loop", fake_consumer_loop)
+    monkeypatch.setattr("app.workers.kafka_worker.time.sleep", lambda seconds: sleeps.append(seconds))
 
     run_consumer_forever({})
 
@@ -366,6 +366,26 @@ def test_kafka_json_producer_raises_when_flush_leaves_messages():
 
     with pytest.raises(RuntimeError, match="未投递"):
         producer.send("topic", "key", envelope("RAG_INDEX_REQUESTED", base_index_payload()))
+
+
+def test_kafka_json_producer_sends_serialized_payload_without_reencoding():
+    """Outbox 已保存的 envelope 必须原样写入 Kafka，不能二次 JSON 编码。"""
+    values = []
+
+    class RecordingProducer:
+        def produce(self, _topic, *, key, value, callback):
+            values.append((key, value))
+            callback(None, None)
+
+        def flush(self, _timeout):
+            return 0
+
+    payload_json = '{"schemaVersion":"1.0","payload":{"title":"保持原文"}}'
+    producer = KafkaJsonProducer(producer=RecordingProducer())
+
+    producer.send_serialized("outbox-topic", "material-1", payload_json, flush_seconds=0.1)
+
+    assert values == [("material-1", payload_json)]
 
 
 def test_download_java_source_streams_to_temp_file(monkeypatch):

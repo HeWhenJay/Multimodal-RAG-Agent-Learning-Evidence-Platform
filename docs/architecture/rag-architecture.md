@@ -13,7 +13,8 @@ flowchart LR
     B --> D{"Kafka 是否开启"}
     D -->|"否"| E["旧 @Async + HTTP 索引<br/>本地开发默认路径"]
     D -->|"是"| O["rag_index_job + rag_outbox_event<br/>事务内创建索引任务"]
-    O --> KAFKA["Kafka request/progress/result/promote topics"]
+    O --> OUTBOX["Java 或 Python 唯一 Outbox Publisher"]
+    OUTBOX --> KAFKA["Kafka request/progress/result/promote topics"]
     KAFKA --> PYW["Python Kafka Index Worker"]
     E --> PYHTTP["Python FastAPI RAG 服务"]
     PYW --> PYPIPE["多格式解析路由<br/>原生结构解析 + MinerU/OCR 补充"]
@@ -37,7 +38,7 @@ Kafka 是高吞吐索引通道，不是查询通道。`/api/rag/query` 和查询
 索引链路升级后的关键步骤：
 
 1. Java 上传或重建资料时，在同一事务内写 `learning_material`、`rag_index_job` 和 `rag_outbox_event`。
-2. Java Outbox Publisher 多实例安全抢占到期事件，发布 `rag.material.index.request.v1`。
+2. 由唯一的 Outbox Publisher 多实例安全抢占到期事件并发布 `rag.material.index.request.v1`。迁移期 Java 与 Python `app.workers.outbox_publisher` 通过所有权开关互斥；Python cron 使用 `FOR UPDATE SKIP LOCKED`、租约和指数退避复刻原有语义。
 3. Python Index Worker 按 `canonicalDocumentId` 串行处理同一资料的索引请求，不同资料可并发；解析、切块、摘要和 embedding 后只写 `stagingDocumentId`。
 4. Python 通过 `rag.material.index.progress.v1` 上报节流进度，通过 `rag.material.index.result.v1` 上报 staging 索引终态。
 5. Java Result Consumer 写进度、校验 `active_index_job_id` 和 `index_request_version`。只有当前 active job 才发布 `rag.material.index.promote.request.v1`。
