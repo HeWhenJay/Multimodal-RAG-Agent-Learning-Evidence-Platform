@@ -216,16 +216,21 @@ def test_generic_worker_command_reuses_current_interpreter_and_config_arguments(
 
 
 def test_run_entry_starts_and_stops_cron_subprocess(monkeypatch):
-    """run.py 启动 API 时监督 cron，Uvicorn 退出后必须回收子进程。"""
+    """run.py 启动 API 时先完成迁移编排，并在退出后回收 cron 子进程。"""
     calls = []
 
     class FakeCronProcess:
         def stop(self):
             calls.append("cron-stop")
 
+    # 启动监督测试只验证进程顺序，迁移 I/O 由 database_migrations 的专门测试覆盖。
+    monkeypatch.setattr(
+        "app.core.database_migrations.apply_python_schema_migrations",
+        lambda: calls.append("migrations") or [],
+    )
     monkeypatch.setattr("app.workers.supervisor.start_cron_process", lambda config_args: calls.append(config_args) or FakeCronProcess())
     monkeypatch.setattr("app.core.runtime_config.uvicorn.run", lambda *args, **kwargs: calls.append("uvicorn"))
 
     main(["--with-cron", "--config", "config/worker-test.yml"])
 
-    assert calls == [["--config", "config/worker-test.yml"], "uvicorn", "cron-stop"]
+    assert calls == ["migrations", ["--config", "config/worker-test.yml"], "uvicorn", "cron-stop"]

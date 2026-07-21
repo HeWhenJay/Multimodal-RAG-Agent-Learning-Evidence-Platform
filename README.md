@@ -80,7 +80,7 @@ flowchart TB
 资料上传不会在 HTTP 请求内同步执行解析或 embedding。FastAPI 先完成权限校验、原始文件落盘和事务写入，再由独立 worker 接管长任务；因此刷新页面、重启 API 或网络短暂波动不会让已提交资料丢失。
 
 ```mermaid
-flowchart LR
+flowchart TB
     U["上传文本、文件或视频分片"] --> FE["React 上传与进度轮询"]
     FE --> API["FastAPI RAG 控制面\n校验 Token、用户与文件边界"]
     API --> STORE["保存原始文件\nlocal / OSS"]
@@ -117,7 +117,7 @@ flowchart LR
 视频与字幕资料走同一份 Python 索引状态机。字幕、语音、关键帧和 OCR 文本都带有时间位置，最终 evidence 可以让前端定位到对应播放片段。
 
 ```mermaid
-flowchart LR
+flowchart TB
     V["视频、字幕或转写文本"] --> STORE["受控原始文件存储\nlocal / OSS"]
     STORE --> WORKER["Python RAG worker"]
     WORKER --> SUB["内嵌/同目录字幕\n或 FFmpeg 分段 ASR"]
@@ -136,7 +136,7 @@ flowchart LR
 查询强制按当前登录用户和 `private` 可见范围过滤。无论是同步查询还是带进度的查询任务，最终回答都返回资料标题、章节、片段、来源、位置和分数等 evidence 结构；证据不足时返回结构化拒答，而不是编造答案。
 
 ```mermaid
-flowchart LR
+flowchart TB
     Q["用户问题"] --> FE["React 工作台 / 知识库"]
     FE --> API["FastAPI /api/rag/query\n或 /api/rag/query/tasks"]
     API --> AUTH["从 Bearer Token 推导当前用户\n覆盖客户端传入 userId"]
@@ -175,40 +175,96 @@ RAG 检索设计采用 Multi-Query 扩展召回范围，再对每个查询的 BM
 
 Agent 不通过内部 HTTP 或 Java gateway 回调自身。FastAPI 将任务和用户操作持久化后，Agent worker 使用进程内 `LocalAgentGateway` 调用受控 RAG、记忆和业务服务；每个事件先落 PostgreSQL，再通过 SSE 投影到前端。
 
+### 耐久任务与事件投影
+
 ```mermaid
 flowchart TB
     U["用户输入任务"] --> FE["React Agent 工作台"]
-    FE --> API["POST /api/agent/tasks"]
-    API --> TASK["PostgreSQL\nagent_task / message / event"]
-    TASK --> AGW["Agent durable worker\n领取任务 + PostgreSQL advisory lock"]
+    FE --> API["FastAPI /api/agent/*\n认证、所有权与 Result 信封"]
+    API --> TASK["PostgreSQL\nagent_task / message / event / review / operation"]
+    TASK --> AGW["Agent durable worker\nPostgreSQL advisory lock"]
+    AGW --> GRAPH["LangGraph PAE + ReAct\n稳定 threadId 执行或恢复"]
+    GRAPH --> GATE["LocalAgentGateway\n白名单、所有权、审批与幂等边界"]
 
-    subgraph GRAPH["LangGraph 统一编排"]
-        PLAN["PAE 计划与状态判断"]
-        ACT["ReAct 工具执行"]
-        GATE["LocalAgentGateway\n权限、所有权、审批边界"]
-        PLAN --> ACT --> GATE
-    end
-
-    AGW --> PLAN
-    GATE --> RAG["RAG 检索与 evidence"]
-    GATE --> MEM["Agent 记忆\n草稿、确认、归档、删除"]
-    GATE --> OPS["受控读写操作\n快照与撤销"]
+    GATE --> RAG["Python RAG\n当前用户 private evidence"]
+    GATE --> MEM["Agent 记忆\n检索与待确认候选"]
+    GATE --> OPS["受控变更\n快照与 undo"]
     RAG --> DB[("PostgreSQL + pgvector")]
     MEM --> DB
     OPS --> DB
 
-    GATE --> REVIEW{"需要人工审批"}
-    REVIEW -->|"否"| EVENT["持久化消息、阶段与结果"]
-    REVIEW -->|"是"| WAIT["WAITING_*_REVIEW\n写入 review"]
-    WAIT --> SSE["SSE agent_event / task / done"]
+    GRAPH --> EVENT["持久化任务状态、消息\n节点事件、工具观察与草稿"]
+    EVENT --> DB
+    EVENT --> SSE["SSE task / agent_event / done"]
     SSE --> FE
-    FE -->|"批准或拒绝"| DECIDE["POST review decide"]
+
+    GRAPH --> REVIEW{"需要用户确认"}
+    REVIEW -->|"否"| EVENT
+    REVIEW -->|"是"| WAIT["WAITING_PLAN_REVIEW\nWAITING_OUTPUT_REVIEW\nWAITING_CRUD_REVIEW"]
+    WAIT --> EVENT
+    FE -->|"APPROVED / REJECTED\nCHANGES_REQUESTED"| DECIDE["POST review decide"]
     DECIDE --> DB
     DB --> AGW
-    EVENT --> SSE
 ```
 
-任务、消息、审批、操作快照和记忆都以 PostgreSQL 为权威记录。连接中断后的前端可以重新读取任务快照并重新连接 SSE；worker 重启后可继续领取未完成的耐久任务。
+### LangGraph PAE + ReAct 节点编排
+
+这张图对应 `ai-python/agents/orchestration/pae_react_graph.py` 的 `StateGraph`、条件边和恢复入口。每次审批恢复都会从 PostgreSQL 读取同一 `threadId` 的任务事实，再重新执行受控节点；不会依赖进程内状态继续运行。
+
+```mermaid
+flowchart TB
+    START["Worker 启动或审批恢复\ninitial_state(taskId, threadId)"] --> TITLE["conversation_title\n生成侧边栏会话标题"]
+    TITLE --> CONTEXT["context_restore\n恢复消息、摘要、上下文预算"]
+    CONTEXT --> ROUTER{"task_router\n只读还是规划任务"}
+
+    ROUTER -->|"只读"| PREPLAN["memory_prefetch_before_planner\n读取当前用户 ACTIVE memory"]
+    PREPLAN --> PLANNER["planner\n计划、完成标准、工具白名单"]
+    ROUTER -->|"规划"| PLANNER
+
+    PLANNER --> PLAN_GATE{"规划任务且\n计划尚未批准"}
+    PLAN_GATE -->|"是"| PLAN_REVIEW["plan_review\n写入 PLAN review"]
+    PLAN_REVIEW --> WAIT_PLAN["WAITING_PLAN_REVIEW\n当前图结束"]
+    WAIT_PLAN --> REVIEW_API["前端审批 -> FastAPI\n持久化决定后重新入队"]
+    REVIEW_API --> START
+
+    PLAN_GATE -->|"否"| REWRITE_GATE{"resume_rewrite_decision\n是否进入简历改写子图"}
+    REWRITE_GATE -->|"是"| REWRITE_PLAN["resume_rewrite_planner\n抽取 JD 要求与改写范围"]
+    REWRITE_PLAN --> REWRITE_GEN["resume_rewrite_generator\n生成待确认候选"]
+    REWRITE_GEN --> REWRITE_ACCEPT["resume_rewrite_acceptance\n不直接写 DOCX 或业务数据"]
+    REWRITE_ACCEPT -->|"通过"| POSTPLAN["memory_prefetch_after_planner\n补充任务级记忆"]
+    REWRITE_ACCEPT -->|"失败"| ANSWER
+    REWRITE_GATE -->|"否"| POSTPLAN
+
+    POSTPLAN --> EXECUTOR["executor\n选择当前步骤的 ReAct action"]
+    EXECUTOR --> ACTION_GATE{"是否选择工具"}
+    ACTION_GATE -->|"是"| TOOL["tool_adapter\nLocalAgentGateway 执行白名单工具"]
+    ACTION_GATE -->|"否"| ACCEPT["acceptance\n校验完成标准与工具观察"]
+
+    TOOL --> TOOL_GATE{"工具成功"}
+    TOOL_GATE -->|"是"| ACCEPT
+    TOOL_GATE -->|"否"| REPAIR["repair\nRETRY / SKIP_TOOL\nREPLAN / REPORT_UNABLE"]
+    REPAIR -->|"有限重试"| TOOL
+    REPAIR -->|"重新规划"| PLANNER
+    REPAIR -->|"跳过或受控失败"| ACCEPT
+
+    ACCEPT --> ACCEPT_GATE{"验收结果"}
+    ACCEPT_GATE -->|"还有步骤"| EXECUTOR
+    ACCEPT_GATE -->|"需要修补"| REPAIR
+    ACCEPT_GATE -->|"完成或失败"| ANSWER["answer_writer\n生成证据回答或失败摘要"]
+
+    ANSWER --> OUTPUT_GATE{"是否需要输出确认"}
+    OUTPUT_GATE -->|"需要"| WAIT_OUTPUT["WAITING_OUTPUT_REVIEW\n输出草稿与 evidence"]
+    WAIT_OUTPUT --> OUTPUT_API["用户批准后\nresume_output_review"]
+    OUTPUT_API --> CRUD_GATE{"是否请求保存类变更"}
+    CRUD_GATE -->|"是"| WAIT_CRUD["WAITING_CRUD_REVIEW\n审批 + operation + idempotencyKey"]
+    WAIT_CRUD --> MUTATION["批准后 execute_approved_mutation\n写入快照，可 undo"]
+    CRUD_GATE -->|"否"| MEMORY
+    MUTATION --> MEMORY
+    OUTPUT_GATE -->|"不需要"| MEMORY["post_answer_memory\n只生成 PENDING_REVIEW 记忆候选"]
+    MEMORY --> END["COMPLETED / FAILED\n持久化终态并发送 done"]
+```
+
+任务、消息、审批、操作快照和记忆都以 PostgreSQL 为权威记录。工具失败只能有限重试、降级、重新规划或受控失败；`AGENT_GRAPH_RECURSION_LIMIT=24` 会终止异常循环。连接中断后的前端可以重新读取任务快照并重新连接 SSE；worker 重启后可继续领取未完成的耐久任务。
 
 ## 运行模式与进程职责
 
