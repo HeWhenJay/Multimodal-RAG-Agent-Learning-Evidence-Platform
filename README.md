@@ -209,67 +209,55 @@ flowchart TB
 
 ### LangGraph PAE + ReAct 节点编排
 
-这张图严格按 `ai-python/agents/orchestration/pae_react_graph.py` 中 `build_unified_graph()` 的真实节点和条件边重绘。一次 Agent 请求在进入 `StateGraph` 前会先由 `start_unified_agent()` 或 `resume_unified_agent()` 构造 `initial_state`；进入图后的第一个节点是 `conversation_title`，随后是 `context_restore -> task_router`。只有路由完成后，`planning_task` 才进入 `planner`，只读任务会先经过 `memory_prefetch_before_planner` 再进入 `planner`。
+这组图严格按 `ai-python/agents/orchestration/pae_react_graph.py` 的 `build_unified_graph()` 重绘。第一张是**整个 Agent 的主调用图**：从真实入口 `conversation_title` 开始，覆盖任务路由、规划审批、ReAct 执行、修补、验收、回答、记忆和人工审批恢复；简历证据改写在主图中折叠为一个子图节点。第二张只展开这个简历子图，避免主图被简历细节淹没。
+
+#### Agent 主调用图
 
 ```mermaid
 flowchart TB
-    START["start_unified_agent / resume_unified_agent<br/>构造 initial_state 后 invoke StateGraph"] --> TITLE["conversation_title<br/>生成侧边栏会话标题"]
+    START["start_unified_agent / resume_unified_agent<br/>构造 initial_state 后启动完整 StateGraph"] --> TITLE["conversation_title<br/>生成侧边栏会话标题"]
     TITLE --> CONTEXT["context_restore<br/>恢复消息、摘要与上下文预算"]
-    CONTEXT --> ROUTER["task_router<br/>标记 planning 或 read_only 子图"]
+    CONTEXT --> ROUTER{"task_router<br/>判断任务进入规划子图还是只读子图"}
 
-    ROUTER -->|"planning_task"| PLANNER["planner<br/>生成 PAE 计划、完成标准与工具范围"]
-    ROUTER -->|"pure_read_query / read / general"| PREPLAN["memory_prefetch_before_planner<br/>只读任务规划前读取 ACTIVE memory"]
+    ROUTER -->|"规划任务 planning_task"| PLANNER["planner<br/>生成 PAE 计划、完成标准与工具范围"]
+    ROUTER -->|"只读任务 pure_read_query / read / general"| PREPLAN["memory_prefetch_before_planner<br/>只读任务规划前读取当前用户 ACTIVE memory"]
     PREPLAN --> PLANNER
 
-    PLANNER --> ROUTE_PLANNER{"route_after_planner"}
-    ROUTE_PLANNER -->|"plan_review"| PLAN_REVIEW["plan_review<br/>发布 PLAN 审批请求"]
-    PLAN_REVIEW --> WAIT_PLAN["WAITING_PLAN_REVIEW<br/>StateGraph 本轮结束"]
+    PLANNER --> PLAN_ROUTE{"规划后判断<br/>是否需要 PLAN 审批、简历子图或普通执行"}
+    PLAN_ROUTE -->|"规划任务且计划未批准"| PLAN_REVIEW["plan_review<br/>发布 PLAN 审批请求"]
+    PLAN_REVIEW --> WAIT_PLAN["WAITING_PLAN_REVIEW<br/>等待用户审批，本轮图结束"]
 
-    ROUTE_PLANNER -->|"resume_rewrite_decision"| REWRITE_DECISION["resume_rewrite_decision<br/>判断是否进入简历证据改写子图"]
-    ROUTE_PLANNER -->|"memory_prefetch_after_planner"| POSTPLAN["memory_prefetch_after_planner<br/>执行前补充任务级记忆"]
+    PLAN_ROUTE -->|"规划任务且计划已批准"| REWRITE_DECISION["resume_rewrite_decision<br/>判断本次任务是否需要简历证据改写"]
+    PLAN_ROUTE -->|"只读任务或无需规划审批"| POSTPLAN["memory_prefetch_after_planner<br/>按计划与工具意图补充任务级记忆"]
 
-    REWRITE_DECISION --> ROUTE_REWRITE{"route_after_resume_rewrite_decision"}
-    ROUTE_REWRITE -->|"resume_jd_analyzer"| JD_ANALYZER["resume_jd_analyzer<br/>将岗位 JD 归纳为 requirement ID 画像"]
-    ROUTE_REWRITE -->|"memory_prefetch_after_planner"| POSTPLAN
-
-    subgraph RESUME_REWRITE["简历证据改写链：只生成待审候选，不直接写 DOCX 或数据库"]
-        direction TB
-        JD_ANALYZER --> EVIDENCE_RETRIEVER["resume_evidence_retriever<br/>按 JD 要求检索当前用户私有 evidence"]
-        EVIDENCE_RETRIEVER -.-> RAG_PROBE["rag_query_probe_non_persistent<br/>内部只读工具调用；不是 StateGraph 节点"]
-        EVIDENCE_RETRIEVER --> EVIDENCE_SUMMARIZER["resume_evidence_summarizer<br/>保留 evidenceId / 标题 / 章节 / 片段 / 来源 / 分数"]
-        EVIDENCE_SUMMARIZER --> REVISION_ADVISOR["resume_revision_advisor<br/>基于 JD、原简历与 evidence 生成字段级修改建议"]
-        REVISION_ADVISOR --> PATCH_BUILDER["resume_patch_builder<br/>确定性整理候选；不写 DOCX"]
-        PATCH_BUILDER --> REWRITE_ACCEPT["resume_rewrite_acceptance<br/>验收字段、引文、风险与缺口"]
-        PATCH_BUILDER -.-> PATCHES["payload.patches<br/>字段候选数据，不是执行节点"]
-        PATCH_BUILDER -.-> GAPS["payload.gapSuggestions<br/>独立补强建议，不是执行节点"]
-    end
-
-    REWRITE_ACCEPT --> ROUTE_REWRITE_ACCEPT{"route_after_resume_rewrite_acceptance"}
-    ROUTE_REWRITE_ACCEPT -->|"answer_writer"| ANSWER["answer_writer<br/>发布草稿、失败摘要或最终回答"]
+    REWRITE_DECISION --> REWRITE_GATE{"是否进入简历证据改写子图"}
+    REWRITE_GATE -->|"是"| RESUME_SUBGRAPH["简历证据改写子图<br/>JD 分析 / RAG 证据 / 修改建议 / 补丁候选 / 验收<br/>详见下方子图"]
+    REWRITE_GATE -->|"否"| POSTPLAN
+    RESUME_SUBGRAPH --> ANSWER["answer_writer<br/>发布输出草稿、最终回答或失败摘要"]
 
     POSTPLAN --> EXECUTOR["executor<br/>选择当前步骤的 ReAct action"]
-    EXECUTOR --> ROUTE_EXECUTOR{"route_after_executor"}
-    ROUTE_EXECUTOR -->|"tool_adapter"| TOOL["tool_adapter<br/>LocalAgentGateway 执行白名单工具"]
-    ROUTE_EXECUTOR -->|"acceptance"| ACCEPT["acceptance<br/>校验完成标准与工具观察"]
+    EXECUTOR --> EXEC_ROUTE{"执行后判断<br/>是否需要调用工具"}
+    EXEC_ROUTE -->|"需要工具"| TOOL["tool_adapter<br/>通过 LocalAgentGateway 执行白名单工具"]
+    EXEC_ROUTE -->|"不需要工具"| ACCEPT["acceptance<br/>校验完成标准与工具观察"]
 
-    TOOL --> ROUTE_TOOL{"route_after_tool_adapter"}
-    ROUTE_TOOL -->|"acceptance"| ACCEPT
-    ROUTE_TOOL -->|"repair"| REPAIR["repair<br/>RETRY / SKIP_TOOL / REPLAN / REPORT_UNABLE"]
+    TOOL --> TOOL_ROUTE{"工具结果判断"}
+    TOOL_ROUTE -->|"成功"| ACCEPT
+    TOOL_ROUTE -->|"失败"| REPAIR["repair<br/>决定 RETRY、SKIP_TOOL、REPLAN 或 REPORT_UNABLE"]
 
-    REPAIR --> ROUTE_REPAIR{"route_after_repair"}
-    ROUTE_REPAIR -->|"tool_adapter"| TOOL
-    ROUTE_REPAIR -->|"planner"| PLANNER
-    ROUTE_REPAIR -->|"acceptance"| ACCEPT
+    REPAIR --> REPAIR_ROUTE{"修补决策"}
+    REPAIR_ROUTE -->|"重试工具"| TOOL
+    REPAIR_ROUTE -->|"重新规划"| PLANNER
+    REPAIR_ROUTE -->|"跳过或受控失败"| ACCEPT
 
-    ACCEPT --> ROUTE_ACCEPT{"route_after_acceptance"}
-    ROUTE_ACCEPT -->|"executor"| EXECUTOR
-    ROUTE_ACCEPT -->|"repair"| REPAIR
-    ROUTE_ACCEPT -->|"answer_writer"| ANSWER
+    ACCEPT --> ACCEPT_ROUTE{"验收结果判断"}
+    ACCEPT_ROUTE -->|"还有步骤"| EXECUTOR
+    ACCEPT_ROUTE -->|"需要修补"| REPAIR
+    ACCEPT_ROUTE -->|"完成或失败"| ANSWER
 
-    ANSWER --> MEMORY["post_answer_memory<br/>仅 COMPLETED 且显式需要时生成 PENDING_REVIEW 记忆候选"]
+    ANSWER --> MEMORY["post_answer_memory<br/>仅 COMPLETED 且用户显式需要时生成 PENDING_REVIEW 记忆候选"]
     MEMORY --> GRAPH_END["END<br/>StateGraph 本轮结束"]
 
-    ANSWER -.-> WAIT_OUTPUT["WAITING_OUTPUT_REVIEW<br/>answer_writer 发布 OUTPUT 审批事件<br/>等待用户确认输出草稿"]
+    ANSWER -.-> WAIT_OUTPUT["WAITING_OUTPUT_REVIEW<br/>answer_writer 发布 OUTPUT 审批事件，等待用户确认输出草稿"]
 
     WAIT_PLAN -->|"APPROVED / CHANGES_REQUESTED"| RESUME_AGAIN["resume_unified_agent<br/>重新构造 initial_state 并再次 invoke 完整图"]
     WAIT_OUTPUT -->|"CHANGES_REQUESTED"| RESUME_AGAIN
@@ -284,6 +272,31 @@ flowchart TB
     WAIT_CRUD -->|"APPROVED"| MUTATION["execute_approved_mutation<br/>非 StateGraph 节点；执行受控变更"]
     WAIT_CRUD -->|"CHANGES_REQUESTED"| RESUME_AGAIN
     WAIT_CRUD -->|"REJECTED"| REVIEW_FAILED
+```
+
+#### 简历证据改写子图
+
+```mermaid
+flowchart TB
+    REWRITE_DECISION["resume_rewrite_decision<br/>读取 Planner 意图、toolHints、JD 与简历上下文"] --> REWRITE_GATE{"是否需要进入简历证据改写"}
+
+    REWRITE_GATE -->|"否"| BACK_TO_MAIN["返回主图<br/>memory_prefetch_after_planner"]
+    REWRITE_GATE -->|"是"| JD_ANALYZER["resume_jd_analyzer<br/>将岗位 JD 归纳为带 requirement ID 的岗位画像"]
+
+    JD_ANALYZER --> EVIDENCE_RETRIEVER["resume_evidence_retriever<br/>按岗位要求检索当前用户私有学习 evidence"]
+    EVIDENCE_RETRIEVER -.-> RAG_PROBE["rag_query_probe_non_persistent<br/>内部只读 RAG 工具调用，不是 StateGraph 节点"]
+    EVIDENCE_RETRIEVER --> EVIDENCE_SUMMARIZER["resume_evidence_summarizer<br/>归纳证据覆盖范围，保留 evidenceId、标题、章节、片段、来源与分数"]
+
+    EVIDENCE_SUMMARIZER --> REVISION_ADVISOR["resume_revision_advisor<br/>基于 JD、原简历和 evidence 生成字段级修改建议"]
+    REVISION_ADVISOR --> PATCH_BUILDER["resume_patch_builder<br/>确定性整理待确认补丁候选，不写 DOCX"]
+    PATCH_BUILDER -.-> PATCHES["payload.patches<br/>字段候选数据，不是执行节点"]
+    PATCH_BUILDER -.-> GAPS["payload.gapSuggestions<br/>独立补强建议，不是执行节点"]
+
+    PATCH_BUILDER --> REWRITE_ACCEPT["resume_rewrite_acceptance<br/>验收字段完整性、evidence 引文、风险标记与缺口建议"]
+    REWRITE_ACCEPT --> ACCEPT_ROUTE{"验收是否通过"}
+
+    ACCEPT_ROUTE -->|"通过"| TO_OUTPUT["返回主图<br/>answer_writer 发布 WAITING_OUTPUT_REVIEW"]
+    ACCEPT_ROUTE -->|"失败"| TO_FAIL["返回主图<br/>answer_writer 发布失败摘要"]
 ```
 
 `resume_output_review` 和 `execute_approved_mutation` 是审批恢复函数，不是 `StateGraph` 节点。当前生产运行面不提供在线 DOCX 导出；若未来接入模板导出，仍需在该受控审批链外补充独立 API 契约、原文 hash、evidence、长度与版式校验。
