@@ -178,7 +178,9 @@ def validate_resume_patches(
         errors.extend(f"{path} {item}" for item in text_errors)
         if field.requiredEvidencePolicy == "REQUIRED" and not patch.evidenceIds:
             errors.append(f"{path} 缺少必需 evidence 引用")
-        invalid_evidence = [evidence_id for evidence_id in patch.evidenceIds if allowed_evidence and evidence_id not in allowed_evidence]
+        if patch.evidenceIds and not allowed_evidence:
+            errors.append(f"{path} 携带 evidenceIds，但当前没有可用候选 evidence 集合")
+        invalid_evidence = [evidence_id for evidence_id in patch.evidenceIds if evidence_id not in allowed_evidence]
         if invalid_evidence:
             errors.append(f"{path} evidenceIds 不属于候选集合: {', '.join(invalid_evidence)}")
         if any(flag == "NONE" for flag in patch.riskFlags) and len(patch.riskFlags) > 1:
@@ -218,9 +220,12 @@ def apply_resume_patches_to_docx(
     validation = validate_resume_patches(template_id, version, fields, patches, allowed_evidence_ids, contract)
     if validation.validationErrors:
         raise ValueError("补丁校验失败: " + "；".join(validation.validationErrors))
+    unconfirmed = [patch.fieldId for patch in validation.patches if patch.status in {"DRAFT", "VALIDATED"}]
+    if unconfirmed:
+        raise ValueError("补丁尚未由用户确认，拒绝导出：" + "、".join(unconfirmed))
     original_fingerprint = layout_fingerprint(content)
     document = Document(io.BytesIO(content))
-    patches_by_id = {patch.fieldId: patch for patch in validation.patches if patch.status in {"CONFIRMED", "VALIDATED"}}
+    patches_by_id = {patch.fieldId: patch for patch in validation.patches if patch.status == "CONFIRMED"}
     applied = 0
     for field in fields:
         patch = patches_by_id.get(field.fieldId)

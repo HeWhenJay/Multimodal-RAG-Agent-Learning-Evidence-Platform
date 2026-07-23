@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from typing import Any, Literal, TypedDict
 
@@ -61,6 +62,9 @@ AGENT_GRAPH_RECURSION_LIMIT_CODE = "AGENT_GRAPH_RECURSION_LIMIT"
 DEFAULT_BEST_WINDOW_TOKENS = 18_000
 DEFAULT_COMPRESSION_THRESHOLD_RATIO = 0.82
 DEFAULT_MAX_CONTEXT_COMPRESSIONS = 2
+RESUME_REWRITE_CONTENT_FIELDS = {"summary", "skills", "project_experience", "learning_plan", "gap_summary"}
+RESUME_PROJECT_EVIDENCE_KEYWORDS = ("项目", "系统", "平台", "开发", "实现", "构建", "作品", "工程", "服务")
+RESUME_COURSEWORK_EVIDENCE_KEYWORDS = ("课程", "练习", "作业", "实验", "基础", "教程", "笔记", "学习", "课堂")
 
 
 class UnifiedAgentState(TypedDict, total=False):
@@ -81,6 +85,10 @@ class UnifiedAgentState(TypedDict, total=False):
     plan_approved: bool
     completion_criteria: list[str]
     resume_rewrite_required: bool
+    resume_jd_profile: dict[str, Any]
+    resume_evidence_bundle: dict[str, Any]
+    resume_revision_advice: dict[str, Any]
+    resume_patch_candidate: dict[str, Any]
     resume_rewrite_plan: dict[str, Any]
     resume_rewrite_draft: dict[str, Any]
     resume_rewrite_result: dict[str, Any]
@@ -343,8 +351,11 @@ def build_unified_graph(client: AgentGateway):
     workflow.add_node("planner", lambda state: planner_node(state, client))
     workflow.add_node("plan_review", lambda state: plan_review_node(state, client))
     workflow.add_node("resume_rewrite_decision", resume_rewrite_decision_node)
-    workflow.add_node("resume_rewrite_planner", lambda state: resume_rewrite_planner_node(state, client))
-    workflow.add_node("resume_rewrite_generator", lambda state: resume_rewrite_generator_node(state, client))
+    workflow.add_node("resume_jd_analyzer", lambda state: resume_jd_analyzer_node(state, client))
+    workflow.add_node("resume_evidence_retriever", lambda state: resume_evidence_retriever_node(state, client))
+    workflow.add_node("resume_evidence_summarizer", lambda state: resume_evidence_summarizer_node(state, client))
+    workflow.add_node("resume_revision_advisor", lambda state: resume_revision_advisor_node(state, client))
+    workflow.add_node("resume_patch_builder", resume_patch_builder_node)
     workflow.add_node("resume_rewrite_acceptance", lambda state: resume_rewrite_acceptance_node(state, client))
     workflow.add_node("memory_prefetch_after_planner", lambda state: memory_prefetch_after_planner(state, client))
     workflow.add_node("executor", lambda state: executor_node(state, client))
@@ -380,17 +391,19 @@ def build_unified_graph(client: AgentGateway):
         "resume_rewrite_decision",
         route_after_resume_rewrite_decision,
         {
-            "resume_rewrite_planner": "resume_rewrite_planner",
+            "resume_jd_analyzer": "resume_jd_analyzer",
             "memory_prefetch_after_planner": "memory_prefetch_after_planner",
         },
     )
-    workflow.add_edge("resume_rewrite_planner", "resume_rewrite_generator")
-    workflow.add_edge("resume_rewrite_generator", "resume_rewrite_acceptance")
+    workflow.add_edge("resume_jd_analyzer", "resume_evidence_retriever")
+    workflow.add_edge("resume_evidence_retriever", "resume_evidence_summarizer")
+    workflow.add_edge("resume_evidence_summarizer", "resume_revision_advisor")
+    workflow.add_edge("resume_revision_advisor", "resume_patch_builder")
+    workflow.add_edge("resume_patch_builder", "resume_rewrite_acceptance")
     workflow.add_conditional_edges(
         "resume_rewrite_acceptance",
         route_after_resume_rewrite_acceptance,
         {
-            "memory_prefetch_after_planner": "memory_prefetch_after_planner",
             "answer_writer": "answer_writer",
         },
     )
@@ -669,69 +682,224 @@ def resume_rewrite_decision_node(state: UnifiedAgentState) -> UnifiedAgentState:
     return {**state, "resume_rewrite_required": required}
 
 
-def resume_rewrite_planner_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
-    """生成简历修改子图的局部计划。"""
+def resume_jd_analyzer_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
+    """第一个简历子 Agent：将原始 JD 约束为可追踪的岗位要求画像。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
     task_input = state.get("task_input") or {}
     jd_text = text_value(task_input.get("jobDescription"))
     resume_text = text_value(task_input.get("resumeText"))
-    requirements = extract_requirements(jd_text or state.get("user_goal") or "")
-    rewrite_plan = {
-        "title": "简历修改子图计划",
-        "scope": "PENDING_REVIEW_RESUME_DRAFT",
-        "steps": [
-            {"name": "定位岗位要求", "description": "从 JD 中抽取需要在简历中回应的能力要求"},
-            {"name": "比对现有简历", "description": "判断哪些要求已有表达、哪些需要改写或补充"},
-            {"name": "生成候选片段", "description": "输出摘要、技能、项目经历和缺口说明候选，不直接写 DOCX"},
-        ],
-        "targetRequirements": requirements,
-        "hasResumeText": bool(resume_text),
-        "guardrails": [
-            "不直接写 DOCX",
-            "不直接保存业务数据",
-            "候选片段必须进入 OUTPUT 审批",
-        ],
+    if not jd_text:
+        return {
+            **state,
+            "status": "FAILED",
+            "error_code": "AGENT_RESUME_JD_REQUIRED",
+            "error_message": "简历优化任务缺少岗位 JD，无法生成可核验的修改建议。",
+        }
+    if not resume_text:
+        return {
+            **state,
+            "status": "FAILED",
+            "error_code": "AGENT_RESUME_TEXT_REQUIRED",
+            "error_message": "简历优化任务缺少原始简历内容，无法定位可修改字段。",
+        }
+    publish_progress_event(
+        client,
+        state,
+        node="resume_jd_analyzer",
+        phase="started",
+        message="JD 分析子 Agent 正在提取岗位硬性要求、加分项和关键词。",
+    )
+    fallback_profile = build_resume_jd_profile(jd_text, task_input)
+    profile = build_llm_resume_jd_profile(state, fallback_profile, client)
+    publish_progress_event(
+        client,
+        state,
+        node="resume_jd_analyzer",
+        phase="finished",
+        message=f"JD 分析完成，已整理 {len(resume_jd_requirements(profile))} 项可检索岗位要求。",
+        extra={"jobTitle": profile.get("jobTitle"), "requirementCount": len(resume_jd_requirements(profile))},
+    )
+    return {
+        **state,
+        "resume_jd_profile": profile,
+        "resume_rewrite_plan": {
+            "title": "简历证据改写计划",
+            "scope": "PENDING_REVIEW_RESUME_DRAFT",
+            "targetRequirements": [item["requirement"] for item in resume_jd_requirements(profile)],
+            "guardrails": ["不直接写 DOCX", "不直接保存业务数据", "候选片段必须进入 OUTPUT 审批"],
+        },
     }
-    rewrite_plan = build_llm_resume_rewrite_plan(state, rewrite_plan, client)
-    return {**state, "resume_rewrite_plan": rewrite_plan}
 
 
-def resume_rewrite_generator_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
-    """生成简历修改候选片段，供最终 OUTPUT 审批展示。"""
+def resume_evidence_retriever_node(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
+    """第二个简历子 Agent：仅通过本地 Gateway 检索当前用户的学习 evidence。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    profile = state.get("resume_jd_profile") or {}
+    task_input = state.get("task_input") or {}
+    question = build_resume_evidence_question(profile, text_value(state.get("user_goal")))
+    publish_progress_event(
+        client,
+        state,
+        node="resume_evidence_retriever",
+        phase="started",
+        message="学习证据子 Agent 正在用岗位要求检索当前用户的私有资料。",
+        status="WAITING_TOOL_RESULT",
+    )
+    retrieved = tool_adapter_node(
+        {
+            **state,
+            "current_action": {
+                "toolName": "rag_query_probe_non_persistent",
+                "toolType": "READ",
+                "arguments": {
+                    "question": question,
+                    "topK": int_value(task_input.get("topK"), 6),
+                    "candidateMultiplier": int_value(task_input.get("candidateMultiplier"), 4),
+                    "metadataFilter": task_input.get("metadataFilter") if isinstance(task_input.get("metadataFilter"), dict) else {},
+                },
+            },
+        },
+        client,
+    )
+    if retrieved.get("status") == "TOOL_FAILED":
+        return {
+            **retrieved,
+            "status": "FAILED",
+            "error_code": retrieved.get("error_code") or "AGENT_RESUME_EVIDENCE_RETRIEVAL_FAILED",
+            "error_message": retrieved.get("error_message") or "学习证据检索失败，无法生成可核验的简历修改建议。",
+        }
+    rag_result = latest_tool_result_by_name(retrieved, "rag_query_probe_non_persistent")
+    rag_data = rag_result.get("data") if isinstance(rag_result.get("data"), dict) else {}
+    bundle = build_resume_evidence_bundle(profile, question, rag_data)
+    publish_progress_event(
+        client,
+        retrieved,
+        node="resume_evidence_retriever",
+        phase="finished",
+        message=f"已检索到 {len(bundle.get('items') or [])} 条候选学习证据，正在进行可引用摘要。",
+        extra={"evidenceCount": len(bundle.get("items") or []), "expandedQueries": bundle.get("expandedQueries") or []},
+    )
+    return {**retrieved, "resume_evidence_bundle": bundle, "current_action": {}}
+
+
+def resume_evidence_summarizer_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
+    """第三个简历子 Agent 的前半段：在保留 evidence 原文引用的前提下归纳可支持事实。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    profile = state.get("resume_jd_profile") or {}
+    bundle = state.get("resume_evidence_bundle") or {}
+    publish_progress_event(
+        client,
+        state,
+        node="resume_evidence_summarizer",
+        phase="started",
+        message="学习证据子 Agent 正在归纳证据覆盖范围，并保留 evidence 引用。",
+    )
+    fallback = build_resume_evidence_summary(profile, bundle)
+    summary = build_llm_resume_evidence_summary(state, fallback, client)
+    merged_bundle = {**bundle, **summary, "items": list(bundle.get("items") or []), "evidenceIds": list(bundle.get("evidenceIds") or [])}
+    publish_progress_event(
+        client,
+        state,
+        node="resume_evidence_summarizer",
+        phase="finished",
+        message="学习证据摘要完成；后续修改建议只能引用本次候选 evidence。",
+        extra={"evidenceCount": len(merged_bundle.get("evidenceIds") or [])},
+    )
+    return {**state, "resume_evidence_bundle": merged_bundle}
+
+
+def resume_revision_advisor_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
+    """第三个简历子 Agent：根据 JD、原简历和 evidence 生成可微调的字段级修改建议。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
     task_input = state.get("task_input") or {}
-    requirements = list((state.get("resume_rewrite_plan") or {}).get("targetRequirements") or [])
-    resume_text = text_value(task_input.get("resumeText"))
-    provisional_alignment = build_alignment(requirements, resume_text, [])
-    provisional_gaps = build_gaps(provisional_alignment)
-    content_map = build_resume_content_map(task_input, provisional_alignment, provisional_gaps, [])
-    draft = {
+    profile = state.get("resume_jd_profile") or {}
+    bundle = state.get("resume_evidence_bundle") or {}
+    alignment = build_resume_evidence_alignment(profile, text_value(task_input.get("resumeText")), bundle)
+    gaps = build_gaps(alignment)
+    supported_evidence_ids = list(
+        dict.fromkeys(
+            evidence_id
+            for item in alignment
+            if item.get("status") == "supported"
+            for evidence_id in item.get("evidenceIds") or []
+            if text_value(evidence_id)
+        )
+    )
+    evidence_bundle = {**bundle, "supportedEvidenceIds": supported_evidence_ids}
+    evidence_bundle["projectEvidenceIds"] = project_resume_evidence_ids(evidence_bundle, supported_evidence_ids)
+    content_map = build_resume_content_map(task_input, alignment, gaps, supported_evidence_ids)
+    supported_requirements = [text_value(item.get("requirement")) for item in alignment if item.get("status") == "supported"]
+    # 弱匹配只用于缺口分析，不能被带有 NONE 风险标记的技能补丁写成已具备能力。
+    content_map["skills"] = " / ".join(supported_requirements[:8]) or "待补充岗位相关技能"
+    fallback_advice = {
+        "contentMap": content_map,
+        "rewriteTargets": [item["requirement"] for item in resume_jd_requirements(profile)],
+        "patches": build_resume_revision_patches(content_map, supported_evidence_ids),
+        "gapSuggestions": build_gap_suggestions(gaps),
+        "message": "已基于岗位要求和可引用学习证据生成字段级修改建议，等待用户确认。",
+    }
+    publish_progress_event(
+        client,
+        state,
+        node="resume_revision_advisor",
+        phase="started",
+        message="简历修改建议子 Agent 正在把岗位要求和学习证据映射到原简历字段。",
+    )
+    advice = build_llm_resume_revision_advice({**state, "resume_evidence_bundle": evidence_bundle}, fallback_advice, client)
+    publish_progress_event(
+        client,
+        state,
+        node="resume_revision_advisor",
+        phase="finished",
+        message=f"已生成 {len(advice.get('patches') or [])} 条待确认字段级修改建议。",
+        extra={"patchCount": len(advice.get("patches") or []), "evidenceCount": len(supported_evidence_ids)},
+    )
+    return {**state, "resume_evidence_bundle": evidence_bundle, "resume_revision_advice": advice}
+
+
+def resume_patch_builder_node(state: UnifiedAgentState) -> UnifiedAgentState:
+    """最终补丁准备节点保持确定性，只整理建议，不让模型直接改写 DOCX。"""
+    if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
+        return state
+    advice = state.get("resume_revision_advice") or {}
+    if not isinstance(advice.get("contentMap"), dict) or not advice.get("contentMap"):
+        return {
+            **state,
+            "status": "FAILED",
+            "error_code": "AGENT_RESUME_REWRITE_EMPTY",
+            "error_message": "简历修改建议没有生成可应用的字段候选。",
+        }
+    candidate = {
         "status": "PENDING_REVIEW",
-        "toolName": "resume_rewrite_subgraph",
+        "toolName": "resume_patch_builder",
         "requiresApproval": True,
         "approvalType": "OUTPUT",
-        "message": "Planner 检测到需要修改简历，已进入简历修改子图并生成待确认候选。",
-        "contentMap": content_map,
-        "rewriteTargets": requirements,
-        "patches": build_resume_rewrite_patches(content_map, provisional_gaps),
+        "message": text_value(advice.get("message")) or "已生成待确认的简历字段补丁候选。",
+        "contentMap": dict(advice.get("contentMap") or {}),
+        "rewriteTargets": list(advice.get("rewriteTargets") or []),
+        "patches": list(advice.get("patches") or []),
+        "gapSuggestions": [item for item in advice.get("gapSuggestions") or [] if isinstance(item, dict)],
+        "jdProfile": state.get("resume_jd_profile") or {},
+        "evidenceBundle": state.get("resume_evidence_bundle") or {},
     }
-    draft = build_llm_resume_rewrite_draft(state, draft, client)
-    return {**state, "resume_rewrite_draft": draft}
+    return {**state, "resume_patch_candidate": candidate, "resume_rewrite_draft": candidate}
 
 
 def resume_rewrite_acceptance_node(state: UnifiedAgentState, client: AgentGateway | None = None) -> UnifiedAgentState:
-    """验收简历修改子图候选是否可并入规划草稿。"""
+    """验收简历证据链和字段候选，合格后直接进入 OUTPUT 审批而非重复执行 RAG。"""
     if state.get("status") == "FAILED" or not state.get("resume_rewrite_required"):
         return state
-    draft = state.get("resume_rewrite_draft") or {}
+    draft = state.get("resume_patch_candidate") or state.get("resume_rewrite_draft") or {}
     if not draft.get("contentMap"):
         return {
             **state,
             "status": "FAILED",
             "error_code": "AGENT_RESUME_REWRITE_EMPTY",
-            "error_message": "简历修改子图没有生成可审批候选",
+            "error_message": "简历修改子图没有生成可审批候选。",
             "resume_rewrite_result": {"accepted": False},
         }
     fallback_result = {
@@ -740,7 +908,26 @@ def resume_rewrite_acceptance_node(state: UnifiedAgentState, client: AgentGatewa
         "candidateCount": len(draft.get("patches") or []),
     }
     result = build_llm_resume_rewrite_acceptance(state, fallback_result, client)
-    return {**state, "resume_rewrite_result": result}
+    if not result.get("accepted"):
+        return {
+            **state,
+            "status": "FAILED",
+            "error_code": "AGENT_RESUME_REWRITE_REJECTED",
+            "error_message": text_value(result.get("reason")) or "简历候选未通过证据和字段完整性验收。",
+            "resume_rewrite_result": result,
+        }
+    accepted_state = {**state, "resume_rewrite_result": result}
+    if client is None:
+        return accepted_state
+    draft_result = synthesize_planning_draft(accepted_state, client)
+    return {
+        **accepted_state,
+        "draft_result": draft_result,
+        "final_result": draft_result,
+        "verifier_result": {"complete": True, "requiresOutputReview": True, "reason": "简历证据改写候选已完成"},
+        "completion_score": 1.0,
+        "status": "WAITING_OUTPUT_REVIEW",
+    }
 
 
 def memory_prefetch_after_planner(state: UnifiedAgentState, client: AgentGateway) -> UnifiedAgentState:
@@ -1149,14 +1336,14 @@ def route_after_planner(state: UnifiedAgentState) -> Literal["plan_review", "res
     return "memory_prefetch_after_planner"
 
 
-def route_after_resume_rewrite_decision(state: UnifiedAgentState) -> Literal["resume_rewrite_planner", "memory_prefetch_after_planner"]:
+def route_after_resume_rewrite_decision(state: UnifiedAgentState) -> Literal["resume_jd_analyzer", "memory_prefetch_after_planner"]:
     """简历修改判定后决定是否进入简历修改子图。"""
-    return "resume_rewrite_planner" if state.get("resume_rewrite_required") else "memory_prefetch_after_planner"
+    return "resume_jd_analyzer" if state.get("resume_rewrite_required") else "memory_prefetch_after_planner"
 
 
-def route_after_resume_rewrite_acceptance(state: UnifiedAgentState) -> Literal["memory_prefetch_after_planner", "answer_writer"]:
-    """简历修改子图验收后回到 Planning 主执行链或直接汇报失败。"""
-    return "answer_writer" if state.get("status") == "FAILED" else "memory_prefetch_after_planner"
+def route_after_resume_rewrite_acceptance(state: UnifiedAgentState) -> Literal["answer_writer"]:
+    """简历证据改写验收后直接进入输出审批，避免重复调用已完成的 RAG。"""
+    return "answer_writer"
 
 
 def route_after_executor(state: UnifiedAgentState) -> Literal["tool_adapter", "acceptance"]:
@@ -2040,12 +2227,14 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: AgentGateway) ->
     task_input = state.get("task_input") or {}
     jd_text = text_value(task_input.get("jobDescription"))
     resume_text = text_value(task_input.get("resumeText"))
+    jd_profile = state.get("resume_jd_profile") if isinstance(state.get("resume_jd_profile"), dict) else {}
+    evidence_bundle = state.get("resume_evidence_bundle") if isinstance(state.get("resume_evidence_bundle"), dict) else {}
     rag_result = latest_tool_result_by_name(state, "rag_query_probe_non_persistent")
     rag_data = rag_result.get("data") if isinstance(rag_result.get("data"), dict) else {}
-    evidences = rag_data.get("evidences") if isinstance(rag_data.get("evidences"), list) else []
-    evidence_ids = [str(item.get("evidenceId")) for item in evidences if isinstance(item, dict) and item.get("evidenceId")]
-    requirements = extract_requirements(jd_text or state.get("user_goal") or "")
-    alignment = build_alignment(requirements, resume_text, evidence_ids)
+    evidences = evidence_bundle.get("items") if isinstance(evidence_bundle.get("items"), list) else rag_data.get("evidences") if isinstance(rag_data.get("evidences"), list) else []
+    evidence_ids = list(evidence_bundle.get("evidenceIds") or []) or [str(item.get("evidenceId")) for item in evidences if isinstance(item, dict) and item.get("evidenceId")]
+    requirements = [item["requirement"] for item in resume_jd_requirements(jd_profile)] or extract_requirements(jd_text or state.get("user_goal") or "")
+    alignment = build_resume_evidence_alignment(jd_profile, resume_text, evidence_bundle) if jd_profile and evidence_bundle else build_alignment(requirements, resume_text, evidence_ids)
     gaps = build_gaps(alignment)
     risk_level = "LOW" if evidence_ids and not any(item["status"] == "missing" for item in alignment) else "MEDIUM"
     resume_template_fill = build_resume_template_fill_candidate(state, alignment, gaps, evidence_ids)
@@ -2059,6 +2248,9 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: AgentGateway) ->
         "webReferences": web_references_from_state(state),
         "resumeRewrite": resume_rewrite,
         "resumeTemplateFill": resume_template_fill,
+        "jdProfile": jd_profile,
+        "evidenceBundle": evidence_bundle,
+        "revisionAdvice": state.get("resume_revision_advice") or {},
         "answer": text_value(rag_data.get("answer")),
         "expandedQueries": rag_data.get("expandedQueries") if isinstance(rag_data.get("expandedQueries"), list) else [],
         "riskLevel": risk_level,
@@ -2104,8 +2296,184 @@ def should_enter_resume_rewrite_subgraph(state: UnifiedAgentState) -> bool:
     return detect_resume_rewrite_intent(task_input)
 
 
-def build_resume_rewrite_patches(content_map: dict[str, str], gaps: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """把简历内容候选转换成前端可展示的修改片段。"""
+def build_resume_jd_profile(jd_text: str, task_input: dict[str, Any]) -> dict[str, Any]:
+    """用确定性规则构造 JD 画像，保证模型不可用时仍可安全发起 RAG。"""
+    requirements = extract_requirements(jd_text)
+    items = [
+        {
+            "id": f"req-{index}",
+            "requirement": requirement,
+            "priority": "HIGH" if index <= 3 else "MEDIUM",
+            "keywords": extract_resume_keywords(requirement),
+        }
+        for index, requirement in enumerate(requirements, start=1)
+    ]
+    job_title = text_value(task_input.get("targetJobTitle")) or text_value(task_input.get("jobTitle")) or "目标岗位"
+    return {
+        "jobTitle": job_title,
+        "mustRequirements": items[:3],
+        "preferredRequirements": items[3:],
+        "summary": f"已从岗位 JD 抽取 {len(items)} 项用于学习证据检索的要求。",
+    }
+
+
+def resume_jd_requirements(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """规范化 JD 画像中的要求，避免子 Agent 之间传递无效或重复 requirement。"""
+    requirements: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for bucket, default_priority in (("mustRequirements", "HIGH"), ("preferredRequirements", "MEDIUM")):
+        values = profile.get(bucket) if isinstance(profile.get(bucket), list) else []
+        for index, value in enumerate(values, start=1):
+            if not isinstance(value, dict):
+                continue
+            requirement = text_value(value.get("requirement"))
+            if not requirement:
+                continue
+            requirement_id = text_value(value.get("id")) or f"req-{len(requirements) + index}"
+            if requirement_id in seen_ids:
+                continue
+            seen_ids.add(requirement_id)
+            priority = text_value(value.get("priority")).upper()
+            keywords = value.get("keywords") if isinstance(value.get("keywords"), list) else []
+            requirements.append(
+                {
+                    "id": requirement_id,
+                    "requirement": truncate_text(requirement, 120),
+                    "priority": priority if priority in {"HIGH", "MEDIUM", "LOW"} else default_priority,
+                    "keywords": [text_value(item) for item in keywords if text_value(item)][:8] or extract_resume_keywords(requirement),
+                }
+            )
+    return requirements[:8]
+
+
+def extract_resume_keywords(requirement: str) -> list[str]:
+    """提取可用于 evidence 相关性判断的短关键词，不把泛化词当成支持证据。"""
+    ignored = {"具备", "熟悉", "掌握", "负责", "相关", "能力", "经验", "要求", "岗位", "优先", "能够", "以及"}
+    parts = re.split(r"[\s、，,；;：:（）()和]+", requirement)
+    keywords = [part.strip() for part in parts if len(part.strip()) >= 2 and part.strip() not in ignored]
+    return keywords[:6] or [truncate_text(requirement, 32)]
+
+
+def build_resume_evidence_question(profile: dict[str, Any], goal: str) -> str:
+    """将结构化 JD 要求转换为 RAG 查询，保留原始要求而不是只传自然语言总结。"""
+    requirements = resume_jd_requirements(profile)
+    requirement_text = "；".join(item["requirement"] for item in requirements)
+    return f"请从当前用户学习资料中检索可证明以下岗位要求的具体项目、课程、作品或技能 evidence：{requirement_text or goal or '岗位相关学习证据'}"
+
+
+def safe_resume_evidence_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    """提取供后续子 Agent 使用的最小 evidence 字段，保留来源和分数。"""
+    evidence_id = text_value(item.get("evidenceId"))
+    if not evidence_id:
+        return None
+    try:
+        score = float(item.get("score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return {
+        "evidenceId": evidence_id,
+        "documentTitle": truncate_text(text_value(item.get("documentTitle")) or text_value(item.get("title")) or "未命名资料", 160),
+        "sectionName": truncate_text(text_value(item.get("sectionName")) or "全文", 120),
+        "snippet": truncate_text(text_value(item.get("snippet")), 500),
+        "source": truncate_text(text_value(item.get("source")) or "learning_material", 120),
+        "score": max(0.0, min(score, 1.0)),
+    }
+
+
+def build_resume_evidence_bundle(profile: dict[str, Any], question: str, rag_data: dict[str, Any]) -> dict[str, Any]:
+    """构造跨子 Agent 传递的 evidence 束，绝不以摘要替换原始引用字段。"""
+    raw_items = rag_data.get("evidences") if isinstance(rag_data.get("evidences"), list) else []
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        item = safe_resume_evidence_item(raw_item)
+        if item is None or item["evidenceId"] in seen_ids:
+            continue
+        seen_ids.add(item["evidenceId"])
+        items.append(item)
+    return {
+        "query": question,
+        "expandedQueries": rag_data.get("expandedQueries") if isinstance(rag_data.get("expandedQueries"), list) else [question],
+        "items": items,
+        "evidenceIds": [item["evidenceId"] for item in items],
+        "retrievalDiagnostics": rag_data.get("diagnostics") if isinstance(rag_data.get("diagnostics"), dict) else {},
+        "requirementEvidence": build_requirement_evidence_map(profile, items),
+        "summary": "" if items else "当前学习资料未检索到可引用证据，仅可输出能力缺口与补强建议。",
+    }
+
+
+def build_requirement_evidence_map(profile: dict[str, Any], evidence_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """以关键词交集建立保守的 requirement-evidence 映射，避免任意 evidence 自动支持首条 JD。"""
+    mapping: list[dict[str, Any]] = []
+    for requirement in resume_jd_requirements(profile):
+        keywords = [item.lower() for item in requirement.get("keywords") or [] if len(item) >= 2]
+        matched_ids: list[str] = []
+        for evidence in evidence_items:
+            searchable = " ".join(
+                [
+                    text_value(evidence.get("documentTitle")),
+                    text_value(evidence.get("sectionName")),
+                    text_value(evidence.get("snippet")),
+                ]
+            ).lower()
+            if any(keyword in searchable for keyword in keywords):
+                matched_ids.append(text_value(evidence.get("evidenceId")))
+        mapping.append({"requirementId": requirement["id"], "evidenceIds": matched_ids[:3]})
+    return mapping
+
+
+def build_resume_evidence_summary(profile: dict[str, Any], bundle: dict[str, Any]) -> dict[str, Any]:
+    """为证据摘要子 Agent 提供确定性 fallback，缺证据时显式保留缺口。"""
+    mapping = bundle.get("requirementEvidence") if isinstance(bundle.get("requirementEvidence"), list) else []
+    covered = sum(1 for item in mapping if isinstance(item, dict) and item.get("evidenceIds"))
+    requirement_count = len(resume_jd_requirements(profile))
+    evidence_count = len(bundle.get("evidenceIds") or [])
+    return {
+        "summary": f"检索到 {evidence_count} 条候选学习证据；按保守关键词映射覆盖 {covered}/{requirement_count} 项岗位要求，未覆盖项只能作为能力缺口处理。",
+        "requirementEvidence": mapping,
+        "missingRequirementIds": [item["requirementId"] for item in mapping if isinstance(item, dict) and not item.get("evidenceIds")],
+    }
+
+
+def build_resume_evidence_alignment(profile: dict[str, Any], resume_text: str, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """将 JD、原简历和相关 evidence 对齐，避免把无关资料误判为能力支持。"""
+    mapping_by_id = {
+        text_value(item.get("requirementId")): [text_value(value) for value in item.get("evidenceIds") or [] if text_value(value)]
+        for item in bundle.get("requirementEvidence") or []
+        if isinstance(item, dict)
+    }
+    normalized_resume = resume_text.lower()
+    alignment: list[dict[str, Any]] = []
+    for requirement in resume_jd_requirements(profile):
+        evidence_ids = mapping_by_id.get(requirement["id"], [])
+        keywords = [item.lower() for item in requirement.get("keywords") or [] if len(item) >= 2]
+        resume_mentions = any(keyword in normalized_resume for keyword in keywords)
+        if evidence_ids and resume_mentions:
+            status = "supported"
+        elif evidence_ids or resume_mentions:
+            status = "weak"
+        else:
+            status = "missing"
+        alignment.append(
+            {
+                "requirement": requirement["requirement"],
+                "requirementId": requirement["id"],
+                "status": status,
+                "evidenceIds": evidence_ids if status != "missing" else [],
+                "reason": {
+                    "supported": "原简历已有表达且存在相关学习 evidence。",
+                    "weak": "原简历表达或学习 evidence 仅满足其中一项，不能夸大为已完全具备。",
+                    "missing": "原简历与当前学习资料均未找到可引用支撑。",
+                }[status],
+            }
+        )
+    return alignment
+
+
+def build_resume_revision_patches(content_map: dict[str, str], _evidence_ids: list[str]) -> list[dict[str, Any]]:
+    """将确定性回退建议规范化为字段候选，不把无精确引文的内容标为已证实。"""
     labels = {
         "summary": "个人摘要",
         "skills": "技能关键词",
@@ -2113,108 +2481,187 @@ def build_resume_rewrite_patches(content_map: dict[str, str], gaps: list[dict[st
         "learning_plan": "补强建议",
         "gap_summary": "差距摘要",
     }
-    patches = []
-    for field, value in content_map.items():
+    patches: list[dict[str, Any]] = []
+    factual_fields = {"summary", "skills", "project_experience"}
+    for field, suggested_text in content_map.items():
+        if field not in RESUME_REWRITE_CONTENT_FIELDS or not text_value(suggested_text):
+            continue
+        # 回退分支不生成精确引文；事实字段只能保留为缺证据草稿，不能伪装成已证实能力。
+        backed_ids: list[str] = []
         patches.append(
             {
                 "field": field,
                 "label": labels.get(field, field),
-                "suggestedText": value,
-                "reason": "根据 JD 要求、简历摘要和当前 evidence 自动生成，需用户确认后才可保存。",
-                "status": "PENDING_REVIEW",
-            }
-        )
-    if gaps:
-        patches.append(
-            {
-                "field": "priority_gaps",
-                "label": "优先补强项",
-                "suggestedText": "；".join(item["suggestion"] for item in gaps[:3]),
-                "reason": "这些要求在当前简历或 evidence 中支撑较弱。",
+                "suggestedText": text_value(suggested_text),
+                "reason": "根据岗位 JD、原简历和本次候选 evidence 生成，需用户逐条确认。",
+                "evidenceIds": backed_ids,
+                "evidenceQuotes": [],
+                "riskFlags": ["MISSING_EVIDENCE"] if field in factual_fields else ["NONE"],
                 "status": "PENDING_REVIEW",
             }
         )
     return patches
 
 
-def build_llm_resume_rewrite_plan(
+def build_gap_suggestions(gaps: list[dict[str, str]]) -> list[dict[str, str]]:
+    """将能力缺口作为独立建议返回，避免被误当作可写入 DOCX 的字段补丁。"""
+    return [
+        {
+            "skill": text_value(item.get("skill")),
+            "priority": text_value(item.get("priority")) or "MEDIUM",
+            "suggestion": text_value(item.get("suggestion")),
+        }
+        for item in gaps[:5]
+        if isinstance(item, dict) and text_value(item.get("suggestion"))
+    ]
+
+
+def build_llm_resume_jd_profile(
     state: UnifiedAgentState,
-    fallback_plan: dict[str, Any],
+    fallback_profile: dict[str, Any],
     client: AgentGateway | None = None,
 ) -> dict[str, Any]:
-    """调用千问辅助生成简历改写局部计划。"""
+    """调用 JD 分析子 Agent；输出仍须回到 JD 原文可追溯的确定性结构。"""
     task_input = state.get("task_input") or {}
     prompt = {
-        "node": "resume_rewrite_planner",
-        "goal": state.get("user_goal"),
-        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 900),
-        "resumeText": truncate_text(text_value(task_input.get("resumeText")), 700),
-        "fallbackPlan": fallback_plan,
+        "node": "resume_jd_analyzer",
+        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 3200),
+        "fallbackProfile": fallback_profile,
         "expectedJson": {
-            "title": "简历修改子图计划",
-            "scope": "PENDING_REVIEW_RESUME_DRAFT",
-            "steps": [{"name": "字符串", "description": "字符串"}],
-            "targetRequirements": ["字符串"],
-            "hasResumeText": True,
-            "guardrails": ["不直接写 DOCX", "不直接保存业务数据", "候选片段必须进入 OUTPUT 审批"],
+            "jobTitle": "岗位名称",
+            "mustRequirements": [{"id": "req-1", "requirement": "字符串", "priority": "HIGH", "keywords": ["关键词"]}],
+            "preferredRequirements": [{"id": "req-4", "requirement": "字符串", "priority": "MEDIUM", "keywords": ["关键词"]}],
+            "summary": "中文摘要",
         },
     }
-    prompt = prepare_llm_payload(state, "resume_rewrite_planner", prompt, client)
+    prompt = prepare_llm_payload(state, "resume_jd_analyzer", prompt, client)
     try:
         result = get_agent_qwen_client().complete_json(
-            node="resume_rewrite_planner",
+            node="resume_jd_analyzer",
             model=agent_qwen_model("resume"),
-            system_prompt=resume_rewrite_planner_system_prompt(),
-            user_prompt=resume_rewrite_planner_user_prompt(prompt),
+            system_prompt=resume_jd_analyzer_system_prompt(),
+            user_prompt=resume_jd_analyzer_user_prompt(prompt),
         )
-        plan = sanitize_resume_rewrite_plan(result.data, fallback_plan)
-        record_llm_diagnostic(state, "resume_rewrite_planner", result.model, "used")
-        return plan
+        profile = sanitize_resume_jd_profile(result.data, fallback_profile, text_value(task_input.get("jobDescription")))
+        record_llm_diagnostic(state, "resume_jd_analyzer", result.model, "used")
+        return profile
     except Exception as exc:
-        record_llm_diagnostic(state, "resume_rewrite_planner", agent_qwen_model("resume"), f"fallback: {exc}")
-        return fallback_plan
+        record_llm_diagnostic(state, "resume_jd_analyzer", agent_qwen_model("resume"), f"fallback: {exc}")
+        return fallback_profile
 
 
-def build_llm_resume_rewrite_draft(
+def build_llm_resume_evidence_summary(
     state: UnifiedAgentState,
-    fallback_draft: dict[str, Any],
+    fallback_summary: dict[str, Any],
     client: AgentGateway | None = None,
 ) -> dict[str, Any]:
-    """调用千问辅助生成简历改写候选，仍保持 PENDING_REVIEW。"""
-    task_input = state.get("task_input") or {}
+    """调用证据归纳子 Agent；模型只能选择本次 RAG 返回的 requirement 和 evidence ID。"""
+    bundle = state.get("resume_evidence_bundle") or {}
+    profile = state.get("resume_jd_profile") or {}
     prompt = {
-        "node": "resume_rewrite_generator",
-        "goal": state.get("user_goal"),
-        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 900),
-        "resumeText": truncate_text(text_value(task_input.get("resumeText")), 700),
-        "rewritePlan": state.get("resume_rewrite_plan") or {},
-        "fallbackDraft": fallback_draft,
+        "node": "resume_evidence_summarizer",
+        "jdProfile": profile,
+        "evidenceItems": bundle.get("items") or [],
+        "fallbackSummary": fallback_summary,
         "expectedJson": {
-            "contentMap": {
-                "summary": "个人摘要候选",
-                "skills": "技能关键词候选",
-                "project_experience": "项目经历候选",
-                "learning_plan": "补强建议候选",
-                "gap_summary": "差距摘要候选",
-            },
-            "rewriteTargets": ["字符串"],
+            "summary": "仅基于 evidence 片段的中文摘要",
+            "requirementEvidence": [{"requirementId": "req-1", "evidenceIds": ["evidence-id"]}],
+            "missingRequirementIds": ["req-2"],
+        },
+    }
+    prompt = prepare_llm_payload(state, "resume_evidence_summarizer", prompt, client)
+    try:
+        result = get_agent_qwen_client().complete_json(
+            node="resume_evidence_summarizer",
+            model=agent_qwen_model("resume"),
+            system_prompt=resume_evidence_summarizer_system_prompt(),
+            user_prompt=resume_evidence_summarizer_user_prompt(prompt),
+        )
+        summary = sanitize_resume_evidence_summary(result.data, fallback_summary, profile, bundle)
+        record_llm_diagnostic(state, "resume_evidence_summarizer", result.model, "used")
+        return summary
+    except Exception as exc:
+        record_llm_diagnostic(state, "resume_evidence_summarizer", agent_qwen_model("resume"), f"fallback: {exc}")
+        return fallback_summary
+
+
+def build_llm_resume_revision_advice(
+    state: UnifiedAgentState,
+    fallback_advice: dict[str, Any],
+    client: AgentGateway | None = None,
+) -> dict[str, Any]:
+    """调用可微调的修改建议子 Agent，输出仍限制为字段候选和本次 evidence 引用。"""
+    task_input = state.get("task_input") or {}
+    bundle = state.get("resume_evidence_bundle") or {}
+    prompt = {
+        "node": "resume_revision_advisor",
+        "jobDescription": truncate_text(text_value(task_input.get("jobDescription")), 2200),
+        "resumeText": truncate_text(text_value(task_input.get("resumeText")), 2600),
+        "jdProfile": state.get("resume_jd_profile") or {},
+        "evidenceBundle": {
+            "items": bundle.get("items") or [],
+            "requirementEvidence": bundle.get("requirementEvidence") or [],
+            "projectEvidenceIds": bundle.get("projectEvidenceIds") or [],
+            "summary": bundle.get("summary") or "",
+        },
+        "fallbackAdvice": fallback_advice,
+        "expectedJson": {
+            "contentMap": {"summary": "字符串", "skills": "字符串", "project_experience": "字符串", "learning_plan": "字符串", "gap_summary": "字符串"},
+            "rewriteTargets": ["岗位要求"],
+            "patches": [{"field": "project_experience", "suggestedText": "字符串", "reason": "中文理由", "evidenceIds": ["evidence-id"], "evidenceQuotes": [{"evidenceId": "evidence-id", "quote": "来自原始 evidence 片段的精确短语"}], "riskFlags": ["NONE"]}],
+            "gapSuggestions": [{"skill": "字符串", "priority": "HIGH", "suggestion": "补强建议"}],
             "message": "中文说明",
         },
     }
-    prompt = prepare_llm_payload(state, "resume_rewrite_generator", prompt, client)
+    prompt = prepare_llm_payload(state, "resume_revision_advisor", prompt, client)
     try:
         result = get_agent_qwen_client().complete_json(
-            node="resume_rewrite_generator",
+            node="resume_revision_advisor",
             model=agent_qwen_model("resume"),
-            system_prompt=resume_rewrite_generator_system_prompt(),
-            user_prompt=resume_rewrite_generator_user_prompt(prompt),
+            system_prompt=resume_revision_advisor_system_prompt(),
+            user_prompt=resume_revision_advisor_user_prompt(prompt),
         )
-        draft = sanitize_resume_rewrite_draft(result.data, fallback_draft)
-        record_llm_diagnostic(state, "resume_rewrite_generator", result.model, "used")
-        return draft
+        advice = sanitize_resume_revision_advice(result.data, fallback_advice, bundle, text_value(task_input.get("resumeText")))
+        record_llm_diagnostic(state, "resume_revision_advisor", result.model, "used")
+        return advice
     except Exception as exc:
-        record_llm_diagnostic(state, "resume_rewrite_generator", agent_qwen_model("resume"), f"fallback: {exc}")
-        return fallback_draft
+        record_llm_diagnostic(state, "resume_revision_advisor", agent_qwen_model("resume"), f"fallback: {exc}")
+        return fallback_advice
+
+
+def build_resume_patch_review_summary(draft: dict[str, Any]) -> dict[str, Any]:
+    """构造验收子 Agent 所需的最小补丁审查上下文，保留风险和 evidence 引文。"""
+    patches = []
+    for item in draft.get("patches") or []:
+        if not isinstance(item, dict):
+            continue
+        patches.append(
+            {
+                "field": text_value(item.get("field")),
+                "suggestedText": truncate_text(text_value(item.get("suggestedText")), 500),
+                "reason": truncate_text(text_value(item.get("reason")), 300),
+                "evidenceIds": [text_value(value) for value in item.get("evidenceIds") or [] if text_value(value)],
+                "evidenceQuotes": [value for value in item.get("evidenceQuotes") or [] if isinstance(value, dict)],
+                "riskFlags": [text_value(value) for value in item.get("riskFlags") or [] if text_value(value)],
+                "status": text_value(item.get("status")),
+            }
+        )
+    bundle = draft.get("evidenceBundle") if isinstance(draft.get("evidenceBundle"), dict) else {}
+    return {
+        "patches": patches,
+        "gapSuggestions": [item for item in draft.get("gapSuggestions") or [] if isinstance(item, dict)],
+        "evidenceIds": [text_value(value) for value in bundle.get("evidenceIds") or [] if text_value(value)],
+        "evidenceItems": [
+            {
+                "evidenceId": text_value(item.get("evidenceId")),
+                "documentTitle": text_value(item.get("documentTitle")),
+                "sectionName": text_value(item.get("sectionName")),
+                "snippet": truncate_text(text_value(item.get("snippet")), 240),
+            }
+            for item in bundle.get("items") or []
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def build_llm_resume_rewrite_acceptance(
@@ -2223,9 +2670,10 @@ def build_llm_resume_rewrite_acceptance(
     client: AgentGateway | None = None,
 ) -> dict[str, Any]:
     """调用千问辅助验收简历候选，只接受结构化布尔结果。"""
+    draft = state.get("resume_patch_candidate") or state.get("resume_rewrite_draft") or {}
     prompt = {
         "node": "resume_rewrite_acceptance",
-        "draftSummary": summarize_result(state.get("resume_rewrite_draft") or {}),
+        "patchReview": build_resume_patch_review_summary(draft),
         "expectedJson": {"accepted": True, "requiresOutputReview": True, "reason": "中文原因"},
     }
     prompt = prepare_llm_payload(state, "resume_rewrite_acceptance", prompt, client)
@@ -2255,14 +2703,15 @@ def build_resume_rewrite_output(
     gaps: list[dict[str, str]],
     evidence_ids: list[str],
 ) -> dict[str, Any]:
-    """合并简历修改子图结果和工具 evidence，形成最终可审批输出。"""
-    draft = state.get("resume_rewrite_draft") or {}
+    """合并 JD 画像、evidence 束和确定性补丁候选，形成最终可审批输出。"""
+    draft = state.get("resume_patch_candidate") or state.get("resume_rewrite_draft") or {}
     if not draft:
         return {}
-    content_map = build_resume_content_map(state.get("task_input") or {}, alignment, gaps, evidence_ids)
     merged = dict(draft)
-    merged["contentMap"] = {**content_map, **(draft.get("contentMap") if isinstance(draft.get("contentMap"), dict) else {})}
     merged["evidenceIds"] = evidence_ids
+    merged["jdProfile"] = state.get("resume_jd_profile") or {}
+    merged["evidenceBundle"] = state.get("resume_evidence_bundle") or {}
+    merged["revisionAdvice"] = state.get("resume_revision_advice") or {}
     merged["subgraphPlan"] = state.get("resume_rewrite_plan") or {}
     merged["subgraphResult"] = state.get("resume_rewrite_result") or {}
     return merged
@@ -2572,49 +3021,271 @@ def sanitize_action(candidate: dict[str, Any], fallback_action: dict[str, Any]) 
     return {"toolName": tool_name, "toolType": "READ", "arguments": arguments}
 
 
-def sanitize_resume_rewrite_plan(candidate: dict[str, Any], fallback_plan: dict[str, Any]) -> dict[str, Any]:
-    """校验简历改写计划，防止模型输出文件路径或保存动作。"""
-    forbidden_keys = {"locationRefs", "docxPath", "xml", "styleXml", "savePath"}
+def sanitize_resume_jd_profile(candidate: dict[str, Any], fallback_profile: dict[str, Any], jd_text: str) -> dict[str, Any]:
+    """只接受可回溯到原 JD 的画像细化，防止 JD 分析子 Agent 编造岗位要求。"""
+    if not isinstance(candidate, dict):
+        raise ValueError("JD 画像必须是对象")
+    forbidden_keys = {"locationRefs", "docxPath", "xml", "styleXml", "savePath", "evidenceIds"}
     if forbidden_keys.intersection(candidate.keys()):
-        raise ValueError("简历改写计划包含禁止字段")
-    plan = dict(fallback_plan)
-    plan["title"] = text_value(candidate.get("title")) or plan.get("title")
-    plan["scope"] = "PENDING_REVIEW_RESUME_DRAFT"
-    requirements = sanitize_string_list(candidate.get("targetRequirements"))
-    if requirements:
-        plan["targetRequirements"] = requirements[:8]
-    steps = candidate.get("steps")
-    if isinstance(steps, list) and steps:
-        plan["steps"] = [
-            {"name": text_value(item.get("name")) or f"步骤 {index}", "description": text_value(item.get("description")) or "生成待确认候选"}
-            for index, item in enumerate(steps[:5], start=1)
-            if isinstance(item, dict)
-        ] or plan.get("steps", [])
-    plan["guardrails"] = ["不直接写 DOCX", "不直接保存业务数据", "候选片段必须进入 OUTPUT 审批"]
-    return plan
+        raise ValueError("JD 画像包含禁止字段")
+    profile = dict(fallback_profile)
+    profile["jobTitle"] = truncate_text(text_value(candidate.get("jobTitle")) or text_value(profile.get("jobTitle")), 80)
+    profile["summary"] = truncate_text(text_value(candidate.get("summary")) or text_value(profile.get("summary")), 400)
+    for bucket, default_priority in (("mustRequirements", "HIGH"), ("preferredRequirements", "MEDIUM")):
+        fallback_items = profile.get(bucket) if isinstance(profile.get(bucket), list) else []
+        candidate_items = candidate.get(bucket) if isinstance(candidate.get(bucket), list) else []
+        candidates_by_id = {text_value(item.get("id")): item for item in candidate_items if isinstance(item, dict) and text_value(item.get("id"))}
+        cleaned: list[dict[str, Any]] = []
+        for fallback in fallback_items:
+            if not isinstance(fallback, dict):
+                continue
+            item = dict(fallback)
+            proposed = candidates_by_id.get(text_value(item.get("id")))
+            if proposed:
+                priority = text_value(proposed.get("priority")).upper()
+                if priority in {"HIGH", "MEDIUM", "LOW"}:
+                    item["priority"] = priority
+                keywords = [text_value(value) for value in proposed.get("keywords") or [] if text_value(value)]
+                item["keywords"] = [value for value in keywords if value.lower() in jd_text.lower()][:8] or item.get("keywords") or []
+            item["priority"] = text_value(item.get("priority")).upper() or default_priority
+            cleaned.append(item)
+        profile[bucket] = cleaned
+    return profile
 
 
-def sanitize_resume_rewrite_draft(candidate: dict[str, Any], fallback_draft: dict[str, Any]) -> dict[str, Any]:
-    """校验简历改写候选，固定为待审批草稿。"""
-    content_map = candidate.get("contentMap")
-    if not isinstance(content_map, dict):
-        raise ValueError("简历候选缺少 contentMap")
-    allowed_fields = {"summary", "skills", "project_experience", "learning_plan", "gap_summary"}
-    cleaned = {key: text_value(value) for key, value in content_map.items() if key in allowed_fields and text_value(value)}
-    if not cleaned:
-        raise ValueError("简历候选 contentMap 为空")
-    draft = dict(fallback_draft)
-    draft["status"] = "PENDING_REVIEW"
-    draft["toolName"] = "resume_rewrite_subgraph"
-    draft["requiresApproval"] = True
-    draft["approvalType"] = "OUTPUT"
-    draft["message"] = text_value(candidate.get("message")) or fallback_draft.get("message")
-    draft["contentMap"] = {**(fallback_draft.get("contentMap") if isinstance(fallback_draft.get("contentMap"), dict) else {}), **cleaned}
-    targets = sanitize_string_list(candidate.get("rewriteTargets"))
-    if targets:
-        draft["rewriteTargets"] = targets[:8]
-    draft["patches"] = build_resume_rewrite_patches(draft["contentMap"], [])
-    return draft
+def sanitize_resume_evidence_summary(
+    candidate: dict[str, Any],
+    fallback_summary: dict[str, Any],
+    profile: dict[str, Any],
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    """证据摘要只保留确定性相关性映射，避免模型把无关 evidence 重新绑定到 JD。"""
+    if not isinstance(candidate, dict):
+        raise ValueError("证据摘要必须是对象")
+    valid_requirement_ids = {item["id"] for item in resume_jd_requirements(profile)}
+    valid_evidence_ids = {text_value(item) for item in bundle.get("evidenceIds") or [] if text_value(item)}
+    mapping_by_requirement: dict[str, list[str]] = {}
+    fallback_mapping = fallback_summary.get("requirementEvidence") if isinstance(fallback_summary.get("requirementEvidence"), list) else []
+    for item in fallback_mapping:
+        if not isinstance(item, dict):
+            continue
+        requirement_id = text_value(item.get("requirementId"))
+        if requirement_id in valid_requirement_ids:
+            mapping_by_requirement[requirement_id] = [text_value(value) for value in item.get("evidenceIds") or [] if text_value(value) in valid_evidence_ids][:3]
+    mapping = [{"requirementId": requirement["id"], "evidenceIds": mapping_by_requirement.get(requirement["id"], [])} for requirement in resume_jd_requirements(profile)]
+    return {
+        "summary": truncate_text(text_value(fallback_summary.get("summary")), 600),
+        "requirementEvidence": mapping,
+        "missingRequirementIds": [item["requirementId"] for item in mapping if not item["evidenceIds"]],
+    }
+
+
+def linked_resume_evidence_ids(bundle: dict[str, Any]) -> list[str]:
+    """仅返回已被确定性 JD 关键词映射命中的 evidence，排除与岗位无关的资料。"""
+    supported = [text_value(item) for item in bundle.get("supportedEvidenceIds") or [] if text_value(item)]
+    if supported:
+        return supported
+    linked = {
+        text_value(evidence_id)
+        for item in bundle.get("requirementEvidence") or []
+        if isinstance(item, dict)
+        for evidence_id in item.get("evidenceIds") or []
+        if text_value(evidence_id)
+    }
+    return [text_value(item) for item in bundle.get("evidenceIds") or [] if text_value(item) in linked]
+
+
+def evidence_text_by_id(bundle: dict[str, Any]) -> dict[str, str]:
+    """建立 evidence ID 到可核验原文的映射，供补丁事实校验使用。"""
+    texts: dict[str, str] = {}
+    for item in bundle.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        evidence_id = text_value(item.get("evidenceId"))
+        if evidence_id:
+            texts[evidence_id] = " ".join(
+                [
+                    text_value(item.get("documentTitle")),
+                    text_value(item.get("sectionName")),
+                    text_value(item.get("snippet")),
+                ]
+            )
+    return texts
+
+
+def project_resume_evidence_ids(bundle: dict[str, Any], allowed_evidence_ids: list[str] | None = None) -> list[str]:
+    """从 JD 相关 evidence 中识别明确可用于项目经历的资料，课程练习不能自动视为项目。"""
+    allowed_ids = set(allowed_evidence_ids if allowed_evidence_ids is not None else linked_resume_evidence_ids(bundle))
+    project_ids: list[str] = []
+    for item in bundle.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        evidence_id = text_value(item.get("evidenceId"))
+        if not evidence_id or evidence_id not in allowed_ids:
+            continue
+        source_text = " ".join(
+            [
+                text_value(item.get("documentTitle")),
+                text_value(item.get("sectionName")),
+                text_value(item.get("snippet")),
+            ]
+        )
+        # 教学资料即使包含“开发/实现”等动词，也不能自动升级为可写入简历的项目事实。
+        if any(keyword in source_text for keyword in RESUME_COURSEWORK_EVIDENCE_KEYWORDS):
+            continue
+        if any(keyword in source_text for keyword in RESUME_PROJECT_EVIDENCE_KEYWORDS):
+            project_ids.append(evidence_id)
+    return list(dict.fromkeys(project_ids))
+
+
+def normalize_grounding_text(value: str) -> str:
+    """归一化事实校验文本，忽略大小写和空白差异。"""
+    return re.sub(r"\s+", "", value or "").lower()
+
+
+def extract_verified_evidence_quotes(raw_quotes: Any, evidence_texts: dict[str, str], allowed_ids: set[str]) -> list[dict[str, str]]:
+    """只接受确实出现在本次 evidence 原文中的精确引文。"""
+    if not isinstance(raw_quotes, list):
+        return []
+    quotes: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_quotes:
+        if not isinstance(item, dict):
+            continue
+        evidence_id = text_value(item.get("evidenceId"))
+        quote = truncate_text(text_value(item.get("quote")), 240)
+        if evidence_id not in allowed_ids or len(quote) < 2:
+            continue
+        if normalize_grounding_text(quote) not in normalize_grounding_text(evidence_texts.get(evidence_id, "")):
+            continue
+        key = (evidence_id, quote)
+        if key not in seen:
+            seen.add(key)
+            quotes.append({"evidenceId": evidence_id, "quote": quote})
+    return quotes
+
+
+def extract_numeric_claims(text: str) -> list[str]:
+    """提取高风险量化声明，防止模型添加资料中不存在的年限、百分比或指标。"""
+    patterns = [
+        r"\d+(?:\.\d+)?\s*%",
+        r"\d+(?:\.\d+)?\s*(?:年|个月|项|次|倍|万|k|K)",
+        r"[一二三四五六七八九十百千万两]+(?:年|个月|项|次|倍)",
+        r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:years?|months?|times?)\b",
+    ]
+    return [match.group(0) for pattern in patterns for match in re.finditer(pattern, text, flags=re.IGNORECASE)]
+
+
+def is_factual_patch_grounded(text: str, resume_text: str, quotes: list[dict[str, str]]) -> bool:
+    """要求事实型候选具备精确引文，并核对量化、技术和高风险职责词不凭空新增。"""
+    if not quotes:
+        return False
+    source = " ".join([resume_text, *(item["quote"] for item in quotes)])
+    normalized_source = normalize_grounding_text(source)
+    for claim in extract_numeric_claims(text):
+        if normalize_grounding_text(claim) not in normalized_source:
+            return False
+    technical_terms = re.findall(r"\b[A-Za-z][A-Za-z0-9+.#/-]{1,}\b", text)
+    if not all(term.lower() in source.lower() for term in technical_terms):
+        return False
+    high_risk_terms = ["主导", "负责", "上线", "部署", "实现", "构建", "开发", "优化", "提升", "降低", "获得", "管理", "设计", "发布", "落地", "完成", "牵头", "领导"]
+    return all(term not in text or term in source for term in high_risk_terms)
+
+
+def sanitize_resume_revision_advice(
+    candidate: dict[str, Any],
+    fallback_advice: dict[str, Any],
+    bundle: dict[str, Any],
+    resume_text: str = "",
+) -> dict[str, Any]:
+    """仅保留有 JD 相关 evidence 精确引文支撑的事实型改写；其余退回安全草稿。"""
+    if not isinstance(candidate, dict):
+        raise ValueError("简历修改建议必须是对象")
+    forbidden_keys = {"locationRefs", "docxPath", "xml", "styleXml", "savePath", "fieldId", "sourceTextHash", "status"}
+    if forbidden_keys.intersection(candidate.keys()):
+        raise ValueError("简历修改建议包含禁止字段")
+    fallback_content = fallback_advice.get("contentMap") if isinstance(fallback_advice.get("contentMap"), dict) else {}
+    content_map = {
+        key: truncate_text(text_value(value), 2000)
+        for key, value in fallback_content.items()
+        if key in RESUME_REWRITE_CONTENT_FIELDS and text_value(value)
+    }
+    if not content_map:
+        raise ValueError("简历修改建议缺少 contentMap")
+    allowed_evidence_ids = linked_resume_evidence_ids(bundle)
+    allowed_evidence_set = set(allowed_evidence_ids)
+    evidence_texts = evidence_text_by_id(bundle)
+    fallback_patches = [
+        dict(item)
+        for item in fallback_advice.get("patches") or []
+        if isinstance(item, dict) and text_value(item.get("field")) in RESUME_REWRITE_CONTENT_FIELDS
+    ] or build_resume_revision_patches(content_map, allowed_evidence_ids)
+    fallback_by_field = {text_value(item.get("field")): item for item in fallback_patches if isinstance(item, dict)}
+    patches: list[dict[str, Any]] = []
+    seen_fields: set[str] = set()
+    factual_fields = {"summary", "skills", "project_experience"}
+    project_evidence_set = set(project_resume_evidence_ids(bundle, allowed_evidence_ids))
+    raw_patches = candidate.get("patches") if isinstance(candidate.get("patches"), list) else []
+    for item in raw_patches:
+        if not isinstance(item, dict):
+            continue
+        field = text_value(item.get("field"))
+        if field not in RESUME_REWRITE_CONTENT_FIELDS or field in seen_fields:
+            continue
+        seen_fields.add(field)
+        evidence_ids = [text_value(value) for value in item.get("evidenceIds") or [] if text_value(value) in allowed_evidence_set]
+        quotes = extract_verified_evidence_quotes(item.get("evidenceQuotes"), evidence_texts, set(evidence_ids))
+        proposed_text = truncate_text(text_value(item.get("suggestedText")) or content_map[field], 2000)
+        project_grounded = field != "project_experience" or (
+            bool(evidence_ids) and set(evidence_ids).issubset(project_evidence_set)
+        )
+        grounded = field not in factual_fields or (
+            is_factual_patch_grounded(proposed_text, resume_text, quotes) and project_grounded
+        )
+        if not grounded:
+            fallback_patch = dict(fallback_by_field.get(field) or {})
+            patches.append(
+                {
+                    **fallback_patch,
+                    "field": field,
+                    "suggestedText": content_map[field],
+                    "reason": "建议缺少与 JD 相关 evidence 的精确引文或包含未被支撑的事实，已退回安全草稿。",
+                    "evidenceIds": [],
+                    "evidenceQuotes": [],
+                    "riskFlags": ["MISSING_EVIDENCE"],
+                    "status": "PENDING_REVIEW",
+                }
+            )
+            continue
+        content_map[field] = proposed_text
+        risk_flags = [text_value(value) for value in item.get("riskFlags") or [] if text_value(value) in {"NONE", "MISSING_EVIDENCE", "LOW_CONFIDENCE"}]
+        if field in factual_fields:
+            risk_flags = ["NONE"]
+        elif not risk_flags:
+            risk_flags = ["NONE"] if evidence_ids else ["MISSING_EVIDENCE"]
+        patches.append(
+            {
+                "field": field,
+                "label": text_value((fallback_by_field.get(field) or {}).get("label")) or field,
+                "suggestedText": proposed_text,
+                "reason": truncate_text(text_value(item.get("reason")) or "根据岗位 JD、原简历和候选 evidence 生成，需用户确认。", 500),
+                "evidenceIds": list(dict.fromkeys(evidence_ids)),
+                "evidenceQuotes": quotes,
+                "riskFlags": risk_flags,
+                "status": "PENDING_REVIEW",
+            }
+        )
+    for field, fallback_patch in fallback_by_field.items():
+        if field not in seen_fields:
+            patches.append(fallback_patch)
+    targets = sanitize_string_list(candidate.get("rewriteTargets")) or sanitize_string_list(fallback_advice.get("rewriteTargets"))
+    return {
+        "contentMap": content_map,
+        "rewriteTargets": targets[:8],
+        "patches": patches,
+        "gapSuggestions": [item for item in fallback_advice.get("gapSuggestions") or [] if isinstance(item, dict)],
+        "message": truncate_text(text_value(candidate.get("message")) or text_value(fallback_advice.get("message")), 500),
+    }
 
 
 def sanitize_risk_level(value: Any, fallback: Any) -> str:
@@ -2784,37 +3455,54 @@ def acceptance_user_prompt(payload: dict[str, Any]) -> str:
     return "请检查任务是否满足完成标准并输出验收 JSON，不得新增 evidence：\n" + json_prompt(payload)
 
 
-def resume_rewrite_planner_system_prompt() -> str:
-    """简历修改规划节点专用提示词。"""
+def resume_jd_analyzer_system_prompt() -> str:
+    """JD 分析子 Agent 的提示词。"""
     return (
-        "你是简历修改子图的规划节点。你根据 JD、简历摘要、用户目标和证据状态确定简历改写范围。"
-        "你不能写 DOCX、不能输出 XML/样式/路径/locationRefs、不能保存数据。只生成待确认候选的计划。只输出 JSON。"
+        "你是简历证据改写工作流中的 JD 分析子 Agent。你只从给定岗位 JD 提取硬性要求、加分项和关键词。"
+        "不能编造 JD 未出现的资格、公司信息或项目要求；不能输出 evidence、DOCX、文件路径、样式、XML 或保存动作。"
+        "保留输入中已有 requirement id，不要新建不可追溯 id。只输出合法 JSON。"
     )
 
 
-def resume_rewrite_planner_user_prompt(payload: dict[str, Any]) -> str:
-    """简历修改规划节点用户提示词。"""
-    return "请基于 JD、简历摘要和目标生成简历改写局部计划 JSON：\n" + json_prompt(payload)
+def resume_jd_analyzer_user_prompt(payload: dict[str, Any]) -> str:
+    """JD 分析子 Agent 的用户提示词。"""
+    return "请将以下岗位 JD 归纳为可检索、可审计的岗位画像 JSON，不要输出解释文字：\n" + json_prompt(payload)
 
 
-def resume_rewrite_generator_system_prompt() -> str:
-    """简历修改候选生成节点专用提示词。"""
+def resume_evidence_summarizer_system_prompt() -> str:
+    """学习证据归纳子 Agent 的提示词。"""
     return (
-        "你是简历修改子图的候选生成节点。你生成个人摘要、技能关键词、项目经历、补强建议和差距摘要候选。"
-        "所有内容必须基于简历摘要、JD 和 evidence 状态；证据不足时明确标记缺口。不能写 DOCX，不能保存数据。只输出 JSON。"
+        "你是学习证据归纳子 Agent。你只能根据输入 evidence 的标题、章节、片段、来源和分数概括支持范围。"
+        "requirementId 和 evidenceId 必须从输入集合中选择；证据不足时必须列为缺口，不能推断学生具备未被片段支持的能力。"
+        "不能输出 DOCX、排版、路径、保存操作或新的 evidence。只输出合法 JSON。"
     )
 
 
-def resume_rewrite_generator_user_prompt(payload: dict[str, Any]) -> str:
-    """简历修改候选生成节点用户提示词。"""
-    return "请生成待审批的简历候选 JSON，只能填写 contentMap 和 rewriteTargets 等允许字段：\n" + json_prompt(payload)
+def resume_evidence_summarizer_user_prompt(payload: dict[str, Any]) -> str:
+    """学习证据归纳子 Agent 的用户提示词。"""
+    return "请在保留 evidence 引用的条件下生成证据覆盖摘要 JSON，不要输出解释文字：\n" + json_prompt(payload)
+
+
+def resume_revision_advisor_system_prompt() -> str:
+    """可微调的简历修改建议子 Agent 提示词。"""
+    return (
+        "你是简历修改建议子 Agent。你的任务是依据 JD、原简历和输入 evidence 生成字段级改写候选。"
+        "你只能修改 summary、skills、project_experience、learning_plan、gap_summary 五类文本候选；每个事实性改写必须引用输入 evidenceId，并提供该 evidence 片段中的精确短语 evidenceQuotes。"
+        "如果证据不足，只输出缺口和补强建议，不能补造项目、技能、指标、证书、实习或工作经历。"
+        "不得输出 fieldId、sourceTextHash、locationRefs、DOCX、XML、样式、路径、确认状态或保存动作。只输出合法 JSON。"
+    )
+
+
+def resume_revision_advisor_user_prompt(payload: dict[str, Any]) -> str:
+    """可微调的简历修改建议子 Agent 用户提示词。"""
+    return "请生成可由用户逐条确认的简历字段修改建议 JSON，不要输出解释文字：\n" + json_prompt(payload)
 
 
 def resume_rewrite_acceptance_system_prompt() -> str:
     """简历修改验收节点专用提示词。"""
     return (
-        "你是简历修改子图的验收节点。你只检查候选是否包含可审批的个人摘要、技能、项目经历、补强建议或差距摘要。"
-        "你不能批准保存、不能写 DOCX、不能新增 evidence。只输出 JSON。"
+        "你是简历修改子图的验收节点。你检查每个字段候选的风险标记、evidenceId、精确引文和独立 gapSuggestions 是否可进入人工 OUTPUT 审批。"
+        "存在 MISSING_EVIDENCE 时只能作为缺口建议，不得认可为已具备能力。你不能批准保存、不能写 DOCX、不能新增 evidence。只输出 JSON。"
     )
 
 

@@ -228,12 +228,23 @@ flowchart TB
     REVIEW_API --> START
 
     PLAN_GATE -->|"否"| REWRITE_GATE{"resume_rewrite_decision\n是否进入简历改写子图"}
-    REWRITE_GATE -->|"是"| REWRITE_PLAN["resume_rewrite_planner\n抽取 JD 要求与改写范围"]
-    REWRITE_PLAN --> REWRITE_GEN["resume_rewrite_generator\n生成待确认候选"]
-    REWRITE_GEN --> REWRITE_ACCEPT["resume_rewrite_acceptance\n不直接写 DOCX 或业务数据"]
-    REWRITE_ACCEPT -->|"通过"| POSTPLAN["memory_prefetch_after_planner\n补充任务级记忆"]
+
+    subgraph RESUME_REWRITE["简历证据改写子图：仅生成可审阅候选，不直接写 DOCX 或业务数据"]
+        direction TB
+        REWRITE_GATE -->|"是"| JD_ANALYZER["resume_jd_analyzer\n子 Agent：将岗位 JD 归纳为带 requirement ID 的画像"]
+        JD_ANALYZER --> EVIDENCE_RETRIEVER["resume_evidence_retriever\n子 Agent：按 JD 要求检索当前用户的私有 evidence"]
+        EVIDENCE_RETRIEVER --> EVIDENCE_SUMMARIZER["resume_evidence_summarizer\n子 Agent：保留 evidenceId、标题、章节、片段、来源、分数"]
+        EVIDENCE_SUMMARIZER --> REVISION_ADVISOR["resume_revision_advisor\n子 Agent：基于 JD、原简历与证据生成字段级建议"]
+        REVISION_ADVISOR --> PATCH_BUILDER["resume_patch_builder\n确定性补丁准备；不写 DOCX"]
+        PATCH_BUILDER --> PATCHES["patches\n待确认字段候选\n不是 DOCX 字段或操作指令"]
+        PATCH_BUILDER --> GAPS["gapSuggestions\n独立补强建议\n不是简历字段，也不是 DOCX 补丁"]
+        PATCHES --> REWRITE_ACCEPT["resume_rewrite_acceptance\n核对引文、风险与字段完整性"]
+        GAPS --> REWRITE_ACCEPT
+    end
+
+    REWRITE_ACCEPT -->|"通过：输出候选草稿"| WAIT_OUTPUT["WAITING_OUTPUT_REVIEW\n输出草稿与 evidence，等待人工审批"]
     REWRITE_ACCEPT -->|"失败"| ANSWER
-    REWRITE_GATE -->|"否"| POSTPLAN
+    REWRITE_GATE -->|"否"| POSTPLAN["memory_prefetch_after_planner\n补充任务级记忆"]
 
     POSTPLAN --> EXECUTOR["executor\n选择当前步骤的 ReAct action"]
     EXECUTOR --> ACTION_GATE{"是否选择工具"}
@@ -253,13 +264,17 @@ flowchart TB
     ACCEPT_GATE -->|"完成或失败"| ANSWER["answer_writer\n生成证据回答或失败摘要"]
 
     ANSWER --> OUTPUT_GATE{"是否需要输出确认"}
-    OUTPUT_GATE -->|"需要"| WAIT_OUTPUT["WAITING_OUTPUT_REVIEW\n输出草稿与 evidence"]
-    WAIT_OUTPUT --> OUTPUT_API["用户批准后\nresume_output_review"]
-    OUTPUT_API --> CRUD_GATE{"是否请求保存类变更"}
-    CRUD_GATE -->|"是"| WAIT_CRUD["WAITING_CRUD_REVIEW\n审批 + operation + idempotencyKey"]
+    OUTPUT_GATE -->|"需要"| WAIT_OUTPUT
+    WAIT_OUTPUT --> OUTPUT_API["用户 OUTPUT 审批\nresume_output_review"]
+    OUTPUT_API -->|"当前生产：仅展示已审批候选"| DOCX_UNAVAILABLE["模板导出路由尚未注册\n不提供在线 DOCX 下载"]
+    DOCX_UNAVAILABLE --> MEMORY
+    OUTPUT_API -. "未来独立接入模板链并二次校验后" .-> CRUD_GATE{"是否请求受控保存/模板导出"}
+    CRUD_GATE -->|"是：仍须审批"| WAIT_CRUD["WAITING_CRUD_REVIEW\n审批 + operation + idempotencyKey"]
     WAIT_CRUD --> MUTATION["批准后 execute_approved_mutation\n写入快照，可 undo"]
     CRUD_GATE -->|"否"| MEMORY
-    MUTATION --> MEMORY
+    MUTATION --> EXPORT_GUARD["仅 CONFIRMED patches\n原文 hash、evidence、长度与版式复验"]
+    EXPORT_GUARD --> FUTURE_EXPORT["受控保存 / 模板导出\n未来能力，非当前在线 DOCX 下载"]
+    FUTURE_EXPORT --> MEMORY
     OUTPUT_GATE -->|"不需要"| MEMORY["post_answer_memory\n只生成 PENDING_REVIEW 记忆候选"]
     MEMORY --> END["COMPLETED / FAILED\n持久化终态并发送 done"]
 ```

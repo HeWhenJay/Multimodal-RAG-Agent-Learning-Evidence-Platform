@@ -143,7 +143,7 @@ def build_resume_content_map(
     gaps: list[dict[str, str]],
     evidence_ids: list[str],
 ) -> dict[str, str]:
-    """基于 JD、简历摘要和 evidence 生成占位符填充值。"""
+    """基于 JD、简历摘要和 evidence 生成待人工确认的回退文本。"""
     resume_text = text_value(task_input.get("resumeText"))
     supported = [item["requirement"] for item in alignment if item.get("status") == "supported"]
     weak = [item["requirement"] for item in alignment if item.get("status") == "weak"]
@@ -166,11 +166,9 @@ def build_resume_summary(resume_text: str, supported: list[str], evidence_ids: l
     return f"{base}；当前知识库 evidence 仍需补充。"
 
 
-def build_project_experience(supported: list[str], evidence_ids: list[str]) -> str:
-    """生成项目经历占位符内容。"""
-    if supported:
-        return f"围绕 {'、'.join(supported[:4])} 完成项目实践，沉淀可追溯学习证据 {len(evidence_ids)} 条。"
-    return "围绕目标岗位继续补充项目实践、学习笔记和可引用成果。"
+def build_project_experience(_supported: list[str], _evidence_ids: list[str]) -> str:
+    """生成项目经历的安全回退文本，避免把课程学习错误写成项目事实。"""
+    return "当前证据不足以自动改写项目经历；请补充可引用的项目材料并由用户确认。"
 
 
 def extract_requirements(text: str) -> list[str]:

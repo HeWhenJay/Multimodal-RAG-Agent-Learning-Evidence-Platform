@@ -99,6 +99,7 @@ def generate_resume_patches(request: ResumePatchGenerationRequest) -> ResumePatc
             raw_patches = generate_local_drafts(request.fields, request.evidenceCandidates)
     else:
         raw_patches = generate_local_drafts(request.fields, request.evidenceCandidates)
+    raw_patches = force_generated_draft_status(raw_patches)
     allowed_evidence_ids = [item.evidenceId for item in request.evidenceCandidates]
     validation = validate_resume_patches(
         template_id=request.templateId,
@@ -116,6 +117,11 @@ def generate_resume_patches(request: ResumePatchGenerationRequest) -> ResumePatc
         patches=raw_patches,
         validationErrors=[*validation_errors, *validation.validationErrors],
     )
+
+
+def force_generated_draft_status(patches: list[ResumeContentPatch]) -> list[ResumeContentPatch]:
+    """模型只能生成草稿；确认状态只能由用户审批后的受控链路写入。"""
+    return [patch.model_copy(update={"status": "DRAFT"}) for patch in patches]
 
 
 def choose_provider(provider: str) -> str:

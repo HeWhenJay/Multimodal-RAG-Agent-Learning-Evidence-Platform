@@ -15,7 +15,7 @@ from rag.resume_template.docx_patch import (
     validate_layout_change,
     validate_resume_patches,
 )
-from rag.resume_template.patch_generation import build_generation_prompt, generate_resume_patches, resume_patch_json_schema
+from rag.resume_template.patch_generation import build_generation_prompt, force_generated_draft_status, generate_resume_patches, resume_patch_json_schema
 from rag.resume_template.preview import build_resume_template_preview, render_pdf_preview
 
 
@@ -100,6 +100,55 @@ def test_validate_resume_patches_rejects_unknown_hash_and_markup_injection():
     assert "不存在对应字段" in "；".join(result.validationErrors)
     assert "原文字段 hash 不匹配" in "；".join(result.validationErrors)
     assert "注入风险" in "；".join(result.validationErrors)
+
+
+def test_validate_rejects_evidence_not_in_empty_candidate_set():
+    """候选 evidence 集合为空时，补丁不得携带伪造 evidence ID。"""
+    document = Document()
+    document.add_paragraph("项目：RAG 检索平台")
+    parsed = parse_resume_template_docx(docx_bytes(document), "resume.docx", template_id="tpl-empty-evidence")
+    field = parsed.fields[0]
+    patch = ResumeContentPatch(
+        fieldId=field.fieldId,
+        sourceTextHash=field.sourceTextHash,
+        newText="项目：RAG 检索平台，支持混合召回",
+        rewriteReason="测试伪造 evidence 拒绝",
+        evidenceIds=["fabricated-evidence"],
+        confidence=0.8,
+        riskFlags=["NONE"],
+        status="DRAFT",
+    )
+
+    result = validate_resume_patches("tpl-empty-evidence", 1, parsed.fields, [patch], allowed_evidence_ids=[])
+
+    assert not result.patches
+    assert "当前没有可用候选 evidence 集合" in "；".join(result.validationErrors)
+
+
+def test_generated_patch_status_is_always_draft_and_validated_patch_cannot_export():
+    """模型生成结果不能越过人工确认，只有 CONFIRMED 补丁允许导出。"""
+    document = Document()
+    document.add_paragraph("原始项目经历")
+    content = docx_bytes(document)
+    parsed = parse_resume_template_docx(content, "resume.docx", template_id="tpl-confirmation")
+    field = parsed.fields[0]
+    model_patch = ResumeContentPatch(
+        fieldId=field.fieldId,
+        sourceTextHash=field.sourceTextHash,
+        newText="优化后的项目经历",
+        rewriteReason="测试模型状态收敛",
+        evidenceIds=["e1"],
+        confidence=0.9,
+        riskFlags=["NONE"],
+        status="CONFIRMED",
+    )
+
+    generated = force_generated_draft_status([model_patch])
+
+    assert generated[0].status == "DRAFT"
+    validated = model_patch.model_copy(update={"status": "VALIDATED"})
+    with pytest.raises(ValueError, match="尚未由用户确认"):
+        apply_resume_patches_to_docx(content, "resume.docx", "tpl-confirmation", 1, parsed.fields, [validated], allowed_evidence_ids=["e1"])
 
 
 def test_apply_rejects_cross_run_field_to_protect_layout():
