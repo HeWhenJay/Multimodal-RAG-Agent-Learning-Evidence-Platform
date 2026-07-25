@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any
 
@@ -57,9 +58,19 @@ TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_DASHSCOPE_EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_DASHSCOPE_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_DASHSCOPE_EMBEDDING_BATCH_SIZE = 10
 DEFAULT_FUSION_STRATEGY = "weighted_rrf"
 DEFAULT_FUSION_RRF_K = 60
 DEFAULT_FUSION_DIAGNOSTIC_LIMIT = 20
+
+
+def index_chunk_workers() -> int:
+    """读取后端 RAG chunk Worker 数；默认 2，防止本机内存紧张时过度并发。"""
+    try:
+        configured = int(os.getenv("RAG_INDEX_CHUNK_WORKERS", "2"))
+    except ValueError:
+        configured = 2
+    return max(1, min(configured, 8))
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,15 @@ class RankedRetrievalRun:
     def query_kind(self) -> str:
         """区分原始问题和 Multi-Query 扩展问题。"""
         return "original" if self.query_index == 0 else "expanded"
+
+
+@dataclass(frozen=True)
+class EmbeddingBatchConfig:
+    """保存百炼 embedding 动态批处理配置。"""
+
+    max_size: int
+    wait_ms: int
+    max_in_flight: int
 
 
 @dataclass(frozen=True)
@@ -327,36 +347,78 @@ class InMemoryRagStore:
             context={"chunkCount": len(chunks), "summaryChildCount": len(summary_chunks), "parser": parser, "status": status},
         )
         total_chunks = len(chunks)
-        for index, chunk in enumerate(chunks, start=1):
+        worker_count = index_chunk_workers()
+        process_event(
+            stage="embedding.chunk",
+            action="memory_embedding_batch_start",
+            message=f"启动动态批处理生成 {total_chunks} 个内存 chunk embedding",
+            context={"chunkCount": total_chunks, "workerCount": worker_count, "documentId": document_id},
+        )
+        if progress_reporter:
+            progress_reporter.emit(
+                "embedding.chunk",
+                "后端启动动态批处理生成切块向量",
+                current_step=7,
+                total_steps=8,
+                current_chunk=0,
+                total_chunks=total_chunks,
+                percent=44,
+                detail=f"目前在使用 {embedding_model_name()} 模型按动态批处理生成切块向量",
+            )
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rag-memory-token") as pool:
+            token_counts_ordered = list(pool.map(lambda chunk: Counter(tokenize(chunk.text)), chunks))
+        embeddings = embed_texts([chunk.text for chunk in chunks])
+        if len(embeddings) != total_chunks:
+            raise RuntimeError("内存 RAG chunk 批量向量准备数量不完整")
+        prepared_chunks_ordered = [
+            (chunk, token_counts, embedding)
+            for chunk, token_counts, embedding in zip(chunks, token_counts_ordered, embeddings)
+        ]
+        for completed, (chunk, _, _) in enumerate(prepared_chunks_ordered, start=1):
             process_event(
                 stage="embedding.chunk",
                 action="memory_embedding_chunk",
-                message=f"第 {index}/{total_chunks} 块：生成 embedding",
+                message=f"第 {completed}/{total_chunks} 块：动态批处理 embedding 已生成",
                 context={
-                    "chunkIndex": index,
+                    "chunkIndex": completed,
+                    "completedChunks": completed,
                     "totalChunks": total_chunks,
                     "chunkId": chunk.chunk_id,
                     "documentId": document_id,
+                    "workerCount": worker_count,
+                    "batchMode": "dynamic",
                 },
             )
             if progress_reporter:
                 progress_reporter.emit(
                     "embedding.chunk",
-                    f"第 {index}/{total_chunks} 块：目前在使用 {embedding_model_name()} 模型完成切块向量生成事件",
+                    f"第 {completed}/{total_chunks} 块：动态批处理向量已生成",
                     current_step=7,
+                    total_steps=8,
+                    current_chunk=completed,
+                    total_chunks=total_chunks,
+                    chunk_id=chunk.chunk_id,
+                    percent=chunk_percent(completed, total_chunks, 45, 86),
+                    detail=f"目前在使用 {embedding_model_name()} 模型完成批量切块向量生成事件",
+                )
+
+        for index, (chunk, token_counts, embedding) in enumerate(prepared_chunks_ordered, start=1):
+            if progress_reporter:
+                progress_reporter.emit(
+                    "memory.upsert.chunk",
+                    f"第 {index}/{total_chunks} 块：写入内存检索索引",
+                    current_step=8,
                     total_steps=8,
                     current_chunk=index,
                     total_chunks=total_chunks,
                     chunk_id=chunk.chunk_id,
-                    percent=chunk_percent(index, total_chunks, 45, 86),
-                    detail=f"目前在使用 {embedding_model_name()} 模型完成切块向量生成事件",
+                    percent=chunk_percent(index, total_chunks, 48, 92),
                 )
             self.chunks[chunk.chunk_id] = chunk
-            tokens = tokenize(chunk.text)
-            token_counts = Counter(tokens)
             self.term_freqs[chunk.chunk_id] = token_counts
             self.doc_freq.update(set(token_counts))
-            self.embeddings[chunk.chunk_id] = embed_text(chunk.text)
+            self.embeddings[chunk.chunk_id] = embedding
             process_event(
                 stage="memory.upsert.chunk",
                 action="memory_upsert_chunk",
@@ -369,17 +431,6 @@ class InMemoryRagStore:
                     "documentId": document_id,
                 },
             )
-            if progress_reporter:
-                progress_reporter.emit(
-                    "memory.upsert.chunk",
-                    f"第 {index}/{total_chunks} 块：写入内存检索索引",
-                    current_step=8,
-                    total_steps=8,
-                    current_chunk=index,
-                    total_chunks=total_chunks,
-                    chunk_id=chunk.chunk_id,
-                    percent=chunk_percent(index, total_chunks, 48, 92),
-                )
 
         self.documents[document_id] = {
             **metadata,
@@ -904,6 +955,21 @@ def embed_text(text: str, dimensions: int | None = None) -> list[float]:
     return list(cached_embedding(cache_key))
 
 
+def embed_texts(texts: list[str], dimensions: int | None = None) -> list[list[float]]:
+    """按官方批量上限生成多段文本向量，返回顺序与输入文本保持一致。"""
+    if not texts:
+        return []
+    target_dimensions = dimensions or embedding_dimensions()
+    provider = embedding_provider_name()
+    if provider == "hash":
+        return [embed_text(text, dimensions=target_dimensions) for text in texts]
+    if provider != "dashscope":
+        raise RuntimeError(f"不支持的 RAG_EMBEDDING_PROVIDER: {provider}")
+    if len(texts) == 1:
+        return [embed_text(texts[0], dimensions=target_dimensions)]
+    return dashscope_embed_texts_dynamic(texts, model=embedding_model_name(), dimensions=target_dimensions)
+
+
 @lru_cache(maxsize=4096)
 def cached_embedding(cache_key: tuple[str, str, int, str]) -> tuple[float, ...]:
     provider, model, dimensions, text = cache_key
@@ -932,8 +998,95 @@ def embedding_provider_name() -> str:
     return "dashscope"
 
 
+def embedding_batch_config() -> EmbeddingBatchConfig:
+    """读取向量化动态批处理参数，默认对齐 text-embedding-v4 官方批量上限。"""
+    warnings: list[str] = []
+    max_size = read_bounded_int_env(
+        "RAG_EMBEDDING_BATCH_MAX_SIZE",
+        DEFAULT_DASHSCOPE_EMBEDDING_BATCH_SIZE,
+        minimum=1,
+        maximum=DEFAULT_DASHSCOPE_EMBEDDING_BATCH_SIZE,
+        warnings=warnings,
+    )
+    wait_ms = read_bounded_int_env("RAG_EMBEDDING_BATCH_WAIT_MS", 1000, minimum=0, maximum=10000, warnings=warnings)
+    max_in_flight = read_bounded_int_env(
+        "RAG_EMBEDDING_MAX_IN_FLIGHT", 2, minimum=1, maximum=8, warnings=warnings
+    )
+    for warning in warnings:
+        process_event(
+            stage="embedding.batch",
+            action="embedding_batch_config_warning",
+            message=warning,
+            level="WARN",
+            success=True,
+        )
+    return EmbeddingBatchConfig(max_size=max_size, wait_ms=wait_ms, max_in_flight=max_in_flight)
+
+
 def dashscope_embed_text(text: str, *, model: str, dimensions: int) -> list[float]:
     """通过百炼 OpenAI 兼容接口生成真实 embedding。"""
+    return dashscope_embed_texts([text], model=model, dimensions=dimensions)[0]
+
+
+def dashscope_embed_texts_dynamic(texts: list[str], *, model: str, dimensions: int) -> list[list[float]]:
+    """将已就绪文本按满批派发；实时队列场景保留等待窗口配置用于诊断。"""
+    config = embedding_batch_config()
+    batches = [
+        (start, texts[start : start + config.max_size])
+        for start in range(0, len(texts), config.max_size)
+    ]
+    process_event(
+        stage="embedding.batch",
+        action="dashscope_embedding_batch_start",
+        message="开始按动态批处理生成文本向量",
+        context={
+            "textCount": len(texts),
+            "batchCount": len(batches),
+            "batchMaxSize": config.max_size,
+            "batchWaitMs": config.wait_ms,
+            "maxInFlight": config.max_in_flight,
+            "modelName": model,
+        },
+    )
+    ordered: list[list[float] | None] = [None] * len(texts)
+
+    def run_batch(start: int, batch_texts: list[str]) -> tuple[int, list[list[float]]]:
+        return start, dashscope_embed_texts(batch_texts, model=model, dimensions=dimensions)
+
+    with ThreadPoolExecutor(max_workers=config.max_in_flight, thread_name_prefix="rag-embedding-batch") as executor:
+        submitted = {executor.submit(run_batch, start, batch_texts): (start, len(batch_texts)) for start, batch_texts in batches}
+        for future in as_completed(submitted):
+            start, batch_size = submitted[future]
+            batch_start = start + 1
+            batch_end = start + batch_size
+            _, embeddings = future.result()
+            for offset, embedding in enumerate(embeddings):
+                ordered[start + offset] = embedding
+            process_event(
+                stage="embedding.batch",
+                action="dashscope_embedding_batch_completed",
+                message=f"向量化批次完成：第 {batch_start}-{batch_end}/{len(texts)} 条",
+                context={
+                    "batchStart": batch_start,
+                    "batchEnd": batch_end,
+                    "batchSize": batch_size,
+                    "textCount": len(texts),
+                    "modelName": model,
+                },
+            )
+    if any(embedding is None for embedding in ordered):
+        raise RuntimeError("百炼 embedding 批量响应数量不完整")
+    process_event(
+        stage="embedding.batch",
+        action="dashscope_embedding_batch_finished",
+        message="动态批处理文本向量生成完成",
+        context={"textCount": len(texts), "batchCount": len(batches), "modelName": model},
+    )
+    return [embedding for embedding in ordered if embedding is not None]
+
+
+def dashscope_embed_texts(texts: list[str], *, model: str, dimensions: int) -> list[list[float]]:
+    """通过百炼 OpenAI 兼容接口批量生成真实 embedding。"""
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
         raise RuntimeError("使用百炼 embedding 需要配置 DASHSCOPE_API_KEY")
@@ -950,7 +1103,7 @@ def dashscope_embed_text(text: str, *, model: str, dimensions: int) -> list[floa
 
     payload: dict[str, Any] = {
         "model": model,
-        "input": text,
+        "input": texts[0] if len(texts) == 1 else texts,
         "dimensions": dimensions,
         "encoding_format": "float",
     }
@@ -960,7 +1113,11 @@ def dashscope_embed_text(text: str, *, model: str, dimensions: int) -> list[floa
         action="dashscope_embedding",
         model_name=model,
         event="文本向量生成",
-        extra_context={"dimensions": dimensions, "textLength": len(text)},
+        extra_context={
+            "dimensions": dimensions,
+            "textCount": len(texts),
+            "textLengths": [len(text) for text in texts],
+        },
     ):
         with httpx.Client(timeout=timeout) as client:
             response = client.post(f"{base_url}/embeddings", headers=headers, json=payload)
@@ -968,13 +1125,27 @@ def dashscope_embed_text(text: str, *, model: str, dimensions: int) -> list[floa
         raise RuntimeError(f"百炼 embedding 调用失败: HTTP {response.status_code} {response.text[:500]}")
     data = response.json()
     try:
-        embedding = data["data"][0]["embedding"]
-    except (KeyError, IndexError, TypeError) as exc:
+        raw_items = data["data"]
+    except (KeyError, TypeError) as exc:
         raise RuntimeError("百炼 embedding 响应结构不符合预期") from exc
-    if not isinstance(embedding, list) or len(embedding) != dimensions:
-        actual = len(embedding) if isinstance(embedding, list) else "非数组"
-        raise RuntimeError(f"百炼 embedding 维度不符合预期: expected={dimensions}, actual={actual}")
-    return [float(value) for value in embedding]
+    if not isinstance(raw_items, list) or len(raw_items) != len(texts):
+        actual = len(raw_items) if isinstance(raw_items, list) else "非数组"
+        raise RuntimeError(f"百炼 embedding 响应数量不符合预期: expected={len(texts)}, actual={actual}")
+    ordered: list[list[float] | None] = [None] * len(texts)
+    for fallback_index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise RuntimeError("百炼 embedding 响应条目不符合预期")
+        item_index = item.get("index", item.get("text_index", fallback_index))
+        if not isinstance(item_index, int) or not 0 <= item_index < len(texts):
+            item_index = fallback_index
+        embedding = item.get("embedding")
+        if not isinstance(embedding, list) or len(embedding) != dimensions:
+            actual = len(embedding) if isinstance(embedding, list) else "非数组"
+            raise RuntimeError(f"百炼 embedding 维度不符合预期: expected={dimensions}, actual={actual}")
+        ordered[item_index] = [float(value) for value in embedding]
+    if any(embedding is None for embedding in ordered):
+        raise RuntimeError("百炼 embedding 响应索引不完整")
+    return [embedding for embedding in ordered if embedding is not None]
 
 
 def hash_embed_text(text: str, dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS) -> list[float]:

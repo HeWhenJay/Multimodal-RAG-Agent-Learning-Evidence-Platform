@@ -1,6 +1,6 @@
 import pytest
 
-from rag.retrievers.retrieval import cached_embedding, embed_text, embedding_provider_name
+from rag.retrievers.retrieval import cached_embedding, embed_text, embed_texts, embedding_provider_name
 from rag.retrievers.retrieval import (
     FusionConfig,
     InMemoryRagStore,
@@ -429,6 +429,54 @@ def test_dashscope_embedding_request_uses_1024_dimensions(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["json"]["model"] == "text-embedding-v4"
     assert captured["json"]["dimensions"] == 1024
+
+
+def test_dashscope_embedding_batch_preserves_response_index_order(monkeypatch):
+    """批量 embedding 使用 DASHSCOPE_API_KEY，并按服务端 index 还原输入顺序。"""
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": 1, "embedding": [2.0] * 1024},
+                    {"index": 0, "embedding": [1.0] * 1024},
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def post(self, url, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    monkeypatch.setenv("RAG_EMBEDDING_PROVIDER", "dashscope")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "batch-test-key")
+    monkeypatch.setenv("RAG_VECTOR_DIMENSIONS", "1024")
+    monkeypatch.setenv("RAG_EMBEDDING_BATCH_MAX_SIZE", "10")
+    monkeypatch.setenv("RAG_EMBEDDING_MAX_IN_FLIGHT", "1")
+
+    embeddings = embed_texts(["第一段", "第二段"])
+
+    assert [embedding[0] for embedding in embeddings] == [1.0, 2.0]
+    assert captured["headers"]["Authorization"] == "Bearer batch-test-key"
+    assert captured["json"]["input"] == ["第一段", "第二段"]
+    assert captured["json"]["model"] == "text-embedding-v4"
 
 
 def test_weighted_rrf_uses_channel_weights_and_exposes_raw_rank_details():

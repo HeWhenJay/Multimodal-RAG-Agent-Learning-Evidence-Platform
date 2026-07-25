@@ -18,6 +18,7 @@ from app.storage.object_storage import (
     download_storage_source,
 )
 from app.schemas.rag import IndexResponse
+from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.observability.progress import RagProgressReporter
 from rag.kafka.producer import KafkaJsonProducer, KafkaProgressProducer, build_envelope, redacted_json
@@ -126,7 +127,20 @@ class RagKafkaIndexWorker:
             try:
                 filename = downloaded.filename or payload.title
                 if is_video_source(filename, payload.documentType, downloaded.content_type):
-                    parsed = self.parser_router.parse_video_source(
+                    parsed = parse_video_source_with_worker_pool(
+                        parser_router=self.parser_router,
+                        document_id=payload.stagingDocumentId,
+                        title=payload.title,
+                        document_type=payload.documentType,
+                        source=payload.source,
+                        user_id=payload.userId,
+                        visibility_scope=payload.stagingVisibilityScope,
+                        source_path=str(downloaded.path),
+                        filename=filename,
+                        content_type=downloaded.content_type,
+                        high_precision=payload.highPrecision,
+                        progress_reporter=progress,
+                    ) or self.parser_router.parse_video_source(
                         document_id=payload.stagingDocumentId,
                         title=payload.title,
                         document_type=payload.documentType,
@@ -177,7 +191,8 @@ class RagKafkaIndexWorker:
         )
 
     def _send_result(self, envelope: KafkaEnvelope, payload: IndexRequestPayload, result: IndexResponse) -> None:
-        result_payload = result.model_dump(mode="json")
+        # 逐块进度已通过独立 topic 持久化，终态消息只保留可用于状态收敛的索引摘要。
+        result_payload = result.model_dump(mode="json", exclude={"progressEvents"})
         result_payload.update(
             {
                 "jobId": payload.jobId,

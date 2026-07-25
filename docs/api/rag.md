@@ -4,7 +4,7 @@
 
 ## Python 公开控制面（阶段 3）
 
-更新日期：2026-07-21
+更新日期：2026-07-25
 
 ### 变更摘要
 
@@ -28,12 +28,49 @@
   `RAG_KAFKA_ENABLED` 与 `AI_KAFKA_WORKER_ENABLED` 置为 `false`，使 API 创建 `LOCAL` 任务并由
   `rag_task_worker` 消费，不能出现“任务投递到 Kafka 但 Kafka worker 未启动”的悬挂状态。相反，
   `--with-kafka` 会同时启用 Kafka 投递模式和 Kafka worker。
+- 前端视频上传分片固定为 20MiB，只负责降低浏览器和 multipart 单请求压力；这些分片不会逐片进入
+  Kafka。`EVIDENCE_STORAGE_PROVIDER=oss` 时，Python 控制面将每片直接作为 OSS multipart part 写入同一个
+  受控对象，只在本机保留单片上传临时文件和小型会话元数据，不合并或持久化整视频；收齐并完成 OSS multipart
+  后仅投递 1 条资料级索引任务。`local` 模式才使用受控本地分片目录合并。
+  Kafka 或 local durable worker 抢到该资料级任务后，如果原文件是视频，会先用 FFmpeg 按约 20MiB
+  目标切成可解析媒体片段，再由后端 2 个 Worker 从共享队列抢占这些媒体片段并发解析，最后聚合
+  blocks 后对同一个 material 的 staging 索引执行一次 index_blocks。这表示并发发生在 Kafka
+  到后端 worker 之后，而不是把前端上传分片分发给不同 Kafka worker。
+- 前端 20MiB 分片上传默认最多 2 个 in-flight，可用 VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY=1/2
+  在同一线上链路中切换顺序上传与并发上传。后端按 userId/uploadId 加锁，持久化 OSS uploadId、已确认 part
+  ETag 与完成资料 ID，支持重复片幂等返回，并避免并发最后几片重复 complete 或重复创建资料。
+- 视频并发切片由 RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED=true 默认启用，RAG_VIDEO_PARALLEL_WORKERS
+  默认 2，RAG_VIDEO_PARALLEL_SEGMENT_TARGET_MIB 默认 20。若原视频同目录存在 .srt/.vtt 侧车字幕，
+  local 存储会将字幕镜像到视频旁；OSS 存储会以同一对象 key 的 .srt/.vtt 保存，并在 Kafka worker
+  下载视频时一并落到临时视频旁。随后 worker 会先把字幕按媒体片段写入临时片段旁边，确保每个片段
+  仍走字幕优先解析。RAG_VIDEO_SIDECAR_SEARCH_DIRS 可配置本机受控字幕目录，供浏览器只上传 mp4
+  的场景按同名文件补齐侧车字幕；若 FFmpeg/ffprobe 不可用、视频过小、切片失败、或切片解析只得到
+  元数据 fallback，则自动回落原整视频解析路径。
+- RAG_INDEX_CHUNK_WORKERS 默认 2，用于解析完成后的递归切块 embedding 并发准备；RAG_TASK_WORKER_CONCURRENCY
+  默认 2，用于 Kafka 关闭时 local durable worker 对同轮 claim 的查询/索引任务并发执行。数据库写入、
+  staging promote 与状态回写仍在各任务内部保持原有幂等和事务边界。
+- RAG_KAFKA_MAX_POLL_INTERVAL_MS 默认 3600000，允许单条长视频索引在同一 consumer handler 中持续执行，
+  避免超过 Kafka 默认 5 分钟 poll 间隔后被移出 consumer group。RAG_VIDEO_FRAME_OCR_ENABLED 默认 true；
+  在已有可信侧车字幕且需要隔离外部 OCR 延迟的性能基准中可显式设为 false，保留视频+字幕 RAG 解析。
+- RAG_KAFKA_AUTO_OFFSET_RESET 默认 earliest，用于生产 consumer group 首次建立时补消费既有任务；
+  独立性能基准可为专用 group 设为 latest，并必须在上传前完成 Worker 订阅，避免历史消息进入本轮计时。
+- 视频关键帧 OCR 默认使用 `qwen3.5-ocr`。该模型的官方实时调用限制为北京地域
+  `6000 RPM / 30,000,000 TPM`，但官方没有公布多图单请求上限，且 OpenAI 兼容 Batch API 的
+  支持列表未列出该模型。因此系统不拼接未经验证的多图请求，而是保持“一帧一请求”语义，通过
+  `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800` 与
+  `RAG_VIDEO_OCR_MAX_IN_FLIGHT=2` 形成受控 OCR 微批：积累满 4 帧立即并发派发；未满时从首帧起最多
+  等待 800ms，输入关闭时立即刷出尾批。两个媒体 Worker 同时运行时最多 4 个 OCR 请求，低于官方
+  RPM 上限并避免长视频帧图占满本机内存。每张帧图仍独立重试、降级到本地 OCR，并保留原时间戳 evidence。
+  由于兼容接口以 Base64 传图，`BAILIAN_OCR_MAX_IMAGE_BYTES` 默认按官方 10MB 编码后字符串上限折算，
+  过大的帧图在远程调用前跳过并走既有降级路径。
 - `POST /api/rag/query/tasks` 在同一事务内写入 `rag_query_history` 和 `rag_query_task`，返回
   `RUNNING`。查询 worker 使用租约抢占任务，进程异常后由租约过期重试；每个阶段事件、最终回答、
   evidence、answer guard 和失败摘要均回写 PostgreSQL。`GET /api/rag/query/tasks/{taskId}` 只读取
   持久化快照，状态为 `RUNNING`、`COMPLETED`、`FAILED` 或 `EXPIRED`。
 - durable worker 的任何错误只保存异常类别和受控中文摘要，不保存原始资料正文、问题、Token、
   OSS 密钥或数据库连接串。Kafka 消息按 `rag_consumed_event` 的 consumer/message/idempotency 三元组去重。
+- Kafka 的 `RAG_INDEX_RESULT` 只携带索引终态摘要（资料、切块数、解析器、摘要和质量信号）；逐块进度
+  仅经 progress topic 持久化，不能把完整 `progressEvents` 历史塞入终态消息，避免长视频超过 Broker 单消息上限。
 
 ### 鉴权与所有权
 
@@ -1435,7 +1472,7 @@ Python `Evidence.metadata` 会保留上述父子索引、OCR occurrence、聚合
 
 ```text
 mp4/mov/webm/mkv/avi
--> FFmpeg 抽取 16kHz 单声道音频
+-> FFmpeg 抽取 16kHz 单声道、64kbps MP3 音频分段
 -> 有公开视频 URL 时优先用百炼 qwen3-asr-flash-filetrans 生成带句级时间戳的 SRT 字幕
 -> 本地/离线视频优先读取同目录同名 .srt/.vtt/.txt 侧车字幕或转写文本，作为无 FFmpeg 时的时间戳证据来源
 -> 若视频存在内嵌字幕轨，使用 FFmpeg 提取为 SRT 后入库
@@ -1459,15 +1496,24 @@ mp4/mov/webm/mkv/avi
 | --- | --- | --- |
 | `FFMPEG_COMMAND` | conda 环境默认通过 `ffmpeg` 包提供，环境外运行时读取 PATH 中的 `ffmpeg`，未配置时可降级使用 `imageio-ffmpeg` 打包的 ffmpeg | 视频抽音频、抽关键帧和内嵌字幕 |
 | `FFPROBE_COMMAND` | conda 环境默认随 `ffmpeg` 包提供，环境外运行时读取 PATH 中的 `ffprobe` | 读取视频时长；不可用时 Python 会尝试用 `ffmpeg -i` 输出解析 `Duration` |
-| `RAG_ASR_PROVIDER` | `auto` | `auto/local/dashscope`，生产有 Key 时走百炼 |
-| `RAG_ASR_FILETRANS_ENABLED` | `auto` | 有公开视频 URL 时优先启用官方异步时间戳转写 |
+| `RAG_ASR_PROVIDER` | `auto` | `auto/local/dashscope/filetrans/dashscope_filetrans`；生产存在 `DASHSCOPE_API_KEY` 时可调用百炼 |
+| `RAG_ASR_TASK_BASE_URL` | `https://dashscope.aliyuncs.com/api/v1` | filetrans 异步任务提交、轮询与结果下载的 API 根地址 |
+| `RAG_ASR_FILETRANS_ENABLED` | `auto` | 存在 DashScope 可访问的 `http(s)` 文件 URL 时优先使用 filetrans；`true` 强制尝试，`false` 仅走同步降级链路 |
 | `RAG_ASR_FILETRANS_MODEL` | `qwen3-asr-flash-filetrans` | 百炼异步文件转写模型，返回句级时间戳 |
 | `RAG_ASR_MODEL` | `qwen3-asr-flash` | filetrans 失败后的同步 ASR 降级模型 |
+| `RAG_ASR_AUDIO_VIA_OSS` | `auto` | `auto` 在 `EVIDENCE_STORAGE_PROVIDER=oss` 时，把本地抽取的音频段临时上传 OSS 以获得 filetrans 可访问 URL；可显式开关 |
+| `RAG_ASR_REQUIRE_OSS_AUDIO_URL` | `false` | `true` 时临时音频上传发生异常即中止该段，避免静默回落到同步 ASR；未得到公开 URL 时仍按现有降级链路处理 |
+| `RAG_ASR_OSS_CLEANUP_ENABLED` | `true` | filetrans 成功、失败或回退后删除本次临时音频对象；不删除用户上传的原视频 |
 | `RAG_ASR_MAX_AUDIO_BYTES` | `10485760` | 同步 ASR 最大音频字节数 |
 | `RAG_ASR_FILETRANS_MAX_POLLS` | `30` | 单次请求内等待异步转写结果的最大轮询次数；每次轮询都会写入 `parse.video.asr` 进度 |
 | `RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS` | `2` | 异步转写任务轮询间隔 |
 | `RAG_ASR_FILETRANS_MAX_ATTEMPTS` | `2` | filetrans 异步任务提交/轮询失败后的最大尝试次数，超过后才降级到字幕、同步 ASR 或视频元数据 |
+| `RAG_ASR_BATCH_MAX_SIZE` | `4` | 一个 ASR 微批最多收集 4 个音频段；微批内仍保持一段音频一个远程请求 |
+| `RAG_ASR_BATCH_WAIT_MS` | `1000` | 首段入队后未满批的最长等待窗口；视频分段全部就绪后尾批立即刷出 |
+| `RAG_ASR_MAX_IN_FLIGHT` | `2` | 单个视频处理上下文中最多 2 个同时执行的 ASR 请求，允许两个后台 Worker 自行抢占任务 |
+| `RAG_ASR_RPM_LIMIT` | `90` | 进程内保守启动速率；实现上限定为 100 RPM，默认预留 10% 余量给账户级限流 |
 | `RAG_VIDEO_AUDIO_SEGMENT_SECONDS` | `300` | 本地或私有长视频同步 ASR 的音频分段时长 |
+| `RAG_ASR_AUDIO_BITRATE` | `64k` | FFmpeg 输出 MP3 的目标码率；采样率固定为 16kHz、单声道 |
 | `RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS` | `1800` | FFmpeg 抽音频、分段和抽帧超时时间 |
 | `RAG_VIDEO_FRAME_SCAN_MODE` | `auto` | `auto/prefix/full`。`prefix` 保持旧版从开头扫描；`full` 严格按视频全时长动态间隔扫描；`auto` 优先 full，失败降级 prefix 并写 warning |
 | `RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS` | `5` | 候选帧采样间隔，用于 PPT 翻页检测 |
@@ -1497,10 +1543,13 @@ mp4/mov/webm/mkv/avi
 | `RAG_QUERY_DIVERSITY_DEDUP_ENABLED` | `true` | 查询阶段是否对 rerank 后 evidence 做多样性过滤 |
 | `RAG_QUERY_VIDEO_TIME_WINDOW_SECONDS` | `120` | 查询阶段按视频时间窗限制近重复 evidence 的窗口长度 |
 | `RAG_QUERY_VIDEO_MAX_PER_TIME_WINDOW` | `1` | 同一视频同一时间窗内每类视频 evidence 默认保留数量 |
+| `RAG_VIDEO_OCR_BATCH_MAX_SIZE` | `4` | 一个 OCR 微批最多收集 4 帧；每帧仍独立调用一次 OCR 接口 |
+| `RAG_VIDEO_OCR_BATCH_WAIT_MS` | `800` | 首帧入队后未满批的最长等待窗口；输入关闭时立即刷出尾批 |
+| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `2` | 单个媒体分段最多 2 个同时 OCR 请求；队列有界以限制帧图内存 |
 | `BAILIAN_OCR_MAX_ATTEMPTS` | `3` | 单张图片或视频关键帧调用百炼 OCR 的总尝试次数，建议生产按稳定性调到 `3-5` |
 | `BAILIAN_OCR_RETRY_DELAY_SECONDS` | `2` | OCR 单次失败后的重试等待秒数 |
 
-如果 FFmpeg、ASR、PPT 翻页检测、OCR 或片段摘要任一环节不可用，Python 会尽量降级保留已生成 evidence；完全没有字幕和画面 OCR 时，只保留 `evidenceChannel=video_metadata` 的视频元数据 evidence，不再用元数据占位块生成假的视频片段摘要，并返回 `PARTIAL`。同步 ASR 降级路径不保证模型一定返回真实时间戳；若只得到纯文本，Python 会按视频时长生成估算 SRT 时间段作为播放定位保底。生产视频资料如已提供侧车字幕或内嵌字幕，Python 不再额外等待 filetrans；缺少字幕时仍建议配置公开 OSS/CDN URL，让 filetrans 返回可验证的句级时间戳。影响资料可用性的阶段告警会进入 `parseQuality.messages`，Java 记录 `RAG_INDEX_PARTIAL`，日志上下文的 `errorLocation` 可直接定位到具体环节。
+如果 FFmpeg、ASR、PPT 翻页检测、OCR 或片段摘要任一环节不可用，Python 会尽量降级保留已生成 evidence；完全没有字幕和画面 OCR 时，只保留 `evidenceChannel=video_metadata` 的视频元数据 evidence，不再用元数据占位块生成假的视频片段摘要，并返回 `PARTIAL`。同步 ASR 降级路径不保证模型一定返回真实时间戳；若只得到纯文本，Python 会按视频时长生成估算 SRT 时间段作为播放定位保底。生产视频资料如已提供侧车字幕或内嵌字幕，Python 不再额外等待 filetrans；缺少字幕时，公网视频直接使用其 URL，本地或私有视频可在 OSS 模式下临时上传音频段后发起 filetrans。影响资料可用性的阶段告警会进入 `parseQuality.messages`，Java 记录 `RAG_INDEX_PARTIAL`，日志上下文的 `errorLocation` 可直接定位到具体环节。
 
 ### 视频 OCR 近重复治理
 
@@ -2007,7 +2056,7 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 | `evidence.storage.local-root` | `EVIDENCE_UPLOAD_ROOT` | `uploads/rag` | 本地模式保存目录 |
 | `evidence.storage.oss.endpoint` | `ALIYUN_OSS_ENDPOINT` | 空 | OSS Endpoint，例如 `https://oss-cn-hangzhou.aliyuncs.com` |
 | `evidence.storage.oss.bucket` | `ALIYUN_OSS_BUCKET` | 空 | OSS Bucket 名称 |
-| `evidence.storage.oss.access-key-id` | `ALIYUN_OSS_ACCESS_KEY_ID` | 空 | OSS AccessKey ID |
+| `evidence.storage.oss.access-key-id` | `ALIYUN_OSS_ACCESS_KEY_ID`（兼容 `ALIOSS_ACCESS_KEY_ID`） | 空 | OSS AccessKey ID；前者优先 |
 | `evidence.storage.oss.access-key-secret` | `ALIYUN_OSS_ACCESS_KEY_SECRET` | 空 | OSS AccessKey Secret |
 | `evidence.storage.oss.object-prefix` | `ALIYUN_OSS_OBJECT_PREFIX` | `learning-evidence` | OSS 对象 key 前缀 |
 | `evidence.storage.oss.public-base-url` | `ALIYUN_OSS_PUBLIC_BASE_URL` | 空 | 可选公开访问域名或 CDN 域名，用于视频播放和 evidence 跳转 |
@@ -2023,7 +2072,7 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 
 ## 百炼 OCR 接入
 
-更新日期：2026-06-16
+更新日期：2026-07-25
 
 本阶段只把 OCR 模型作为 Python RAG 文档解析降级链路的一部分，不新增 Agent 编排、工具调用或长任务调度。Java 仍只上传文件、记录状态并调用 Python；百炼 OCR 调用统一使用 `DASHSCOPE_API_KEY`，模型选择、超时和失败降级全部位于 `ai-python/`。
 
@@ -2060,9 +2109,12 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 | `BAILIAN_OCR_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容 API 根地址 |
 | `BAILIAN_OCR_MODEL` | `qwen3.5-ocr` | OCR 模型名 |
 | `BAILIAN_OCR_TIMEOUT_SECONDS` | `60` | 单次 HTTP 调用超时 |
-| `BAILIAN_OCR_MAX_IMAGE_BYTES` | `10485760` | 图片转 Base64 前的最大字节数 |
+| `BAILIAN_OCR_MAX_IMAGE_BYTES` | `7499952` | 图片转 Base64 前的原始字节上限；实现会强制限制在该值以内，预留 data URL 头以满足 10,000,000 字节 Base64 字符串上限 |
 | `BAILIAN_OCR_MAX_ATTEMPTS` | `3` | 单张图片或关键帧 OCR 总尝试次数，第一次失败不会立刻降级 |
 | `BAILIAN_OCR_RETRY_DELAY_SECONDS` | `2` | 每次 OCR 失败后的重试等待秒数，最后一次失败后不再等待 |
+| `RAG_VIDEO_OCR_BATCH_MAX_SIZE` | `4` | 视频关键帧微批容量；不改变每个请求只传一张图片的兼容接口 schema |
+| `RAG_VIDEO_OCR_BATCH_WAIT_MS` | `800` | 从首帧开始等待未满批的最大毫秒数 |
+| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `2` | 单个媒体分段的 OCR 并发请求数，配置值限定为 `1-8` |
 
 请求 schema：
 
@@ -2106,3 +2158,83 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 | 百炼和本地 OCR 均无可索引文本 | `FAILED` | 返回资料记录，状态为解析失败 |
 | Key 未配置 | 不视为接口错误 | 自动跳过百炼并使用本地降级链路 |
 | 视频处理任一阶段出现 warning | `PARTIAL` 或由整体质量决定 | Java 从 `parseQuality.messages` 读取阶段位置，写入 `log_error.contextJson.errorLocation` |
+
+## 百炼 ASR、向量化与动态批处理
+
+更新日期：2026-07-25
+
+本节描述 Python Worker 的内部调度，不新增 Java 或前端 HTTP 接口。资料仍通过既有状态
+`PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING` 和 `rag_progress` 返回进度；“微批”不是新的
+资料状态，也不会改变证据、切块或原始视频的归属关系。
+
+### 统一鉴权和适配边界
+
+`DASHSCOPE_API_KEY` 是 `qwen3.5-ocr`、`qwen3-asr-flash`、`qwen3-asr-flash-filetrans` 与
+`text-embedding-v4` 共用的百炼 API Key。Python 只在请求头 `Authorization: Bearer ...` 中使用它，
+不会把 Key 写入响应、`rag_progress`、过程日志、资料表或 evidence metadata。
+
+未配置 Key 时，OCR 的 `auto` 模式跳过远程识别并走 `pytesseract` 等既有降级；ASR 保留侧车字幕、
+内嵌字幕和视频元数据降级；默认 `RAG_EMBEDDING_PROVIDER=dashscope` 的真实向量化则无法完成，
+离线测试必须显式设为 `hash`，不能将 hash 向量作为生产索引结果。
+
+### OSS filetrans 异步转写
+
+`qwen3-asr-flash-filetrans` 采用一文件 URL 一任务的异步协议，而非 Chat Completions 音频 payload：
+
+```text
+公开视频 URL
+  或 本地/私有视频 -> FFmpeg 提取 MP3 音频段 -> 临时 OSS 公开 URL
+-> POST /services/audio/asr/transcription (X-DashScope-Async: enable)
+-> task_id 轮询 GET /tasks/{task_id}
+-> 下载 transcription_url JSON -> 句级时间戳转换为 SRT -> DocumentBlock
+```
+
+- 公网视频直接使用其 `http(s)` URL；本地或私有视频在 `EVIDENCE_STORAGE_PROVIDER=oss` 且
+  `RAG_ASR_AUDIO_VIA_OSS=auto/true` 时，按段上传临时 MP3。临时对象只有配置
+  `ALIYUN_OSS_PUBLIC_BASE_URL` 后才具备可提交给 filetrans 的公开 URL。
+- `RAG_ASR_OSS_CLEANUP_ENABLED=true` 会在 filetrans 返回、报错或转入后续降级时删除临时音频对象；
+  原视频、用户 OSS 对象和 Kafka 消费所下载的工作副本不受影响。
+- 任务提交、`RUNNING` 轮询、结果下载和最终失败分别写入 `parse.video.asr` 进度。达到
+  `RAG_ASR_FILETRANS_MAX_POLLS * RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS` 的轮询预算，或提交/轮询
+  在 `RAG_ASR_FILETRANS_MAX_ATTEMPTS` 次后仍失败时，按可用性回退到同步 ASR、字幕或视频元数据。
+
+### 微批调度与配置
+
+| 环节 | 默认配置 | 实际派发语义 | 保护范围 |
+| --- | --- | --- | --- |
+| 视频 OCR | `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800`、`RAG_VIDEO_OCR_MAX_IN_FLIGHT=2` | 满 4 帧立即派发，未满从首帧最多等待 800ms；批内以最多 2 个线程并发执行单帧 OCR | 队列容量受批大小和并发数约束；每帧独立重试、降级和 evidence 时间戳 |
+| 视频 ASR | `RAG_ASR_BATCH_MAX_SIZE=4`、`RAG_ASR_BATCH_WAIT_MS=1000`、`RAG_ASR_MAX_IN_FLIGHT=2` | 满 4 段立即派发，尾批立即刷出；单个视频处理上下文内最多 2 个线程并发执行单段 ASR/filetrans | 单视频节流与进程共享限流器均按 `RAG_ASR_RPM_LIMIT=90` 限制启动速率 |
+| 切块 embedding | `RAG_EMBEDDING_BATCH_MAX_SIZE=10`、`RAG_EMBEDDING_BATCH_WAIT_MS=1000`、`RAG_EMBEDDING_MAX_IN_FLIGHT=2` | 已完成解析的切块按最多 10 条组成一个 `input` 数组，并发最多 2 个远程批次；响应按原始输入顺序复位 | token 统计使用受限线程池，向量数量不完整即中止本次索引，避免错配 chunk |
+
+OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多张图片或多个音频段拼进一个未经验证的
+模型请求。OCR 仍发送一张 Base64 图片，ASR/filetrans 仍发送一个音频文件 URL；这样保留每帧/每段
+独立的失败重试、时间轴合并和 evidence 追踪。embedding 使用模型兼容接口支持的真实数组输入，
+是唯一会把多个业务项置入一次远程请求的环节。
+
+`RAG_EMBEDDING_BATCH_WAIT_MS` 预留给持续流式生产切块的调度诊断。当前一次 `index_blocks` 在切块集合
+已完整就绪后才进入向量化，因此不会为了等待更多文本额外阻塞 1000ms；实际分批由 10 条上限和
+`max-in-flight` 控制。所有三类配置均接受环境变量覆盖；非法值回退默认值，超过实现上限的并发或批量值会被限制在安全范围内。
+
+### 模型限制、兼容性和可观测性
+
+| 模型/接口 | 本实现采用的限制 | 兼容性处理 |
+| --- | --- | --- |
+| `qwen3.5-ocr` | Base64 图片字符串上限为 10,000,000 字节；原图默认上限为 7,499,952 字节，避免 data URL 头和 Base64 膨胀越界 | 使用 OpenAI 兼容 `chat/completions` 单图 schema；不假设存在多图单请求能力 |
+| `qwen3-asr-flash` | ASR 启动速率实现上限为 100 RPM，默认保守设置为 90 RPM | 单音频段同步请求；超出同步音频大小限制时不提交，并继续可用降级链路 |
+| `qwen3-asr-flash-filetrans` | 一个异步任务对应一个可访问的 `http(s)` 文件 URL，等待轮数默认 `30`、间隔默认 `2s` | 采用百炼异步任务 API 并把句级 `begin_time/end_time` 转为 SRT；不兼容时不再把该模型错误地当成 Chat Completions ASR |
+| `text-embedding-v4` | 每个远程 `input` 批次最多 10 条文本，默认 1024 维 | 使用 OpenAI 兼容数组 `input`，结果强制按输入下标映射回 chunk；每批最大并发 2 |
+
+账户、地域或模型版本的实时配额低于上述保护值时，以百炼返回的限流响应为准，应相应调低并发与 RPM；
+这些参数不是提高账户配额的手段。运行时可通过下列过程事件定位实际批次，而不需要读取敏感请求内容：
+
+- OCR：`dispatch_ocr_microbatch` 与 `bailian_ocr`，每帧 metadata 含 `ocrBatchIndex`、`ocrBatchSize`、
+  `ocrBatchMaxSize`、`ocrBatchWaitMs`。
+- ASR：`dispatch_asr_microbatch`、`bailian_filetrans_asr`、`bailian_sync_asr` 与
+  `asr_microbatch_segment_merged`，进度阶段为 `parse.video.asr`。
+- embedding：`dashscope_embedding_batch_start`、`dashscope_embedding_batch_completed`、
+  `dashscope_embedding_batch_finished`，上下文含 `textCount`、`batchCount`、`batchMaxSize` 和
+  `maxInFlight`。
+
+单个 OCR/ASR 子任务失败不会自动抹去已完成的字幕、关键帧或向量；聚合后仍可返回 `READY` 或 `PARTIAL`。
+若没有任何可索引文本、向量批次缺失或索引事务失败，则按既有失败规则进入 `FAILED`，前端通过资料状态接口
+和进度事件展示结果，无需引入额外轮询协议。

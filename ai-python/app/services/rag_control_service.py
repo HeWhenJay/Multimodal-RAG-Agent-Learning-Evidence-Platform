@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import json
+import logging
 import mimetypes
 import os
 from pathlib import Path
 import shutil
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -33,18 +35,24 @@ from app.schemas.rag_control import (
 )
 from app.storage.object_storage import (
     LocalRagObjectStorage,
+    OssMultipartPart,
+    OssRagObjectStorage,
     RagObjectStorage,
     StoredObject,
     build_rag_object_storage,
 )
+from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import create_rag_store
 
 
+logger = logging.getLogger(__name__)
+
 TEXT_PREVIEW_TYPES = {"markdown", "md", "txt", "text", "srt", "vtt"}
 VIDEO_TYPES = {"mp4", "mov", "m4v", "webm", "mkv", "avi"}
+VIDEO_SIDECAR_SUFFIXES = (".srt", ".vtt")
 DOCUMENT_TYPES = {
     ".md": "markdown",
     ".pdf": "pdf",
@@ -81,6 +89,9 @@ BUSINESS_METADATA_FILTER_KEYS = {
     "pageIndex",
     "slideIndex",
 }
+_CHUNK_UPLOAD_LOCKS: dict[str, threading.Lock] = {}
+_CHUNK_UPLOAD_COMPLETED_MATERIALS: dict[str, int] = {}
+_CHUNK_UPLOAD_LOCKS_GUARD = threading.Lock()
 
 
 class RagControlService:
@@ -209,15 +220,45 @@ class RagControlService:
             )
         else:
             stored = self.object_storage.store_bytes(content or b"", safe_filename, user_id, document_type)
+        return self._create_material_from_stored(
+            stored=stored,
+            source_path=source_path,
+            filename=safe_filename,
+            document_type=document_type,
+            content_type=content_type,
+            high_precision=high_precision,
+            user_id=user_id,
+        )
+
+    def _create_material_from_stored(
+        self,
+        *,
+        stored: StoredObject,
+        source_path: str | Path | None,
+        filename: str,
+        document_type: str,
+        content_type: str | None,
+        high_precision: bool,
+        user_id: str,
+    ) -> RagMaterialResponse:
+        """为已写入 local 或 OSS 的原始对象建档并投递耐久索引任务。"""
+        copy_video_sidecars_to_storage(
+            stored=stored,
+            object_storage=self.object_storage,
+            source_path=source_path,
+            filename=filename,
+            document_type=document_type,
+            user_id=user_id,
+        )
         try:
             with self.repository.transaction() as transaction:
                 material = transaction.insert_material(
-                    title=safe_filename,
+                    title=filename,
                     user_id=user_id,
                     document_type=document_type,
                     source="upload",
                     status="PARSING",
-                    original_filename=safe_filename,
+                    original_filename=filename,
                     original_file_path=stored.source_path,
                     storage_type=stored.storage_type,
                     object_key=stored.object_key,
@@ -230,7 +271,7 @@ class RagControlService:
                     high_precision=high_precision,
                     source_ref={
                         "type": "STORAGE",
-                        "filename": safe_filename,
+                        "filename": filename,
                         "contentType": content_type,
                         "storageType": stored.storage_type,
                         "sourcePath": stored.source_path,
@@ -273,6 +314,19 @@ class RagControlService:
                 chunk_size=Path(source_path).stat().st_size,
             )
         safe_upload_id = sanitize_upload_id(upload_id) or uuid4().hex
+        if isinstance(self.object_storage, OssRagObjectStorage):
+            return self._upload_chunk_to_oss(
+                content=content,
+                source_path=source_path,
+                filename=filename,
+                upload_id=safe_upload_id,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                total_size=total_size,
+                content_type=content_type,
+                high_precision=high_precision,
+                user_id=user_id,
+            )
         directory = self._chunk_directory(user_id, safe_upload_id)
         directory.mkdir(parents=True, exist_ok=True)
         chunk_path = directory / chunk_filename(chunk_index)
@@ -319,6 +373,19 @@ class RagControlService:
             chunk_size=Path(source_path).stat().st_size,
         )
         safe_upload_id = sanitize_upload_id(upload_id) or uuid4().hex
+        if isinstance(self.object_storage, OssRagObjectStorage):
+            return self._upload_chunk_to_oss(
+                content=None,
+                source_path=source_path,
+                filename=filename,
+                upload_id=safe_upload_id,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                total_size=total_size,
+                content_type=content_type,
+                high_precision=high_precision,
+                user_id=user_id,
+            )
         directory = self._chunk_directory(user_id, safe_upload_id)
         directory.mkdir(parents=True, exist_ok=True)
         chunk_path = directory / chunk_filename(chunk_index)
@@ -338,6 +405,178 @@ class RagControlService:
             user_id=user_id,
         )
 
+    def _upload_chunk_to_oss(
+        self,
+        *,
+        content: bytes | None,
+        source_path: str | Path | None,
+        filename: str,
+        upload_id: str,
+        chunk_index: int,
+        total_chunks: int,
+        total_size: int | None,
+        content_type: str | None,
+        high_precision: bool,
+        user_id: str,
+    ) -> MaterialUploadChunkResponse:
+        """把浏览器分片直接上传 OSS multipart，避免本机合并完整长视频。"""
+        storage = self.object_storage
+        if not isinstance(storage, OssRagObjectStorage):
+            raise BusinessError("当前对象存储不支持 OSS 分片上传")
+
+        safe_name = safe_filename(filename)
+        directory = self._chunk_directory(user_id, upload_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        upload_key = chunk_upload_completion_key(
+            directory=directory,
+            user_id=user_id,
+            upload_id=upload_id,
+            filename=safe_name,
+            total_chunks=total_chunks,
+            total_size=total_size,
+        )
+        with chunk_upload_lock(upload_key):
+            completed = self._completed_chunk_material(upload_key, user_id)
+            if completed is not None:
+                return completed_chunk_response(
+                    upload_id=upload_id,
+                    filename=safe_name,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    material=self._material_response_for_user(completed, user_id),
+                )
+
+            marker = directory / "material.id"
+            existing = self._chunk_marker_material(marker, user_id)
+            if existing is not None:
+                remember_completed_chunk_material(upload_key, existing.id)
+                return completed_chunk_response(
+                    upload_id=upload_id,
+                    filename=safe_name,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    material=self._material_response_for_user(existing, user_id),
+                )
+
+            state_path = oss_multipart_state_path(directory)
+            state = load_oss_multipart_state(state_path)
+            if state is None:
+                session = storage.start_multipart_upload(
+                    filename=safe_name,
+                    user_id=user_id,
+                    document_type=detect_document_type(safe_name),
+                    content_type=content_type,
+                )
+                state = {
+                    "version": 1,
+                    "objectKey": session.object_key,
+                    "ossUploadId": session.upload_id,
+                    "filename": safe_name,
+                    "totalChunks": total_chunks,
+                    "totalSize": total_size,
+                    "contentType": content_type,
+                    "parts": {},
+                }
+                save_oss_multipart_state(state_path, state)
+            validate_oss_multipart_state(
+                state,
+                filename=safe_name,
+                total_chunks=total_chunks,
+                total_size=total_size,
+            )
+
+            stored_material_id = safe_int_or_none(state.get("materialId"))
+            if stored_material_id is not None:
+                with self.repository.transaction() as transaction:
+                    stored_material = transaction.find_material(stored_material_id, user_id)
+                if stored_material is not None:
+                    remember_completed_chunk_material(upload_key, stored_material.id)
+                    marker.write_text(str(stored_material.id), encoding="utf-8")
+                    return completed_chunk_response(
+                        upload_id=upload_id,
+                        filename=safe_name,
+                        chunk_index=chunk_index,
+                        total_chunks=total_chunks,
+                        material=self._material_response_for_user(stored_material, user_id),
+                    )
+
+            parts = oss_multipart_parts(state, total_chunks)
+            if chunk_index not in parts:
+                object_key = str(state["objectKey"])
+                oss_upload_id = str(state["ossUploadId"])
+                if source_path is not None:
+                    uploaded_part = storage.upload_multipart_part_file(
+                        object_key=object_key,
+                        upload_id=oss_upload_id,
+                        part_number=chunk_index + 1,
+                        source=source_path,
+                    )
+                else:
+                    uploaded_part = storage.upload_multipart_part_bytes(
+                        object_key=object_key,
+                        upload_id=oss_upload_id,
+                        part_number=chunk_index + 1,
+                        content=content or b"",
+                    )
+                raw_parts = state.setdefault("parts", {})
+                if not isinstance(raw_parts, dict):
+                    raise BusinessError("OSS 分片上传会话状态不合法")
+                raw_parts[str(chunk_index)] = {
+                    "etag": uploaded_part.etag,
+                    "size": uploaded_part.size,
+                }
+                save_oss_multipart_state(state_path, state)
+                parts = oss_multipart_parts(state, total_chunks)
+
+            received_chunks = len(parts)
+            next_chunk_index = next_missing_oss_chunk_index(parts, total_chunks)
+            if received_chunks < total_chunks:
+                return MaterialUploadChunkResponse(
+                    uploadId=upload_id,
+                    filename=safe_name,
+                    chunkIndex=chunk_index,
+                    totalChunks=total_chunks,
+                    receivedChunks=received_chunks,
+                    nextChunkIndex=next_chunk_index,
+                    status="UPLOADING",
+                    message=f"已直传 OSS 视频分片：{received_chunks}/{total_chunks}，下次从第 {next_chunk_index + 1} 片继续",
+                    completed=False,
+                )
+
+            actual_size = sum(part.size for part in parts.values())
+            if total_size is not None and actual_size != total_size:
+                raise BusinessError("OSS 已上传分片大小与前端声明不一致")
+            stored = storage.complete_multipart_upload(
+                object_key=str(state["objectKey"]),
+                upload_id=str(state["ossUploadId"]),
+                parts=[parts[index] for index in sorted(parts)],
+            )
+            material = self._create_material_from_stored(
+                stored=stored,
+                source_path=None,
+                filename=safe_name,
+                document_type=detect_document_type(safe_name),
+                content_type=content_type,
+                high_precision=high_precision,
+                user_id=user_id,
+            )
+            state["materialId"] = material.id
+            save_oss_multipart_state(state_path, state)
+            marker.write_text(str(material.id), encoding="utf-8")
+            remember_completed_chunk_material(upload_key, material.id)
+            return MaterialUploadChunkResponse(
+                uploadId=upload_id,
+                filename=safe_name,
+                chunkIndex=chunk_index,
+                totalChunks=total_chunks,
+                receivedChunks=total_chunks,
+                nextChunkIndex=total_chunks,
+                status="PROCESSING",
+                message="视频分片已直传 OSS 并完成合并，已触发索引",
+                completed=True,
+                material=material,
+            )
+
     def _finish_chunk_upload(
         self,
         *,
@@ -352,6 +591,29 @@ class RagControlService:
         user_id: str,
     ) -> MaterialUploadChunkResponse:
         """检查分片收齐状态，并把合并文件按路径交给对象存储。"""
+        upload_key = chunk_upload_completion_key(
+            directory=directory,
+            user_id=user_id,
+            upload_id=upload_id,
+            filename=filename,
+            total_chunks=total_chunks,
+            total_size=total_size,
+        )
+        completed = self._completed_chunk_material(upload_key, user_id)
+        if completed is not None:
+            return MaterialUploadChunkResponse(
+                uploadId=upload_id,
+                filename=filename,
+                chunkIndex=chunk_index,
+                totalChunks=total_chunks,
+                receivedChunks=total_chunks,
+                nextChunkIndex=total_chunks,
+                status="PROCESSING",
+                message="视频分片已收齐，继续沿用已有资料记录",
+                completed=True,
+                material=self._material_response_for_user(completed, user_id),
+            )
+
         received_chunks = count_received_chunks(directory)
         next_chunk_index = next_missing_chunk_index(directory, total_chunks)
         if received_chunks < total_chunks:
@@ -367,46 +629,80 @@ class RagControlService:
                 completed=False,
             )
 
-        marker = directory / "material.id"
-        existing = self._chunk_marker_material(marker, user_id)
-        if existing is not None:
-            return MaterialUploadChunkResponse(
-                uploadId=upload_id,
-                filename=filename,
-                chunkIndex=chunk_index,
-                totalChunks=total_chunks,
-                receivedChunks=total_chunks,
-                nextChunkIndex=total_chunks,
-                status="PROCESSING",
-                message="视频分片已收齐，继续沿用已有资料记录",
-                completed=True,
-                material=self._material_response_for_user(existing, user_id),
-            )
+        lock = chunk_upload_lock(upload_key)
+        with lock:
+            completed = self._completed_chunk_material(upload_key, user_id)
+            if completed is not None:
+                return MaterialUploadChunkResponse(
+                    uploadId=upload_id,
+                    filename=filename,
+                    chunkIndex=chunk_index,
+                    totalChunks=total_chunks,
+                    receivedChunks=total_chunks,
+                    nextChunkIndex=total_chunks,
+                    status="PROCESSING",
+                    message="视频分片已收齐，继续沿用已有资料记录",
+                    completed=True,
+                    material=self._material_response_for_user(completed, user_id),
+                )
 
-        merged = merge_chunks(directory, filename, total_chunks, total_size)
-        try:
-            material = self.upload_material(
-                filename=filename,
-                source_path=merged,
-                content_type=content_type,
-                high_precision=high_precision,
-                user_id=user_id,
-            )
-            marker.write_text(str(material.id), encoding="utf-8")
-            return MaterialUploadChunkResponse(
-                uploadId=upload_id,
-                filename=filename,
-                chunkIndex=chunk_index,
-                totalChunks=total_chunks,
-                receivedChunks=total_chunks,
-                nextChunkIndex=total_chunks,
-                status="PROCESSING",
-                message="视频分片已收齐，已完成合并并触发索引",
-                completed=True,
-                material=material,
-            )
-        finally:
-            cleanup_chunk_directory(directory, self._chunk_root())
+            marker = directory / "material.id"
+            existing = self._chunk_marker_material(marker, user_id)
+            if existing is not None:
+                remember_completed_chunk_material(upload_key, existing.id)
+                return MaterialUploadChunkResponse(
+                    uploadId=upload_id,
+                    filename=filename,
+                    chunkIndex=chunk_index,
+                    totalChunks=total_chunks,
+                    receivedChunks=total_chunks,
+                    nextChunkIndex=total_chunks,
+                    status="PROCESSING",
+                    message="视频分片已收齐，继续沿用已有资料记录",
+                    completed=True,
+                    material=self._material_response_for_user(existing, user_id),
+                )
+
+            received_chunks = count_received_chunks(directory)
+            if received_chunks < total_chunks:
+                next_chunk_index = next_missing_chunk_index(directory, total_chunks)
+                return MaterialUploadChunkResponse(
+                    uploadId=upload_id,
+                    filename=filename,
+                    chunkIndex=chunk_index,
+                    totalChunks=total_chunks,
+                    receivedChunks=received_chunks,
+                    nextChunkIndex=next_chunk_index,
+                    status="UPLOADING",
+                    message=f"已接收视频分片：{received_chunks}/{total_chunks}，下次从第 {next_chunk_index + 1} 片继续",
+                    completed=False,
+                )
+
+            merged = merge_chunks(directory, filename, total_chunks, total_size)
+            try:
+                material = self.upload_material(
+                    filename=filename,
+                    source_path=merged,
+                    content_type=content_type,
+                    high_precision=high_precision,
+                    user_id=user_id,
+                )
+                marker.write_text(str(material.id), encoding="utf-8")
+                remember_completed_chunk_material(upload_key, material.id)
+                return MaterialUploadChunkResponse(
+                    uploadId=upload_id,
+                    filename=filename,
+                    chunkIndex=chunk_index,
+                    totalChunks=total_chunks,
+                    receivedChunks=total_chunks,
+                    nextChunkIndex=total_chunks,
+                    status="PROCESSING",
+                    message="视频分片已收齐，已完成合并并触发索引",
+                    completed=True,
+                    material=material,
+                )
+            finally:
+                cleanup_chunk_directory(directory, self._chunk_root())
 
     def reindex_material(self, material_id: int, high_precision: bool, user_id: str) -> RagMaterialResponse:
         """校验受控原文件后投递新版本耐久重建任务。"""
@@ -594,7 +890,20 @@ class RagControlService:
             source_path = self.object_storage.local_path(material)
             if source_path is None:
                 raise BusinessError("视频资料必须存储在 Python 可访问的受控对象存储中")
-            parsed = self.parser_router.parse_video_source(
+            parsed = parse_video_source_with_worker_pool(
+                parser_router=self.parser_router,
+                document_id=document_id,
+                title=material.title,
+                document_type=material.document_type,
+                source=material.source or "upload",
+                user_id=material.user_id,
+                visibility_scope="private",
+                source_path=str(source_path),
+                filename=material.original_filename or material.title,
+                content_type=content_type,
+                high_precision=high_precision,
+                progress_reporter=progress,
+            ) or self.parser_router.parse_video_source(
                 document_id=document_id,
                 title=material.title,
                 document_type=material.document_type,
@@ -834,6 +1143,17 @@ class RagControlService:
         except Exception:
             return None
 
+    def _completed_chunk_material(self, upload_key: str, user_id: str) -> MaterialRecord | None:
+        """读取当前进程已完成的分片上传记录，支撑并发最终分片幂等返回。"""
+        material_id = completed_chunk_material_id(upload_key)
+        if material_id is None:
+            return None
+        try:
+            with self.repository.transaction() as transaction:
+                return transaction.find_material(material_id, user_id)
+        except Exception:
+            return None
+
     def _delete_stored_object(self, stored: StoredObject) -> None:
         """资料建档失败时清理刚写入的本地或 OSS 对象。"""
         if stored.storage_type == "local":
@@ -1048,6 +1368,112 @@ def preview_content_type(document_type: str) -> str:
     return "text/markdown; charset=UTF-8" if document_type.lower() in {"markdown", "md"} else "text/plain; charset=UTF-8"
 
 
+def copy_video_sidecars_to_storage(
+    *,
+    stored: StoredObject,
+    object_storage: RagObjectStorage,
+    source_path: str | Path | None,
+    filename: str,
+    document_type: str,
+    user_id: str,
+) -> None:
+    """将视频同名字幕同步到实际存储，供 worker 下载原视频后优先发现字幕。"""
+    storage_type = str(stored.storage_type or "").strip().lower()
+    if not is_video_upload(filename, document_type):
+        return
+    candidates = iter_video_sidecar_candidates(source_path, filename)
+    if storage_type == "oss":
+        upload_sidecar = getattr(object_storage, "store_video_sidecar_file", None)
+        if not callable(upload_sidecar) or not stored.object_key:
+            return
+        copied_suffixes: set[str] = set()
+        for candidate in candidates:
+            suffix = candidate.suffix.lower()
+            if suffix not in VIDEO_SIDECAR_SUFFIXES or suffix in copied_suffixes:
+                continue
+            try:
+                resolved_candidate = candidate.expanduser().resolve()
+                if not resolved_candidate.is_file():
+                    continue
+                upload_sidecar(resolved_candidate, stored.object_key, user_id)
+                copied_suffixes.add(suffix)
+            except Exception as exc:
+                # 字幕侧车文件只是视频解析增强信息，上传失败不能阻断资料主流程。
+                logger.warning("上传 OSS 视频侧车字幕失败，已忽略: %s", exc)
+        return
+    if storage_type != "local":
+        return
+    try:
+        target_video = Path(stored.source_path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return
+    if not target_video.is_file():
+        return
+
+    copied_suffixes: set[str] = set()
+    for candidate in candidates:
+        suffix = candidate.suffix.lower()
+        if suffix not in VIDEO_SIDECAR_SUFFIXES or suffix in copied_suffixes:
+            continue
+        try:
+            resolved_candidate = candidate.expanduser().resolve()
+            if not resolved_candidate.is_file() or resolved_candidate == target_video.with_suffix(suffix).resolve():
+                continue
+            _copy_file(resolved_candidate, target_video.with_suffix(suffix))
+            copied_suffixes.add(suffix)
+        except Exception as exc:
+            # 字幕侧车文件只是视频解析增强信息，复制失败不能阻断资料上传主流程。
+            logger.warning("复制视频侧车字幕失败，已忽略: %s", exc)
+
+
+def is_video_upload(filename: str, document_type: str) -> bool:
+    """判断本次上传是否属于视频资料。"""
+    detected_type = str(document_type or "").strip().lower()
+    suffix_type = Path(filename or "").suffix.lower().lstrip(".")
+    return detected_type in VIDEO_TYPES or suffix_type in VIDEO_TYPES
+
+
+def iter_video_sidecar_candidates(source_path: str | Path | None, filename: str) -> list[Path]:
+    """按上传源目录与额外搜索目录寻找同名 .srt/.vtt 字幕。"""
+    candidates: list[Path] = []
+    original_name = Path(safe_filename(filename))
+    source = Path(source_path).expanduser() if source_path is not None else None
+    if source is not None:
+        # 同目录优先查原始文件名；兼容临时源文件本身已经保留原名的情况。
+        for suffix in VIDEO_SIDECAR_SUFFIXES:
+            candidates.append(source.parent / original_name.with_suffix(suffix).name)
+            candidates.append(source.with_suffix(suffix))
+
+    for directory in configured_sidecar_search_dirs():
+        for suffix in VIDEO_SIDECAR_SUFFIXES:
+            candidates.append(directory / original_name.with_suffix(suffix).name)
+    return unique_paths(candidates)
+
+
+def configured_sidecar_search_dirs() -> list[Path]:
+    """读取 RAG_VIDEO_SIDECAR_SEARCH_DIRS 中用分号或逗号分隔的字幕搜索目录。"""
+    raw_value = os.getenv("RAG_VIDEO_SIDECAR_SEARCH_DIRS", "")
+    directories: list[Path] = []
+    for item in raw_value.replace(";", ",").split(","):
+        text = item.strip().strip('"')
+        if text:
+            directories.append(Path(text).expanduser())
+    return directories
+
+
+def unique_paths(paths: list[Path]) -> list[Path]:
+    """保留候选路径顺序并去重，避免重复复制同一个字幕文件。"""
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
 def detect_document_type(filename: str) -> str:
     """根据受控文件名后缀推断解析路线。"""
     return DOCUMENT_TYPES.get(Path(filename).suffix.lower(), "text")
@@ -1075,11 +1501,156 @@ def safe_path_token(value: str) -> str:
     return cleaned or "anonymous"
 
 
+def chunk_upload_completion_key(
+    *,
+    directory: Path,
+    user_id: str,
+    upload_id: str,
+    filename: str,
+    total_chunks: int,
+    total_size: int | None,
+) -> str:
+    """生成分片上传完成幂等键，避免并发最终分片重复合并建档。"""
+    safe_size = "" if total_size is None else str(total_size)
+    return "|".join(
+        [
+            str(directory.resolve()),
+            safe_path_token(user_id),
+            sanitize_upload_id(upload_id),
+            safe_filename(filename),
+            str(total_chunks),
+            safe_size,
+        ]
+    )
+
+
+def chunk_upload_lock(upload_key: str) -> threading.Lock:
+    """返回 upload 级别进程内锁，保证单进程 API 并发收尾只执行一次。"""
+    with _CHUNK_UPLOAD_LOCKS_GUARD:
+        lock = _CHUNK_UPLOAD_LOCKS.get(upload_key)
+        if lock is None:
+            lock = threading.Lock()
+            _CHUNK_UPLOAD_LOCKS[upload_key] = lock
+        return lock
+
+
+def remember_completed_chunk_material(upload_key: str, material_id: int) -> None:
+    """记录已完成上传对应资料，供同一 uploadId 的并发请求直接复用。"""
+    with _CHUNK_UPLOAD_LOCKS_GUARD:
+        _CHUNK_UPLOAD_COMPLETED_MATERIALS[upload_key] = material_id
+
+
+def completed_chunk_material_id(upload_key: str) -> int | None:
+    """读取已完成分片上传资料 ID。"""
+    with _CHUNK_UPLOAD_LOCKS_GUARD:
+        return _CHUNK_UPLOAD_COMPLETED_MATERIALS.get(upload_key)
+
+
 def sanitize_upload_id(value: str | None) -> str:
     """upload ID 仅保留安全字符，防止目录穿越。"""
     if not value:
         return ""
     return "".join(char for char in value if char.isalnum() or char in "_-")
+
+
+def completed_chunk_response(
+    *,
+    upload_id: str,
+    filename: str,
+    chunk_index: int,
+    total_chunks: int,
+    material: RagMaterialResponse,
+) -> MaterialUploadChunkResponse:
+    """构造同一 uploadId 的幂等完成响应。"""
+    return MaterialUploadChunkResponse(
+        uploadId=upload_id,
+        filename=filename,
+        chunkIndex=chunk_index,
+        totalChunks=total_chunks,
+        receivedChunks=total_chunks,
+        nextChunkIndex=total_chunks,
+        status="PROCESSING",
+        message="视频分片已收齐，继续沿用已有资料记录",
+        completed=True,
+        material=material,
+    )
+
+
+def oss_multipart_state_path(directory: Path) -> Path:
+    """返回仅含元数据的 OSS multipart 会话文件，不保存视频正文。"""
+    return directory / "oss-multipart.json"
+
+
+def load_oss_multipart_state(path: Path) -> dict[str, Any] | None:
+    """读取可续传的 OSS multipart 会话元数据。"""
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BusinessError("OSS 分片上传会话状态损坏，请重新选择文件上传") from exc
+    if not isinstance(raw, dict):
+        raise BusinessError("OSS 分片上传会话状态不合法")
+    return raw
+
+
+def save_oss_multipart_state(path: Path, state: dict[str, Any]) -> None:
+    """原子写入小型 multipart 会话元数据，避免并发请求留下半截 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as output:
+        json.dump(state, output, ensure_ascii=False, separators=(",", ":"))
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+
+
+def validate_oss_multipart_state(
+    state: dict[str, Any],
+    *,
+    filename: str,
+    total_chunks: int,
+    total_size: int | None,
+) -> None:
+    """拒绝同一 uploadId 被不同文件或分片参数复用。"""
+    if str(state.get("objectKey") or "").strip() == "" or str(state.get("ossUploadId") or "").strip() == "":
+        raise BusinessError("OSS 分片上传会话缺少对象信息")
+    if state.get("filename") != filename or safe_int_or_none(state.get("totalChunks")) != total_chunks:
+        raise BusinessError("uploadId 已绑定其他视频或分片数量")
+    stored_total_size = safe_int_or_none(state.get("totalSize"))
+    if stored_total_size != total_size:
+        raise BusinessError("uploadId 已绑定其他文件大小")
+    if not isinstance(state.get("parts"), dict):
+        raise BusinessError("OSS 分片上传会话缺少 part 信息")
+
+
+def oss_multipart_parts(state: dict[str, Any], total_chunks: int) -> dict[int, OssMultipartPart]:
+    """把会话 JSON 中已确认的 ETag 转换为连续性可校验的 part 清单。"""
+    raw_parts = state.get("parts")
+    if not isinstance(raw_parts, dict):
+        raise BusinessError("OSS 分片上传会话缺少 part 信息")
+    parts: dict[int, OssMultipartPart] = {}
+    for raw_index, raw_part in raw_parts.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise BusinessError("OSS 分片序号不合法") from exc
+        if index < 0 or index >= total_chunks or not isinstance(raw_part, dict):
+            raise BusinessError("OSS 分片序号不合法")
+        etag = str(raw_part.get("etag") or "").strip()
+        size = safe_int_or_none(raw_part.get("size"))
+        if not etag or size is None or size <= 0:
+            raise BusinessError("OSS 分片确认信息不完整")
+        parts[index] = OssMultipartPart(part_number=index + 1, etag=etag, size=size)
+    return parts
+
+
+def next_missing_oss_chunk_index(parts: dict[int, OssMultipartPart], total_chunks: int) -> int:
+    """返回 OSS multipart 最小缺失片序号，供前端续传。"""
+    for index in range(total_chunks):
+        if index not in parts:
+            return index
+    return total_chunks
 
 
 def chunk_filename(index: int) -> str:

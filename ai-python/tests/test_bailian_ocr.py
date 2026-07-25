@@ -1,4 +1,4 @@
-from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
+from video.ocr.bailian_ocr import DEFAULT_MAX_IMAGE_BYTES, BailianOcrClient, OcrResult
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.observability.process_logger import RagProcessLogger, use_process_logger
 
@@ -68,6 +68,19 @@ def test_bailian_ocr_client_uses_dashscope_api_key(monkeypatch):
 
     assert client.api_key == "dashscope-test-key"
     assert client.enabled is True
+
+
+def test_bailian_ocr_clamps_raw_image_limit_for_base64_payload():
+    """避免把原始 10MiB 图片编码为超过百炼 10MB 上限的 Base64 请求。"""
+
+    client = BailianOcrClient(
+        api_key="test-api-key",
+        enabled=True,
+        max_image_bytes=10 * 1024 * 1024,
+    )
+
+    assert client.max_image_bytes == DEFAULT_MAX_IMAGE_BYTES
+    assert client.max_image_bytes < 10 * 1024 * 1024
 
 
 def test_bailian_ocr_request_failure_is_recoverable_warning(capsys):

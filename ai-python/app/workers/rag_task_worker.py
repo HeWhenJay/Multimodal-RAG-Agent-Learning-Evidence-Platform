@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
 import os
@@ -98,28 +99,47 @@ class RagDurableTaskWorker:
         self.worker_id = worker_id or f"{socket.gethostname() or 'python'}-{uuid4().hex[:12]}"
 
     def run_once(self) -> dict[str, int]:
-        """执行一轮抢占任务；单个任务失败不阻塞同轮其他任务。"""
+        """执行一轮抢占任务；同类任务由固定 Worker 池并发执行。"""
         summary = {"queryClaimed": 0, "queryCompleted": 0, "queryFailed": 0, "indexClaimed": 0, "indexCompleted": 0, "indexFailed": 0}
         batch_size = positive_int("RAG_TASK_WORKER_BATCH_SIZE", 4)
         lease_seconds = positive_int("RAG_TASK_WORKER_LEASE_SECONDS", 120)
-        for task in self.query_repository.claim(worker_id=self.worker_id, batch_size=batch_size, lease_seconds=lease_seconds):
-            summary["queryClaimed"] += 1
-            if self._run_query_task(task):
+        worker_count = task_worker_concurrency()
+        query_tasks = list(self.query_repository.claim(worker_id=self.worker_id, batch_size=batch_size, lease_seconds=lease_seconds))
+        summary["queryClaimed"] = len(query_tasks)
+        for succeeded in self._run_concurrently(query_tasks, self._run_query_task, worker_count):
+            if succeeded:
                 summary["queryCompleted"] += 1
             else:
                 summary["queryFailed"] += 1
         if local_index_enabled():
-            for job in self.index_repository.claim_local_jobs(
+            index_jobs = list(self.index_repository.claim_local_jobs(
                 worker_id=self.worker_id,
                 batch_size=batch_size,
                 lease_seconds=lease_seconds,
-            ):
-                summary["indexClaimed"] += 1
-                if self._run_local_index_job(job):
+            ))
+            summary["indexClaimed"] = len(index_jobs)
+            for succeeded in self._run_concurrently(index_jobs, self._run_local_index_job, worker_count):
+                if succeeded:
                     summary["indexCompleted"] += 1
                 else:
                     summary["indexFailed"] += 1
         return summary
+
+    @staticmethod
+    def _run_concurrently(tasks: list[Any], handler: Any, worker_count: int) -> list[bool]:
+        """让抢占到的任务由共享线程池自行承接，结果由主线程汇总。"""
+        if not tasks:
+            return []
+        active_workers = min(worker_count, len(tasks))
+        with ThreadPoolExecutor(max_workers=active_workers, thread_name_prefix="rag-durable-worker") as pool:
+            futures = [pool.submit(handler, task) for task in tasks]
+            results: list[bool] = []
+            for future in as_completed(futures):
+                try:
+                    results.append(bool(future.result()))
+                except Exception:
+                    results.append(False)
+            return results
 
     def _run_query_task(self, task: DurableQueryTask) -> bool:
         """执行一条已租约查询，并逐阶段更新其持久化历史。"""
@@ -237,6 +257,11 @@ def local_index_enabled() -> bool:
     if read_bool("RAG_KAFKA_ENABLED", False):
         return False
     return read_bool("RAG_LOCAL_INDEX_WORKER_ENABLED", True)
+
+
+def task_worker_concurrency() -> int:
+    """读取耐久任务 Worker 并发数，默认 2，避免当前本机内存压力下过度抢占。"""
+    return min(8, positive_int("RAG_TASK_WORKER_CONCURRENCY", 2))
 
 
 def parse_not_before(value: object) -> datetime:

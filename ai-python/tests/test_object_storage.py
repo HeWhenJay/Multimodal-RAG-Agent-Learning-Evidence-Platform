@@ -38,6 +38,8 @@ class FakeOssBucket:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.calls: list[tuple[str, str]] = []
+        self.multipart_uploads: dict[tuple[str, str], dict[int, tuple[str, bytes]]] = {}
+        self.multipart_calls: list[tuple[str, str, int]] = []
 
     def put_object_from_file(self, key: str, filename: str, headers=None) -> None:
         """保存上传文件并记录调用。"""
@@ -59,6 +61,25 @@ class FakeOssBucket:
     def delete_object(self, key: str) -> None:
         """删除对象。"""
         self.objects.pop(key, None)
+
+    def init_multipart_upload(self, key: str, headers=None):  # noqa: ANN001
+        """创建可由测试读取的 multipart 会话。"""
+        upload_id = f"upload-{len(self.multipart_uploads) + 1}"
+        self.multipart_uploads[(key, upload_id)] = {}
+        return SimpleNamespace(upload_id=upload_id)
+
+    def upload_part(self, key: str, upload_id: str, part_number: int, data):  # noqa: ANN001
+        """接收文件流或 bytes，并返回稳定 ETag。"""
+        content = data.read() if hasattr(data, "read") else bytes(data)
+        etag = f"etag-{part_number}-{len(content)}"
+        self.multipart_uploads[(key, upload_id)][part_number] = (etag, content)
+        self.multipart_calls.append((key, upload_id, part_number))
+        return SimpleNamespace(etag=etag)
+
+    def complete_multipart_upload(self, key: str, upload_id: str, parts, headers=None):  # noqa: ANN001
+        """按 SDK PartInfo 序号聚合 multipart 内容。"""
+        uploaded = self.multipart_uploads[(key, upload_id)]
+        self.objects[key] = b"".join(uploaded[item.part_number][1] for item in parts)
 
 
 def test_provider_switches_between_local_and_oss(monkeypatch, tmp_path):
@@ -95,6 +116,47 @@ def test_oss_key_is_user_scoped_and_stream_uploads(tmp_path):
         storage.validate_object_key("learning-evidence/42/markdown/../43/file.md", "42")
 
 
+def test_oss_multipart_streams_file_parts_and_completes(tmp_path):
+    """长视频分片应直接写入 OSS multipart，不需要本地合并文件。"""
+    bucket = FakeOssBucket()
+    storage = OssRagObjectStorage(bucket=bucket, bucket_name="evidence", object_prefix="learning-evidence")
+    first = tmp_path / "part-1.bin"
+    second = tmp_path / "part-2.bin"
+    first.write_bytes(b"abc")
+    second.write_bytes(b"def")
+
+    session = storage.start_multipart_upload(
+        filename="lesson.mp4",
+        user_id="42",
+        document_type="mp4",
+        content_type="video/mp4",
+    )
+    part_one = storage.upload_multipart_part_file(
+        object_key=session.object_key,
+        upload_id=session.upload_id,
+        part_number=1,
+        source=first,
+    )
+    part_two = storage.upload_multipart_part_file(
+        object_key=session.object_key,
+        upload_id=session.upload_id,
+        part_number=2,
+        source=second,
+    )
+    stored = storage.complete_multipart_upload(
+        object_key=session.object_key,
+        upload_id=session.upload_id,
+        parts=[part_one, part_two],
+    )
+
+    assert stored.object_key == session.object_key
+    assert bucket.multipart_calls == [
+        (session.object_key, session.upload_id, 1),
+        (session.object_key, session.upload_id, 2),
+    ]
+    assert bucket.objects[session.object_key] == b"abcdef"
+
+
 def test_kafka_oss_source_downloads_and_cleans_temp_file(monkeypatch, tmp_path):
     """Kafka OSS source 必须下载到临时文件，并在 cleanup 后删除。"""
     bucket = FakeOssBucket()
@@ -122,6 +184,41 @@ def test_kafka_oss_source_downloads_and_cleans_temp_file(monkeypatch, tmp_path):
     assert downloaded.read_bytes() == b"pdf bytes"
     opened.cleanup()
     assert not downloaded.exists()
+
+
+def test_kafka_oss_video_source_downloads_same_key_sidecar(monkeypatch, tmp_path):
+    """OSS 视频与同名侧车字幕应一起下载，并在 worker 清理时一起删除。"""
+    bucket = FakeOssBucket()
+    storage = OssRagObjectStorage(
+        bucket=bucket,
+        bucket_name="evidence",
+        object_prefix="learning-evidence",
+    )
+    video = tmp_path / "course.mp4"
+    subtitle = tmp_path / "course.srt"
+    video.write_bytes(b"video bytes")
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n课程字幕\n", encoding="utf-8")
+    stored = storage.store_file(video, "course.mp4", "42", "mp4", "video/mp4")
+    sidecar_key = storage.store_video_sidecar_file(subtitle, stored.object_key or "", "42")
+    monkeypatch.setenv("EVIDENCE_UPLOAD_TEMP_ROOT", str(tmp_path / "temp"))
+
+    opened = open_storage_source(
+        StorageSourceRef(
+            storageType="oss",
+            objectKey=stored.object_key,
+            filename="course.mp4",
+            contentType="video/mp4",
+        ),
+        user_id="42",
+        object_storage=storage,
+    )
+    downloaded = opened.path
+    downloaded_subtitle = downloaded.with_suffix(".srt")
+    assert sidecar_key.endswith(".srt")
+    assert downloaded_subtitle.read_text(encoding="utf-8") == subtitle.read_text(encoding="utf-8")
+    opened.cleanup()
+    assert not downloaded.exists()
+    assert not downloaded_subtitle.exists()
 
 
 @pytest.mark.anyio

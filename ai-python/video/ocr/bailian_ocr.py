@@ -14,6 +14,10 @@ from rag.observability.process_logger import process_event
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.5-ocr"
+MAX_BASE64_IMAGE_BYTES = 10_000_000
+DATA_URL_OVERHEAD_BYTES = 64
+# 百炼对 Base64 图片字符串限制为 10MB，保守预留 data URL 头后换算为原始图片字节数。
+DEFAULT_MAX_IMAGE_BYTES = ((MAX_BASE64_IMAGE_BYTES - DATA_URL_OVERHEAD_BYTES) // 4) * 3
 DEFAULT_PROMPT = (
     "请只返回图片中的 OCR 文本，保留自然段、标题和表格结构。"
     "如果是表格，请优先使用 Markdown 表格；不要输出解释、免责声明或额外说明。"
@@ -52,7 +56,10 @@ class BailianOcrClient:
         self.base_url = (base_url or os.getenv("BAILIAN_OCR_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or os.getenv("BAILIAN_OCR_MODEL") or DEFAULT_MODEL
         self.timeout_seconds = timeout_seconds or float(os.getenv("BAILIAN_OCR_TIMEOUT_SECONDS", "60"))
-        self.max_image_bytes = max_image_bytes or int(os.getenv("BAILIAN_OCR_MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+        configured_max_image_bytes = max_image_bytes or int(
+            os.getenv("BAILIAN_OCR_MAX_IMAGE_BYTES", str(DEFAULT_MAX_IMAGE_BYTES))
+        )
+        self.max_image_bytes = min(max(1, configured_max_image_bytes), DEFAULT_MAX_IMAGE_BYTES)
         self.max_attempts = max(1, max_attempts or int(os.getenv("BAILIAN_OCR_MAX_ATTEMPTS", "3")))
         self.retry_delay_seconds = max(
             0.0,
@@ -90,7 +97,10 @@ class BailianOcrClient:
             return OcrResult(
                 text="",
                 parser="bailian-qwen-ocr",
-                warnings=[f"Bailian OCR skipped: image is larger than {self.max_image_bytes} bytes"],
+                warnings=[
+                    f"Bailian OCR skipped: image is larger than {self.max_image_bytes} raw bytes "
+                    f"allowed by the {MAX_BASE64_IMAGE_BYTES} byte Base64 limit"
+                ],
             )
 
         payload = self._build_payload(image_bytes=image_bytes, filename=filename, mime_type=mime_type, prompt=prompt)

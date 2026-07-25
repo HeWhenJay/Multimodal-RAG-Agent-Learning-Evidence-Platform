@@ -8,9 +8,11 @@ os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope, StorageSourceRef
 from app.workers.kafka_worker import (
     KafkaWorkerConnectionError,
+    kafka_auto_offset_reset,
     is_connection_exception,
     is_reconnectable_error,
     message_hash,
+    positive_milliseconds,
     publish_consumer_dlq,
     reconnect_max_seconds,
     run_consumer_forever,
@@ -70,6 +72,22 @@ def test_kafka_worker_error_classifier_ignores_unknown_error_code():
 
     assert is_reconnectable_error(Error(), KafkaErrorType) is False
     assert reconnect_max_seconds(2.0) >= 2.0
+
+
+def test_kafka_long_task_poll_interval_has_safe_default(monkeypatch):
+    """长视频索引应允许覆盖 Kafka 默认 5 分钟 poll 间隔。"""
+    monkeypatch.setenv("RAG_KAFKA_MAX_POLL_INTERVAL_MS", "1800000")
+    assert positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 3_600_000) == 1_800_000
+    monkeypatch.setenv("RAG_KAFKA_MAX_POLL_INTERVAL_MS", "invalid")
+    assert positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 3_600_000) == 3_600_000
+
+
+def test_kafka_auto_offset_reset_accepts_only_supported_values(monkeypatch):
+    """测试隔离消费组可从启动后新增消息开始，非法值仍保持安全默认。"""
+    monkeypatch.setenv("RAG_KAFKA_AUTO_OFFSET_RESET", "latest")
+    assert kafka_auto_offset_reset() == "latest"
+    monkeypatch.setenv("RAG_KAFKA_AUTO_OFFSET_RESET", "invalid")
+    assert kafka_auto_offset_reset() == "earliest"
 
 
 def test_unhandled_consumer_message_is_redacted_into_dlq():
@@ -176,6 +194,44 @@ def test_inline_text_indexes_staging_and_private_query_does_not_see_it(monkeypat
     assert store.documents["material-1__job-job-1"]["visibilityScope"] == "staging"
     assert response.answerStatus == "REFUSED"
     assert any(sent[2].messageType == "RAG_INDEX_RESULT" for sent in fake_producer.sent)
+
+
+def test_index_result_omits_full_progress_history_from_kafka_payload():
+    """长视频的进度历史应走 progress topic，不能撑大终态消息。"""
+    from app.schemas.rag import IndexResponse, ProgressEvent
+
+    fake_producer = FakeProducer()
+    worker = RagKafkaIndexWorker(
+        store=InMemoryRagStore(),
+        producer=fake_producer,
+        progress_producer=FakeProgressProducer(),
+    )
+    payload = IndexRequestPayload.model_validate(base_index_payload())
+    response = IndexResponse(
+        documentId=payload.stagingDocumentId,
+        title=payload.title,
+        status="READY",
+        chunkCount=1702,
+        parser="video-parallel-worker-pool+sidecar-subtitle",
+        documentSummary="长视频已完成索引",
+        progressEvents=[
+            ProgressEvent(
+                stageCode="vector.upsert.chunk",
+                stageLabel="写入向量数据库",
+                message="逐块进度",
+                currentChunk=index,
+                totalChunks=1702,
+            )
+            for index in range(1, 6200)
+        ],
+    )
+
+    worker._send_result(envelope("RAG_INDEX_REQUESTED", payload.model_dump(mode="json")), payload, response)
+
+    result_event = fake_producer.sent[-1][2]
+    assert result_event.messageType == "RAG_INDEX_RESULT"
+    assert "progressEvents" not in result_event.payload
+    assert len(result_event.model_dump_json().encode("utf-8")) < 1_048_588
 
 
 def test_promote_is_idempotent_and_private_query_can_see_canonical(monkeypatch):

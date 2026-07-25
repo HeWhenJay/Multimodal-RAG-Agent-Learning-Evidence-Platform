@@ -195,6 +195,11 @@ $env:BAILIAN_OCR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 - `BAILIAN_OCR_ENABLED`：默认 `auto`，存在 Key 时启用；设置为 `false` 可强制禁用。
 - `BAILIAN_OCR_TIMEOUT_SECONDS`：默认 `60`。
-- `BAILIAN_OCR_MAX_IMAGE_BYTES`：默认 `10485760`。
+- `BAILIAN_OCR_MAX_IMAGE_BYTES`：默认 `7499952`，按 Base64 编码字符串 10MB 上限保守换算；配置更大的值仍会被客户端限制到该上限。
 - `BAILIAN_OCR_MAX_ATTEMPTS`：默认 `3`，单张图片或关键帧失败后会先重试，生产可按稳定性调到 `3-5`。
 - `BAILIAN_OCR_RETRY_DELAY_SECONDS`：默认 `2`，每次 OCR 失败后等待再重试的秒数。
+- `RAG_VIDEO_OCR_BATCH_MAX_SIZE`：默认 `4`，关键帧 OCR 微批最多收集 4 帧；仍是一帧一个兼容接口请求，不依赖未声明的多图 API。
+- `RAG_VIDEO_OCR_BATCH_WAIT_MS`：默认 `800`，首帧到达后未满批时的最大等待窗口；满批或输入关闭立即派发。
+- `RAG_VIDEO_OCR_MAX_IN_FLIGHT`：默认 `2`，单个媒体分段最多同时执行的远程 OCR 请求。配合默认 2 个媒体 Worker，最多为 4 个并发请求。
+
+`qwen3.5-ocr` 的官方文档未声明单请求多图上限，且 Batch API 支持列表未列出该模型，因此本项目不把多帧拼入一个请求。详细限制和运行契约见 `docs/api/rag.md`。

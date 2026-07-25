@@ -1,8 +1,10 @@
 ﻿from pathlib import Path
 
+from app.storage.object_storage import StoredObject
 from video.asr.bailian_asr import BailianAsrClient, milliseconds_to_srt_timestamp, transcription_json_to_srt
 from video.chunking.video_processing import (
     AudioSegment,
+    AudioSegmentAsrMicrobatchDispatcher,
     TranscriptCue,
     cue_center_in_segment,
     estimate_srt_from_transcript,
@@ -147,6 +149,47 @@ def test_filetrans_reports_poll_progress(monkeypatch):
     assert any(event.get("phase") == "download" for event in events)
 
 
+def test_local_audio_segment_uses_oss_url_for_filetrans(monkeypatch, tmp_path: Path):
+    """本地音频段应临时上传 OSS，用公开 URL 发起 filetrans 后清理对象。"""
+    audio_path = tmp_path / "segment.mp3"
+    audio_path.write_bytes(b"fake-audio")
+    calls = {"stored": [], "deleted": [], "urls": []}
+
+    class FakeStorage:
+        storage_type = "oss"
+
+        def store_file(self, source, filename, user_id, document_type, content_type=None):
+            calls["stored"].append((Path(source), filename, user_id, document_type, content_type))
+            return StoredObject(
+                storage_type="oss",
+                source_path="https://oss.example.com/asr-temp/segment.mp3",
+                object_key="learning-evidence/asr-temp/asr-audio/segment.mp3",
+                public_url="https://oss.example.com/asr-temp/segment.mp3",
+            )
+
+        def delete_object_key(self, key):
+            calls["deleted"].append(key)
+
+    monkeypatch.setenv("EVIDENCE_STORAGE_PROVIDER", "oss")
+    monkeypatch.setenv("RAG_ASR_AUDIO_VIA_OSS", "true")
+    monkeypatch.setenv("RAG_ASR_FILETRANS_ENABLED", "true")
+    monkeypatch.setattr("app.storage.object_storage.build_rag_object_storage", lambda: FakeStorage())
+    client = BailianAsrClient(api_key="test-key", provider="dashscope_filetrans")
+    monkeypatch.setattr(
+        client,
+        "_call_filetrans",
+        lambda url, progress_callback=None: calls["urls"].append(url) or "1\n00:00:00,000 --> 00:00:01,000\n转写文本",
+    )
+
+    text, warnings = client.transcribe_audio_file(audio_path)
+
+    assert "转写文本" in text
+    assert warnings == []
+    assert calls["stored"][0][4] == "audio/mpeg"
+    assert calls["urls"] == ["https://oss.example.com/asr-temp/segment.mp3"]
+    assert calls["deleted"] == ["learning-evidence/asr-temp/asr-audio/segment.mp3"]
+
+
 def test_transcription_json_to_srt_requires_timestamped_sentences():
     srt = transcription_json_to_srt(
         {
@@ -188,6 +231,51 @@ def test_overlapped_audio_segment_only_indexes_nominal_window(tmp_path: Path):
 
     assert not cue_center_in_segment(TranscriptCue(1, 292, 296, "上一段上下文"), segment)
     assert cue_center_in_segment(TranscriptCue(2, 598, 603, "边界处连续讲解"), segment)
+
+
+def test_audio_segment_asr_microbatch_preserves_submit_order(tmp_path: Path):
+    """ASR 微批并发返回后，调用方可按提交 Future 保持原视频分段顺序。"""
+
+    class FakeAsrClient:
+        should_call_dashscope = False
+        api_key = None
+        model = "fake-asr"
+
+        def transcribe_audio_file(self, audio_path):
+            return f"{audio_path.stem} 转写文本", []
+
+    segments = []
+    for index in range(3):
+        audio_path = tmp_path / f"segment-{index + 1}.wav"
+        audio_path.write_bytes(b"fake-audio")
+        segments.append(
+            AudioSegment(
+                path=audio_path,
+                nominal_start=index * 300,
+                nominal_end=(index + 1) * 300,
+                extract_start=index * 300,
+                extract_end=(index + 1) * 300,
+            )
+        )
+    dispatcher = AudioSegmentAsrMicrobatchDispatcher(
+        asr_client=FakeAsrClient(),
+        batch_max_size=2,
+        batch_wait_ms=10,
+        max_in_flight=2,
+        progress_reporter=None,
+        total_segments=len(segments),
+    )
+
+    futures = [
+        dispatcher.submit(index=segment_index, segment=segment)
+        for segment_index, segment in enumerate(segments, start=1)
+    ]
+    dispatcher.close()
+    results = [future.result() for future in futures]
+
+    assert [result.index for result in results] == [1, 2, 3]
+    assert [result.text for result in results] == ["segment-1 转写文本", "segment-2 转写文本", "segment-3 转写文本"]
+    assert [result.batch_size for result in results] == [2, 2, 1]
 
 
 def test_merge_transcript_cues_deduplicates_overlap_text():

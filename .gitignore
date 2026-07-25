@@ -48,6 +48,7 @@ ai-python/config/application.local.yml
 uploads/
 data/
 tmp/
+test-results/
 *.mp4
 *.mov
 *.mkv

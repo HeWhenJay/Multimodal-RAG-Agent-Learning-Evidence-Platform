@@ -1,3 +1,5 @@
+import threading
+import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -6,12 +8,15 @@ from app.schemas.rag import DocumentBlock
 from video.chunking import video_processing as vp
 from video.chunking.video_dedup import dedupe_video_frame_blocks
 from video.chunking.video_processing import (
+    FrameOcrMicrobatchDispatcher,
     FrameImage,
     build_video_segment_summary_blocks,
     extract_keyframes,
     frames_between,
+    ocr_video_frames,
     select_ppt_slide_frames,
 )
+from video.ocr.bailian_ocr import OcrResult
 
 
 def make_frame(path: Path, text: str, *, fill: str = "white") -> Path:
@@ -302,3 +307,116 @@ def test_visual_dedup_disabled_falls_back_to_basic_v2(tmp_path, monkeypatch):
     assert warnings == []
     assert [frame.trigger for frame in selected] == ["initial_slide", "interval"]
     assert all(frame.visual_decision is None for frame in selected)
+
+
+class TimedOcrClient:
+    """记录并发起点的 OCR 替身，避免单测访问远程百炼服务。"""
+
+    available = True
+    enabled = True
+    model = "timed-fake-ocr"
+
+    def __init__(self, delay_seconds: float = 0.12) -> None:
+        self.delay_seconds = delay_seconds
+        self.starts: list[float] = []
+        self.lock = threading.Lock()
+
+    def recognize_image_bytes(self, *, image_bytes, filename, retry_callback=None):
+        with self.lock:
+            self.starts.append(time.monotonic())
+        time.sleep(self.delay_seconds)
+        return OcrResult(
+            text=f"识别 {filename}",
+            parser="timed-fake-ocr",
+            confidence=0.9,
+            metadata={"ocrModel": self.model},
+        )
+
+
+def test_ocr_microbatch_dispatches_four_frames_with_two_in_flight(tmp_path, monkeypatch):
+    """验证满批立即派发、并发受限且每帧 evidence 仍完整保留。"""
+
+    monkeypatch.setenv("RAG_VIDEO_OCR_BATCH_MAX_SIZE", "4")
+    monkeypatch.setenv("RAG_VIDEO_OCR_BATCH_WAIT_MS", "800")
+    monkeypatch.setenv("RAG_VIDEO_OCR_MAX_IN_FLIGHT", "2")
+    client = TimedOcrClient()
+    frames = [
+        FrameImage(time_seconds=index * 30, path=make_frame(tmp_path / f"batch-{index}.jpg", str(index)))
+        for index in range(4)
+    ]
+
+    started = time.monotonic()
+    blocks, warnings = ocr_video_frames(
+        frames=frames,
+        document_id="doc-batch",
+        file_type="mp4",
+        source_title="批量视频",
+        source_path="uploads/rag/batch.mp4",
+        ocr_client=client,
+    )
+    elapsed = time.monotonic() - started
+
+    assert warnings == []
+    assert len(blocks) == 4
+    assert elapsed < 0.38  # 串行四帧至少约 0.48s；2 个 in-flight 应为两波。
+    assert max(client.starts[:2]) - min(client.starts[:2]) < 0.08
+    assert {block.metadata["ocrBatchSize"] for block in blocks} == {4}
+    assert {block.metadata["ocrBatchMaxSize"] for block in blocks} == {4}
+    assert all(block.metadata["ocrBatchWaitMs"] == 800 for block in blocks)
+
+
+def test_ocr_microbatch_fallback_uses_the_matching_frame_bytes(tmp_path, monkeypatch):
+    """远端单帧失败时，本地 OCR 降级必须保留该帧而非最后一帧的字节。"""
+
+    class PartiallyFailingOcrClient:
+        available = True
+        enabled = True
+        model = "partial-fake-ocr"
+
+        def recognize_image_bytes(self, *, image_bytes, filename, retry_callback=None):
+            if filename == "first.jpg":
+                return OcrResult(text="", parser="partial-fake-ocr")
+            return OcrResult(text="第二帧远端文本", parser="partial-fake-ocr", confidence=0.9)
+
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first-frame-local-fallback")
+    second.write_bytes(b"second-frame")
+    monkeypatch.setattr(vp, "tesseract_frame_text", lambda image_bytes: (image_bytes.decode("ascii"), None))
+
+    blocks, warnings = ocr_video_frames(
+        frames=[FrameImage(time_seconds=0, path=first), FrameImage(time_seconds=30, path=second)],
+        document_id="doc-fallback",
+        file_type="mp4",
+        source_title="降级视频",
+        source_path="uploads/rag/fallback.mp4",
+        ocr_client=PartiallyFailingOcrClient(),
+    )
+
+    assert warnings == []
+    assert blocks[0].contentText.endswith("first-frame-local-fallback")
+    assert blocks[1].contentText.endswith("第二帧远端文本")
+
+
+def test_ocr_microbatch_waits_for_partial_batch_before_dispatch(tmp_path):
+    """验证未满批时按窗口等待，避免稀疏帧立即产生过多远程请求。"""
+
+    client = TimedOcrClient(delay_seconds=0)
+    frame = FrameImage(time_seconds=0, path=make_frame(tmp_path / "tail.jpg", "tail"))
+    dispatcher = FrameOcrMicrobatchDispatcher(
+        ocr_client=client,
+        batch_max_size=4,
+        batch_wait_ms=60,
+        max_in_flight=1,
+        progress_reporter=None,
+        total_frames=1,
+    )
+    started = time.monotonic()
+    result_future = dispatcher.submit(index=1, frame=frame, image_bytes=frame.path.read_bytes())
+    result = result_future.result(timeout=1)
+    elapsed = time.monotonic() - started
+    dispatcher.close()
+
+    assert result.text == "识别 tail.jpg"
+    assert elapsed >= 0.04
+    assert result.metadata["ocrBatchSize"] == 1

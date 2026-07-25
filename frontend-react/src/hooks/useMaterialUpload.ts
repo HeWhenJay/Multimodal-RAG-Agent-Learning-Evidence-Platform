@@ -5,6 +5,7 @@ import type { LearningMaterial } from '../api/types';
 export const MATERIAL_FILE_ACCEPT = '.pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp,.mp4,.mov,.m4v,.webm,.mkv,.avi';
 export const MATERIAL_UPLOADED_EVENT = 'learning-evidence:material-uploaded';
 const VIDEO_CHUNK_SIZE = 20 * 1024 * 1024;
+const VIDEO_CHUNK_UPLOAD_CONCURRENCY = readPositiveIntEnv('VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY', 2);
 const PROGRESS_POLL_INTERVAL_MS = 2000;
 const CHUNK_UPLOAD_RETRY_LIMIT = 3;
 const CHUNK_UPLOAD_SESSION_PREFIX = 'learning-evidence:chunk-upload:';
@@ -149,21 +150,26 @@ async function uploadVideoInChunks(
 ): Promise<LearningMaterial> {
   const totalChunks = Math.ceil(file.size / VIDEO_CHUNK_SIZE);
   const sessionKey = chunkUploadSessionKey(file);
-  let session = readChunkUploadSession(sessionKey);
-  if (!session) {
-    session = {
-      uploadId: createUploadId(),
-      nextChunkIndex: 0
-    };
-    writeChunkUploadSession(sessionKey, session);
-  }
+  let session: ChunkUploadSession = readChunkUploadSession(sessionKey) ?? {
+    uploadId: createUploadId(),
+    nextChunkIndex: 0
+  };
+  writeChunkUploadSession(sessionKey, session);
 
-  for (let chunkIndex = clampChunkIndex(session.nextChunkIndex, totalChunks); chunkIndex < totalChunks; chunkIndex += 1) {
+  const uploaded = new Set<number>();
+  const initialChunkIndex = clampChunkIndex(session.nextChunkIndex, totalChunks);
+  for (let index = 0; index < initialChunkIndex; index += 1) {
+    uploaded.add(index);
+  }
+  const activeUploads = new Map<number, Promise<{ chunkIndex: number; result: Awaited<ReturnType<typeof uploadChunkWithRetry>> }>>();
+  let nextChunkToSchedule = initialChunkIndex;
+
+  const scheduleUpload = (chunkIndex: number) => {
     const start = chunkIndex * VIDEO_CHUNK_SIZE;
     const end = Math.min(file.size, start + VIDEO_CHUNK_SIZE);
     const chunk = file.slice(start, end, file.type || 'application/octet-stream');
-    setUploadMessage(`正在上传视频分片：${chunkIndex + 1}/${totalChunks}，uploadId=${session.uploadId}`);
-    const result = await uploadChunkWithRetry(
+    setUploadMessage(`正在并发上传视频分片：${chunkIndex + 1}/${totalChunks}，并发 ${VIDEO_CHUNK_UPLOAD_CONCURRENCY}，uploadId=${session.uploadId}`);
+    const task = uploadChunkWithRetry(
       {
         chunk,
         filename: file.name,
@@ -174,10 +180,22 @@ async function uploadVideoInChunks(
         highPrecision
       },
       setUploadMessage
-    );
+    ).then((result) => ({ chunkIndex, result }));
+    activeUploads.set(chunkIndex, task);
+  };
+
+  while (nextChunkToSchedule < totalChunks || activeUploads.size > 0) {
+    while (activeUploads.size < VIDEO_CHUNK_UPLOAD_CONCURRENCY && nextChunkToSchedule < totalChunks) {
+      scheduleUpload(nextChunkToSchedule);
+      nextChunkToSchedule += 1;
+    }
+
+    const { chunkIndex, result } = await Promise.race(activeUploads.values());
+    activeUploads.delete(chunkIndex);
+    uploaded.add(chunkIndex);
     session = {
       uploadId: result.uploadId || session.uploadId,
-      nextChunkIndex: clampChunkIndex(result.nextChunkIndex ?? chunkIndex + 1, totalChunks)
+      nextChunkIndex: firstMissingChunkIndex(uploaded, totalChunks, result.nextChunkIndex ?? chunkIndex + 1)
     };
     writeChunkUploadSession(sessionKey, session);
     if (result.message) {
@@ -187,7 +205,6 @@ async function uploadVideoInChunks(
       clearChunkUploadSession(sessionKey);
       return result.material;
     }
-    chunkIndex = session.nextChunkIndex - 1;
   }
   throw new Error('视频分片已上传，但后端未返回可轮询的资料记录');
 }
@@ -266,4 +283,21 @@ function clampChunkIndex(value: number, totalChunks: number) {
     return 0;
   }
   return Math.max(0, Math.min(totalChunks, Math.trunc(value)));
+}
+
+// 并发上传时按已成功分片集合推进续传游标，避免刷新后重复上传连续前缀。
+function firstMissingChunkIndex(uploaded: Set<number>, totalChunks: number, fallback: number) {
+  for (let index = 0; index < totalChunks; index += 1) {
+    if (!uploaded.has(index)) {
+      return index;
+    }
+  }
+  return clampChunkIndex(fallback, totalChunks);
+}
+
+// 从 Vite 环境变量读取前端上传并发，便于同一线上链路做 1 并发/2 并发 A/B 测试。
+function readPositiveIntEnv(name: string, fallback: number) {
+  const env = ((import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {});
+  const parsed = Number.parseInt(env[name] || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 4) : fallback;
 }

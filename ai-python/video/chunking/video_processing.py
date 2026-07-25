@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from math import ceil
 from pathlib import Path
@@ -13,7 +17,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from video.asr.bailian_asr import BailianAsrClient
-from video.ocr.bailian_ocr import BailianOcrClient
+from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
 from app.schemas.rag import DocumentBlock
 from rag.observability.process_logger import logged_rag_method, process_event
 from rag.observability.progress import RagProgressReporter
@@ -46,6 +50,155 @@ class FrameCandidateEvent:
 
 
 @dataclass
+class FrameOcrTask:
+    """保存一帧 OCR 请求及其回传 Future，队列容量用于限制图片内存占用。"""
+
+    index: int
+    frame: FrameImage
+    image_bytes: bytes
+    result_future: Future[OcrResult]
+
+
+class FrameOcrMicrobatchDispatcher:
+    """按满批或等待窗口派发单图 OCR 请求，保持单帧 evidence 语义。"""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        *,
+        ocr_client: BailianOcrClient,
+        batch_max_size: int,
+        batch_wait_ms: int,
+        max_in_flight: int,
+        progress_reporter: RagProgressReporter | None,
+        total_frames: int,
+    ) -> None:
+        self.ocr_client = ocr_client
+        self.batch_max_size = batch_max_size
+        self.batch_wait_seconds = batch_wait_ms / 1000
+        self.progress_reporter = progress_reporter
+        self.total_frames = total_frames
+        self._queue: queue.Queue[FrameOcrTask | object] = queue.Queue(
+            maxsize=max(batch_max_size * 2, max_in_flight * 2)
+        )
+        self._executor = ThreadPoolExecutor(max_workers=max_in_flight, thread_name_prefix="rag-video-ocr")
+        self._closed = False
+        self._worker = threading.Thread(target=self._run, name="rag-video-ocr-batcher", daemon=True)
+        self._worker.start()
+
+    def submit(self, *, index: int, frame: FrameImage, image_bytes: bytes) -> Future[OcrResult]:
+        """提交单帧；队列饱和时阻塞生产者，防止长视频堆积大量 Base64 图片。"""
+
+        if self._closed:
+            raise RuntimeError("关键帧 OCR 微批已关闭，不能继续提交")
+        result_future: Future[OcrResult] = Future()
+        self._queue.put(FrameOcrTask(index=index, frame=frame, image_bytes=image_bytes, result_future=result_future))
+        return result_future
+
+    def close(self) -> None:
+        """通知没有更多帧，立即刷出未满的尾批并等待全部请求结束。"""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(self._STOP)
+        self._worker.join()
+        self._executor.shutdown(wait=True)
+
+    def _run(self) -> None:
+        """首帧后等待有限窗口，满批或窗口结束即派发，不依赖未声明的多图 API。"""
+
+        batch_index = 0
+        stopped = False
+        while not stopped:
+            first = self._queue.get()
+            if first is self._STOP:
+                return
+            assert isinstance(first, FrameOcrTask)
+            batch = [first]
+            deadline = time.monotonic() + self.batch_wait_seconds
+            while len(batch) < self.batch_max_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is self._STOP:
+                    stopped = True
+                    break
+                assert isinstance(item, FrameOcrTask)
+                batch.append(item)
+            batch_index += 1
+            self._dispatch(batch, batch_index)
+
+    def _dispatch(self, batch: list[FrameOcrTask], batch_index: int) -> None:
+        """在微批内并发调用单图 OCR，并把批次诊断写入各帧 metadata。"""
+
+        process_event(
+            stage="parse.video.ocr",
+            action="dispatch_ocr_microbatch",
+            message="关键帧 OCR 微批已派发",
+            context={
+                "batchIndex": batch_index,
+                "batchSize": len(batch),
+                "batchMaxSize": self.batch_max_size,
+                "batchWaitMs": round(self.batch_wait_seconds * 1000),
+            },
+        )
+        submitted = {
+            self._executor.submit(self._recognize_one, task, batch_index, len(batch)): task
+            for task in batch
+        }
+        for call_future in as_completed(submitted):
+            task = submitted[call_future]
+            try:
+                task.result_future.set_result(call_future.result())
+            except Exception as exc:
+                task.result_future.set_exception(exc)
+
+    def _recognize_one(self, task: FrameOcrTask, batch_index: int, batch_size: int) -> OcrResult:
+        """执行单帧识别，重试仍委托既有 OCR 客户端处理。"""
+
+        if ocr_client_available(self.ocr_client):
+            emit_model_progress(
+                self.progress_reporter,
+                f"第 {task.index}/{self.total_frames} 帧：微批 {batch_index}（{batch_size} 帧）正在使用 {self.ocr_client.model} OCR",
+                percent=20,
+                detail=f"关键帧 OCR 微批 {batch_index}，当前批 {batch_size} 帧",
+                stage_code="parse.video.ocr",
+            )
+        result = self.ocr_client.recognize_image_bytes(
+            image_bytes=task.image_bytes,
+            filename=task.frame.path.name,
+            retry_callback=lambda event: emit_ocr_retry_progress(
+                self.progress_reporter,
+                event,
+                frame_index=task.index,
+                total_frames=self.total_frames,
+            ),
+        )
+        metadata = {
+            **result.metadata,
+            "ocrBatchIndex": batch_index,
+            "ocrBatchSize": batch_size,
+            "ocrBatchMaxSize": self.batch_max_size,
+            "ocrBatchWaitMs": round(self.batch_wait_seconds * 1000),
+        }
+        if ocr_client_available(self.ocr_client) and result.text:
+            emit_model_progress(
+                self.progress_reporter,
+                f"第 {task.index}/{self.total_frames} 帧：已完成 {self.ocr_client.model} OCR 微批 {batch_index}",
+                percent=22,
+                detail=f"关键帧 OCR 微批 {batch_index} 已返回",
+                stage_code="parse.video.ocr",
+            )
+        return replace(result, metadata=metadata)
+
+
+@dataclass
 class VisualFrameGroup:
     group_id: str
     hash_value: str
@@ -65,6 +218,190 @@ class AudioSegment:
     nominal_end: float
     extract_start: float
     extract_end: float
+
+
+@dataclass
+class AudioSegmentAsrTask:
+    """保存一个音频分段 ASR 请求及其回传 Future。"""
+
+    index: int
+    segment: AudioSegment
+    result_future: Future["AudioSegmentAsrResult"]
+
+
+@dataclass(frozen=True)
+class AudioSegmentAsrResult:
+    """保存单个音频分段的 ASR 结果和动态微批诊断信息。"""
+
+    index: int
+    segment: AudioSegment
+    text: str
+    warnings: list[str]
+    batch_index: int
+    batch_size: int
+    batch_max_size: int
+    batch_wait_ms: int
+
+
+class AudioSegmentAsrMicrobatchDispatcher:
+    """按满批或等待窗口派发单段 ASR 请求，保留官方单音频请求语义。"""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        *,
+        asr_client: BailianAsrClient,
+        batch_max_size: int,
+        batch_wait_ms: int,
+        max_in_flight: int,
+        progress_reporter: RagProgressReporter | None,
+        total_segments: int,
+    ) -> None:
+        self.asr_client = asr_client
+        self.batch_max_size = max(1, batch_max_size)
+        self.batch_wait_ms = max(0, batch_wait_ms)
+        self.batch_wait_seconds = self.batch_wait_ms / 1000
+        self.max_in_flight = max(1, max_in_flight)
+        self.rpm_limit = video_asr_rpm_limit()
+        self._min_start_gap_seconds = 60.0 / self.rpm_limit if self.rpm_limit > 0 else 0.0
+        self._last_started_at = 0.0
+        self._start_lock = threading.Lock()
+        self.progress_reporter = progress_reporter
+        self.total_segments = total_segments
+        self._queue: queue.Queue[AudioSegmentAsrTask | object] = queue.Queue(
+            maxsize=max(self.batch_max_size * 2, max(1, max_in_flight) * 2)
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_in_flight,
+            thread_name_prefix="rag-video-asr",
+        )
+        self._closed = False
+        self._worker = threading.Thread(target=self._run, name="rag-video-asr-batcher", daemon=True)
+        self._worker.start()
+
+    def submit(self, *, index: int, segment: AudioSegment) -> Future[AudioSegmentAsrResult]:
+        """提交一个音频分段；队列饱和时阻塞，避免长视频积压过多任务。"""
+
+        if self._closed:
+            raise RuntimeError("视频 ASR 微批已关闭，不能继续提交")
+        result_future: Future[AudioSegmentAsrResult] = Future()
+        self._queue.put(AudioSegmentAsrTask(index=index, segment=segment, result_future=result_future))
+        return result_future
+
+    def close(self) -> None:
+        """通知没有更多分段，立即刷出尾批并等待全部请求结束。"""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(self._STOP)
+        self._worker.join()
+        self._executor.shutdown(wait=True)
+
+    def _run(self) -> None:
+        """首段进入后等待有限窗口，满批或窗口结束即派发。"""
+
+        batch_index = 0
+        stopped = False
+        while not stopped:
+            first = self._queue.get()
+            if first is self._STOP:
+                return
+            assert isinstance(first, AudioSegmentAsrTask)
+            batch = [first]
+            deadline = time.monotonic() + self.batch_wait_seconds
+            while len(batch) < self.batch_max_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is self._STOP:
+                    stopped = True
+                    break
+                assert isinstance(item, AudioSegmentAsrTask)
+                batch.append(item)
+            batch_index += 1
+            self._dispatch(batch, batch_index)
+
+    def _dispatch(self, batch: list[AudioSegmentAsrTask], batch_index: int) -> None:
+        """在微批内并发调用单段 ASR，并把批次信息传给结果处理。"""
+
+        process_event(
+            stage="parse.video.asr",
+            action="dispatch_asr_microbatch",
+            message="视频音频 ASR 微批已派发",
+            context={
+                "batchIndex": batch_index,
+                "batchSize": len(batch),
+                "batchMaxSize": self.batch_max_size,
+                "batchWaitMs": self.batch_wait_ms,
+                "maxInFlight": self.max_in_flight,
+                "rpmLimit": self.rpm_limit,
+            },
+        )
+        submitted = {
+            self._executor.submit(self._transcribe_one, task, batch_index, len(batch)): task
+            for task in batch
+        }
+        for call_future in as_completed(submitted):
+            task = submitted[call_future]
+            try:
+                task.result_future.set_result(call_future.result())
+            except Exception as exc:
+                task.result_future.set_exception(exc)
+
+    def _transcribe_one(
+        self,
+        task: AudioSegmentAsrTask,
+        batch_index: int,
+        batch_size: int,
+    ) -> AudioSegmentAsrResult:
+        """执行单个音频分段识别，失败降级仍委托既有 ASR 客户端处理。"""
+
+        if self.asr_client.should_call_dashscope and self.asr_client.api_key:
+            emit_model_progress(
+                self.progress_reporter,
+                f"第 {task.index}/{self.total_segments} 段：微批 {batch_index}（{batch_size} 段）正在使用 {self.asr_client.model} ASR",
+                percent=16,
+                detail=f"视频音频 ASR 微批 {batch_index}，当前批 {batch_size} 段",
+                stage_code="parse.video.asr",
+            )
+            self._wait_for_request_slot()
+        segment_text, warnings = self.asr_client.transcribe_audio_file(task.segment.path)
+        if self.asr_client.should_call_dashscope and self.asr_client.api_key and segment_text:
+            emit_model_progress(
+                self.progress_reporter,
+                f"第 {task.index}/{self.total_segments} 段：已完成 {self.asr_client.model} ASR 微批 {batch_index}",
+                percent=18,
+                detail=f"视频音频 ASR 微批 {batch_index} 已返回",
+                stage_code="parse.video.asr",
+            )
+        return AudioSegmentAsrResult(
+            index=task.index,
+            segment=task.segment,
+            text=segment_text,
+            warnings=warnings,
+            batch_index=batch_index,
+            batch_size=batch_size,
+            batch_max_size=self.batch_max_size,
+            batch_wait_ms=self.batch_wait_ms,
+        )
+
+    def _wait_for_request_slot(self) -> None:
+        """按官方 RPM 限制控制远端 ASR 请求启动间隔。"""
+
+        if self._min_start_gap_seconds <= 0:
+            return
+        with self._start_lock:
+            now = time.monotonic()
+            sleep_seconds = self._last_started_at + self._min_start_gap_seconds - now
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+            self._last_started_at = time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -188,18 +525,27 @@ def process_video_input(
         )
         warnings.extend(asr_warnings)
 
-        frames, frame_warnings = extract_keyframes(video_input, tmp_dir, progress_reporter=progress_reporter)
-        warnings.extend(frame_warnings)
-        frame_blocks, ocr_warnings = ocr_video_frames(
-            frames=frames,
-            document_id=document_id,
-            file_type=normalize_video_file_type(filename),
-            source_title=source_title,
-            source_path=source_path,
-            ocr_client=ocr_client,
-            progress_reporter=progress_reporter,
-        )
-        warnings.extend(ocr_warnings)
+        if video_frame_ocr_enabled():
+            frames, frame_warnings = extract_keyframes(video_input, tmp_dir, progress_reporter=progress_reporter)
+            warnings.extend(frame_warnings)
+            frame_blocks, ocr_warnings = ocr_video_frames(
+                frames=frames,
+                document_id=document_id,
+                file_type=normalize_video_file_type(filename),
+                source_title=source_title,
+                source_path=source_path,
+                ocr_client=ocr_client,
+                progress_reporter=progress_reporter,
+            )
+            warnings.extend(ocr_warnings)
+        else:
+            frame_blocks = []
+            process_event(
+                stage="parse.video",
+                action="video_frame_ocr_skipped",
+                message="已按配置跳过视频关键帧 OCR，保留字幕/ASR 证据解析",
+                context={"filename": filename},
+            )
 
     if transcript_text and source_path and is_public_url(source_path):
         transcript_text = prepend_video_url_header(transcript_text, source_path)
@@ -295,25 +641,28 @@ def transcribe_video_input(
 
     cues: list[TranscriptCue] = []
     plain_parts: list[str] = []
-    for segment_index, segment in enumerate(segments, start=1):
-        if client.should_call_dashscope and client.api_key:
-            emit_model_progress(
-                progress_reporter,
-                f"第 {segment_index}/{len(segments)} 段：目前在使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
-                percent=16,
-                detail=f"目前在使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
-            )
-        segment_text, asr_warnings = client.transcribe_audio_file(segment.path)
-        warnings.extend(stage_warning(f"video.asr.segment[{segment_index}]", warning) for warning in asr_warnings)
+    dispatcher = AudioSegmentAsrMicrobatchDispatcher(
+        asr_client=client,
+        batch_max_size=video_asr_batch_max_size(),
+        batch_wait_ms=video_asr_batch_wait_ms(),
+        max_in_flight=video_asr_max_in_flight(),
+        progress_reporter=progress_reporter,
+        total_segments=len(segments),
+    )
+    futures = [
+        dispatcher.submit(index=segment_index, segment=segment)
+        for segment_index, segment in enumerate(segments, start=1)
+    ]
+    dispatcher.close()
+
+    for future in futures:
+        asr_result = future.result()
+        segment_index = asr_result.index
+        segment = asr_result.segment
+        segment_text = asr_result.text
+        warnings.extend(stage_warning(f"video.asr.segment[{segment_index}]", warning) for warning in asr_result.warnings)
         if not segment_text:
             continue
-        if client.should_call_dashscope and client.api_key:
-            emit_model_progress(
-                progress_reporter,
-                f"第 {segment_index}/{len(segments)} 段：已使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
-                percent=18,
-                detail=f"已使用 {client.model} 模型完成视频音频同步 ASR 转写事件",
-            )
         if transcript_has_timestamps(segment_text):
             segment_cues = parse_srt_cues(offset_srt_transcript(segment_text, segment.extract_start))
         else:
@@ -324,6 +673,18 @@ def transcribe_video_input(
                 f"video.asr.segment[{segment_index}].timestamp",
                 "百炼同步 ASR 未返回时间戳，已按分段时长生成估算字幕时间段",
             ))
+        process_event(
+            stage="parse.video.asr",
+            action="asr_microbatch_segment_merged",
+            message="视频音频 ASR 微批结果已按时间轴合并",
+            context={
+                "segmentIndex": segment_index,
+                "batchIndex": asr_result.batch_index,
+                "batchSize": asr_result.batch_size,
+                "batchMaxSize": asr_result.batch_max_size,
+                "batchWaitMs": asr_result.batch_wait_ms,
+            },
+        )
         cues.extend(cue for cue in segment_cues if cue_center_in_segment(cue, segment))
 
     merged = merge_transcript_cues(cues, overlap_seconds=audio_overlap_seconds())
@@ -485,7 +846,7 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
         nominal_end = min(duration, start + segment_seconds)
         extract_start = max(0.0, start - overlap)
         extract_end = min(duration, nominal_end + overlap)
-        audio_path = segment_dir / f"audio-{index:04d}.wav"
+        audio_path = segment_dir / f"audio-{index:04d}.mp3"
         command = [
             ffmpeg,
             "-y",
@@ -500,6 +861,10 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
             "1",
             "-ar",
             "16000",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            os.getenv("RAG_ASR_AUDIO_BITRATE", "64k"),
             str(audio_path),
         ]
         try:
@@ -1457,6 +1822,75 @@ def transcript_has_timestamps(text: str) -> bool:
     return "-->" in text or bool(re.search(r"\d{1,2}:\d{2}(?::\d{2})?", text))
 
 
+def video_frame_ocr_enabled() -> bool:
+    """读取关键帧 OCR 开关，长视频字幕基准可显式隔离外部 OCR 波动。"""
+    value = os.getenv("RAG_VIDEO_FRAME_OCR_ENABLED", "true")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def ocr_batch_max_size() -> int:
+    """读取 OCR 微批帧数上限，默认 4 帧以控制 Base64 图片瞬时内存。"""
+
+    return bounded_positive_int("RAG_VIDEO_OCR_BATCH_MAX_SIZE", default=4, maximum=16)
+
+
+def ocr_batch_wait_ms() -> int:
+    """读取微批首帧等待窗口，满批立即派发，尾批由输入关闭立即刷出。"""
+
+    return bounded_positive_int("RAG_VIDEO_OCR_BATCH_WAIT_MS", default=800, maximum=5000)
+
+
+def ocr_max_in_flight() -> int:
+    """限制每个媒体分段的同时 OCR 请求，默认 2 个以适配双 Worker 机器。"""
+
+    return bounded_positive_int("RAG_VIDEO_OCR_MAX_IN_FLIGHT", default=2, maximum=8)
+
+
+def video_asr_batch_max_size() -> int:
+    """读取 ASR 微批音频段数上限，仍保持一个音频段一个官方请求。"""
+
+    return bounded_positive_int("RAG_ASR_BATCH_MAX_SIZE", default=4, maximum=8)
+
+
+def video_asr_batch_wait_ms() -> int:
+    """读取 ASR 微批等待窗口；长视频所有分段已就绪时通常会满批立即派发。"""
+
+    return bounded_positive_int("RAG_ASR_BATCH_WAIT_MS", default=1000, maximum=10000)
+
+
+def video_asr_max_in_flight() -> int:
+    """限制同一视频内并发 ASR 请求数，默认 2 个以控制本机与远端负载。"""
+
+    return bounded_positive_int("RAG_ASR_MAX_IN_FLIGHT", default=2, maximum=4)
+
+
+def video_asr_rpm_limit() -> int:
+    """按 qwen3-asr-flash 官方 100 RPM 上限保守控制请求启动速率。"""
+
+    return bounded_positive_int("RAG_ASR_RPM_LIMIT", default=90, maximum=100)
+
+
+def ocr_client_available(ocr_client: BailianOcrClient) -> bool:
+    """兼容真实客户端和轻量测试替身的可用状态判断。"""
+
+    available = getattr(ocr_client, "available", None)
+    if available is not None:
+        return bool(available)
+    return bool(getattr(ocr_client, "enabled", False))
+
+
+def bounded_positive_int(name: str, *, default: int, maximum: int) -> int:
+    """读取受上限保护的正整数环境变量，避免错误配置放大长视频资源消耗。"""
+
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return min(value, maximum)
+
+
 SRT_RANGE_PATTERN = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}(?:[,.]\d{1,3})?)\s*-->\s*"
     r"(?P<end>\d{1,2}:\d{2}:\d{2}(?:[,.]\d{1,3})?)"
@@ -1598,38 +2032,38 @@ def ocr_video_frames(
     blocks: list[DocumentBlock] = []
     warnings: list[str] = []
     video_url = source_path if is_public_url(source_path) else None
-    for index, frame in enumerate(frames, start=1):
-        image_bytes = frame.path.read_bytes()
+    if not frames:
+        return blocks, warnings
+
+    batch_max_size = ocr_batch_max_size()
+    batch_wait_ms = ocr_batch_wait_ms()
+    max_in_flight = ocr_max_in_flight()
+    dispatcher = FrameOcrMicrobatchDispatcher(
+        ocr_client=ocr_client,
+        batch_max_size=batch_max_size,
+        batch_wait_ms=batch_wait_ms,
+        max_in_flight=max_in_flight,
+        progress_reporter=progress_reporter,
+        total_frames=len(frames),
+    )
+    submitted: list[tuple[int, FrameImage, bytes, Future[OcrResult]]] = []
+    try:
+        for index, frame in enumerate(frames, start=1):
+            try:
+                image_bytes = frame.path.read_bytes()
+            except OSError as exc:
+                warnings.append(stage_warning(f"video.frame_ocr[{index}]", f"读取关键帧失败: {exc.__class__.__name__}"))
+                continue
+            submitted.append((index, frame, image_bytes, dispatcher.submit(index=index, frame=frame, image_bytes=image_bytes)))
+    finally:
+        dispatcher.close()
+
+    for index, frame, image_bytes, result_future in submitted:
         try:
-            if ocr_client.available:
-                emit_model_progress(
-                    progress_reporter,
-                    f"第 {index}/{len(frames)} 帧：目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
-                    percent=20,
-                    detail=f"目前在使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
-                    stage_code="parse.video.ocr",
-                )
-            ocr_result = ocr_client.recognize_image_bytes(
-                image_bytes=image_bytes,
-                filename=frame.path.name,
-                retry_callback=lambda event, frame_index=index, total_frames=len(frames): emit_ocr_retry_progress(
-                    progress_reporter,
-                    event,
-                    frame_index=frame_index,
-                    total_frames=total_frames,
-                ),
-            )
+            ocr_result = result_future.result()
         except Exception as exc:
             warnings.append(stage_warning(f"video.frame_ocr[{index}]", f"百炼 OCR 调用异常: {exc}"))
             ocr_result = None
-        if ocr_client.available and ocr_result and ocr_result.text:
-            emit_model_progress(
-                progress_reporter,
-                f"第 {index}/{len(frames)} 帧：已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
-                percent=22,
-                detail=f"已使用 {ocr_client.model} 模型完成关键帧 OCR 识别事件",
-                stage_code="parse.video.ocr",
-            )
         if ocr_result and ocr_result.warnings:
             warnings.extend(stage_warning(f"video.frame_ocr[{index}]", warning) for warning in ocr_result.warnings)
         text = normalize_text(ocr_result.text if ocr_result else "")

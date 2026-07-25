@@ -5,6 +5,7 @@ import math
 import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from rag.generation.bailian_llm import generate_grounded_answer
@@ -29,6 +30,7 @@ from rag.retrievers.retrieval import (
     build_playback_url,
     chunk_percent,
     embed_text,
+    embed_texts,
     embedding_model_name,
     fuse_ranked_runs,
     format_evidence_titles,
@@ -72,6 +74,16 @@ FILTER_COLUMNS = {
 }
 
 TABLE_PREFIX_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PARSER_MAX_LENGTH = 80
+
+
+def index_chunk_workers() -> int:
+    """读取后端 RAG chunk Worker 数，限制在避免本机内存过载的安全范围。"""
+    try:
+        configured = int(os.getenv("RAG_INDEX_CHUNK_WORKERS", "2"))
+    except ValueError:
+        configured = 2
+    return max(1, min(configured, 8))
 
 
 def normalize_table_prefix(value: str | None) -> str:
@@ -82,6 +94,22 @@ def normalize_table_prefix(value: str | None) -> str:
     if not TABLE_PREFIX_PATTERN.fullmatch(prefix):
         raise RuntimeError("RAG_TABLE_PREFIX 只能包含字母、数字和下划线，并且必须以字母或下划线开头。")
     return prefix
+
+
+def bounded_postgres_text(value: str, maximum_length: int, field_name: str) -> str:
+    """清理并限制可安全截断的 PostgreSQL VARCHAR 展示字段。"""
+
+    cleaned = clean_postgres_text(value)
+    if len(cleaned) <= maximum_length:
+        return cleaned
+    process_event(
+        stage="index.database",
+        action="pgvector_varchar_value_truncated",
+        message=f"{field_name} 超过数据库字段长度，已截断展示值",
+        level="WARN",
+        context={"fieldName": field_name, "originalLength": len(cleaned), "maximumLength": maximum_length},
+    )
+    return cleaned[:maximum_length]
 
 
 def quote_identifier(value: str) -> str:
@@ -173,7 +201,7 @@ class PgVectorRagStore:
         user_id = clean_postgres_text(user_id)
         visibility_scope = clean_postgres_text(visibility_scope)
         language = clean_postgres_text(language)
-        parser = clean_postgres_text(parser)
+        parser = bounded_postgres_text(parser, PARSER_MAX_LENGTH, "parser")
         status = clean_postgres_text(status)
         source_path = clean_postgres_text(source_path) if source_path else source_path
         if progress_reporter:
@@ -257,34 +285,61 @@ class PgVectorRagStore:
         )
 
         total_chunks = len(chunks)
-        prepared_chunks: list[tuple[Chunk, dict[str, int], str]] = []
-        for index, chunk in enumerate(chunks, start=1):
+        chunk_workers = index_chunk_workers()
+        process_event(
+            stage="embedding.chunk",
+            action="pgvector_embedding_batch_start",
+            message=f"启动动态批处理生成 {total_chunks} 个 chunk embedding",
+            context={"chunkCount": total_chunks, "workerCount": chunk_workers, "documentId": document_id},
+        )
+        if progress_reporter:
+            progress_reporter.emit(
+                "embedding.chunk",
+                "后端启动动态批处理生成切块向量",
+                current_step=7,
+                total_steps=8,
+                current_chunk=0,
+                total_chunks=total_chunks,
+                percent=44,
+                detail=f"目前在使用 {embedding_model_name()} 模型按动态批处理生成切块向量",
+            )
+
+        with ThreadPoolExecutor(max_workers=chunk_workers, thread_name_prefix="rag-index-token") as pool:
+            token_counts_ordered = list(pool.map(lambda chunk: dict(Counter(tokenize(chunk.text))), chunks))
+        embeddings = embed_texts([chunk.text for chunk in chunks], dimensions=self.dimensions)
+        if len(embeddings) != total_chunks:
+            raise RuntimeError("RAG chunk 批量向量准备数量不完整")
+        prepared_chunks_ordered = [
+            (chunk, token_counts, vector_literal(embedding))
+            for chunk, token_counts, embedding in zip(chunks, token_counts_ordered, embeddings)
+        ]
+        for completed, (chunk, _, _) in enumerate(prepared_chunks_ordered, start=1):
             process_event(
                 stage="embedding.chunk",
                 action="pgvector_embedding_chunk",
-                message=f"第 {index}/{total_chunks} 块：生成 embedding",
+                message=f"第 {completed}/{total_chunks} 块：动态批处理 embedding 已生成",
                 context={
-                    "chunkIndex": index,
+                    "chunkIndex": completed,
+                    "completedChunks": completed,
                     "totalChunks": total_chunks,
                     "chunkId": chunk.chunk_id,
                     "documentId": document_id,
+                    "workerCount": chunk_workers,
+                    "batchMode": "dynamic",
                 },
             )
             if progress_reporter:
                 progress_reporter.emit(
                     "embedding.chunk",
-                    f"第 {index}/{total_chunks} 块：目前在使用 {embedding_model_name()} 模型完成切块向量生成事件",
+                    f"第 {completed}/{total_chunks} 块：动态批处理向量已生成",
                     current_step=7,
                     total_steps=8,
-                    current_chunk=index,
+                    current_chunk=completed,
                     total_chunks=total_chunks,
                     chunk_id=chunk.chunk_id,
-                    percent=chunk_percent(index, total_chunks, 45, 86),
-                    detail=f"目前在使用 {embedding_model_name()} 模型完成切块向量生成事件",
+                    percent=chunk_percent(completed, total_chunks, 45, 86),
+                    detail=f"目前在使用 {embedding_model_name()} 模型完成批量切块向量生成事件",
                 )
-            token_counts = Counter(tokenize(chunk.text))
-            embedding = embed_text(chunk.text, dimensions=self.dimensions)
-            prepared_chunks.append((chunk, dict(token_counts), vector_literal(embedding)))
 
         Json = self._json_adapter()
         process_event(
@@ -328,7 +383,7 @@ class PgVectorRagStore:
                             total_chunks,
                         ),
                     )
-                    for index, (chunk, token_counts, embedding_literal) in enumerate(prepared_chunks, start=1):
+                    for index, (chunk, token_counts, embedding_literal) in enumerate(prepared_chunks_ordered, start=1):
                         process_event(
                             stage="vector.upsert.chunk",
                             action="pgvector_upsert_chunk",

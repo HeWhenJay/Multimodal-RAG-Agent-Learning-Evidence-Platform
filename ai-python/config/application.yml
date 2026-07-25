@@ -19,6 +19,9 @@ rag:
     model: ${RAG_EMBEDDING_MODEL:text-embedding-v4}
     base-url: ${RAG_EMBEDDING_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
     timeout-seconds: ${RAG_EMBEDDING_TIMEOUT_SECONDS:30}
+    batch-max-size: ${RAG_EMBEDDING_BATCH_MAX_SIZE:10}
+    batch-wait-ms: ${RAG_EMBEDDING_BATCH_WAIT_MS:1000}
+    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:2}
   rerank:
     provider: ${RAG_RERANK_PROVIDER:auto}
     model: ${RAG_RERANK_MODEL:qwen3-rerank}
@@ -59,6 +62,8 @@ rag:
     enabled: ${RAG_KAFKA_ENABLED:false}
     bootstrap-servers: ${RAG_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
     worker:
+      auto-offset-reset: ${RAG_KAFKA_AUTO_OFFSET_RESET:earliest}
+      max-poll-interval-ms: ${RAG_KAFKA_MAX_POLL_INTERVAL_MS:3600000}
       reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
       reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
     producer:
@@ -155,9 +160,14 @@ ocr:
     model: ${BAILIAN_OCR_MODEL:qwen3.5-ocr}
     base-url: ${BAILIAN_OCR_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
     timeout-seconds: ${BAILIAN_OCR_TIMEOUT_SECONDS:60}
-    max-image-bytes: ${BAILIAN_OCR_MAX_IMAGE_BYTES:10485760}
+    # Base64 编码字符串受百炼 10MB 限制，默认值已换算为保守原始图片字节数。
+    max-image-bytes: ${BAILIAN_OCR_MAX_IMAGE_BYTES:7499952}
     max-attempts: ${BAILIAN_OCR_MAX_ATTEMPTS:3}
     retry-delay-seconds: ${BAILIAN_OCR_RETRY_DELAY_SECONDS:2}
+    # 不使用未经官方确认的多图单请求，微批内仍是一帧一请求。
+    batch-max-size: ${RAG_VIDEO_OCR_BATCH_MAX_SIZE:4}
+    batch-wait-ms: ${RAG_VIDEO_OCR_BATCH_WAIT_MS:800}
+    max-in-flight: ${RAG_VIDEO_OCR_MAX_IN_FLIGHT:2}
 
 asr:
   provider: ${RAG_ASR_PROVIDER:auto}
@@ -166,11 +176,18 @@ asr:
   model: ${RAG_ASR_MODEL:qwen3-asr-flash}
   filetrans-model: ${RAG_ASR_FILETRANS_MODEL:qwen3-asr-flash-filetrans}
   filetrans-enabled: ${RAG_ASR_FILETRANS_ENABLED:auto}
+  audio-via-oss: ${RAG_ASR_AUDIO_VIA_OSS:auto}
+  require-oss-audio-url: ${RAG_ASR_REQUIRE_OSS_AUDIO_URL:false}
+  oss-cleanup-enabled: ${RAG_ASR_OSS_CLEANUP_ENABLED:true}
   enable-words: ${RAG_ASR_ENABLE_WORDS:false}
   timeout-seconds: ${RAG_ASR_TIMEOUT_SECONDS:120}
   max-audio-bytes: ${RAG_ASR_MAX_AUDIO_BYTES:10485760}
   filetrans-max-polls: ${RAG_ASR_FILETRANS_MAX_POLLS:30}
   filetrans-poll-interval-seconds: ${RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS:2}
+  batch-max-size: ${RAG_ASR_BATCH_MAX_SIZE:4}
+  batch-wait-ms: ${RAG_ASR_BATCH_WAIT_MS:1000}
+  max-in-flight: ${RAG_ASR_MAX_IN_FLIGHT:2}
+  rpm-limit: ${RAG_ASR_RPM_LIMIT:90}
 
 video:
   ffmpeg-command: ${FFMPEG_COMMAND:}
@@ -178,6 +195,7 @@ video:
   ffmpeg-timeout-seconds: ${RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS:1800}
   audio-segment-seconds: ${RAG_VIDEO_AUDIO_SEGMENT_SECONDS:300}
   audio-overlap-seconds: ${RAG_VIDEO_AUDIO_OVERLAP_SECONDS:10}
+  asr-audio-bitrate: ${RAG_ASR_AUDIO_BITRATE:64k}
   frame-scan-mode: ${RAG_VIDEO_FRAME_SCAN_MODE:auto}
   frame-sample-interval-seconds: ${RAG_VIDEO_FRAME_SAMPLE_INTERVAL_SECONDS:5}
   frame-interval-seconds: ${RAG_VIDEO_FRAME_INTERVAL_SECONDS:30}

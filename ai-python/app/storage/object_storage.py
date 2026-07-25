@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -29,6 +29,23 @@ class StoredObject:
     public_url: str | None = None
 
 
+@dataclass(frozen=True)
+class OssMultipartUpload:
+    """OSS multipart 会话的受控对象定位信息。"""
+
+    object_key: str
+    upload_id: str
+
+
+@dataclass(frozen=True)
+class OssMultipartPart:
+    """已确认的 OSS multipart part，序号使用 OSS 的 1-based 规则。"""
+
+    part_number: int
+    etag: str
+    size: int
+
+
 @dataclass
 class OpenedStorageObject:
     """worker 解析时打开的对象，OSS 临时文件由 `cleanup` 负责删除。"""
@@ -38,6 +55,7 @@ class OpenedStorageObject:
     content_type: str | None
     source_path: str | None
     _temporary: bool = False
+    _sidecar_paths: list[Path] = field(default_factory=list)
 
     def cleanup(self) -> None:
         """只删除本次下载创建的临时文件，绝不删除本地原始对象。"""
@@ -46,7 +64,12 @@ class OpenedStorageObject:
         try:
             self.path.unlink(missing_ok=True)
         except OSError:
-            return
+            pass
+        for sidecar in self._sidecar_paths:
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 class RagObjectStorage(Protocol):
@@ -166,7 +189,7 @@ class OssRagObjectStorage:
     ) -> None:
         self.endpoint = (endpoint or os.getenv("ALIYUN_OSS_ENDPOINT", "")).strip().rstrip("/")
         self.bucket_name = (bucket_name or os.getenv("ALIYUN_OSS_BUCKET", "")).strip()
-        self.access_key_id = access_key_id or os.getenv("ALIYUN_OSS_ACCESS_KEY_ID", "")
+        self.access_key_id = access_key_id or os.getenv("ALIYUN_OSS_ACCESS_KEY_ID", "") or os.getenv("ALIOSS_ACCESS_KEY_ID", "")
         self.access_key_secret = access_key_secret or os.getenv("ALIYUN_OSS_ACCESS_KEY_SECRET", "")
         self.object_prefix = normalize_object_prefix(
             object_prefix or os.getenv("ALIYUN_OSS_OBJECT_PREFIX", "learning-evidence")
@@ -236,6 +259,131 @@ class OssRagObjectStorage:
             object_key=key,
             public_url=self.public_url(key),
         )
+
+    def start_multipart_upload(
+        self,
+        *,
+        filename: str,
+        user_id: str,
+        document_type: str,
+        content_type: str | None,
+    ) -> OssMultipartUpload:
+        """创建一次受控 multipart 会话，不在本地预先合并完整视频。"""
+        key = self.build_object_key(user_id, document_type, filename)
+        headers = {"Content-Type": content_type} if content_type else None
+        try:
+            result = self.bucket.init_multipart_upload(key, headers=headers)
+        except TypeError:
+            try:
+                result = self.bucket.init_multipart_upload(key)
+            except Exception as exc:
+                raise BusinessError("初始化 OSS 分片上传失败") from exc
+        except Exception as exc:
+            raise BusinessError("初始化 OSS 分片上传失败") from exc
+        upload_id = str(getattr(result, "upload_id", "") or "")
+        if not upload_id:
+            raise BusinessError("OSS 分片上传未返回 uploadId")
+        return OssMultipartUpload(object_key=key, upload_id=upload_id)
+
+    def upload_multipart_part_file(
+        self,
+        *,
+        object_key: str,
+        upload_id: str,
+        part_number: int,
+        source: str | Path,
+    ) -> OssMultipartPart:
+        """把单个请求临时文件流式写为 OSS part，调用结束即可删除本地临时文件。"""
+        source_path = Path(source).expanduser().resolve()
+        if not source_path.is_file():
+            raise BusinessError("上传分片临时文件不存在")
+        if part_number <= 0:
+            raise BusinessError("OSS 分片序号不合法")
+        key = normalize_object_key(object_key, self.bucket_name)
+        try:
+            with source_path.open("rb") as stream:
+                result = self.bucket.upload_part(key, upload_id, part_number, stream)
+        except Exception as exc:
+            raise BusinessError("上传分片到 OSS 失败") from exc
+        return self._multipart_part_from_result(part_number, source_path.stat().st_size, result)
+
+    def upload_multipart_part_bytes(
+        self,
+        *,
+        object_key: str,
+        upload_id: str,
+        part_number: int,
+        content: bytes,
+    ) -> OssMultipartPart:
+        """兼容内部小分片调用；公开 HTTP 路径应使用文件流版本。"""
+        if not content:
+            raise BusinessError("上传分片不能为空")
+        if part_number <= 0:
+            raise BusinessError("OSS 分片序号不合法")
+        key = normalize_object_key(object_key, self.bucket_name)
+        try:
+            result = self.bucket.upload_part(key, upload_id, part_number, content)
+        except Exception as exc:
+            raise BusinessError("上传分片到 OSS 失败") from exc
+        return self._multipart_part_from_result(part_number, len(content), result)
+
+    def complete_multipart_upload(
+        self,
+        *,
+        object_key: str,
+        upload_id: str,
+        parts: list[OssMultipartPart],
+    ) -> StoredObject:
+        """完成已确认 part 的 OSS 合并，返回正常资料建档可复用的对象信息。"""
+        if not parts:
+            raise BusinessError("OSS 分片上传没有可完成的 part")
+        ordered = sorted(parts, key=lambda item: item.part_number)
+        expected_numbers = list(range(1, len(ordered) + 1))
+        if [item.part_number for item in ordered] != expected_numbers:
+            raise BusinessError("OSS 分片序号不连续")
+        key = normalize_object_key(object_key, self.bucket_name)
+        try:
+            from oss2.models import PartInfo  # type: ignore
+
+            sdk_parts = [PartInfo(item.part_number, item.etag, size=item.size) for item in ordered]
+            self.bucket.complete_multipart_upload(key, upload_id, sdk_parts)
+        except Exception as exc:
+            raise BusinessError("完成 OSS 分片上传失败") from exc
+        return StoredObject(
+            storage_type=self.storage_type,
+            source_path=self.public_url(key) or f"oss://{self.bucket_name}/{key}",
+            object_key=key,
+            public_url=self.public_url(key),
+        )
+
+    @staticmethod
+    def _multipart_part_from_result(part_number: int, size: int, result: Any) -> OssMultipartPart:
+        """提取 SDK 回传 ETag，避免未确认的 part 被写入完成清单。"""
+        etag = str(getattr(result, "etag", "") or "")
+        if not etag:
+            raise BusinessError("OSS 分片上传未返回 ETag")
+        return OssMultipartPart(part_number=part_number, etag=etag, size=size)
+
+    def store_video_sidecar_file(self, source: str | Path, video_object_key: str, user_id: str) -> str:
+        """将视频同名 .srt/.vtt 侧车字幕保存到同一 OSS 对象路径。"""
+        source_path = Path(source).expanduser().resolve()
+        suffix = source_path.suffix.lower()
+        if suffix not in {".srt", ".vtt"}:
+            raise BusinessError("视频侧车字幕仅支持 .srt 或 .vtt")
+        if not source_path.is_file():
+            raise BusinessError("视频侧车字幕文件不存在")
+        video_key = self.validate_object_key(video_object_key, user_id)
+        sidecar_key = str(PurePosixPath(video_key).with_suffix(suffix))
+        try:
+            self.bucket.put_object_from_file(sidecar_key, str(source_path), headers={"Content-Type": "text/plain; charset=utf-8"})
+        except TypeError:
+            try:
+                self.bucket.put_object_from_file(sidecar_key, str(source_path))
+            except Exception as exc:
+                raise BusinessError("上传视频侧车字幕到 OSS 失败") from exc
+        except Exception as exc:
+            raise BusinessError("上传视频侧车字幕到 OSS 失败") from exc
+        return sidecar_key
 
     def load_bytes(self, material: Any) -> bytes:
         """读取受控 OSS 对象；文本预览才使用该小范围读取接口。"""
@@ -329,6 +477,23 @@ class OssRagObjectStorage:
             _temporary=True,
         )
 
+    def download_video_sidecars(self, *, video_object_key: str, user_id: str, target_video: Path) -> list[Path]:
+        """下载与 OSS 视频对象同名的侧车字幕到临时视频旁。"""
+        video_key = self.validate_object_key(video_object_key, user_id)
+        sidecars: list[Path] = []
+        for suffix in (".srt", ".vtt"):
+            sidecar_key = str(PurePosixPath(video_key).with_suffix(suffix))
+            target = target_video.with_suffix(suffix)
+            try:
+                self.bucket.get_object_to_file(sidecar_key, str(target))
+                if target.is_file() and target.stat().st_size > 0:
+                    sidecars.append(target)
+                else:
+                    target.unlink(missing_ok=True)
+            except Exception:
+                target.unlink(missing_ok=True)
+        return sidecars
+
 
 def build_rag_object_storage() -> RagObjectStorage:
     """按 EVIDENCE_STORAGE_PROVIDER 选择实际对象存储实现。"""
@@ -370,13 +535,22 @@ def download_storage_source(
         key = getattr(source_ref, "objectKey", None)
         if not key:
             raise BusinessError("OSS 索引任务缺少 objectKey")
-        return storage.download_to_temp(
+        opened = storage.download_to_temp(
             key=key,
             user_id=user_id,
             filename=filename,
             content_type=content_type,
         )
+        downloader = getattr(storage, "download_video_sidecars", None)
+        if is_video_filename(filename) and callable(downloader):
+            opened._sidecar_paths = downloader(video_object_key=key, user_id=user_id, target_video=opened.path)
+        return opened
     raise BusinessError("索引任务的存储类型不受支持")
+
+
+def is_video_filename(filename: str | None) -> bool:
+    """按受控文件名判断 OSS 下载后是否需要补齐侧车字幕。"""
+    return Path(filename or "").suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 
 def normalize_object_prefix(value: str) -> str:

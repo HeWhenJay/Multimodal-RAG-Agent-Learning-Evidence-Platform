@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +19,44 @@ DEFAULT_ASR_PROMPT = (
     "请将音频转写为 SRT 字幕格式，只输出字幕内容。"
     "每段必须包含序号、HH:MM:SS,mmm --> HH:MM:SS,mmm 时间范围和中文转写文本。"
 )
+
+
+class RollingWindowRateLimiter:
+    """用进程内滚动窗口限制百炼 ASR 请求启动速率。"""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        self.requests_per_minute = max(1, requests_per_minute)
+        self._starts: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """阻塞到最近 60 秒内请求数低于上限，避免超过官方 RPM。"""
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._starts and now - self._starts[0] >= 60:
+                    self._starts.popleft()
+                if len(self._starts) < self.requests_per_minute:
+                    self._starts.append(now)
+                    return
+                wait_seconds = max(0.01, 60 - (now - self._starts[0]))
+            time.sleep(wait_seconds)
+
+
+_LIMITERS_LOCK = threading.Lock()
+_LIMITERS: dict[tuple[str, str, int], RollingWindowRateLimiter] = {}
+
+
+def asr_rate_limiter(key: tuple[str, str, int]) -> RollingWindowRateLimiter:
+    """按模型和接口复用限流器，让同进程内多个 Worker 共享 100RPM 约束。"""
+
+    with _LIMITERS_LOCK:
+        limiter = _LIMITERS.get(key)
+        if limiter is None:
+            limiter = RollingWindowRateLimiter(key[2])
+            _LIMITERS[key] = limiter
+        return limiter
 
 
 class BailianAsrClient:
@@ -36,6 +76,7 @@ class BailianAsrClient:
         max_polls: int | None = None,
         poll_interval_seconds: float | None = None,
         filetrans_max_attempts: int | None = None,
+        requests_per_minute: int | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = (base_url or os.getenv("RAG_ASR_BASE_URL") or DEFAULT_ASR_BASE_URL).rstrip("/")
@@ -54,6 +95,11 @@ class BailianAsrClient:
             os.getenv("RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS", "2")
         )
         self.filetrans_max_attempts = filetrans_max_attempts or int(os.getenv("RAG_ASR_FILETRANS_MAX_ATTEMPTS", "2"))
+        self.requests_per_minute = requests_per_minute or int(
+            os.getenv("RAG_ASR_RPM_LIMIT") or os.getenv("RAG_ASR_REQUESTS_PER_MINUTE", "90")
+        )
+        self._sync_limiter = asr_rate_limiter((self.base_url, self.model, self.requests_per_minute))
+        self._filetrans_limiter = asr_rate_limiter((self.task_base_url, self.filetrans_model, self.requests_per_minute))
 
     @property
     def should_call_dashscope(self) -> bool:
@@ -83,6 +129,17 @@ class BailianAsrClient:
 
         if not audio_path.exists() or audio_path.stat().st_size == 0:
             return "", [*warnings, "抽取的音频文件为空，无法调用百炼 ASR"]
+
+        uploaded_audio = self._store_audio_on_oss(audio_path)
+        if uploaded_audio is not None:
+            audio_url, cleanup_audio = uploaded_audio
+            try:
+                if self.should_call_filetrans(audio_url):
+                    return self._call_filetrans(audio_url, progress_callback=progress_callback), warnings
+            except Exception as exc:
+                warnings.append(f"百炼 ASR 音频段 OSS 异步转写失败: {exc}")
+            finally:
+                cleanup_audio()
 
         if audio_path.stat().st_size > self.max_audio_bytes:
             warnings.append(f"抽取的音频超过 {self.max_audio_bytes} 字节，当前同步 ASR 已跳过")
@@ -161,6 +218,7 @@ class BailianAsrClient:
                 for attempt in range(1, max_attempts + 1):
                     notify_progress(progress_callback, phase="submit", attempt=attempt, maxAttempts=max_attempts)
                     try:
+                        self._filetrans_limiter.acquire()
                         response = client.post(f"{self.task_base_url}/services/audio/asr/transcription", headers=headers, json=payload)
                         if response.status_code >= 400:
                             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
@@ -239,7 +297,7 @@ class BailianAsrClient:
         except ImportError as exc:
             raise RuntimeError("使用百炼 ASR 需要安装 httpx 依赖") from exc
 
-        audio_base64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+        audio_reference, cleanup_audio_reference = self._prepare_audio_reference(audio_path)
         payload = {
             "model": self.model,
             "messages": [
@@ -249,7 +307,7 @@ class BailianAsrClient:
                         {
                             "type": "input_audio",
                             "input_audio": {
-                                "data": audio_base64,
+                                "data": audio_reference,
                                 "format": audio_path.suffix.lstrip(".") or "wav",
                             },
                         },
@@ -272,8 +330,12 @@ class BailianAsrClient:
             recoverable=True,
             fallback_message=f"使用 {self.model} 模型完成视频音频同步 ASR 转写事件失败，已降级到字幕、关键帧 OCR 或视频元数据继续处理",
         ):
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+            try:
+                with httpx.Client(timeout=self.timeout_seconds) as client:
+                    self._sync_limiter.acquire()
+                    response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+            finally:
+                cleanup_audio_reference()
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()
@@ -281,6 +343,75 @@ class BailianAsrClient:
         if not text:
             raise RuntimeError("百炼 ASR 返回空转写")
         return text
+
+    def _prepare_audio_reference(self, audio_path: Path) -> tuple[str, Callable[[], None]]:
+        """为同步 ASR 准备音频引用；生产优先用 OSS 公开 URL，离线保留 Base64 兜底。"""
+
+        uploaded_audio = self._store_audio_on_oss(audio_path)
+        if uploaded_audio is not None:
+            return uploaded_audio
+        audio_base64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+        return audio_base64, lambda: None
+
+    def _store_audio_on_oss(self, audio_path: Path) -> tuple[str, Callable[[], None]] | None:
+        """上传临时音频段并返回公开 URL；失败时由调用方决定是否降级。"""
+
+        if not should_upload_audio_for_asr():
+            return None
+        try:
+            from app.storage.object_storage import build_rag_object_storage
+
+            storage = build_rag_object_storage()
+            if getattr(storage, "storage_type", "") != "oss":
+                return None
+            stored = storage.store_file(
+                audio_path,
+                audio_path.name,
+                os.getenv("RAG_ASR_OSS_USER_ID", "asr-temp"),
+                "asr-audio",
+                content_type=audio_content_type(audio_path),
+            )
+            if not stored.public_url:
+                return None
+
+            def cleanup() -> None:
+                if os.getenv("RAG_ASR_OSS_CLEANUP_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+                    return
+                if stored.object_key:
+                    try:
+                        storage.delete_object_key(stored.object_key)
+                    except Exception:
+                        return
+
+            return stored.public_url, cleanup
+        except Exception as exc:
+            if os.getenv("RAG_ASR_REQUIRE_OSS_AUDIO_URL", "false").strip().lower() in {"1", "true", "yes", "on"}:
+                raise RuntimeError(f"ASR 音频段上传 OSS 失败: {exc}") from exc
+            return None
+
+
+def should_upload_audio_for_asr() -> bool:
+    """读取同步 ASR 音频 URL 模式；auto 时 OSS 存储自动启用。"""
+
+    value = os.getenv("RAG_ASR_AUDIO_VIA_OSS", "auto").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("EVIDENCE_STORAGE_PROVIDER", "").strip().lower() == "oss"
+
+
+def audio_content_type(audio_path: Path) -> str:
+    """根据音频后缀给 OSS 和模型提供稳定 Content-Type。"""
+
+    suffix = audio_path.suffix.lower()
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".m4a":
+        return "audio/mp4"
+    return "application/octet-stream"
 
 
 def extract_message_content(data: dict[str, Any]) -> str:

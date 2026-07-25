@@ -83,7 +83,9 @@ def run_consumer_loop(handlers: dict[str, Callable[[KafkaEnvelope], object]]) ->
                 "bootstrap.servers": os.getenv("RAG_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
                 "group.id": os.getenv("RAG_KAFKA_GROUP_ID", "rag-python-index-workers"),
                 "enable.auto.commit": False,
-                "auto.offset.reset": "earliest",
+                "auto.offset.reset": kafka_auto_offset_reset(),
+                # 单条长视频索引可超过默认 5 分钟，避免处理期间被 consumer group 判定离组。
+                "max.poll.interval.ms": positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 3_600_000),
             }
         )
     except KafkaException as exc:
@@ -154,6 +156,21 @@ def positive_seconds(name: str, default: float) -> float:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def positive_milliseconds(name: str, default: int) -> int:
+    """读取 Kafka 长任务最大 poll 间隔，非法值回退到一小时。"""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def kafka_auto_offset_reset() -> str:
+    """读取 Kafka 首次订阅的 offset 策略，仅允许官方支持的两个枚举。"""
+    value = os.getenv("RAG_KAFKA_AUTO_OFFSET_RESET", "earliest").strip().lower()
+    return value if value in {"earliest", "latest"} else "earliest"
 
 
 def is_reconnectable_error(error: object, kafka_error_type: object) -> bool:

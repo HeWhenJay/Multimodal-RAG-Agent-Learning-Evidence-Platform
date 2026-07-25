@@ -1,7 +1,7 @@
 import pytest
 
 from app.schemas.rag import DocumentBlock
-from rag.indexes.pgvector_store import PgVectorRagStore, normalize_table_prefix, quote_identifier
+from rag.indexes.pgvector_store import PgVectorRagStore, bounded_postgres_text, normalize_table_prefix, quote_identifier
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.core.models import Chunk
 
@@ -147,6 +147,14 @@ def test_pgvector_store_rejects_invalid_table_prefix(monkeypatch):
 
     with pytest.raises(RuntimeError, match="RAG_TABLE_PREFIX"):
         PgVectorRagStore("postgresql://unused", ensure_schema=False)
+
+
+def test_pgvector_parser_varchar_guard_keeps_storage_compatible() -> None:
+    """超长 parser 仅截断展示字段，避免数据库事务因 VARCHAR(80) 回滚。"""
+
+    value = "video-parallel-worker-pool+" + "very-long-parser+" * 8
+
+    assert len(bounded_postgres_text(value, 80, "parser")) == 80
 
 
 def test_pgvector_index_blocks_cleans_index_when_committed_count_mismatches(monkeypatch):

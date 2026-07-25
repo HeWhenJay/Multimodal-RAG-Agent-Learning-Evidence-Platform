@@ -78,6 +78,35 @@ def test_answer_guard_config_env_mapping_is_effective():
     assert env_defaults["RAG_ANSWER_STRICT_MODE"] == "true"
 
 
+def test_model_dynamic_batch_config_env_mapping_is_effective():
+    """校验 OCR/ASR/embedding 动态批处理配置可由 YAML 统一映射。"""
+    env_defaults = build_env_defaults(
+        {
+            "rag": {
+                "embedding": {
+                    "batch-max-size": 10,
+                    "batch-wait-ms": 1000,
+                    "max-in-flight": 2,
+                }
+            },
+            "asr": {
+                "batch-max-size": 4,
+                "batch-wait-ms": 1000,
+                "max-in-flight": 2,
+                "rpm-limit": 90,
+            },
+        }
+    )
+
+    assert env_defaults["RAG_EMBEDDING_BATCH_MAX_SIZE"] == "10"
+    assert env_defaults["RAG_EMBEDDING_BATCH_WAIT_MS"] == "1000"
+    assert env_defaults["RAG_EMBEDDING_MAX_IN_FLIGHT"] == "2"
+    assert env_defaults["RAG_ASR_BATCH_MAX_SIZE"] == "4"
+    assert env_defaults["RAG_ASR_BATCH_WAIT_MS"] == "1000"
+    assert env_defaults["RAG_ASR_MAX_IN_FLIGHT"] == "2"
+    assert env_defaults["RAG_ASR_RPM_LIMIT"] == "90"
+
+
 def test_video_v6_config_env_mapping_is_effective():
     """校验 V6 视频 OCR 新配置能从 YAML 映射为运行环境变量。"""
     env_defaults = build_env_defaults(
@@ -97,7 +126,14 @@ def test_video_v6_config_env_mapping_is_effective():
                 "frame-visual-revisit-verify-seconds": 1800,
                 "frame-visual-verification-ratio": 0.25,
                 "frame-max-verifications-per-visual-group": 2,
-            }
+            },
+            "ocr": {
+                "bailian": {
+                    "batch-max-size": 4,
+                    "batch-wait-ms": 800,
+                    "max-in-flight": 2,
+                }
+            },
         }
     )
 
@@ -115,6 +151,9 @@ def test_video_v6_config_env_mapping_is_effective():
     assert env_defaults["RAG_VIDEO_FRAME_VISUAL_REVISIT_VERIFY_SECONDS"] == "1800"
     assert env_defaults["RAG_VIDEO_FRAME_VISUAL_VERIFICATION_RATIO"] == "0.25"
     assert env_defaults["RAG_VIDEO_FRAME_MAX_VERIFICATIONS_PER_VISUAL_GROUP"] == "2"
+    assert env_defaults["RAG_VIDEO_OCR_BATCH_MAX_SIZE"] == "4"
+    assert env_defaults["RAG_VIDEO_OCR_BATCH_WAIT_MS"] == "800"
+    assert env_defaults["RAG_VIDEO_OCR_MAX_IN_FLIGHT"] == "2"
 
 
 def test_worker_cron_config_env_mapping_is_effective():
@@ -149,6 +188,25 @@ def test_worker_cron_config_env_mapping_is_effective():
     assert env_defaults["RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS"] == "600"
     assert env_defaults["RAG_TASK_WORKER_ENABLED"] == "true"
     assert env_defaults["RAG_TASK_WORKER_POLL_SECONDS"] == "0.2"
+
+
+def test_kafka_worker_consumer_config_env_mapping_is_effective():
+    """隔离基准与长视频 worker 参数应由 YAML 统一映射。"""
+    env_defaults = build_env_defaults(
+        {
+            "rag": {
+                "kafka": {
+                    "worker": {
+                        "auto-offset-reset": "latest",
+                        "max-poll-interval-ms": 1_800_000,
+                    }
+                }
+            }
+        }
+    )
+
+    assert env_defaults["RAG_KAFKA_AUTO_OFFSET_RESET"] == "latest"
+    assert env_defaults["RAG_KAFKA_MAX_POLL_INTERVAL_MS"] == "1800000"
 
 
 def test_cron_cli_override_and_worker_config_forwarding(monkeypatch):
