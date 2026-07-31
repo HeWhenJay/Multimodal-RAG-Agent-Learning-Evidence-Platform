@@ -323,6 +323,66 @@ Python index worker 调用现有解析、递归切块、摘要、embedding 后�
 RAG 进度事件按现有代码链路拆分，不使用临时示例阶段名。前端展示时优先读取 `LearningMaterialVO.latestProgress`，需要历史时读取 `progressEvents`。
 视频资料会在资料卡片中额外汇总展示 `parse.video.frame.extract`、`parse.video.frame.candidates`、`parse.video.slide_detect` 和 `parse.video.ocr`，用户可以看到抽帧候选数量、PPT 翻页命中、视觉去重跳过、最小间隔和最终进入 OCR 的帧数。Java 返回资料进度时除最近事件外会额外保留这些视频关键阶段，避免长视频逐帧 OCR 进度把翻页检测结果挤出前端。
 
+### 资料处理进度快照
+
+更新日期：2026-08-01
+
+资料对象新增 `processingProgress`，由 Python 根据资料主状态和已经持久化的 `progressEvents` 生成。该字段用于工作台“多模态数据接入通道”的稳定展示；`latestProgress/progressEvents` 继续保留，供视频子阶段和诊断页面使用。
+
+| 接口 | 鉴权 | 返回位置 |
+| --- | --- | --- |
+| `GET /api/rag/materials` | `Authorization: Bearer <token>` | 每个资料对象的 `processingProgress` |
+| `GET /api/rag/materials/{materialId}` | `Authorization: Bearer <token>` | 资料对象的 `processingProgress` |
+| `POST /api/rag/materials/text`、`POST /api/rag/materials/upload`、`POST /api/rag/materials/{materialId}/reindex` | `Authorization: Bearer <token>` | 返回资料对象的 `processingProgress` |
+| `GET /api/page-data/dashboard` | `Authorization: Bearer <token>` | `recentMaterials[*].processingProgress` |
+
+响应片段：
+
+```json
+{
+  "processingProgress": {
+    "materialStatus": "PARSING",
+    "statusLabel": "解析中",
+    "isProcessing": true,
+    "isTerminal": false,
+    "currentPhaseCode": "EMBEDDING",
+    "currentPhaseLabel": "向量生成",
+    "currentStageCode": "embedding.chunk",
+    "currentStageLabel": "生成 embedding",
+    "message": "第 12/18 块：动态批处理向量已生成",
+    "detail": null,
+    "percent": 67,
+    "currentStep": 7,
+    "totalSteps": 8,
+    "currentChunk": 12,
+    "totalChunks": 18,
+    "completedPhaseCount": 3,
+    "totalPhaseCount": 6,
+    "startedAt": "2026-08-01T10:00:00",
+    "lastUpdatedAt": "2026-08-01T10:02:14",
+    "elapsedSeconds": 134,
+    "failureMessage": null,
+    "nextAction": "向量生成完成后将写入检索索引，无需保持页面开启",
+    "phases": [
+      {"phaseCode": "UPLOAD", "phaseLabel": "接收与存储", "status": "COMPLETED", "message": "文件已保存", "updatedAt": "2026-08-01T10:00:08"},
+      {"phaseCode": "PARSE", "phaseLabel": "内容解析", "status": "COMPLETED", "message": "解析完成", "updatedAt": "2026-08-01T10:00:42"},
+      {"phaseCode": "CHUNK", "phaseLabel": "结构切块", "status": "COMPLETED", "message": "当前文件被切分为 18 块", "updatedAt": "2026-08-01T10:00:45"},
+      {"phaseCode": "EMBEDDING", "phaseLabel": "向量生成", "status": "RUNNING", "message": "第 12/18 块：动态批处理向量已生成", "updatedAt": "2026-08-01T10:02:14"},
+      {"phaseCode": "INDEX", "phaseLabel": "索引写入", "status": "PENDING", "message": null, "updatedAt": null},
+      {"phaseCode": "READY", "phaseLabel": "完成入库", "status": "PENDING", "message": null, "updatedAt": null}
+    ]
+  }
+}
+```
+
+快照规则：
+
+- 六个标准阶段固定为 `UPLOAD -> PARSE -> CHUNK -> EMBEDDING -> INDEX -> READY`；`currentStageCode` 仍返回 Python 的原始细分阶段，例如视频抽帧、PPT 翻页检测、OCR 或逐块向量写入。
+- `percent` 优先使用最新事件百分比；缺失时根据资料终态或标准阶段推导，始终限制在 `0-100`。
+- `FAILED` 返回受控的 `failureMessage` 和可执行的 `nextAction`；`READY/PARTIAL/FAILED` 均为终态，`isProcessing=false`。
+- 进度日志暂时不可读时，接口不整体失败，而是依据资料状态返回降级快照，并提示“等待后台上报详细进度”。快照文本不得包含本地绝对路径、临时下载路径、私有 `oss://` 地址或密钥。
+- 上传和索引任务与浏览器连接解耦。前端仅在 `isProcessing=true` 时每 2 秒轮询；收到终态后立即停止。当前任务属于低频、可恢复的持久化状态查询，不改为 SSE/WebSocket，避免额外引入连接保活、断线重放和代理超时问题。
+
 日志事件职责：
 
 | 事件类型 | 表 | 来源 | 用途 |
@@ -2039,7 +2099,7 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 - 工作台 `/api/page-data/dashboard` 支持 `startDate`、`endDate`、`recentDays` 和 `recentLimit` 查询参数；新前端使用 `startDate/endDate` 做“从/到”日期范围筛选，用户点击“确定”后才触发后端查询，范围限制在最近 7 天内，`recentDays` 仅作为旧调用兜底，`recentLimit` 默认 5 条、最多 50 条。
 - `DashboardVO` 会返回 `recentTaskStartDate`、`recentTaskEndDate` 和 `recentTaskLimit`，用于前端展示后端实际生效的任务查询范围；后端通过 `learning_material.updated_at >= startDate 00:00:00` 且 `< endDate + 1 day 00:00:00` 查询，已用单测校验 mapper 收到真实起止时间。
 - 工作台 RAG 快速检索区通过 `/api/rag/query/history` 展示“近期询问记录”，用户可选择最近 7 天内的从/到日期和条数，点击历史记录后回填该次回答、证据、问题和阶段事件快照。
-- 上传后的顶部栏、工作台上传区和资料页上传区不再只显示“已上传，正在后台解析”，而是轮询单个资料状态并显示类似“第 133/173 块：生成 embedding · 切块 133/173 · 77%”的主进度。
+- 上传后的顶部栏、工作台上传区和资料页上传区不再只显示“已上传，正在后台解析”，而是读取 `processingProgress` 展示当前标准阶段、原始细分阶段、步骤/切块、百分比、累计耗时和下一步；兼容旧响应时回退到 `latestProgress`。
 - 资料列表显示 `PENDING/PARSING/READY/PARTIAL/FAILED/REINDEXING`。
 - 点击刷新时，如果接口短暂没有返回 `latestProgress`，前端保留该资料已有进度，避免大文件解析过程中进度块闪烁或消失；后端返回新的 `latestProgress` 时立即覆盖旧进度。
 - 上传资料卡片提供“重建索引”和“高精度补跑”入口；高精度补跑会调用 `/api/rag/materials/{id}/reindex?highPrecision=true`。

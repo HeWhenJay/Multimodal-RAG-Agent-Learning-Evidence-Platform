@@ -6,6 +6,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.rag import MaterialProcessingProgress
+
 
 class RagProgressResponse(BaseModel):
     """资料卡片展示的 RAG 进度事件。"""
@@ -44,6 +46,7 @@ class LearningMaterialPageResponse(BaseModel):
     publicUrl: str | None = None
     latestProgress: RagProgressResponse | None = None
     progressEvents: list[RagProgressResponse] = Field(default_factory=list)
+    processingProgress: MaterialProcessingProgress | None = None
     createdAt: datetime | None = None
     updatedAt: datetime | None = None
 

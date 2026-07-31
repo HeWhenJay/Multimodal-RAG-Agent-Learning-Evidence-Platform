@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.schemas.rag import Evidence, ProgressEvent, QueryResponse, QueryTaskResponse
+from app.schemas.rag import Evidence, MaterialProcessingProgress, ProgressEvent, QueryResponse, QueryTaskResponse
 
 
 MaterialStatus = Literal["PENDING", "PARSING", "READY", "PARTIAL", "FAILED", "REINDEXING"]
@@ -76,6 +76,7 @@ class RagMaterialResponse(BaseModel):
     publicUrl: str | None = None
     latestProgress: ProgressEvent | None = None
     progressEvents: list[ProgressEvent] = Field(default_factory=list)
+    processingProgress: MaterialProcessingProgress | None = None
     createdAt: datetime | None = None
     updatedAt: datetime | None = None
 

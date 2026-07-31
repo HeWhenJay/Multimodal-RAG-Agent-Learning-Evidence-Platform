@@ -39,29 +39,34 @@ export function useMaterialUpload({ highPrecision = false, onUploaded }: UseMate
   // 停止当前上传资料的进度轮询，避免连续上传时串扰。
   const stopProgressPolling = useCallback(() => {
     if (progressTimerRef.current !== null) {
-      window.clearInterval(progressTimerRef.current);
+      window.clearTimeout(progressTimerRef.current);
       progressTimerRef.current = null;
     }
   }, []);
 
-  // 上传完成后继续轮询 Python 资料状态，让上传提示显示真实 RAG 阶段。
+  // 上传完成后按请求完成时间递归轮询，避免慢请求重叠并在终态立即停止。
   const startProgressPolling = useCallback((materialId: number, filename: string) => {
     stopProgressPolling();
     const poll = async () => {
+      let shouldContinue = true;
       try {
         const material = await fetchMaterial(materialId);
         setUploadMessage(formatUploadProgress(material, filename));
-        if (isTerminalStatus(material.status)) {
+        if (isTerminalStatus(material)) {
+          shouldContinue = false;
           stopProgressPolling();
         }
       } catch {
         setUploadMessage(`已上传，等待 RAG 进度：${filename}`);
+      } finally {
+        if (shouldContinue) {
+          progressTimerRef.current = window.setTimeout(() => {
+            void poll();
+          }, PROGRESS_POLL_INTERVAL_MS);
+        }
       }
     };
     void poll();
-    progressTimerRef.current = window.setInterval(() => {
-      void poll();
-    }, PROGRESS_POLL_INTERVAL_MS);
   }, [stopProgressPolling]);
 
   useEffect(() => stopProgressPolling, [stopProgressPolling]);
@@ -108,9 +113,19 @@ function shouldUseChunkUpload(file: File) {
 
 // 生成上传提示的主文案，优先展示当前 RAG 处理阶段和切块进度。
 function formatUploadProgress(material: LearningMaterial, filename: string) {
+  const processing = material.processingProgress;
+  if (processing) {
+    const parts = [
+      processing.currentPhaseLabel,
+      processing.message,
+      processing.currentChunk && processing.totalChunks ? `切块 ${processing.currentChunk}/${processing.totalChunks}` : '',
+      `${Math.round(processing.percent)}%`
+    ].filter(Boolean);
+    return parts.join(' · ') || `${processing.statusLabel}：${filename}`;
+  }
   const progress = material.latestProgress;
   if (!progress) {
-    if (isTerminalStatus(material.status)) {
+    if (isTerminalStatus(material)) {
       return `${formatMaterialStatus(material.status)}：${filename}`;
     }
     return `已上传，等待 RAG 进度：${filename}`;
@@ -127,8 +142,8 @@ function formatUploadProgress(material: LearningMaterial, filename: string) {
 }
 
 // 判断后台解析是否已经进入终态。
-function isTerminalStatus(status: string) {
-  return ['READY', 'PARTIAL', 'FAILED'].includes(status);
+function isTerminalStatus(material: LearningMaterial) {
+  return material.processingProgress?.isTerminal ?? ['READY', 'PARTIAL', 'FAILED'].includes(material.status);
 }
 
 // 将资料终态转换为上传提示文本。
@@ -168,7 +183,7 @@ async function uploadVideoInChunks(
     const start = chunkIndex * VIDEO_CHUNK_SIZE;
     const end = Math.min(file.size, start + VIDEO_CHUNK_SIZE);
     const chunk = file.slice(start, end, file.type || 'application/octet-stream');
-    setUploadMessage(`正在并发上传视频分片：${chunkIndex + 1}/${totalChunks}，并发 ${VIDEO_CHUNK_UPLOAD_CONCURRENCY}，uploadId=${session.uploadId}`);
+    setUploadMessage(`正在并发上传视频分片：${chunkIndex + 1}/${totalChunks}，并发 ${VIDEO_CHUNK_UPLOAD_CONCURRENCY}`);
     const task = uploadChunkWithRetry(
       {
         chunk,

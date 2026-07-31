@@ -24,7 +24,8 @@ function mergeSingleMaterialProgress(previous: LearningMaterial | undefined, nex
   return {
     ...next,
     latestProgress: next.latestProgress || previous.latestProgress,
-    progressEvents: mergeProgressEvents(previous.progressEvents, next.progressEvents)
+    progressEvents: mergeProgressEvents(previous.progressEvents, next.progressEvents),
+    processingProgress: next.processingProgress || previous.processingProgress
   };
 }
 

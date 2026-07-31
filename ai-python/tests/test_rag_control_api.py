@@ -10,6 +10,7 @@ from app.api.auth import get_auth_service
 from app.api.rag_control import get_rag_control_service
 from app.auth.service import AuthBusinessError
 from app.main import app
+from app.repositories.rag_control import MaterialRecord, ProgressLogRecord
 from app.schemas.auth import AuthUserResponse
 from app.schemas.rag import QueryResponse, QueryTaskResponse
 from app.schemas.rag_control import (
@@ -223,6 +224,61 @@ def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
         assert service.users == ["42"] * 13
     finally:
         app.dependency_overrides.clear()
+
+
+def test_material_detail_response_contains_processing_snapshot() -> None:
+    """资料详情接口使用的响应转换必须返回统一处理快照。"""
+
+    class ProgressTransaction:
+        """返回一条向量生成事件的最小事务替身。"""
+
+        def list_progress(self, material_id: int, limit: int) -> list[ProgressLogRecord]:
+            """模拟资料详情查询最近进度。"""
+            assert material_id == 9
+            assert limit == 30
+            return [
+                ProgressLogRecord(
+                    stage="embedding.chunk",
+                    message="第 2/4 块：生成 embedding",
+                    success=True,
+                    context_json=(
+                        '{"stageCode":"embedding.chunk","stageLabel":"生成 embedding",'
+                        '"status":"RUNNING","currentStep":7,"totalSteps":8,'
+                        '"currentChunk":2,"totalChunks":4,"percent":60}'
+                    ),
+                    created_at=datetime(2026, 8, 1, 10, 1),
+                )
+            ]
+
+    material = MaterialRecord(
+        id=9,
+        title="课程视频",
+        user_id="42",
+        document_type="mp4",
+        source="upload",
+        status="PARSING",
+        parser="video-rag-v6",
+        document_summary=None,
+        chunk_count=0,
+        original_filename="course.mp4",
+        original_file_path="oss://private/course.mp4",
+        storage_type="oss",
+        object_key="private/course.mp4",
+        public_url=None,
+        active_index_job_id="job-9",
+        index_request_version=1,
+        created_at=datetime(2026, 8, 1, 10, 0),
+        updated_at=datetime(2026, 8, 1, 10, 0),
+    )
+    service = object.__new__(RagControlService)
+
+    response = service._material_response(ProgressTransaction(), material)
+
+    assert response.processingProgress is not None
+    assert response.processingProgress.currentPhaseCode == "EMBEDDING"
+    assert response.processingProgress.currentChunk == 2
+    assert response.processingProgress.totalChunks == 4
+    assert response.processingProgress.percent == 60
 
 
 def test_public_rag_validation_and_missing_token_use_result_envelope() -> None:

@@ -1,0 +1,222 @@
+.channel-progress {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px 0 2px;
+  border-top: 1px solid var(--line);
+}
+
+.channel-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.channel-progress-title {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+}
+
+.channel-progress-title > div,
+.channel-phase-list li > div {
+  min-width: 0;
+}
+
+.channel-progress-title strong,
+.channel-progress-title small,
+.channel-progress-message,
+.channel-progress-detail,
+.channel-progress-failure,
+.channel-progress-next {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.channel-progress-title strong {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.channel-progress-title small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.channel-progress-icon,
+.channel-phase-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: #64748b;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+}
+
+.channel-progress-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.channel-progress-icon.is-running,
+.channel-phase-list li.is-running .channel-phase-icon {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.channel-progress-icon.is-completed,
+.channel-phase-list li.is-completed .channel-phase-icon {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.channel-progress-icon.is-failed,
+.channel-phase-list li.is-failed .channel-phase-icon {
+  color: #b91c1c;
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.channel-progress-percent {
+  flex: 0 0 auto;
+  color: var(--primary);
+  font-size: 16px;
+}
+
+.channel-progress-message {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.channel-progress-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.channel-progress-metrics span {
+  padding: 3px 7px;
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.channel-phase-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 8px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.channel-phase-list li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  padding-top: 8px;
+  border-top: 2px solid #e2e8f0;
+}
+
+.channel-phase-list li.is-running {
+  border-top-color: #60a5fa;
+}
+
+.channel-phase-list li.is-completed {
+  border-top-color: #34d399;
+}
+
+.channel-phase-list li.is-failed {
+  border-top-color: #f87171;
+}
+
+.channel-phase-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.channel-phase-list strong,
+.channel-phase-list small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.channel-phase-list strong {
+  color: #334155;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.channel-phase-list small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.channel-progress-detail,
+.channel-progress-failure,
+.channel-progress-next {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.channel-progress-failure {
+  color: #b91c1c;
+}
+
+.channel-progress-next {
+  color: #0369a1;
+  font-weight: 700;
+}
+
+.task-progress-compact {
+  display: grid;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.task-progress-compact > span {
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  background: #e5e7eb;
+  border-radius: 999px;
+}
+
+.task-progress-compact > span i {
+  display: block;
+  height: 100%;
+  background: #2563eb;
+  border-radius: inherit;
+  transition: width 180ms ease;
+}
+
+.task-progress-compact small.failed,
+.task-status strong.failed {
+  color: var(--danger);
+}

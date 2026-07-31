@@ -1,9 +1,13 @@
 import {
+  ArrowRight,
   CalendarDays,
   Anchor,
   Bot,
+  Check,
   ChevronDown,
   CloudUpload,
+  CircleAlert,
+  CircleDot,
   Database,
   FileText,
   LibraryBig,
@@ -17,12 +21,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, ty
 import { fetchDashboardData } from '../api/pageData';
 import { fetchRagQueryHistory, runRagQueryTask } from '../api/rag';
 import type { DashboardData, LearningMaterial, RagEvidence, RagProgress, RagQueryHistory } from '../api/types';
+import type { MaterialProcessingProgress } from '../api/materialProcessingTypes';
 import { MarkdownText } from '../components/MarkdownText';
 import { RagQueryProgress } from '../components/RagQueryProgress';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
 import { markRagQueryProgressFailed } from '../services/ragQueryProgress';
 import { buildEvidenceHrefRewriter, buildEvidenceOpenHref } from '../utils/evidenceLinks';
+import '../styles/DashboardProgress.css';
 import {
   BLOCK_TYPE_OPTIONS,
   DEFAULT_RAG_ADVANCED_SEARCH,
@@ -83,12 +89,18 @@ export function Dashboard() {
     }
   });
   const rangeBounds = useMemo(() => recentRangeBounds(), []);
+  const processingMaterials = useMemo(
+    () => (dashboard?.recentMaterials || []).filter(isProcessingMaterial),
+    [dashboard?.recentMaterials]
+  );
+  const hasProcessingMaterials = processingMaterials.length > 0;
+  const activeProcessingMaterial = processingMaterials[0] || null;
   const backgroundProgressMessage = useMemo(
     () => formatChannelProcessingMessage(dashboard?.recentMaterials || []),
     [dashboard?.recentMaterials]
   );
   const channelMessage = uploadMessage || backgroundProgressMessage;
-  const channelBusy = uploading || Boolean(backgroundProgressMessage);
+  const channelBusy = uploading || processingMaterials.length > 0;
 
   // 拉取最近 RAG 询问历史，用于回答区回填。
   const loadQueryHistory = useCallback(async () => {
@@ -141,14 +153,32 @@ export function Dashboard() {
   }, [loadQueryHistory]);
 
   useEffect(() => {
-    if (!dashboard?.recentMaterials?.some(isProcessingMaterial)) {
+    if (!hasProcessingMaterials) {
       return undefined;
     }
-    const timer = window.setInterval(() => {
-      void loadDashboard();
+    let active = true;
+    let timer: number | null = null;
+
+    // 请求完成后才安排下一轮，避免慢接口导致多个工作台请求重叠。
+    const refresh = async () => {
+      await loadDashboard();
+      if (active) {
+        timer = window.setTimeout(() => {
+          void refresh();
+        }, 2000);
+      }
+    };
+
+    timer = window.setTimeout(() => {
+      void refresh();
     }, 2000);
-    return () => window.clearInterval(timer);
-  }, [dashboard?.recentMaterials, loadDashboard]);
+    return () => {
+      active = false;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [hasProcessingMaterials, loadDashboard]);
 
   // 处理工作台文件选择上传。
   function handleUploadChange(event: ChangeEvent<HTMLInputElement>) {
@@ -476,6 +506,11 @@ export function Dashboard() {
             <input type="file" accept={MATERIAL_FILE_ACCEPT} disabled={uploading} onChange={handleUploadChange} />
           </label>
           {channelMessage ? <p className="form-message">{channelMessage}</p> : null}
+          <ChannelProcessingPanel
+            item={activeProcessingMaterial}
+            uploading={uploading}
+            uploadMessage={uploadMessage}
+          />
           <div className="task-toolbar">
             <div className="task-heading">
               <h4>近期处理任务</h4>
@@ -539,11 +574,22 @@ export function Dashboard() {
               <FileText size={20} />
               <span>
                 <strong>{item.title}</strong>
-                {item.latestProgress ? <small>{formatTaskProgress(item)}</small> : null}
+                {formatTaskProgress(item) ? <small>{formatTaskProgress(item)}</small> : null}
                 <small>{formatDocumentMeta(item)}</small>
+                {item.processingProgress ? (
+                  <span className="task-progress-compact">
+                    <span aria-hidden="true">
+                      <i style={{ width: `${clampPercent(item.processingProgress.percent)}%` }} />
+                    </span>
+                    <small>{formatProcessingMeta(item.processingProgress)}</small>
+                    {item.processingProgress.failureMessage ? (
+                      <small className="failed">{item.processingProgress.failureMessage}</small>
+                    ) : null}
+                  </span>
+                ) : null}
               </span>
               <div className="task-status">
-                <strong className={displayMaterialStatus(item) === 'READY' ? '' : 'processing'}>{formatMaterialStatus(displayMaterialStatus(item))}</strong>
+                <strong className={materialStatusClass(item)}>{formatMaterialStatus(displayMaterialStatus(item))}</strong>
                 <small>{item.chunkCount} 个切块</small>
               </div>
             </div>
@@ -554,6 +600,91 @@ export function Dashboard() {
 
 
       </section>
+    </div>
+  );
+}
+
+// 展示当前上传资料的阶段快照，避免接入通道只反馈一行笼统文案。
+function ChannelProcessingPanel({
+  item,
+  uploading,
+  uploadMessage
+}: {
+  item: LearningMaterial | null;
+  uploading: boolean;
+  uploadMessage: string;
+}) {
+  const progress = item?.processingProgress;
+  if (!progress && !uploading) {
+    return null;
+  }
+
+  if (!progress) {
+    return (
+      <div className="channel-progress" aria-live="polite">
+        <div className="channel-progress-head">
+          <div className="channel-progress-title">
+            <span className="channel-progress-icon is-running"><Loader2 className="spin" size={17} /></span>
+            <div>
+              <strong>正在上传资料</strong>
+              <small>{uploadMessage || '正在接收文件，完成后将自动进入 RAG 处理'}</small>
+            </div>
+          </div>
+          <strong className="channel-progress-percent">上传中</strong>
+        </div>
+      </div>
+    );
+  }
+
+  const percent = clampPercent(progress.percent);
+  return (
+    <div className="channel-progress" aria-live="polite">
+      <div className="channel-progress-head">
+        <div className="channel-progress-title">
+          <span className={`channel-progress-icon ${phaseStatusClass(progress, progress.currentPhaseCode)}`}>
+            {phaseStatusIcon(progress, progress.currentPhaseCode)}
+          </span>
+          <div>
+            <strong>{item?.title || '当前资料'}</strong>
+            <small>{progress.statusLabel} · {progress.currentPhaseLabel}</small>
+          </div>
+        </div>
+        <strong className="channel-progress-percent">{percent}%</strong>
+      </div>
+      <div
+        className="material-progress-bar"
+        role="progressbar"
+        aria-label="多模态资料处理进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <p className="channel-progress-message">{progress.message}</p>
+      <div className="channel-progress-metrics">
+        <span>阶段 {progress.completedPhaseCount}/{progress.totalPhaseCount}</span>
+        {progress.currentStep && progress.totalSteps ? <span>流程 {progress.currentStep}/{progress.totalSteps}</span> : null}
+        {progress.currentChunk && progress.totalChunks ? <span>切块 {progress.currentChunk}/{progress.totalChunks}</span> : null}
+        {progress.elapsedSeconds > 0 ? <span>累计耗时 {formatElapsedSeconds(progress.elapsedSeconds)}</span> : null}
+        {progress.lastUpdatedAt ? <span>更新 {formatDateTime(progress.lastUpdatedAt)}</span> : null}
+      </div>
+      <ol className="channel-phase-list" aria-label="资料处理阶段">
+        {progress.phases.map((phase) => (
+          <li className={phaseStatusClass(progress, phase.phaseCode, phase.status)} key={phase.phaseCode}>
+            <span className="channel-phase-icon">{phaseStatusIcon(progress, phase.phaseCode, phase.status)}</span>
+            <div>
+              <strong>{phase.phaseLabel}</strong>
+              <small>{phase.message || phaseStatusLabel(phase.status)}</small>
+            </div>
+          </li>
+        ))}
+      </ol>
+      {progress.detail ? <p className="channel-progress-detail">{progress.detail}</p> : null}
+      {progress.failureMessage ? (
+        <p className="channel-progress-failure"><CircleAlert size={15} />{progress.failureMessage}</p>
+      ) : null}
+      <p className="channel-progress-next"><ArrowRight size={15} />{progress.nextAction}</p>
     </div>
   );
 }
@@ -651,7 +782,18 @@ function formatMaterialStatus(status: string) {
 
 // 当前进度仍在运行时，以进度事件覆盖滞后的资料主状态。
 function displayMaterialStatus(item: LearningMaterial) {
-  return isProcessingMaterial(item) ? 'PARSING' : item.status;
+  if (item.processingProgress?.isProcessing) {
+    return item.processingProgress.materialStatus || 'PARSING';
+  }
+  return item.processingProgress?.materialStatus || item.status;
+}
+
+// 根据终态和处理中的标准阶段返回任务状态样式。
+function materialStatusClass(item: LearningMaterial) {
+  const status = normalizeStatus(displayMaterialStatus(item));
+  if (status === 'FAILED') return 'failed';
+  if (status === 'READY' || status === 'PARTIAL') return '';
+  return 'processing';
 }
 
 // 展示资料类型、解析器和更新时间等任务元数据。
@@ -725,6 +867,17 @@ function formatDuration(value: number) {
     return `${value}ms`;
   }
   return `${(value / 1000).toFixed(1)}s`;
+}
+
+// 将资料处理耗时转换为工作台易读的短文本。
+function formatElapsedSeconds(value: number) {
+  const seconds = Math.max(0, Math.round(value));
+  if (seconds < 60) return `${seconds}秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remain = seconds % 60;
+  if (minutes < 60) return remain ? `${minutes}分${remain}秒` : `${minutes}分`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}小时${minutes % 60 ? `${minutes % 60}分` : ''}`;
 }
 
 // 默认查询最近 7 天内的任务。
@@ -810,6 +963,9 @@ function clampNumber(value: string, min: number, max: number) {
 
 // 判断资料是否仍处于后台处理，优先结合最新进度事件而非只看资料主状态。
 function isProcessingMaterial(item: LearningMaterial) {
+  if (item.processingProgress) {
+    return item.processingProgress.isProcessing;
+  }
   if (PROCESSING_MATERIAL_STATUSES.has(normalizeStatus(item.status))) {
     return true;
   }
@@ -853,6 +1009,16 @@ function formatChannelProcessingMessage(items: LearningMaterial[]) {
 
 // 工作台任务行展示当前 RAG 阶段和切块计数。
 function formatTaskProgress(item: LearningMaterial) {
+  const snapshot = item.processingProgress;
+  if (snapshot) {
+    const parts = [
+      snapshot.currentPhaseLabel,
+      snapshot.message,
+      snapshot.currentChunk && snapshot.totalChunks ? `切块 ${snapshot.currentChunk}/${snapshot.totalChunks}` : '',
+      `${clampPercent(snapshot.percent)}%`
+    ].filter(Boolean);
+    return parts.join(' · ');
+  }
   const progress = item.latestProgress;
   if (!progress) return '';
   const parts = [
@@ -861,5 +1027,58 @@ function formatTaskProgress(item: LearningMaterial) {
     typeof progress.percent === 'number' ? `${Math.round(progress.percent)}%` : ''
   ].filter(Boolean);
   return parts.join(' · ');
+}
+
+// 展示标准阶段完成度、耗时和最后一次进度更新时间。
+function formatProcessingMeta(progress: MaterialProcessingProgress) {
+  const parts = [`阶段 ${progress.completedPhaseCount}/${progress.totalPhaseCount}`];
+  if (progress.elapsedSeconds > 0) {
+    parts.push(`耗时 ${formatElapsedSeconds(progress.elapsedSeconds)}`);
+  }
+  if (progress.lastUpdatedAt) {
+    parts.push(`更新 ${formatDateTime(progress.lastUpdatedAt)}`);
+  }
+  return parts.join(' · ');
+}
+
+// 限制进度条宽度，兼容旧接口返回空值或异常数字。
+function clampPercent(value: number | null | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+// 返回阶段节点的视觉状态，统一当前阶段、完成和失败的反馈。
+function phaseStatusClass(
+  progress: MaterialProcessingProgress,
+  phaseCode: string,
+  explicitStatus?: string
+) {
+  const status = normalizeStatus(explicitStatus || progress.phases.find((phase) => phase.phaseCode === phaseCode)?.status);
+  if (status === 'FAILED') return 'is-failed';
+  if (status === 'COMPLETED') return 'is-completed';
+  if (progress.currentPhaseCode === phaseCode) return 'is-running';
+  return 'is-pending';
+}
+
+// 使用图标区分阶段状态，避免用户只能从颜色猜当前处理位置。
+function phaseStatusIcon(
+  progress: MaterialProcessingProgress,
+  phaseCode: string,
+  explicitStatus?: string
+) {
+  const status = normalizeStatus(explicitStatus || progress.phases.find((phase) => phase.phaseCode === phaseCode)?.status);
+  if (status === 'FAILED') return <CircleAlert size={15} />;
+  if (status === 'COMPLETED') return <Check size={15} />;
+  if (progress.currentPhaseCode === phaseCode) return <Loader2 className="spin" size={15} />;
+  return <CircleDot size={15} />;
+}
+
+// 将阶段状态转换为时间线中的短标签。
+function phaseStatusLabel(status: string) {
+  const normalized = normalizeStatus(status);
+  if (normalized === 'COMPLETED') return '已完成';
+  if (normalized === 'FAILED') return '失败';
+  if (normalized === 'RUNNING') return '处理中';
+  return '等待';
 }
 

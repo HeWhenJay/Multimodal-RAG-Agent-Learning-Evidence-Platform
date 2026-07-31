@@ -42,6 +42,7 @@ from app.storage.object_storage import (
     build_rag_object_storage,
 )
 from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
+from app.services.material_processing_progress import build_material_processing_progress, public_progress_text
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.observability.progress import RagProgressReporter
@@ -1012,6 +1013,13 @@ class RagControlService:
             publicUrl=material.public_url,
             latestProgress=latest,
             progressEvents=events,
+            processingProgress=build_material_processing_progress(
+                material_status=material.status,
+                events=events,
+                created_at=material.created_at,
+                updated_at=material.updated_at,
+                failure_summary=material.document_summary if material.status == "FAILED" else None,
+            ),
             createdAt=material.created_at,
             updatedAt=material.updated_at,
         )
@@ -1237,8 +1245,11 @@ def progress_record_to_event(record: ProgressLogRecord) -> ProgressEvent:
     context = parse_json_object(record.context_json)
     return ProgressEvent(
         stageCode=str(context.get("stageCode") or record.stage or "unknown"),
-        stageLabel=str(context.get("stageLabel") or context.get("stageCode") or record.stage or "处理中"),
-        message=str(context.get("message") or record.message or "RAG 处理进度更新"),
+        stageLabel=public_progress_text(
+            context.get("stageLabel") or context.get("stageCode") or record.stage,
+            "处理中",
+        ),
+        message=public_progress_text(context.get("message") or record.message, "RAG 处理进度更新"),
         status=str(context.get("status") or ("RUNNING" if record.success is not False else "FAILED")),
         currentStep=safe_int_or_none(context.get("currentStep")),
         totalSteps=safe_int_or_none(context.get("totalSteps")),
@@ -1247,7 +1258,7 @@ def progress_record_to_event(record: ProgressLogRecord) -> ProgressEvent:
         chunkId=nullable_str(context.get("chunkId")),
         blockId=nullable_str(context.get("blockId")),
         percent=safe_int_or_none(context.get("percent")),
-        detail=nullable_str(context.get("detail")),
+        detail=public_progress_text(nullable_str(context.get("detail")), "") or None,
         createdAt=iso_or_none(record.created_at),
     )
 

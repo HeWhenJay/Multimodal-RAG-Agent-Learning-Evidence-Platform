@@ -64,6 +64,44 @@ class ProgressEvent(BaseModel):
     createdAt: str | None = None
 
 
+class MaterialProcessingPhase(BaseModel):
+    """面向工作台展示的标准资料处理阶段。"""
+
+    phaseCode: Literal["UPLOAD", "PARSE", "CHUNK", "EMBEDDING", "INDEX", "READY"]
+    phaseLabel: str
+    status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"] = "PENDING"
+    message: str | None = None
+    updatedAt: str | None = None
+
+
+class MaterialProcessingProgress(BaseModel):
+    """由资料状态和原始事件聚合得到的用户可读处理快照。"""
+
+    materialStatus: str
+    statusLabel: str
+    isProcessing: bool = False
+    isTerminal: bool = False
+    currentPhaseCode: Literal["UPLOAD", "PARSE", "CHUNK", "EMBEDDING", "INDEX", "READY"]
+    currentPhaseLabel: str
+    currentStageCode: str
+    currentStageLabel: str
+    message: str
+    detail: str | None = None
+    percent: int = Field(default=0, ge=0, le=100)
+    currentStep: int | None = None
+    totalSteps: int | None = None
+    currentChunk: int | None = None
+    totalChunks: int | None = None
+    completedPhaseCount: int = 0
+    totalPhaseCount: int = 6
+    startedAt: str | None = None
+    lastUpdatedAt: str | None = None
+    elapsedSeconds: int = 0
+    failureMessage: str | None = None
+    nextAction: str
+    phases: list[MaterialProcessingPhase] = Field(default_factory=list)
+
+
 class IndexTextRequest(BaseModel):
     documentId: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)

@@ -22,6 +22,7 @@ from app.schemas.page_data import (
     RagProgressResponse,
     SystemSettingResponse,
 )
+from app.services.material_processing_progress import build_material_processing_progress, public_progress_text
 
 
 class PageDataBusinessError(BusinessError):
@@ -80,7 +81,7 @@ class PageDataService:
                 recentTaskStartDate=recent_query.start_date.isoformat(),
                 recentTaskEndDate=recent_query.end_date.isoformat(),
                 recentTaskLimit=recent_query.limit,
-                recentMaterials=[to_material_response(transaction, material) for material in materials],
+                recentMaterials=[to_material_response(transaction, material, now=now) for material in materials],
             )
 
     def system_settings(self) -> list[SystemSettingResponse]:
@@ -128,6 +129,8 @@ def normalize_recent_task_query(
 def to_material_response(
     transaction: PageDataTransaction,
     material: PageMaterialRecord,
+    *,
+    now: datetime | None = None,
 ) -> LearningMaterialPageResponse:
     """将资料记录和合并去重后的 RAG 进度转换为前端响应。"""
     material_progress = progress_events(transaction, material.id)
@@ -148,6 +151,14 @@ def to_material_response(
         publicUrl=material.public_url,
         latestProgress=material_progress[0] if material_progress else None,
         progressEvents=material_progress,
+        processingProgress=build_material_processing_progress(
+            material_status=material.status,
+            events=material_progress,
+            created_at=material.created_at,
+            updated_at=material.updated_at,
+            failure_summary=material.document_summary if material.status == "FAILED" else None,
+            now=now,
+        ),
         createdAt=local_datetime_or_none(material.created_at),
         updatedAt=local_datetime_or_none(material.updated_at),
     )
@@ -179,8 +190,8 @@ def to_progress_response(record: PageProgressRecord) -> RagProgressResponse:
     context = parse_context(record.context_json)
     return RagProgressResponse(
         stageCode=text_or_none(context.get("stageCode")) or record.stage,
-        stageLabel=text_or_none(context.get("stageLabel")),
-        message=text_or_none(context.get("message")) or record.message or "",
+        stageLabel=public_progress_text(text_or_none(context.get("stageLabel")), "") or None,
+        message=public_progress_text(text_or_none(context.get("message")) or record.message, ""),
         status=text_or_none(context.get("status")) or ("RUNNING" if record.success is True else "FAILED"),
         currentStep=integer_or_none(context.get("currentStep")),
         totalSteps=integer_or_none(context.get("totalSteps")),
@@ -189,7 +200,7 @@ def to_progress_response(record: PageProgressRecord) -> RagProgressResponse:
         chunkId=text_or_none(context.get("chunkId")),
         blockId=text_or_none(context.get("blockId")),
         percent=integer_or_none(context.get("percent")),
-        detail=text_or_none(context.get("detail")),
+        detail=public_progress_text(text_or_none(context.get("detail")), "") or None,
         createdAt=local_datetime_or_none(record.created_at),
     )
 

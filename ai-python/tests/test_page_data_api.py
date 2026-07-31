@@ -215,6 +215,20 @@ def test_dashboard_uses_authenticated_user_clamps_dates_and_merges_progress() ->
         material = body["data"]["recentMaterials"][0]
         assert material["userId"] == "42"
         assert material["latestProgress"]["stageCode"] == "embedding.chunk"
+        processing = material["processingProgress"]
+        assert processing["materialStatus"] == "PARSING"
+        assert processing["currentPhaseCode"] == "EMBEDDING"
+        assert processing["currentStageCode"] == "embedding.chunk"
+        assert processing["percent"] == 55
+        assert processing["completedPhaseCount"] == 3
+        assert [item["status"] for item in processing["phases"]] == [
+            "COMPLETED",
+            "COMPLETED",
+            "COMPLETED",
+            "RUNNING",
+            "PENDING",
+            "PENDING",
+        ]
         assert [item["stageCode"] for item in material["progressEvents"]] == [
             "embedding.chunk",
             "parse.video.ocr",
