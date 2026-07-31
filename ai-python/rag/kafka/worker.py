@@ -124,6 +124,7 @@ class RagKafkaIndexWorker:
                 object_storage=self.object_storage,
             )
             source_path = downloaded.source_path
+            source_reference = source_path or str(downloaded.path)
             try:
                 filename = downloaded.filename or payload.title
                 if is_video_source(filename, payload.documentType, downloaded.content_type):
@@ -136,6 +137,7 @@ class RagKafkaIndexWorker:
                         user_id=payload.userId,
                         visibility_scope=payload.stagingVisibilityScope,
                         source_path=str(downloaded.path),
+                        source_reference=source_reference,
                         filename=filename,
                         content_type=downloaded.content_type,
                         high_precision=payload.highPrecision,
@@ -148,6 +150,7 @@ class RagKafkaIndexWorker:
                         user_id=payload.userId,
                         visibility_scope=payload.stagingVisibilityScope,
                         source_path=str(downloaded.path),
+                        source_reference=source_reference,
                         filename=filename,
                         content_type=downloaded.content_type,
                         high_precision=payload.highPrecision,

@@ -65,6 +65,7 @@ def parse_video_source_with_worker_pool(
     user_id: str,
     visibility_scope: str,
     source_path: str,
+    source_reference: str | None = None,
     filename: str,
     content_type: str | None,
     high_precision: bool,
@@ -79,6 +80,7 @@ def parse_video_source_with_worker_pool(
     if not read_bool("RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED", True):
         return None
     original_path = Path(source_path).expanduser().resolve()
+    evidence_source_path = source_reference or str(original_path)
     if not original_path.is_file():
         return None
     target_bytes = segment_target_bytes()
@@ -142,7 +144,7 @@ def parse_video_source_with_worker_pool(
             source=source,
             user_id=user_id,
             visibility_scope=visibility_scope,
-            original_source_path=str(original_path),
+            original_source_path=evidence_source_path,
             filename=filename,
             content_type=content_type,
             high_precision=high_precision,
@@ -159,7 +161,7 @@ def parse_video_source_with_worker_pool(
             parser_router=parser_router,
             document_id=document_id,
             title=title,
-            original_source_path=str(original_path),
+            original_source_path=evidence_source_path,
             results=results,
             warnings=warnings,
         )
@@ -297,6 +299,7 @@ def parse_segments_with_shared_queue(
                     user_id=user_id,
                     visibility_scope=visibility_scope,
                     source_path=str(task.path),
+                    source_reference=original_source_path,
                     filename=segment_filename(filename, task.index),
                     content_type=content_type,
                     high_precision=high_precision,
@@ -451,7 +454,7 @@ def adjust_segment_block(
             "videoMediaSegmentIndex": task.index,
             "videoMediaSegmentStartTime": seconds_to_timestamp(task.start_seconds),
             "videoMediaSegmentEndTime": seconds_to_timestamp(task.end_seconds),
-            "videoMediaSegmentSourcePath": str(task.path),
+            "videoMediaSegmentFilename": task.path.name,
             "sourcePath": original_source_path,
         }
     )

@@ -186,6 +186,37 @@ def test_kafka_oss_source_downloads_and_cleans_temp_file(monkeypatch, tmp_path):
     assert not downloaded.exists()
 
 
+def test_kafka_oss_source_uses_public_base_url_as_evidence_reference(monkeypatch, tmp_path):
+    """OSS 临时下载路径只供解析使用，evidence 来源必须由公开 BaseUrl 构造。"""
+    bucket = FakeOssBucket()
+    storage = OssRagObjectStorage(
+        bucket=bucket,
+        bucket_name="evidence",
+        object_prefix="learning-evidence",
+        public_base_url="https://cdn.example.com",
+    )
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"video bytes")
+    stored = storage.store_file(source, "课程视频.mp4", "42", "mp4", "video/mp4")
+    monkeypatch.setenv("EVIDENCE_UPLOAD_TEMP_ROOT", str(tmp_path / "temp"))
+
+    opened = open_storage_source(
+        StorageSourceRef(
+            storageType="oss",
+            objectKey=stored.object_key,
+            filename="课程视频.mp4",
+            contentType="video/mp4",
+        ),
+        user_id="42",
+        object_storage=storage,
+    )
+
+    assert opened.source_path == storage.public_url(stored.object_key or "")
+    assert opened.source_path and opened.source_path.startswith("https://cdn.example.com/learning-evidence/42/mp4/")
+    assert str(opened.path) not in opened.source_path
+    opened.cleanup()
+
+
 def test_kafka_oss_video_source_downloads_same_key_sidecar(monkeypatch, tmp_path):
     """OSS 视频与同名侧车字幕应一起下载，并在 worker 清理时一起删除。"""
     bucket = FakeOssBucket()

@@ -11,6 +11,7 @@ from typing import Any
 from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.core.models import Chunk, utc_now_iso
+from rag.core.source_references import public_http_source
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.core.metadata_filters import (
     BUSINESS_METADATA_FILTER_KEYS,
@@ -1230,8 +1231,8 @@ class PgVectorRagStore:
             title=title,
             snippet=snippet,
             source=str(row.get("source") or "unknown"),
-            sourcePath=as_optional_str(metadata.get("sourcePath")),
-            assetPath=as_optional_str(metadata.get("assetPath")),
+            sourcePath=public_http_source(metadata.get("sourcePath")),
+            assetPath=public_http_source(metadata.get("assetPath")),
             playbackUrl=build_playback_url(
                 document_id=str(row["document_id"]),
                 title=title,

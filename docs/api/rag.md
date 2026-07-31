@@ -482,6 +482,8 @@ Multi-Query 生成契约：
 
 用途：RAG 回答和 evidence 卡片中的 Markdown 资料位置不再直接跳到 OSS/CDN 原始 URL，避免对象存储 `Content-Disposition` 或 `Content-Type` 触发浏览器下载。前端打开 `/preview/material/{id}` 新标签页后，由该接口读取当前用户名下资料的原始 Markdown/Text 内容并在应用内渲染。视频 evidence 不调用该文本预览接口，而是由前端把原始 `.mp4/.mov/.webm` 等来源链接改写到 `/videos?...startTime=...&endTime=...&videoUrl=...`，在应用内播放器按时间段定位。
 
+2026-07-31 补充：工作台、Agent 工作台和回答 Markdown 渲染器必须使用同一套 evidence 跳转规则。非视频 Markdown/Text evidence 的证据标题、章节位置和回答中的来源链接应打开 `/preview/material/{id}` 新标签页；视频 evidence 的证据标题、播放定位按钮和回答中的来源链接应打开 `/videos` 新标签页，并携带 `documentId/title/startTime/endTime` 以及经过公开来源校验的 `sourcePath/videoUrl`。Windows/Unix 本地绝对路径、`file://`、worker 临时下载路径和私有 `oss://` 定位符不得写入浏览器查询参数或页面正文。若视频来源不是浏览器可直接播放的 `http(s)` 地址，`/videos` 页面仍需展示已定位时间段和不可播放原因，不能静默生成不可点击文本。
+
 `MaterialPreviewVO`：
 
 ```json
@@ -1239,6 +1241,8 @@ Java 会把日期范围限制在最近 7 天内，查询条件为 `created_at >=
 
 `source_path` 在 OSS 模式下优先保存公开 CDN URL；如果未配置公开访问地址，则保存 `oss://bucket/objectKey`，仅用于 evidence 来源追踪。Python worker 通过 `objectKey` 和用户隔离校验读取私有 OSS 对象；真实视频浏览器播放仍需要 `ALIYUN_OSS_PUBLIC_BASE_URL` 或签名 URL 服务。
 
+2026-07-31 修复约定：Kafka worker 必须严格区分“解析输入路径”和“对外来源引用”。OSS 对象可以下载到 `rag-oss-*` 临时文件供 FFmpeg、ASR 和 OCR 读取，但临时文件路径及 `rag-video-segments-*` 分片路径只允许存在于当前解析进程，不能写入 `DocumentBlock.sourcePath/assetPath/metadata`、向量索引、evidence 响应、日志上下文或前端 URL。对外来源优先使用由当前 OSS `objectKey` 和 `ALIYUN_OSS_PUBLIC_BASE_URL` 重新构造的公开 URL；未配置公开地址时只在服务端保存 `oss://bucket/objectKey` 追踪定位，前端统一显示为不可播放的受控来源，不回显内部定位符。
+
 ### 按视频源索引
 
 `POST /internal/rag/documents/index-video-source` 使用 `application/json`，用于长视频分片合并后避免 Java 再次转发完整文件。
@@ -1461,10 +1465,10 @@ Python `Evidence.metadata` 会保留上述父子索引、OCR occurrence、聚合
 | `title` | `documentTitle/title` | 播放页标题 |
 | `startTime` | `evidence.startTime` | 必填定位时间，支持 `HH:MM:SS`、`MM:SS` 和带毫秒时间 |
 | `endTime` | `evidence.endTime` | 可选结束时间 |
-| `sourcePath` | `evidence.sourcePath` 或明确视频 URL 来源 | 来源追踪，页面只在其为明确视频 URL 时自动作为播放器地址 |
+| `sourcePath` | 经过公开来源校验的 `evidence.sourcePath` | 仅传递 `http(s)` 来源；本地路径、临时路径、`file://` 和私有 `oss://` 不进入浏览器 URL |
 | `videoUrl` | 公开视频 URL | 显式播放器地址，支持签名 URL、CDN 转发 URL 或无扩展名播放接口 |
 
-如果 Python 返回的 `playbackUrl` 已经是 `/videos?...`，前端会归一化后复用，并优先保留 evidence 自身的 `startTime/endTime`。如果 `playbackUrl` 是 `https://...mp4#t=10` 这类外部 URL，前端会剥离 fragment 后作为 `videoUrl` 传入 `/videos`，避免 fragment 秒点和 query 秒点冲突。`/videos` 只允许浏览器直接访问的 `http(s)` 播放地址；缺少可播放 URL 但已有时间戳时展示降级提示：“当前 evidence 已定位到时间段，但来源不是浏览器可直接访问的视频 URL，请配置 ALIYUN_OSS_PUBLIC_BASE_URL 或补充签名 URL 服务。”
+如果 Python 返回的 `playbackUrl` 已经是 `/videos?...`，前端会归一化后复用，并优先保留 evidence 自身的 `startTime/endTime`。如果 `playbackUrl` 是 `https://...mp4#t=10` 这类外部 URL，前端会剥离 fragment 后作为 `videoUrl` 传入 `/videos`，避免 fragment 秒点和 query 秒点冲突。`/videos` 只允许浏览器直接访问的 `http(s)` 播放地址；历史 evidence 即使包含本地或 worker 临时路径，前端也必须丢弃该值且不得回显。缺少可播放 URL 但已有时间戳时展示受控降级提示，不向用户暴露内部目录或对象定位信息。
 
 ## 原始视频 RAG 策略
 
@@ -2064,6 +2068,8 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 对象 key 固定为 `prefix/{userId}/{documentType}/{yyyyMMdd}/{uuid}-{filename}`。用户 ID、资料类型和文件名均先经过单路径段清理；Kafka worker 读取 OSS 前还会校验 bucket、前缀和用户段，拒绝 `..`、绝对路径、反斜杠及跨用户 key。未配置 `ALIYUN_OSS_PUBLIC_BASE_URL` 时，数据库只保存 `oss://bucket/key` 来源追踪地址，worker 仍可用密钥下载私有对象。
 
 `EVIDENCE_STORAGE_PROVIDER=local` 使用 `EVIDENCE_UPLOAD_ROOT`；`EVIDENCE_STORAGE_PROVIDER=oss` 必须配置 Endpoint、Bucket、AccessKey ID 和 Secret，否则 Python 启动或首次构造存储适配器时返回中文配置错误。OSS 下载只写入 `EVIDENCE_UPLOAD_TEMP_ROOT` 下的临时文件，解析结束后在 `finally` 中删除，原始对象不会被 worker 删除。
+
+`ALIYUN_OSS_PUBLIC_BASE_URL` 由 FastAPI/Kafka worker 进程在构造 OSS 适配器时读取。修改 Windows 用户环境变量后，已运行的服务不会自动刷新，必须重启 Python API 与 Kafka worker。新增资料会直接使用公开 URL；已有索引若曾写入 `rag-oss-*` 或其他本地路径，需要执行资料“重建索引”，由保存在资料记录中的 `objectKey` 重新生成公开来源。
 
 OSS 模式写入 `learning_material.original_file_path` 的优先级：
 

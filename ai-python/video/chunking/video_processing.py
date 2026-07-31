@@ -453,18 +453,20 @@ def process_video_bytes(
 def process_video_source(
     *,
     source_path: str,
+    source_reference: str | None = None,
     filename: str,
     document_id: str,
     source_title: str,
     ocr_client: BailianOcrClient,
     progress_reporter: RagProgressReporter | None = None,
 ) -> VideoProcessingResult:
-    """按本地路径或公开视频 URL 处理长视频，避免 Java 转发完整视频字节。"""
+    """按本地路径或公开视频 URL 读取视频，并隔离对外 evidence 来源。"""
+    evidence_source_path = source_reference or source_path
     process_event(
         stage="parse.video",
         action="process_video_source_route",
         message="已进入视频来源路径处理",
-        context={"sourcePath": source_path, "filename": filename},
+        context={"filename": filename},
     )
     if is_public_url(source_path):
         return process_video_input(
@@ -472,22 +474,22 @@ def process_video_source(
             filename=filename,
             document_id=document_id,
             source_title=source_title,
-            source_path=source_path,
+            source_path=evidence_source_path,
             ocr_client=ocr_client,
             progress_reporter=progress_reporter,
         )
     if source_path.startswith("oss://"):
         warning = stage_warning("video.source", "当前 sourcePath 是 oss:// 私有地址，Python 无法直接读取，请配置公开 OSS/CDN URL")
         return VideoProcessingResult(
-            frame_blocks=[fallback_video_metadata_block(document_id, filename, source_title, source_path)],
+            frame_blocks=[fallback_video_metadata_block(document_id, filename, source_title, evidence_source_path)],
             parser="video-metadata-fallback",
             warnings=[warning, stage_warning("video.fallback", "视频未生成可检索字幕或关键帧 OCR 文本")],
         )
     local_path = resolve_local_video_path(source_path)
     if not local_path.exists() or not local_path.is_file():
-        warning = stage_warning("video.source", f"视频来源文件不存在或不可读取: {source_path}")
+        warning = stage_warning("video.source", "视频来源文件不存在或不可读取")
         return VideoProcessingResult(
-            frame_blocks=[fallback_video_metadata_block(document_id, filename, source_title, source_path)],
+            frame_blocks=[fallback_video_metadata_block(document_id, filename, source_title, evidence_source_path)],
             parser="video-metadata-fallback",
             warnings=[warning, stage_warning("video.fallback", "视频未生成可检索字幕或关键帧 OCR 文本")],
         )
@@ -496,7 +498,7 @@ def process_video_source(
         filename=filename,
         document_id=document_id,
         source_title=source_title,
-        source_path=source_path,
+        source_path=evidence_source_path,
         ocr_client=ocr_client,
         progress_reporter=progress_reporter,
     )
@@ -2476,7 +2478,7 @@ def fallback_video_metadata_block(
         fileType=normalize_video_file_type(filename),
         blockType="text",
         sectionTitle="视频资料元数据",
-        contentText=f"视频资料《{source_title}》已上传，来源：{source_path or filename}。当前未生成 ASR 字幕或关键帧 OCR 文本。",
+        contentText=f"视频资料《{source_title}》已上传。当前未生成 ASR 字幕或关键帧 OCR 文本。",
         parseEngine="video-metadata-fallback",
         confidence=0.3,
         sourceTitle=source_title,

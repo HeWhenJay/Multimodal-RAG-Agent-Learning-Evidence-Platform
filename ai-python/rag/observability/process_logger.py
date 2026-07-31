@@ -16,7 +16,21 @@ from rag.observability.progress import parse_material_id, truncate
 
 logger = logging.getLogger(__name__)
 _CURRENT_PROCESS_LOGGER: ContextVar[RagProcessLogger | None] = ContextVar("rag_process_logger", default=None)
-SENSITIVE_KEYS = {"content", "text", "question", "answer", "resume", "resumetext", "jobdescription", "file"}
+SENSITIVE_KEYS = {
+    "content",
+    "text",
+    "question",
+    "answer",
+    "resume",
+    "resumetext",
+    "jobdescription",
+    "file",
+    "sourcepath",
+    "source_path",
+    "assetpath",
+    "asset_path",
+    "video_input",
+}
 
 
 class RagProcessLogger:

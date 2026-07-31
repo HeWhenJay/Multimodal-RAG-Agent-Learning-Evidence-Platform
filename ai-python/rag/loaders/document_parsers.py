@@ -327,13 +327,15 @@ class DocumentParserRouter:
         user_id: str,
         visibility_scope: str,
         source_path: str,
+        source_reference: str | None = None,
         filename: str | None = None,
         content_type: str | None = None,
         high_precision: bool = False,
         progress_reporter: RagProgressReporter | None = None,
     ) -> ParsedBlockDocument:
-        """按已保存的视频来源路径解析长视频，避免 Java 再次转发完整文件。"""
+        """读取受控视频文件，并用独立公开引用生成 evidence 来源。"""
         source_filename = filename or title
+        evidence_source_path = source_reference or source_path
         file_type = detect_file_type(source_filename, document_type, content_type)
         if file_type not in VIDEO_FILE_TYPES:
             file_type = normalize_file_type(document_type)
@@ -341,12 +343,13 @@ class DocumentParserRouter:
             stage="parse.video",
             action="parse_video_source_route",
             message="已进入视频源解析路线",
-            context={"filename": source_filename, "documentType": document_type, "fileType": file_type, "sourcePath": source_path},
+            context={"filename": source_filename, "documentType": document_type, "fileType": file_type},
         )
         emit_parse_stage(progress_reporter, "video")
         try:
             blocks, quality, parser, warnings = self._parse_video_source(
                 source_path=source_path,
+                source_reference=evidence_source_path,
                 filename=source_filename,
                 document_id=document_id,
                 source_title=title,
@@ -770,6 +773,7 @@ class DocumentParserRouter:
         self,
         *,
         source_path: str,
+        source_reference: str,
         filename: str,
         document_id: str,
         source_title: str,
@@ -778,6 +782,7 @@ class DocumentParserRouter:
     ) -> tuple[list[DocumentBlock], ParseQuality, str, list[str]]:
         artifacts = process_video_source(
             source_path=source_path,
+            source_reference=source_reference,
             filename=filename,
             document_id=document_id,
             source_title=source_title,
@@ -794,7 +799,7 @@ class DocumentParserRouter:
                 document_id=document_id,
                 file_type=file_type,
                 source_title=source_title,
-                source_path=source_path,
+                source_path=source_reference,
                 parse_engine=artifacts.transcript_parser,
             )
             blocks.extend(transcript_blocks)
@@ -814,7 +819,7 @@ class DocumentParserRouter:
             document_id=document_id,
             file_type=file_type,
             source_title=source_title,
-            source_path=source_path,
+            source_path=source_reference,
             transcript_blocks=transcript_blocks,
             frame_blocks=summary_frame_blocks,
         )

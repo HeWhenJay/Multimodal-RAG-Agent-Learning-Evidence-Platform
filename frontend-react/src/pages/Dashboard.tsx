@@ -22,7 +22,7 @@ import { RagQueryProgress } from '../components/RagQueryProgress';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
 import { markRagQueryProgressFailed } from '../services/ragQueryProgress';
-import { buildPreviewHrefRewriter } from '../utils/evidencePreview';
+import { buildEvidenceHrefRewriter, buildEvidenceOpenHref } from '../utils/evidenceLinks';
 import {
   BLOCK_TYPE_OPTIONS,
   DEFAULT_RAG_ADVANCED_SEARCH,
@@ -348,16 +348,25 @@ export function Dashboard() {
             {answerStatus === 'REFUSED' && refusalMessage ? <p className="form-message danger">{refusalMessage}</p> : null}
             <MarkdownText
               content={answer || '提交问题后展示基于数据库证据检索生成的回答。'}
-              rewriteHref={buildPreviewHrefRewriter(evidences)}
+              rewriteHref={buildEvidenceHrefRewriter(evidences)}
             />
             <div className="citation-row">
               {evidences.length > 0 ? (
-                evidences.slice(0, 3).map((item) => (
-                  <span key={item.evidenceId}>
-                    <FileText size={15} />
-                    [{item.title} / {item.sectionTitle || item.sectionName}]
-                  </span>
-                ))
+                evidences.slice(0, 3).map((item) => {
+                  const href = buildEvidenceOpenHref(item);
+                  const label = `[${item.title} / ${item.sectionTitle || item.sectionName}]`;
+                  return href ? (
+                    <a key={item.evidenceId} href={href} target="_blank" rel="noreferrer">
+                      <FileText size={15} />
+                      {label}
+                    </a>
+                  ) : (
+                    <span key={item.evidenceId}>
+                      <FileText size={15} />
+                      {label}
+                    </span>
+                  );
+                })
               ) : <span><FileText size={15} />{answerStatus === 'REFUSED' ? '证据不足，已拒答' : '暂无证据引用'}</span>}
             </div>
           </div>

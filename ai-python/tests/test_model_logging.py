@@ -1,5 +1,5 @@
 from rag.observability.model_logging import log_model_call
-from rag.observability.process_logger import RagProcessLogger, use_process_logger
+from rag.observability.process_logger import RagProcessLogger, sanitize_context, use_process_logger
 
 
 def test_model_call_logs_before_and_after(capsys):
@@ -43,3 +43,13 @@ def test_recoverable_model_failure_logs_degraded_warning(capsys):
     assert "已降级继续处理" in output
     assert "action=bailian_ocr_model_failed" not in output
     assert "level=ERROR" not in output
+
+
+def test_process_log_hides_source_file_paths():
+    """Worker 临时文件路径不应进入过程日志上下文。"""
+    source_path = r"C:\Users\student\AppData\Local\Temp\rag-oss-private.mp4"
+
+    context = sanitize_context({"sourcePath": source_path, "filename": "course.mp4"})
+
+    assert context["sourcePath"] == {"type": "text", "length": len(source_path)}
+    assert source_path not in str(context)

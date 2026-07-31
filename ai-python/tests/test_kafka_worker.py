@@ -6,6 +6,8 @@ import pytest
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope, StorageSourceRef
+from app.schemas.rag import DocumentBlock, ParseQuality
+from app.storage.object_storage import OpenedStorageObject
 from app.workers.kafka_worker import (
     KafkaWorkerConnectionError,
     kafka_auto_offset_reset,
@@ -21,6 +23,7 @@ from rag.kafka.producer import KafkaJsonProducer, KafkaProgressThrottler, redact
 from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, open_storage_source
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import InMemoryRagStore
+from rag.core.models import ParsedBlockDocument
 from app.schemas.rag import QueryRequest
 
 
@@ -232,6 +235,86 @@ def test_index_result_omits_full_progress_history_from_kafka_payload():
     assert result_event.messageType == "RAG_INDEX_RESULT"
     assert "progressEvents" not in result_event.payload
     assert len(result_event.model_dump_json().encode("utf-8")) < 1_048_588
+
+
+def test_kafka_oss_video_keeps_temp_path_out_of_index(monkeypatch, tmp_path):
+    """Kafka worker 应读取 OSS 临时文件，但只把公开来源交给视频解析器和索引。"""
+
+    class RecordingVideoParser:
+        def __init__(self) -> None:
+            self.call: dict = {}
+
+        def parse_video_source(self, **kwargs) -> ParsedBlockDocument:
+            self.call = kwargs
+            block = DocumentBlock(
+                documentId=kwargs["document_id"],
+                blockId=f"{kwargs['document_id']}-subtitle-1",
+                fileType="mp4",
+                blockType="text",
+                startTime="00:00:01",
+                endTime="00:00:02",
+                sectionTitle="00:00:01 - 00:00:02",
+                contentText="OSS 视频字幕证据",
+                parseEngine="unit-video-parser",
+                sourceTitle=kwargs["title"],
+                sourcePath=kwargs["source_reference"],
+                metadata={"mediaType": "video", "evidenceChannel": "subtitle"},
+            )
+            return ParsedBlockDocument(
+                blocks=[block],
+                parser="unit-video-parser",
+                status="READY",
+                parse_quality=ParseQuality(score=1.0, nativeTextChars=len(block.contentText)),
+            )
+
+    class TempOssStorage:
+        def __init__(self, path, public_url) -> None:
+            self.path = path
+            self.public_url = public_url
+
+        def download_to_temp(self, **_kwargs) -> OpenedStorageObject:
+            return OpenedStorageObject(
+                path=self.path,
+                filename="course.mp4",
+                content_type="video/mp4",
+                source_path=self.public_url,
+                _temporary=True,
+            )
+
+    temp_video = tmp_path / "rag-oss-private.mp4"
+    temp_video.write_bytes(b"video")
+    public_source = "https://cdn.example.com/learning-evidence/7/mp4/course.mp4"
+    parser = RecordingVideoParser()
+    store = InMemoryRagStore()
+    worker = RagKafkaIndexWorker(
+        store=store,
+        parser_router=parser,
+        producer=FakeProducer(),
+        progress_producer=FakeProgressProducer(),
+        object_storage=TempOssStorage(temp_video, public_source),
+    )
+    monkeypatch.setenv("RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED", "false")
+    payload = IndexRequestPayload.model_validate({
+        **base_index_payload(),
+        "operation": "INDEX_UPLOAD",
+        "documentType": "mp4",
+        "source": "upload",
+        "sourceRef": {
+            "type": "STORAGE",
+            "filename": "course.mp4",
+            "contentType": "video/mp4",
+            "storageType": "oss",
+            "objectKey": "learning-evidence/7/mp4/course.mp4",
+        },
+        "text": None,
+    })
+
+    worker._index_to_staging(payload)
+
+    assert parser.call["source_path"] == str(temp_video)
+    assert parser.call["source_reference"] == public_source
+    assert not temp_video.exists()
+    assert {chunk.metadata.get("sourcePath") for chunk in store.chunks.values()} == {public_source}
 
 
 def test_promote_is_idempotent_and_private_query_can_see_canonical(monkeypatch):

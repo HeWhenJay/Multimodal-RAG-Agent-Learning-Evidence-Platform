@@ -473,7 +473,7 @@ class OssRagObjectStorage:
             path=temp_path,
             filename=filename or temp_path.name,
             content_type=content_type,
-            source_path=f"oss://{self.bucket_name}/{validated}",
+            source_path=self.public_url(validated) or f"oss://{self.bucket_name}/{validated}",
             _temporary=True,
         )
 

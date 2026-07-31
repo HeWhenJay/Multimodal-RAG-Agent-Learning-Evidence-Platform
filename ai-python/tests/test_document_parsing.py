@@ -60,7 +60,7 @@ def test_index_blocks_preserves_evidence_metadata():
     assert evidences[0].documentTitle == "证据结构"
     assert evidences[0].blockId
     assert evidences[0].sectionTitle
-    assert evidences[0].sourcePath == "uploads/rag/evidence.md"
+    assert evidences[0].sourcePath is None
 
 
 def test_subtitle_file_preserves_video_timestamp_metadata():
@@ -138,6 +138,7 @@ def test_video_source_with_sidecar_txt_indexes_subtitle_evidence(tmp_path, monke
         encoding="utf-8",
     )
     parser = DocumentParserRouter()
+    public_source = "https://cdn.example.com/learning-evidence/42/mp4/course.subtitled.mp4"
 
     parsed = parser.parse_video_source(
         document_id="doc-video-sidecar-txt",
@@ -147,12 +148,15 @@ def test_video_source_with_sidecar_txt_indexes_subtitle_evidence(tmp_path, monke
         user_id="unit-user",
         visibility_scope="private",
         source_path=str(source_video),
+        source_reference=public_source,
         filename=source_video.name,
     )
 
     assert parsed.status == "READY"
     assert any(block.metadata.get("evidenceChannel") == "subtitle" for block in parsed.blocks)
     assert any(block.metadata.get("evidenceChannel") == "video_segment_summary" for block in parsed.blocks)
+    assert {block.sourcePath for block in parsed.blocks} == {public_source}
+    assert all(str(tmp_path) not in block.model_dump_json() for block in parsed.blocks)
     assert not any(message.startswith("video.fallback:") for message in parsed.parse_quality.messages)
 
 

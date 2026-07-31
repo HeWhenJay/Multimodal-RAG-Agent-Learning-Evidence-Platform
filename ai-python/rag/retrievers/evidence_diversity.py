@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.core.source_references import sanitize_evidence_metadata
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
@@ -137,7 +138,7 @@ def build_evidence_metadata_view(metadata: dict[str, Any]) -> dict[str, Any]:
             view[key] = metadata.get(key)
         elif key in block_metadata and block_metadata.get(key) is not None:
             view[key] = block_metadata.get(key)
-    return view
+    return sanitize_evidence_metadata(view)
 
 
 def should_skip_by_group(channel: str, group_key: str | None, seen_groups: set[str]) -> bool:

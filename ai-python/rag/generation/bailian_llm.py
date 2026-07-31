@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.schemas.rag import Evidence
+from rag.core.source_references import evidence_source_label
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import logged_rag_method, process_event
 
@@ -183,7 +184,7 @@ def render_evidence(item: Evidence, index: int) -> str:
     location = "，".join(location_parts) or "全文"
     return (
         f"{index}. evidenceId={item.evidenceId}；资料={item.title}；位置={location}；"
-        f"来源={item.sourcePath or item.source}；分数={item.score:.4f}；片段={item.snippet}"
+        f"来源={evidence_source_label(item.sourcePath, item.source)}；分数={item.score:.4f}；片段={item.snippet}"
     )
 
 
@@ -222,7 +223,7 @@ def append_evidence_reference_summary(answer: str, evidences: list[Evidence]) ->
         location = clean_evidence_location(raw_location)
         if item.startTime:
             location = f"{location}，时间={item.startTime}-{item.endTime}" if item.endTime else f"{location}，时间={item.startTime}"
-        source = item.sourcePath or item.source or "未知来源"
+        source = evidence_source_label(item.sourcePath, item.source)
         location_link = build_evidence_location_link(raw_location, source)
         if location_link:
             location = f"[{location}]({location_link})"

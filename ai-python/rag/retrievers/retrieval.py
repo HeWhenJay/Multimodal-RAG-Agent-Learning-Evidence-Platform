@@ -14,6 +14,7 @@ from typing import Any
 from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.core.models import Chunk, utc_now_iso
+from rag.core.source_references import public_http_source
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality
 from rag.core.metadata_filters import (
     MetadataFilterPlan,
@@ -859,8 +860,8 @@ class InMemoryRagStore:
             title=title,
             snippet=snippet,
             source=str(metadata.get("source") or "unknown"),
-            sourcePath=as_optional_str(metadata.get("sourcePath")),
-            assetPath=as_optional_str(metadata.get("assetPath")),
+            sourcePath=public_http_source(metadata.get("sourcePath")),
+            assetPath=public_http_source(metadata.get("assetPath")),
             playbackUrl=build_playback_url(
                 document_id=chunk.document_id,
                 title=title,
@@ -896,9 +897,9 @@ def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]
     if not start_time:
         return None
     start_seconds = timestamp_to_seconds(start_time)
-    media_url = first_present(metadata, "playbackUrl", "videoUrl", "mediaUrl", "sourceVideoUrl")
+    media_url = public_http_source(first_present(metadata, "playbackUrl", "videoUrl", "mediaUrl", "sourceVideoUrl"))
     if not media_url:
-        source_path = as_optional_str(metadata.get("sourcePath"))
+        source_path = public_http_source(metadata.get("sourcePath"))
         if source_path and is_video_url(source_path):
             media_url = source_path
     if media_url:
@@ -910,7 +911,7 @@ def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]
         "startTime": start_time,
     }
     end_time = as_optional_str(metadata.get("endTime"))
-    source_path = as_optional_str(metadata.get("sourcePath"))
+    source_path = public_http_source(metadata.get("sourcePath"))
     if end_time:
         params["endTime"] = end_time
     if source_path:

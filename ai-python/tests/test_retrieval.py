@@ -665,7 +665,7 @@ def test_deterministic_answer_keeps_evidence_citation():
     assert f"[{evidence.evidenceId}]" in answer
 
 
-def test_answer_reference_summary_keeps_source_location_and_score():
+def test_answer_reference_summary_hides_local_source_path_and_keeps_score():
     store = InMemoryRagStore()
     store.index_text(
         IndexTextRequest(
@@ -684,8 +684,59 @@ def test_answer_reference_summary_keeps_source_location_and_score():
     assert "证据引用：" in answer
     assert evidence.evidenceId in answer
     assert "引用摘要笔记" in answer
-    assert "uploads/rag/reference.md" in answer
+    assert "uploads/rag/reference.md" not in answer
+    assert "来源：unit-test" in answer
     assert "分数：" in answer
+
+
+def test_query_hides_historical_worker_temp_paths_from_evidence_and_answer():
+    """旧索引中的 worker 临时路径不能再通过 evidence、metadata、播放链接或回答泄露。"""
+    temp_source = r"C:\Users\student\AppData\Local\Temp\rag-oss-private.mp4"
+    store = InMemoryRagStore()
+    block = DocumentBlock(
+        documentId="material-88",
+        blockId="material-88-subtitle-1",
+        fileType="mp4",
+        blockType="text",
+        startTime="00:00:01",
+        endTime="00:00:03",
+        sectionTitle="00:00:01 - 00:00:03",
+        contentText="这一段说明 RAG evidence 如何定位视频时间。",
+        parseEngine="legacy-video-parser",
+        sourceTitle="旧索引视频",
+        sourcePath=temp_source,
+        assetPath=temp_source,
+        metadata={
+            "mediaType": "video",
+            "evidenceChannel": "subtitle",
+            "videoUrl": temp_source,
+            "videoMediaSegmentSourcePath": temp_source,
+        },
+    )
+    store.index_blocks(
+        document_id="material-88",
+        title="旧索引视频",
+        document_type="mp4",
+        source="upload",
+        user_id="unit-user",
+        visibility_scope="private",
+        language="zh-CN",
+        parser="legacy-video-parser",
+        blocks=[block],
+        parse_quality=evaluate_parse_quality(QualitySignals(native_text_chars=len(block.contentText))),
+        status="READY",
+        source_path=temp_source,
+    )
+
+    response = store.query(QueryRequest(question="视频 evidence 如何定位时间？", topK=1))
+    evidence = response.evidences[0]
+    answer = append_evidence_reference_summary("根据资料回答。", response.evidences)
+
+    assert evidence.sourcePath is None
+    assert evidence.assetPath is None
+    assert evidence.playbackUrl and temp_source not in evidence.playbackUrl
+    assert temp_source not in evidence.model_dump_json()
+    assert temp_source not in answer
 
 
 def test_answer_reference_summary_links_location_to_source_path():

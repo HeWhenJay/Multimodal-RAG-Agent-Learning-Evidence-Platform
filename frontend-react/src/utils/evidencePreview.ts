@@ -1,4 +1,5 @@
 import type { RagEvidence } from '../api/types';
+import { browserHttpSource } from './sourceSafety';
 
 const PREVIEWABLE_TYPES = new Set(['markdown', 'md', 'txt', 'text', 'srt', 'vtt']);
 
@@ -23,7 +24,8 @@ export function buildMaterialPreviewLink(evidence: RagEvidence) {
   }
   const anchor = extractEvidenceAnchor(evidence.sectionTitle || evidence.sectionName) || extractSourceHash(source);
   const params = new URLSearchParams();
-  if (source) params.set('source', source);
+  const publicSource = browserHttpSource(source);
+  if (publicSource) params.set('source', publicSource);
   if (anchor) params.set('anchor', anchor);
   const query = params.toString();
   return `/preview/material/${materialId}${query ? `?${query}` : ''}`;

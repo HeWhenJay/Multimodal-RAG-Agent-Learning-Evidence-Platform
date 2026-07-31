@@ -102,6 +102,7 @@ def test_video_segments_are_claimed_by_two_workers_and_merged_on_original_timeli
     )
 
     parser = ConcurrentVideoParser()
+    public_source = "https://cdn.example.com/learning-evidence/42/mp4/merged-video.mp4"
     parsed = video_parallel_indexing.parse_video_source_with_worker_pool(
         parser_router=parser,
         document_id="material-101-staging-v1",
@@ -111,6 +112,7 @@ def test_video_segments_are_claimed_by_two_workers_and_merged_on_original_timeli
         user_id="42",
         visibility_scope="private",
         source_path=str(source_path),
+        source_reference=public_source,
         filename=source_path.name,
         content_type="video/mp4",
         high_precision=False,
@@ -122,8 +124,10 @@ def test_video_segments_are_claimed_by_two_workers_and_merged_on_original_timeli
     assert parser.max_active >= 2
     assert len(parser.worker_names) >= 2
     assert {block.documentId for block in parsed.blocks} == {"material-101-staging-v1"}
-    assert {block.sourcePath for block in parsed.blocks} == {str(source_path.resolve())}
+    assert {block.sourcePath for block in parsed.blocks} == {public_source}
     assert {block.metadata["videoMediaSegmentIndex"] for block in parsed.blocks} == {1, 2, 3, 4}
+    assert all("videoMediaSegmentSourcePath" not in block.metadata for block in parsed.blocks)
+    assert all(str(tmp_path) not in block.model_dump_json() for block in parsed.blocks)
     assert parsed.blocks[0].startTime == "00:00:05"
     assert parsed.blocks[1].startTime == "00:01:05"
     assert parsed.blocks[1].metadata["startTime"] == "00:01:05"
