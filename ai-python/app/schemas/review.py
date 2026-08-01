@@ -1,0 +1,117 @@
+"""学习资料复习中心的公开请求与响应模型。"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+from app.schemas.rag import Evidence
+
+
+class ReviewSettings(BaseModel):
+    """用户的 FSRS 排程与提醒偏好。"""
+
+    enabled: bool = True
+    desiredRetention: float = Field(default=0.90, ge=0.80, le=0.97)
+    dailyLimit: int = Field(default=20, ge=1, le=100)
+    reminderTime: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=80)
+
+    @field_validator("timezone")
+    @classmethod
+    def normalize_timezone(cls, value: str) -> str:
+        """去掉时区名称两端空白，具体 IANA 校验由服务层完成。"""
+        return value.strip()
+
+
+class ReviewCard(BaseModel):
+    """一张可独立评分的关键知识点卡片。"""
+
+    id: int
+    materialId: int
+    materialTitle: str
+    documentType: str
+    question: str
+    # 到期列表隐藏答案，用户主动揭示后才返回正文。
+    answer: str | None = None
+    hint: str | None = None
+    evidenceRefs: list[Evidence] = Field(default_factory=list)
+    dueAt: datetime
+    retrievability: float = Field(default=0.0, ge=0.0, le=1.0)
+    reviewCount: int = Field(default=0, ge=0)
+    lapseCount: int = Field(default=0, ge=0)
+
+
+class ReviewOverview(BaseModel):
+    """复习中心顶部统计。"""
+
+    dueCount: int = Field(default=0, ge=0)
+    actionableDueCount: int = Field(default=0, ge=0)
+    todayReviewedCount: int = Field(default=0, ge=0)
+    totalCardCount: int = Field(default=0, ge=0)
+    activeMaterialCount: int = Field(default=0, ge=0)
+    nextDueAt: datetime | None = None
+    settings: ReviewSettings
+
+
+class ReviewCardGroup(BaseModel):
+    """按用户上传资料聚合的一组每日复习卡片。"""
+
+    materialId: int
+    materialTitle: str
+    documentType: str
+    dueCardCount: int = Field(default=0, ge=0)
+    cards: list[ReviewCard] = Field(default_factory=list)
+
+
+class ReviewDueGroups(BaseModel):
+    """每日到期卡片的资料分组响应。"""
+
+    totalDueCount: int = Field(default=0, ge=0)
+    remainingToday: int = Field(default=0, ge=0)
+    groups: list[ReviewCardGroup] = Field(default_factory=list)
+
+
+class ReviewMaterial(BaseModel):
+    """一条资料的学习分类与卡片生成状态。"""
+
+    materialId: int
+    title: str
+    documentType: str
+    materialStatus: str
+    isLearningContent: bool | None = None
+    category: str | None = None
+    status: Literal["PENDING", "GENERATING", "GENERATED", "SKIPPED", "FAILED"] = "PENDING"
+    reason: str | None = None
+    cardCount: int = Field(default=0, ge=0)
+    indexRequestVersion: int = Field(default=0, ge=0)
+    syncedIndexRequestVersion: int | None = Field(default=None, ge=0)
+    updatedAt: datetime | None = None
+
+
+class ReviewSyncResult(BaseModel):
+    """一次增量扫描的汇总结果。"""
+
+    processedMaterialCount: int = Field(default=0, ge=0)
+    generatedCardCount: int = Field(default=0, ge=0)
+    skippedMaterialCount: int = Field(default=0, ge=0)
+    failedMaterialCount: int = Field(default=0, ge=0)
+
+
+class ReviewGradeRequest(BaseModel):
+    """用户对一次主动回忆的四档评分。"""
+
+    rating: int = Field(..., ge=1, le=4)
+    durationMs: int | None = Field(default=None, ge=0, le=3_600_000)
+
+
+class ReviewGradeResult(BaseModel):
+    """评分后更新的卡片及下一次复习信息。"""
+
+    card: ReviewCard
+    previousDueAt: datetime
+    nextDueAt: datetime
+    intervalDays: float = Field(ge=0.0)
+    retrievability: float = Field(ge=0.0, le=1.0)

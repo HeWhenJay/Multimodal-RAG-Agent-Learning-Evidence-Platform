@@ -90,7 +90,7 @@
 | GET | `/api/rag/materials` | 当前用户最近资料列表 |
 | GET | `/api/rag/materials/{id}` | 资料状态与进度 |
 | GET | `/api/rag/materials/{id}/evidences?limit=20` | 当前资料的 evidence |
-| GET | `/api/rag/materials/{id}/preview?source=` | 文本类原文件预览 |
+| GET | `/api/rag/materials/{id}/preview?source=` | 原始文本或非视频资料的 RAG 提取视图 |
 | POST | `/api/rag/materials/text` | 创建并索引手工文本资料 |
 | POST | `/api/rag/materials/upload` | 保存并索引单个文件 |
 | POST | `/api/rag/materials/upload/chunk` | 0-based 分片上传、合并并索引 |
@@ -108,7 +108,7 @@
 - 资料状态为 `PENDING`、`PARSING`、`READY`、`PARTIAL`、`FAILED`、`REINDEXING`。
 - 查询任务状态为 `RUNNING`、`COMPLETED`、`FAILED`、`EXPIRED`。任务历史持久化到
   `rag_query_history`，任务读取必须校验 user ID。
-- 空文件、非法分片、越出资料目录的预览来源、非文本预览、手工文本资料重建均返回稳定中文业务错误。
+- 空文件、非法分片、越出资料目录的预览来源、没有可用 RAG 原文、手工文本资料重建均返回稳定中文业务错误。
 - 解析或索引失败只记录异常类别和受控摘要，不能返回原文、Token、OSS 密钥或数据库连接信息。
 
 ### 运行边界
@@ -530,7 +530,7 @@ Multi-Query 生成契约：
 
 用途：前端轮询或刷新单个资料的解析状态、摘要、切块数和原始文件路径。
 
-### 预览学习资料文本内容
+### 预览学习资料原文
 
 | 项目 | 内容 |
 | --- | --- |
@@ -540,9 +540,9 @@ Multi-Query 生成契约：
 | Query | `source`，可选；来自 evidence 的 `sourcePath/source`，用于校验预览来源确实属于该资料 |
 | 响应 | `Result<MaterialPreviewVO>` |
 
-用途：RAG 回答和 evidence 卡片中的 Markdown 资料位置不再直接跳到 OSS/CDN 原始 URL，避免对象存储 `Content-Disposition` 或 `Content-Type` 触发浏览器下载。前端打开 `/preview/material/{id}` 新标签页后，由该接口读取当前用户名下资料的原始 Markdown/Text 内容并在应用内渲染。视频 evidence 不调用该文本预览接口，而是由前端把原始 `.mp4/.mov/.webm` 等来源链接改写到 `/videos?...startTime=...&endTime=...&videoUrl=...`，在应用内播放器按时间段定位。
+用途：RAG 回答和 evidence 卡片中的非视频资料位置不再直接跳到本地路径或 OSS/CDN 原始 URL。前端打开 `/preview/material/{id}` 后，该接口优先读取当前用户名下的 Markdown/Text 原文件；PDF、Word、PPT、表格、图片、手工文本或原文件已清理时，则按当前资料 canonical RAG chunks 的顺序生成限长 Markdown 提取视图，并保留章节、页码、幻灯片、sheet 与 cell range。视频 evidence 不调用该接口，而是由前端改写到 `/videos?...startTime=...&endTime=...&videoUrl=...`，在应用内播放器按时间段定位。
 
-2026-07-31 补充：工作台、Agent 工作台和回答 Markdown 渲染器必须使用同一套 evidence 跳转规则。非视频 Markdown/Text evidence 的证据标题、章节位置和回答中的来源链接应打开 `/preview/material/{id}` 新标签页；视频 evidence 的证据标题、播放定位按钮和回答中的来源链接应打开 `/videos` 新标签页，并携带 `documentId/title/startTime/endTime` 以及经过公开来源校验的 `sourcePath/videoUrl`。Windows/Unix 本地绝对路径、`file://`、worker 临时下载路径和私有 `oss://` 定位符不得写入浏览器查询参数或页面正文。若视频来源不是浏览器可直接播放的 `http(s)` 地址，`/videos` 页面仍需展示已定位时间段和不可播放原因，不能静默生成不可点击文本。
+2026-08-01 补充：工作台、Agent 工作台、复习中心和回答 Markdown 渲染器必须使用同一套 evidence 跳转规则。非视频 evidence 的证据标题、章节位置和回答中的来源链接应打开 `/preview/material/{id}`；视频 evidence 的证据标题、播放定位按钮和回答中的来源链接应打开 `/videos`，并携带 `documentId/title/startTime/endTime` 以及经过公开来源校验的 `sourcePath/videoUrl`。Windows/Unix 本地绝对路径、`file://`、worker 临时下载路径和私有 `oss://` 定位符不得写入浏览器查询参数或页面正文。若视频来源不是浏览器可直接播放的 `http(s)` 地址，`/videos` 页面仍需展示已定位时间段和不可播放原因，不能静默生成不可点击文本。
 
 `MaterialPreviewVO`：
 
@@ -561,7 +561,8 @@ Multi-Query 生成契约：
 
 - Java 必须按当前登录用户和资料 ID 查询 `learning_material`，不能按任意外部 URL 抓取。
 - 如果传入 `source`，需去掉 `#fragment` 后与该资料的 `originalFilePath/publicUrl/objectKey` 对应关系匹配，不匹配时返回业务错误。
-- 现阶段只把 `markdown/md/txt/srt/vtt/text` 作为文本预览渲染；PDF、Word、PPT 和图片仍通过 evidence 摘要定位，不在该接口中转为浏览器预览；视频 evidence 使用 `/videos` 页面按 `startTime/endTime` 播放定位。
+- `markdown/md/txt/srt/vtt/text` 优先读取受控原文件；其余非视频格式只返回已入库 RAG chunks 的限长提取视图，不读取任意 URL、不返回原始文件路径，也不把二进制文件整体加载到浏览器。
+- 视频 evidence 使用 `/videos` 页面按 `startTime/endTime` 播放定位，不进入文本提取视图。
 
 ### 重建资料索引 / 高精度补跑
 
@@ -2104,7 +2105,7 @@ OpenAI provider 可用时，Python 使用 Chat Completions `response_format.type
 - 点击刷新时，如果接口短暂没有返回 `latestProgress`，前端保留该资料已有进度，避免大文件解析过程中进度块闪烁或消失；后端返回新的 `latestProgress` 时立即覆盖旧进度。
 - 上传资料卡片提供“重建索引”和“高精度补跑”入口；高精度补跑会调用 `/api/rag/materials/{id}/reindex?highPrecision=true`。
 - evidence 卡片展示页码、幻灯片、sheet、cell range、视频时间段、播放定位入口、解析器和检索来源。视频 evidence 的位置链接和播放定位入口都使用 React Router 内部跳转到 `/videos?documentId=...&title=...&startTime=...&endTime=...&sourcePath=...&videoUrl=...&returnTo=...`，播放器加载后跳到 `startTime`，到达 `endTime` 后在视频画面上弹出提示并暂停一次，用户可点击“继续播放”恢复视频，也可点击“返回检索页”回到进入播放页前的检索页面；非视频 evidence 不展示播放按钮。
-- 非视频 Markdown/text evidence 的位置链接和回答末尾“证据引用”中的来源链接打开 `/preview/material/{id}` 新标签页，由前端预览页调用 `/api/rag/materials/{id}/preview` 展示内容，避免直接访问 OSS URL 触发下载。视频 evidence 的回答链接会按 evidenceId 或同一行的 `时间=开始-结束` 匹配到对应 `/videos` 播放链接，避免直接打开 OSS 视频文件触发下载。
+- 非视频 evidence 的位置链接和回答末尾“证据引用”中的来源链接打开 `/preview/material/{id}`，由前端预览页调用 `/api/rag/materials/{id}/preview` 展示原始文本或 RAG 提取视图，避免直接访问本地路径或 OSS URL。视频 evidence 的回答链接会按 evidenceId 或同一行的 `时间=开始-结束` 匹配到对应 `/videos` 播放链接，避免直接打开 OSS 视频文件触发下载。
 - 知识库页、工作台快速检索和近期询问记录都需要展示 `answerStatus`。`REFUSED` 时使用 `refusalMessage` 或 `answer` 显示“证据不足”状态，不展示空 evidence 为异常，不触发前端错误态。
 - 知识库页和工作台 RAG 快速检索区必须把 `RagQueryVO.answer` 按安全 Markdown 子集渲染，支持标题、段落、列表、引用、代码、链接、加粗、行内公式和 `[evidenceId=...]` 标记，禁止使用未净化 HTML 注入。渲染回答时需要结合返回的 `evidences` 把可预览或可播放的资料 URL 改写为应用内预览页或视频播放器链接。
 - RAG 查询提交后立即展示 `query.expand -> query.filter -> query.bm25 -> query.vector -> query.fusion -> query.rerank -> query.guard -> query.answer` 阶段面板；响应返回后使用 `RagQueryVO.progressEvents` 中的真实阶段、百分比、模型事件和完成/失败状态覆盖前端占位状态。

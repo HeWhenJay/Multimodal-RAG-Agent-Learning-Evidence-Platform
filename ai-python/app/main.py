@@ -22,6 +22,7 @@ from app.api.auth import router as auth_router
 from app.api.logs import router as logs_router
 from app.api.page_data import router as page_data_router
 from app.api.rag_control import router as rag_control_router
+from app.api.review import router as review_router
 from app.core.result import BusinessError, Result
 
 
@@ -39,8 +40,8 @@ async def handle_business_error(_: Request, error: BusinessError) -> JSONRespons
 
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(request: Request, error: RequestValidationError):
-    """将公开认证和 RAG 参数错误转换为既有 `Result` 信封。"""
-    if request.url.path.startswith(("/api/auth", "/api/rag", "/api/agent")):
+    """将公开认证、RAG 和复习参数错误转换为既有 `Result` 信封。"""
+    if request.url.path.startswith(("/api/auth", "/api/rag", "/api/agent", "/api/reviews")):
         return JSONResponse(status_code=200, content=Result.failure(public_validation_message(error)).model_dump())
     return await request_validation_exception_handler(request, error)
 
@@ -62,6 +63,16 @@ def public_validation_message(error: RequestValidationError) -> str:
             return "内容不能为空"
         if field == "file":
             return "上传文件不能为空"
+        if field == "rating":
+            return "复习评分必须是 1 到 4"
+        if field == "desiredRetention":
+            return "目标记忆率必须在 0.80 到 0.97 之间"
+        if field == "dailyLimit":
+            return "每日复习上限必须是 1 到 100"
+        if field == "reminderTime":
+            return "提醒时间必须使用 HH:mm 格式"
+        if field == "timezone":
+            return "提醒时区不能为空"
     return "请求参数不合法"
 
 
@@ -75,3 +86,4 @@ app.include_router(auth_router)
 app.include_router(logs_router)
 app.include_router(page_data_router)
 app.include_router(rag_control_router)
+app.include_router(review_router)

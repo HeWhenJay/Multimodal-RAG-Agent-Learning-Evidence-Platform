@@ -7,6 +7,7 @@ import { LearningMaterials } from './pages/materials/LearningMaterials';
 import { MaterialPreview } from './pages/material-preview/MaterialPreview';
 import { Settings } from './pages/Settings';
 import { VideoReview } from './pages/video-review/VideoReview';
+import { ReviewCenter } from './pages/reviews/ReviewCenter';
 import { RequireAuth } from './routes/RequireAuth';
 import { AppLayout } from './layouts/AppLayout';
 import { AuthProvider } from './stores/auth';
@@ -40,6 +41,7 @@ const router = createBrowserRouter([
       { path: 'materials', element: <LearningMaterials /> },
       { path: 'preview/material/:id', element: <MaterialPreview /> },
       { path: 'videos', element: <VideoReview /> },
+      { path: 'reviews', element: <ReviewCenter /> },
       { path: 'agent', element: <AgentWorkspace /> },
       { path: 'settings', element: <Settings /> },
       { path: '*', element: <Navigate to="/" replace /> }

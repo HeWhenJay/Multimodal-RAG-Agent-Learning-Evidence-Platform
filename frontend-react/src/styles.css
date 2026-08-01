@@ -3860,7 +3860,36 @@ input:disabled {
 }
 
 @media (max-width: 760px) {
+  .sidebar {
+    display: none;
+  }
+
+  .app-shell.sidebar-open::before {
+    position: fixed;
+    z-index: 20;
+    inset: 0;
+    display: block;
+    content: '';
+    background: rgba(15, 23, 42, .28);
+  }
+
+  .app-shell.sidebar-open .sidebar {
+    position: fixed;
+    z-index: 30;
+    top: 0;
+    left: 0;
+    display: flex;
+    width: min(280px, 84vw);
+    height: 100vh;
+    overflow: auto;
+    border-right: 1px solid var(--line);
+    border-bottom: 0;
+    box-shadow: 12px 0 30px rgba(15, 23, 42, .16);
+  }
+
   .topbar {
+    position: relative;
+    z-index: 25;
     padding: 12px;
     flex-wrap: wrap;
   }

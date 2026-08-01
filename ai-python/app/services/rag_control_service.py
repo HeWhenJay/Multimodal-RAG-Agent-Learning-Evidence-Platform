@@ -147,21 +147,44 @@ class RagControlService:
         return self.store.list_evidences(f"material-{material.id}", safe_limit)
 
     def preview_material(self, material_id: int, source: str | None, user_id: str) -> MaterialPreviewResponse:
-        """只预览当前用户拥有的文本类原文件。"""
+        """优先预览原始文本；其他格式回退为当前资料的受控 RAG 提取视图。"""
         with self.repository.transaction() as transaction:
             material = self._require_material(transaction.find_material(material_id, user_id))
-        if material.document_type.lower() not in TEXT_PREVIEW_TYPES:
-            raise BusinessError("当前资料类型暂不支持文本预览")
         validate_preview_source(material, source)
-        content = self.object_storage.load_bytes(material)
-        text = content.decode("utf-8-sig", errors="replace")
+        if material.document_type.lower() in TEXT_PREVIEW_TYPES:
+            try:
+                content = self.object_storage.load_bytes(material)
+            except BusinessError:
+                # 手工文本和已清理原文件仍可通过已入库 RAG chunks 定位。
+                logger.info("原始文本不可读取，回退 RAG 提取视图，materialId=%s", material.id)
+            else:
+                text = content.decode("utf-8-sig", errors="replace")
+                return MaterialPreviewResponse(
+                    materialId=material.id,
+                    title=material.original_filename or material.title,
+                    documentType=material.document_type,
+                    source=source or material.public_url or material.original_file_path,
+                    contentType=preview_content_type(material.document_type),
+                    content=text,
+                )
+        return self._indexed_preview(material)
+
+    def _indexed_preview(self, material: MaterialRecord) -> MaterialPreviewResponse:
+        """从当前用户资料的 RAG chunks 生成带章节定位的安全提取视图。"""
+        try:
+            evidences = self.store.list_evidences(f"material-{material.id}", 1000)
+        except Exception as exc:
+            logger.exception("读取资料 RAG 提取视图失败，materialId=%s", material.id)
+            raise BusinessError("读取资料原文失败") from exc
+        if not evidences:
+            raise BusinessError("当前资料没有可预览的 RAG 原文")
         return MaterialPreviewResponse(
             materialId=material.id,
             title=material.original_filename or material.title,
             documentType=material.document_type,
-            source=source or material.public_url or material.original_file_path,
-            contentType=preview_content_type(material.document_type),
-            content=text,
+            source=None,
+            contentType="text/markdown; charset=UTF-8",
+            content=build_indexed_preview_content(material.title, evidences),
         )
 
     def index_text(self, request: RagIndexTextPublicRequest, user_id: str) -> RagMaterialResponse:
@@ -1377,6 +1400,58 @@ def preview_source_matches(allowed: str | None, requested: str | None) -> bool:
 def preview_content_type(document_type: str) -> str:
     """按文本格式返回浏览器可用的 UTF-8 内容类型。"""
     return "text/markdown; charset=UTF-8" if document_type.lower() in {"markdown", "md"} else "text/plain; charset=UTF-8"
+
+
+def build_indexed_preview_content(title: str, evidences: list[Evidence], *, maximum_length: int = 1_500_000) -> str:
+    """按 RAG chunk 顺序组装可跳转的章节、页码和原文片段。"""
+    safe_title = " ".join(str(title or "学习资料").split()).replace("#", "") or "学习资料"
+    lines = [
+        f"# {safe_title}",
+        "",
+        "> 当前页面由该资料已入库的 RAG 原文片段组成，章节和页码用于定位答案来源。",
+        "",
+    ]
+    last_section = ""
+    seen: set[tuple[str, str]] = set()
+    for evidence in evidences:
+        section = " ".join(str(evidence.sectionName or evidence.sectionTitle or "全文").split()).replace("#", "") or "全文"
+        snippet = " ".join(str(evidence.snippet or "").split())
+        if not snippet:
+            continue
+        dedupe_key = (section, snippet)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        if section != last_section:
+            lines.extend([f"## {section}", ""])
+            last_section = section
+        location = evidence_location_label(evidence)
+        if location:
+            lines.extend([f"> {location}", ""])
+        lines.extend([snippet, ""])
+        if sum(len(item) + 1 for item in lines) >= maximum_length:
+            break
+    content = "\n".join(lines).strip()
+    return content[:maximum_length].rstrip() + ("..." if len(content) > maximum_length else "")
+
+
+def evidence_location_label(evidence: Evidence) -> str:
+    """将 evidence 的页码、幻灯片、表格或视频位置转换为中文定位标签。"""
+    labels: list[str] = []
+    if evidence.pageIndex is not None:
+        labels.append(f"页码 {evidence.pageIndex}")
+    if evidence.slideIndex is not None:
+        labels.append(f"幻灯片 {evidence.slideIndex}")
+    if evidence.sheetName:
+        labels.append(f"工作表 {evidence.sheetName}")
+    if evidence.cellRange:
+        labels.append(f"单元格 {evidence.cellRange}")
+    if evidence.startTime:
+        time_range = evidence.startTime
+        if evidence.endTime:
+            time_range += f"-{evidence.endTime}"
+        labels.append(f"时间 {time_range}")
+    return " · ".join(labels)
 
 
 def copy_video_sidecars_to_storage(

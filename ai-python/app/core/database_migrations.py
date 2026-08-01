@@ -8,7 +8,10 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 MIGRATION_DIRECTORY = REPOSITORY_ROOT / "infra" / "sql" / "alter-database"
-PYTHON_MIGRATIONS = ("20260721_0100_add_python_rag_durable_tasks.sql",)
+PYTHON_MIGRATIONS = (
+    "20260721_0100_add_python_rag_durable_tasks.sql",
+    "20260801_0100_create_learning_review_tables.sql",
+)
 
 
 def apply_python_schema_migrations(database_url: str | None = None) -> list[str]:

@@ -1,29 +1,21 @@
 import type { RagEvidence } from '../api/types';
 import { browserHttpSource } from './sourceSafety';
 
-const PREVIEWABLE_TYPES = new Set(['markdown', 'md', 'txt', 'text', 'srt', 'vtt']);
-
 interface PreviewLinkEntry {
   evidence: RagEvidence;
   preview: string;
   sources: string[];
 }
 
-// 根据 evidence 构造应用内资料预览链接，避免直接访问 OSS 触发下载。
+// 根据 evidence 构造应用内资料预览链接，避免直接访问本地路径或 OSS 对象。
 export function buildMaterialPreviewLink(evidence: RagEvidence) {
-  if (!isPreviewableEvidence(evidence)) {
-    return '';
-  }
   const materialId = extractMaterialId(evidence.documentId || evidence.evidenceId);
-  if (!materialId) {
+  if (!materialId || !isPreviewableEvidence(evidence)) {
     return '';
   }
-  const source = cleanValue(evidence.sourcePath) || cleanValue(evidence.source);
-  if (!source || source.toLowerCase() === 'manual') {
-    return '';
-  }
-  const anchor = extractEvidenceAnchor(evidence.sectionTitle || evidence.sectionName) || extractSourceHash(source);
   const params = new URLSearchParams();
+  const source = cleanValue(evidence.sourcePath) || cleanValue(evidence.source);
+  const anchor = extractEvidenceAnchor(evidence.sectionTitle || evidence.sectionName) || extractSourceHash(source);
   const publicSource = browserHttpSource(source);
   if (publicSource) params.set('source', publicSource);
   if (anchor) params.set('anchor', anchor);
@@ -141,10 +133,10 @@ function timestampToSeconds(value?: string | null) {
     + (Number.parseFloat(secondsText) || 0);
 }
 
-// 判断 evidence 是否可用文本预览页展示。
+// 非视频资料统一进入受控预览页；服务端会优先返回原始文本，否则返回 RAG 提取视图。
 export function isPreviewableEvidence(evidence: RagEvidence) {
   const documentType = cleanValue(evidence.documentType).toLowerCase();
-  return PREVIEWABLE_TYPES.has(documentType);
+  return !/^(mp4|mov|m4v|webm|mkv|avi|video)$/i.test(documentType);
 }
 
 // 从 documentId 或 evidenceId 中提取 material 数字 ID。
@@ -159,7 +151,7 @@ export function extractEvidenceAnchor(value?: string | null) {
   const markdownLink = /\[[^\]]+]\(([^)]+)\)/.exec(text);
   const href = markdownLink?.[1]?.trim().replace(/^<|>$/g, '') || '';
   if (href.startsWith('#')) return href.slice(1);
-  return extractSourceHash(href);
+  return extractSourceHash(href) || (text ? text.replace(/^#+\s*/, '') : '');
 }
 
 // 去掉来源 URL 的 hash，便于与后端返回 evidence sourcePath 比较。

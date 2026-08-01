@@ -31,6 +31,8 @@ def test_init_snapshot_is_converted_to_non_destructive_plan():
     assert len(plan.skipped_statements) >= 20
     assert "DROP TABLE" not in sql
     assert "CREATE TABLE IF NOT EXISTS LEARNING_EVIDENCE.APP_USER" in sql
+    assert "CREATE TABLE IF NOT EXISTS LEARNING_EVIDENCE.LEARNING_REVIEW_CARD" in sql
+    assert "CREATE TABLE IF NOT EXISTS LEARNING_EVIDENCE.LEARNING_REVIEW_LOG" in sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS UK_RAG_QUERY_HISTORY_TASK_ID" in sql
     assert "ON CONFLICT (ACCOUNT) DO NOTHING" in sql
     assert all("CREATE INDEX " not in statement.upper() or "IF NOT EXISTS" in statement.upper() for statement in plan.statements)

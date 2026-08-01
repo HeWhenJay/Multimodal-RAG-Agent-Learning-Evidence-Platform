@@ -30,6 +30,12 @@ dashscope:
 - `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
 - `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
 - `RAG_LLM_MODEL`：默认 `qwen-plus`
+- `REVIEW_EXTRACTION_PROVIDER`：默认 `auto`；配置 `DASHSCOPE_API_KEY` 时每份资料索引版本执行一次模型生成，否则使用本地确定性降级
+- `REVIEW_EXTRACTION_MODEL`：默认 `qwen-plus`，复习卡片专用模型可独立于 RAG 答案模型配置
+- `REDIS_URL`：可选；用于跨实例复习生成短锁，不能替代 PostgreSQL 的 dueAt 和评分日志
+- `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
+
+复习 Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
 
 本机覆盖时复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 后修改。`application.local.yml` 已加入 `.gitignore`，可用于填写本机路径或临时离线模式。
 
@@ -117,10 +123,12 @@ conda run -n learning-evidence-rag python -B ai-python/run.py
 - `app/api/`：认证、页面数据、日志、RAG、Agent 和记忆公开接口路由。
 - `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
 - `app/schemas/`：与 React 契约保持一致的 Pydantic 请求/响应模型。
+- `app/review/`：资料级复习卡片提炼、FSRS 排程、分组队列、答案揭示和生成并发保护。
 - `app/workers/`：Kafka 消费、Outbox 发布、RAG/Agent 耐久任务和独立 cron 调度。
 - `agents/gateway/`：受控本地工具、RAG 和记忆调用网关。
 - `agents/llm/`：Agent 规划、执行和回答使用的模型客户端。
 - `agents/orchestration/`：统一 PAE/ReAct 状态图及只读、规划辅助函数。
+- `prompts/`：复习功能模型 Prompt 及版本号的集中目录；其他模块可按同一方式逐步迁移。
 - `agents/memory/`：长期记忆候选、冲突判断、索引和检索服务。
 - `agents/resume_adapter/`：简历模板填充适配；`agents/note_writer/` 当前仅为预留目录。
 - `rag/core/`：RAG 通用模型、元数据过滤和文本清洗。

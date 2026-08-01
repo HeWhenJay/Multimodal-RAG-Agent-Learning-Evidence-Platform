@@ -2,6 +2,7 @@ import {
   Bell,
   BookOpen,
   Brain,
+  CalendarClock,
   ChevronDown,
   Folder,
   FolderPlus,
@@ -27,30 +28,84 @@ import {
   moveAgentConversation
 } from '../api/agent';
 import type { AgentConversationFolder, AgentConversationTree, AgentTask } from '../api/types';
-import { MATERIAL_FILE_ACCEPT, useMaterialUpload } from '../hooks/useMaterialUpload';
+import { REVIEW_OVERVIEW_UPDATED_EVENT, fetchReviewOverview, syncReviewMaterials, type ReviewOverview } from '../api/reviews';
+import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { useAuth } from '../stores/auth';
 
 const navItems = [
   { to: '/', label: '\u5de5\u4f5c\u53f0', icon: LayoutDashboard },
   { to: '/materials', label: '\u5b66\u4e60\u8d44\u6599', icon: BookOpen },
   { to: '/agent', label: 'Agent', icon: WandSparkles },
+  { to: '/reviews', label: '\u590d\u4e60\u4e2d\u5fc3', icon: CalendarClock },
   { to: '/settings', label: '\u7cfb\u7edf\u8bbe\u7f6e', icon: Settings }
 ];
 
 export function AppLayout() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const { user, logout } = useAuth();
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const { uploading, uploadMessage, uploadFile } = useMaterialUpload();
+  const [reviewDueCount, setReviewDueCount] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const displayName = user?.displayName || '\u7ba1\u7406\u5458';
   const accountLabel = user?.email || user?.account || '\u672a\u767b\u5f55';
   const avatarText = displayName.slice(0, 1).toUpperCase();
+
+  // 移动端导航完成后自动收起侧栏，桌面端不影响固定导航。
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [location.pathname]);
 
   function openUploadPicker() {
     uploadInputRef.current?.click();
   }
 
+  // 定时读取服务端持久化到期数量，并在已授权且页面隐藏时发送一次浏览器提醒。
+  useEffect(() => {
+    let active = true;
+    let syncInFlight = false;
+    const refreshReviewOverview = async () => {
+      try {
+        const overview = await fetchReviewOverview();
+        if (!active) return;
+        const actionableDueCount = resolveActionableDueCount(overview);
+        setReviewDueCount(actionableDueCount);
+        notifyDueReviews(overview, actionableDueCount);
+      } catch {
+        // 复习服务暂不可用时不影响其他工作台功能。
+      }
+    };
+    const syncAndRefreshReviewOverview = async () => {
+      if (syncInFlight) return;
+      syncInFlight = true;
+      try {
+        // 资料上传事件只处理一份新完成入库的资料，概览事件本身不触发模型调用。
+        await syncReviewMaterials(1).catch(() => undefined);
+        await refreshReviewOverview();
+      } finally {
+        syncInFlight = false;
+      }
+    };
+    void refreshReviewOverview();
+    // 普通轮询只读取持久化概览；资料上传事件才触发增量卡片生成，避免重复调用 LLM。
+    const timer = window.setInterval(() => void refreshReviewOverview(), 60_000);
+    window.addEventListener(REVIEW_OVERVIEW_UPDATED_EVENT, refreshReviewOverview);
+    window.addEventListener(MATERIAL_UPLOADED_EVENT, syncAndRefreshReviewOverview);
+    window.addEventListener('review-notification-permission-updated', refreshReviewOverview);
+    window.addEventListener('focus', refreshReviewOverview);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener(REVIEW_OVERVIEW_UPDATED_EVENT, refreshReviewOverview);
+      window.removeEventListener(MATERIAL_UPLOADED_EVENT, syncAndRefreshReviewOverview);
+      window.removeEventListener('review-notification-permission-updated', refreshReviewOverview);
+      window.removeEventListener('focus', refreshReviewOverview);
+    };
+  }, []);
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarOpen ? ' sidebar-open' : ''}`}>
       <aside className="sidebar">
         <div className="brand-block">
           <div className="brand-mark">
@@ -89,7 +144,7 @@ export function AppLayout() {
 
       <div className="content-shell">
         <header className="topbar">
-          <button className="icon-button compact" aria-label="\u5c55\u5f00\u83dc\u5355">
+          <button className="icon-button compact" aria-label={sidebarOpen ? '收起菜单' : '展开菜单'} aria-expanded={sidebarOpen} onClick={() => setSidebarOpen((value) => !value)}>
             <Menu size={19} />
           </button>
           <div className="search-box">
@@ -117,8 +172,15 @@ export function AppLayout() {
             <LifeBuoy size={17} />
             <span>{'\u5e2e\u52a9'}</span>
           </button>
-          <button className="icon-button" aria-label="\u901a\u77e5">
+          <button
+            className="icon-button review-bell-button"
+            type="button"
+            aria-label={reviewDueCount > 0 ? `\u6709 ${reviewDueCount} \u4e2a\u77e5\u8bc6\u70b9\u5f85\u590d\u4e60` : '\u6682\u65e0\u5f85\u590d\u4e60\u77e5\u8bc6\u70b9'}
+            title={reviewDueCount > 0 ? `${reviewDueCount} \u4e2a\u77e5\u8bc6\u70b9\u5f85\u590d\u4e60` : '\u590d\u4e60\u4e2d\u5fc3'}
+            onClick={() => navigate('/reviews')}
+          >
             <Bell size={18} />
+            {reviewDueCount > 0 ? <span className="review-bell-badge" aria-hidden="true">{reviewDueCount > 99 ? '99+' : reviewDueCount}</span> : null}
           </button>
           <button className="icon-button" aria-label={`${displayName} \u8d26\u6237`}>
             <UserCircle size={20} />
@@ -135,6 +197,67 @@ export function AppLayout() {
       </div>
     </div>
   );
+}
+
+const REVIEW_NOTIFICATION_MARKER_KEY = 'learning-evidence.review-notification-marker';
+
+// 每个用户时区的自然日最多通知一次，页面可见时由顶部徽标承担提醒。
+function notifyDueReviews(overview: ReviewOverview, actionableDueCount: number) {
+  if (!overview.settings.enabled || actionableDueCount <= 0 || !document.hidden) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const reminderDay = resolveReminderDay(overview.settings.timezone, overview.settings.reminderTime);
+  if (!reminderDay) return;
+  const marker = `${reminderDay}:${overview.settings.reminderTime}`;
+  try {
+    if (window.localStorage.getItem(REVIEW_NOTIFICATION_MARKER_KEY) === marker) return;
+  } catch {
+    // 隐私模式可能禁用 localStorage，仍允许本次提醒继续。
+  }
+  try {
+    new Notification('\u5b66\u4e60\u590d\u4e60\u63d0\u9192', {
+      body: `\u4f60\u4eca\u5929\u6709 ${actionableDueCount} \u4e2a\u5173\u952e\u77e5\u8bc6\u70b9\u5f85\u590d\u4e60\u3002`,
+      tag: 'learning-evidence-review'
+    });
+    try {
+      window.localStorage.setItem(REVIEW_NOTIFICATION_MARKER_KEY, marker);
+    } catch {
+      // 无法记录去重标记时不影响通知本身。
+    }
+  } catch {
+    // 浏览器拒绝构造通知时保留顶部徽标，不影响页面使用。
+  }
+}
+
+// 顶部徽标只展示今日额度内真正可操作的到期卡片。
+function resolveActionableDueCount(overview: ReviewOverview) {
+  if (Number.isFinite(overview.actionableDueCount)) {
+    return Math.max(0, overview.actionableDueCount);
+  }
+  const remainingToday = Math.max(0, overview.settings.dailyLimit - overview.todayReviewedCount);
+  return Math.min(Math.max(0, overview.dueCount), remainingToday);
+}
+
+// 仅在设置时区的本地时间到达提醒点后返回当天键。
+function resolveReminderDay(timezone: string, reminderTime: string, now = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(now);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const currentMinutes = Number(values.hour) * 60 + Number(values.minute);
+    const [reminderHour, reminderMinute] = reminderTime.split(':').map(Number);
+    if (!Number.isFinite(currentMinutes) || !Number.isFinite(reminderHour) || !Number.isFinite(reminderMinute)) return null;
+    if (currentMinutes < reminderHour * 60 + reminderMinute) return null;
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch {
+    return null;
+  }
 }
 
 function AgentConversationNav() {

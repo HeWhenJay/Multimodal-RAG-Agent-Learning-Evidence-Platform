@@ -32,6 +32,8 @@ npm run dev
 
 - 多模态资料入库：文本、PDF、Office 文档、图片、字幕与视频；PDF 优先 MinerU，失败时走本地降级解析。
 - 可追溯 RAG：结构化解析、递归切块、文档/章节摘要、元数据隔离、BM25 与 pgvector 向量召回、Multi-Query、RRF/RAG-Fusion、重排和 evidence 引用。
+- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；每个资料索引版本通过一次 LLM 调用提炼多张关键知识点卡片，并用 FSRS 根据四档回忆结果安排下一次复习。
+- Prompt 统一管理：复习功能的 LLM Prompt 集中在 `ai-python/prompts/`，答案只在用户主动揭示后返回，并保留 RAG evidence 原文定位。
 - 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
 - Agent 工作台：LangGraph PAE/ReAct 编排、受控工具、记忆、审批、撤销、任务消息、事件投影与 SSE。
 - 统一业务边界：所有公开接口保持 React 既有 `/api/*` 路径、Bearer Token、camelCase 字段和 `{code,msg,data}` 响应信封。
@@ -362,6 +364,9 @@ conda run -n learning-evidence-rag python -B ai-python/run.py --bootstrap-databa
 | `MINERU_COMMAND` | 可选 MinerU 命令模板，使用 `{input}` 与 `{output}` 占位符 |
 | `EVIDENCE_STORAGE_PROVIDER` | `local` 或 `oss` 原始文件存储 |
 | `RAG_KAFKA_ENABLED` | 启用 Kafka 索引通道；默认 `false` |
+| `REVIEW_EXTRACTION_PROVIDER` / `REVIEW_EXTRACTION_MODEL` | 复习卡片模型提供方和模型；默认 `auto` / `qwen-plus`，模型失败时自动本地降级 |
+| `REDIS_URL` | 可选复习资料生成短锁和 Agent 运行态缓存；PostgreSQL 仍是复习排程事实源 |
+| `REVIEW_GENERATION_LOCK_TTL_SECONDS` | 复习资料级生成锁 TTL，默认 `180` 秒 |
 | `TAVILY_API_KEY` | 预留配置；当前纯 Python Agent 尚未启用联网搜索，默认留空 |
 
 启动后端：
@@ -395,6 +400,7 @@ npm run dev
 | 工作台和设置 | `/api/page-data/*` |
 | 系统日志 | `/api/logs/*` |
 | 学习资料和 RAG | `/api/rag/*` |
+| 学习复习与提醒 | `/api/reviews/*` |
 | Agent、审批、记忆和 SSE | `/api/agent/*` |
 
 完整请求、鉴权、错误和异步状态说明见 [API 文档](docs/api/)。
@@ -419,6 +425,8 @@ conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_
 - [纯 Python FastAPI 后端迁移计划](docs/architecture/python-backend-migration-plan.md)
 - [RAG 架构说明](docs/architecture/rag-architecture.md)
 - [RAG 接口契约](docs/api/rag.md)
+- [学习复习接口契约](docs/api/review.md)
+- [FSRS 复习排程设计](docs/architecture/learning-review-scheduling.md)
 - [Agent 接口契约](docs/api/agent.md)
 - [日志接口契约](docs/api/logs.md)
 - [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)

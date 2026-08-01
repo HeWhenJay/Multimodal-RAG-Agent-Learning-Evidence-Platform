@@ -82,7 +82,7 @@ class RagMaterialResponse(BaseModel):
 
 
 class MaterialPreviewResponse(BaseModel):
-    """文本类原文件预览结果。"""
+    """原始文本或 RAG 提取视图的受控预览结果。"""
 
     materialId: int
     title: str
