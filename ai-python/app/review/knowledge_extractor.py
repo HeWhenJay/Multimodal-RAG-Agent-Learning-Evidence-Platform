@@ -227,7 +227,7 @@ class KnowledgePointExtractor:
             seen_questions.add(question_key)
             points.append(
                 KnowledgePoint(
-                    source_key=stable_source_key(section, len(points) + 1),
+                    source_key=stable_source_key(section, refs, answer),
                     question=question,
                     answer=answer,
                     hint=compact_text(raw.get("hint"), 180),
@@ -286,7 +286,7 @@ class KnowledgePointExtractor:
                 continue
             points.append(
                 KnowledgePoint(
-                    source_key=stable_source_key(section, ordinal),
+                    source_key=stable_source_key(section, (evidence,), answer),
                     question=build_question(section, answer, ordinal),
                     answer=answer,
                     hint=build_hint(section, answer),
@@ -524,11 +524,20 @@ def normalize_answer_text(value: object, maximum_length: int) -> str | None:
     return compact_text(clean_content_text(text), maximum_length)
 
 
-def stable_source_key(section: str, ordinal: int) -> str:
-    """按章节槽位生成稳定键，使重建索引时保留既有学习状态。"""
-    normalized = re.sub(r"\s+", "", section).lower()
-    digest = hashlib.sha256(f"{normalized}:{ordinal}".encode("utf-8")).hexdigest()[:24]
-    return f"section-{digest}"
+def stable_source_key(
+    section: str,
+    evidence_refs: tuple[Evidence, ...],
+    answer: str,
+) -> str:
+    """按证据和知识内容生成身份键，避免卡片调序后错误继承学习状态。"""
+    identity = {
+        "section": re.sub(r"\s+", "", section).lower(),
+        "evidenceIds": sorted({reference.evidenceId.strip() for reference in evidence_refs}),
+        "knowledge": normalized_sentence(answer),
+    }
+    serialized = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
+    return f"knowledge-{digest}"
 
 
 def compact_text(value: object, maximum_length: int) -> str | None:

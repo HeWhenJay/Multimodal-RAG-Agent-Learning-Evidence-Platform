@@ -17,11 +17,7 @@ logger = logging.getLogger(__name__)
 class RedisLike(Protocol):
     """复习生成锁使用的最小 Redis 接口。"""
 
-    def get(self, name: str) -> Any: ...
-
     def set(self, name: str, value: str, ex: int | None = None, nx: bool = False) -> Any: ...
-
-    def delete(self, *names: str) -> Any: ...
 
     def eval(self, script: str, numkeys: int, *keys_and_args: str) -> Any: ...
 
@@ -43,13 +39,8 @@ class _GenerationLease:
                 try:
                     self.redis_client.eval(script, 1, self.key, self.token)
                 except Exception:
-                    # 测试替身或旧 Redis 客户端没有 eval 时，避免删除其他实例刚续租的锁。
-                    try:
-                        current = self.redis_client.get(self.key)
-                        if current == self.token or current == self.token.encode("utf-8"):
-                            self.redis_client.delete(self.key)
-                    except Exception:
-                        logger.warning("Redis 复习生成锁释放失败，将等待 TTL 自动过期")
+                    # GET 后 DELETE 存在误删新持有者锁的竞态，失败时只等待 TTL 回收。
+                    logger.warning("Redis 复习生成锁原子释放失败，将等待 TTL 自动过期")
         finally:
             self.local_lock.release()
 

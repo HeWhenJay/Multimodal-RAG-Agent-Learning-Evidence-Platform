@@ -12,6 +12,7 @@ PYTHON_MIGRATIONS = (
     "20260721_0100_add_python_rag_durable_tasks.sql",
     "20260801_0100_create_learning_review_tables.sql",
 )
+PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 
 
 def apply_python_schema_migrations(database_url: str | None = None) -> list[str]:
@@ -30,6 +31,11 @@ def apply_python_schema_migrations(database_url: str | None = None) -> list[str]
     try:
         with psycopg.connect(url) as connection:
             with connection.cursor() as cursor:
+                # 同一数据库的多个 API 实例必须串行检查和执行迁移。
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (PYTHON_MIGRATION_LOCK_KEY,),
+                )
                 cursor.execute("CREATE SCHEMA IF NOT EXISTS learning_evidence")
                 cursor.execute(
                     """

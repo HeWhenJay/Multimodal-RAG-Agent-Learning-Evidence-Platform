@@ -131,6 +131,13 @@ class FakeRedis:
         return 0
 
 
+class EvalFailureRedis(FakeRedis):
+    """模拟 Redis 无法执行原子 Lua 解锁。"""
+
+    def eval(self, script: str, numkeys: int, *keys_and_args: str):
+        raise RuntimeError("eval unavailable")
+
+
 def test_generation_guard_rejects_duplicate_work_and_releases_lock() -> None:
     """同一资料版本并发生成时只允许一个持有者，释放后可再次生成。"""
     redis = FakeRedis()
@@ -148,3 +155,16 @@ def test_generation_guard_rejects_duplicate_work_and_releases_lock() -> None:
     next_lease = second_guard.acquire("7:12:3")
     assert next_lease is not None
     next_lease.release()
+
+
+def test_generation_guard_never_deletes_new_owner_lock_when_eval_fails() -> None:
+    """原子解锁失败后必须等待 TTL，不能用 GET/DELETE 误删新持有者。"""
+    redis = EvalFailureRedis()
+    guard = ReviewGenerationGuard(redis_client=redis, ttl_seconds=60)
+    lease = guard.acquire("7:12:3")
+
+    assert lease is not None
+    redis.values[lease.key] = "new-owner-token"
+    lease.release()
+
+    assert redis.values[lease.key] == "new-owner-token"

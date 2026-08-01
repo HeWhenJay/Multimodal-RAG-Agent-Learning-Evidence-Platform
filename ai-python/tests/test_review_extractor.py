@@ -14,6 +14,7 @@ from app.review.knowledge_extractor import (
     is_noise_fragment,
     is_repetitive_noise,
     split_knowledge_sentences,
+    stable_source_key,
 )
 from app.schemas.rag import Evidence
 from prompts.review import REVIEW_CARD_PROMPT_VERSION, review_card_system_prompt
@@ -130,6 +131,32 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert calls[0]["messages"][1]["role"] == "user"
     assert result.extractor == f"model:{REVIEW_CARD_PROMPT_VERSION}"
     assert len(result.knowledge_points) == 3
+
+
+def test_source_key_uses_evidence_and_content_instead_of_card_order() -> None:
+    """卡片调序不能改变身份，不同知识内容也不能错误继承旧进度。"""
+    reference = evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合。")
+    second_reference = evidence("material-12-8", "ISR", "Leader 故障后会触发副本选举。")
+
+    first = stable_source_key(
+        "ISR",
+        (reference, second_reference),
+        "ISR 保存与 Leader 保持同步的副本集合。",
+    )
+    reordered = stable_source_key(
+        "ISR",
+        (second_reference, reference),
+        "ISR 保存与 Leader 保持同步的副本集合。",
+    )
+    different = stable_source_key(
+        "ISR",
+        (reference, second_reference),
+        "Leader 故障后优先从 ISR 中选举新 Leader。",
+    )
+
+    assert first == reordered
+    assert first.startswith("knowledge-")
+    assert first != different
 
 
 def test_local_fallback_avoids_timecode_and_repeated_subtitle_questions() -> None:
