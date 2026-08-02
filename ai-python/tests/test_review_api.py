@@ -11,7 +11,9 @@ from app.main import app
 from app.schemas.auth import AuthUserResponse
 from app.schemas.review import (
     ReviewCard,
+    ReviewBatchDeletionResult,
     ReviewCardGroup,
+    ReviewDeletionResult,
     ReviewDueGroups,
     ReviewGradeResult,
     ReviewMaterial,
@@ -97,6 +99,21 @@ class StubReviewService:
         assert material_id == 12
         return sample_material()
 
+    def delete_material(self, material_id: int, user_id: str) -> ReviewDeletionResult:
+        self.remember(user_id)
+        assert material_id == 12
+        return ReviewDeletionResult(scope="MATERIAL", materialId=material_id)
+
+    def delete_materials(self, material_ids: list[int], user_id: str) -> ReviewBatchDeletionResult:
+        self.remember(user_id)
+        assert material_ids == [12, 13]
+        return ReviewBatchDeletionResult(
+            scope="MATERIAL",
+            requestedCount=2,
+            deletedCount=2,
+            materialIds=material_ids,
+        )
+
     def grade(self, card_id: int, payload, user_id: str) -> ReviewGradeResult:
         self.remember(user_id)
         assert card_id == 81 and payload.rating == 3
@@ -106,6 +123,21 @@ class StubReviewService:
             nextDueAt=NOW,
             intervalDays=0.01,
             retrievability=1.0,
+        )
+
+    def delete_card(self, card_id: int, user_id: str) -> ReviewDeletionResult:
+        self.remember(user_id)
+        assert card_id == 81
+        return ReviewDeletionResult(scope="CARD", materialId=12, cardId=card_id)
+
+    def delete_cards(self, card_ids: list[int], user_id: str) -> ReviewBatchDeletionResult:
+        self.remember(user_id)
+        assert card_ids == [81, 82]
+        return ReviewBatchDeletionResult(
+            scope="CARD",
+            requestedCount=2,
+            deletedCount=2,
+            cardIds=card_ids,
         )
 
     def update_settings(self, payload: ReviewSettings, user_id: str) -> ReviewSettings:
@@ -144,7 +176,7 @@ def sample_material() -> ReviewMaterial:
 
 
 def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
-    """9 个公开端点只能使用认证用户并保持 Result 信封。"""
+    """13 个公开端点只能使用认证用户并保持 Result 信封。"""
     service = StubReviewService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_review_service] = lambda: service
@@ -158,14 +190,18 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
             client.get("/api/reviews/due-groups?limit=20", headers=headers),
             client.get("/api/reviews/materials", headers=headers),
             client.post("/api/reviews/materials/12/generate", headers=headers),
+            client.post("/api/reviews/materials/batch-delete", headers=headers, json={"materialIds": [13, 12]}),
+            client.delete("/api/reviews/materials/12", headers=headers),
             client.get("/api/reviews/cards/81", headers=headers),
             client.post("/api/reviews/cards/81/grade", headers=headers, json={"rating": 3}),
+            client.post("/api/reviews/cards/batch-delete", headers=headers, json={"cardIds": [82, 81]}),
+            client.delete("/api/reviews/cards/81", headers=headers),
             client.put("/api/reviews/settings", headers=headers, json=ReviewSettings().model_dump()),
         ]
 
         assert all(response.status_code == 200 for response in responses)
         assert all(response.json()["code"] == 1 for response in responses)
-        assert service.users == ["42"] * 9
+        assert service.users == ["42"] * 13
     finally:
         app.dependency_overrides.clear()
 
@@ -183,5 +219,24 @@ def test_invalid_review_rating_uses_chinese_result_envelope() -> None:
         )
         assert response.status_code == 200
         assert response.json() == {"code": 0, "msg": "复习评分必须是 1 到 4", "data": None}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_empty_batch_delete_uses_result_envelope() -> None:
+    """批量删除空数组不能进入服务层，并保持统一中文 Result 信封。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/reviews/cards/batch-delete",
+            headers={"Authorization": "Bearer review-token"},
+            json={"cardIds": []},
+        )
+        assert response.status_code == 200
+        assert response.json()["code"] == 0
+        assert service.users == []
     finally:
         app.dependency_overrides.clear()

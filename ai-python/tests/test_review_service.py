@@ -161,7 +161,84 @@ def test_sync_candidates_include_outdated_extractor_versions() -> None:
 
     assert transaction.list_sync_candidates("7", 3) == []
     assert "rm.extractor NOT IN (%s, %s, %s)" in cursor.statement
+    assert "learning_review_material_exclusion" in cursor.statement
     assert cursor.params == ("7", *CURRENT_REVIEW_EXTRACTORS, 3)
+
+
+class DeletionTransaction:
+    """提供卡片与资料持久排除测试所需的最小事务。"""
+
+    def __init__(self, *, card_material_id: int | None = 12, material_exists: bool = True) -> None:
+        self.card_material_id = card_material_id
+        self.material_exists = material_exists
+        self.card_calls: list[tuple[int, str]] = []
+        self.material_calls: list[tuple[int, str]] = []
+
+    def exclude_card(self, card_id: int, user_id: str) -> int | None:
+        self.card_calls.append((card_id, user_id))
+        return self.card_material_id
+
+    def exclude_material(self, material_id: int, user_id: str) -> bool:
+        self.material_calls.append((material_id, user_id))
+        return self.material_exists
+
+
+def test_delete_card_returns_idempotent_scope_and_owner() -> None:
+    """卡片删除响应应保留资料定位，并只向仓储传递认证用户。"""
+    transaction = DeletionTransaction(card_material_id=12)
+    service = ReviewService(repository=FakeReviewRepository(transaction))
+
+    result = service.delete_card(81, "7")
+
+    assert result.model_dump() == {
+        "scope": "CARD",
+        "materialId": 12,
+        "cardId": 81,
+        "deleted": True,
+    }
+    assert transaction.card_calls == [(81, "7")]
+
+
+def test_delete_card_hides_missing_or_cross_user_card() -> None:
+    """不存在或越权卡片统一返回稳定业务错误。"""
+    service = ReviewService(repository=FakeReviewRepository(DeletionTransaction(card_material_id=None)))
+
+    with pytest.raises(BusinessError, match="复习卡片不存在"):
+        service.delete_card(81, "7")
+
+
+def test_delete_material_keeps_rag_owner_boundary() -> None:
+    """资料级排除应返回 MATERIAL scope，越权资料不得暴露。"""
+    transaction = DeletionTransaction(material_exists=True)
+    service = ReviewService(repository=FakeReviewRepository(transaction))
+
+    result = service.delete_material(12, "7")
+
+    assert result.scope == "MATERIAL"
+    assert result.materialId == 12
+    assert result.cardId is None
+    assert transaction.material_calls == [(12, "7")]
+
+    missing_service = ReviewService(repository=FakeReviewRepository(DeletionTransaction(material_exists=False)))
+    with pytest.raises(BusinessError, match="学习资料不存在"):
+        missing_service.delete_material(12, "7")
+
+
+def test_batch_delete_deduplicates_and_uses_one_transaction() -> None:
+    """批量卡片和资料删除应去重排序，并返回实际命中的 ID。"""
+    transaction = DeletionTransaction(card_material_id=12, material_exists=True)
+    repository = FakeReviewRepository(transaction)
+    service = ReviewService(repository=repository)
+
+    card_result = service.delete_cards([82, 81, 82], "7")
+    material_result = service.delete_materials([13, 12, 13], "7")
+
+    assert card_result.requestedCount == 2
+    assert card_result.cardIds == [81, 82]
+    assert transaction.card_calls == [(81, "7"), (82, "7")]
+    assert material_result.requestedCount == 2
+    assert material_result.materialIds == [12, 13]
+    assert transaction.material_calls == [(12, "7"), (13, "7")]
 
 
 def test_current_index_with_legacy_extractor_still_requires_regeneration() -> None:

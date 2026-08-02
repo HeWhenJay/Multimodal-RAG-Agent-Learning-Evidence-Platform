@@ -126,6 +126,8 @@ class ReviewTransaction(Protocol):
 
     def find_material(self, material_id: int, user_id: str) -> MaterialSourceRecord | None: ...
 
+    def find_material_by_id(self, material_id: int) -> MaterialSourceRecord | None: ...
+
     def list_evidences(self, material: MaterialSourceRecord, limit: int = 24) -> list[Evidence]: ...
 
     def save_generation(
@@ -138,11 +140,17 @@ class ReviewTransaction(Protocol):
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
-    ) -> ReviewMaterialRecord: ...
+    ) -> ReviewMaterialRecord | None: ...
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]: ...
 
     def find_review_material(self, material_id: int, user_id: str) -> ReviewMaterialRecord | None: ...
+
+    def is_material_excluded(self, material_id: int, user_id: str) -> bool: ...
+
+    def exclude_material(self, material_id: int, user_id: str) -> bool: ...
+
+    def exclude_card(self, card_id: int, user_id: str) -> int | None: ...
 
     def get_or_create_settings(
         self,
@@ -217,6 +225,12 @@ class DatabaseReviewTransaction:
                 LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = lm.id
                 WHERE lm.user_id = %s
                   AND lm.status IN ('READY', 'PARTIAL')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = lm.id
+                        AND excluded_material.user_id = lm.user_id
+                  )
                   AND (
                       rm.material_id IS NULL
                       OR rm.index_request_version < lm.index_request_version
@@ -242,6 +256,21 @@ class DatabaseReviewTransaction:
                 """
             ),
             (material_id, user_id),
+        )
+        row = self._cursor.fetchone()
+        return self._to_material(row) if row else None
+
+    def find_material_by_id(self, material_id: int) -> MaterialSourceRecord | None:
+        """按资料 ID 读取索引终态，仅供内部 worker 衔接复习生成。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT *
+                FROM {schema}.learning_material
+                WHERE id = %s
+                """
+            ),
+            (material_id,),
         )
         row = self._cursor.fetchone()
         return self._to_material(row) if row else None
@@ -280,15 +309,21 @@ class DatabaseReviewTransaction:
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
-    ) -> ReviewMaterialRecord:
+    ) -> ReviewMaterialRecord | None:
         """更新分类并按稳定来源键刷新正文，已有卡片不重置 FSRS 状态。"""
         self._cursor.execute(
             self._statement(
                 """
-                SELECT index_request_version
-                FROM {schema}.learning_material
-                WHERE id = %s AND user_id = %s
-                FOR UPDATE
+                SELECT lm.index_request_version,
+                       EXISTS (
+                           SELECT 1
+                           FROM {schema}.learning_review_material_exclusion excluded_material
+                           WHERE excluded_material.material_id = lm.id
+                             AND excluded_material.user_id = lm.user_id
+                       ) AS review_excluded
+                FROM {schema}.learning_material lm
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm
                 """
             ),
             (material.id, material.user_id),
@@ -296,6 +331,8 @@ class DatabaseReviewTransaction:
         current_material = self._cursor.fetchone()
         if current_material is None:
             raise RuntimeError("保存复习卡片时资料已不存在")
+        if bool(current_material.get("review_excluded")):
+            return None
         if int(current_material.get("index_request_version") or 0) != material.index_request_version:
             # 提炼期间资料已进入新索引版本时，丢弃旧结果并等待下一轮同步。
             current = self._find_review_material(material.id, material.user_id)
@@ -346,6 +383,17 @@ class DatabaseReviewTransaction:
         self._cursor.execute(
             self._statement(
                 """
+                SELECT source_key
+                FROM {schema}.learning_review_card_exclusion
+                WHERE material_id = %s AND user_id = %s
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        excluded_source_keys = {str(row["source_key"]) for row in self._cursor.fetchall()}
+        self._cursor.execute(
+            self._statement(
+                """
                 UPDATE {schema}.learning_review_card
                 SET active = FALSE, updated_at = CURRENT_TIMESTAMP
                 WHERE material_id = %s AND user_id = %s
@@ -354,6 +402,8 @@ class DatabaseReviewTransaction:
             (material.id, material.user_id),
         )
         for card in cards:
+            if card.source_key in excluded_source_keys:
+                continue
             self._cursor.execute(
                 self._statement(
                     """
@@ -410,7 +460,17 @@ class DatabaseReviewTransaction:
         """展示资料当前索引版本及其复习同步状态。"""
         self._cursor.execute(
             self._review_material_select(
-                "WHERE lm.user_id = %s ORDER BY lm.updated_at DESC, lm.id DESC LIMIT %s"
+                """
+                WHERE lm.user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = lm.id
+                        AND excluded_material.user_id = lm.user_id
+                  )
+                ORDER BY lm.updated_at DESC, lm.id DESC
+                LIMIT %s
+                """
             ),
             (user_id, limit),
         )
@@ -419,6 +479,138 @@ class DatabaseReviewTransaction:
     def find_review_material(self, material_id: int, user_id: str) -> ReviewMaterialRecord | None:
         """按资料和用户读取当前复习生成状态，用于生成前幂等复核。"""
         return self._find_review_material(material_id, user_id)
+
+    def is_material_excluded(self, material_id: int, user_id: str) -> bool:
+        """读取资料级 tombstone，自动同步和显式生成都以此为准。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT 1
+                FROM {schema}.learning_review_material_exclusion
+                WHERE material_id = %s AND user_id = %s
+                """
+            ),
+            (material_id, user_id),
+        )
+        return self._cursor.fetchone() is not None
+
+    def exclude_material(self, material_id: int, user_id: str) -> bool:
+        """锁定资料后写入排除记录，并停用该资料全部复习卡片。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT id
+                FROM {schema}.learning_material
+                WHERE id = %s AND user_id = %s
+                FOR UPDATE
+                """
+            ),
+            (material_id, user_id),
+        )
+        if self._cursor.fetchone() is None:
+            return False
+        self._cursor.execute(
+            self._statement(
+                """
+                INSERT INTO {schema}.learning_review_material_exclusion (material_id, user_id)
+                VALUES (%s, %s)
+                ON CONFLICT (material_id) DO NOTHING
+                """
+            ),
+            (material_id, user_id),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_card
+                SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                """
+            ),
+            (material_id, user_id),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material
+                SET card_count = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE material_id = %s AND user_id = %s
+                """
+            ),
+            (material_id, user_id),
+        )
+        return True
+
+    def exclude_card(self, card_id: int, user_id: str) -> int | None:
+        """幂等停用一张卡片，并保存来源键避免重新生成后复活。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT material_id
+                FROM {schema}.learning_review_card_exclusion
+                WHERE original_card_id = %s AND user_id = %s
+                """
+            ),
+            (card_id, user_id),
+        )
+        excluded = self._cursor.fetchone()
+        if excluded is not None:
+            return int(excluded["material_id"])
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT c.material_id, c.source_key, c.review_material_id
+                FROM {schema}.learning_review_card c
+                JOIN {schema}.learning_material lm ON lm.id = c.material_id
+                WHERE c.id = %s AND c.user_id = %s AND lm.user_id = %s
+                FOR UPDATE OF c
+                """
+            ),
+            (card_id, user_id, user_id),
+        )
+        card = self._cursor.fetchone()
+        if card is None:
+            return None
+        material_id = int(card["material_id"])
+        self._cursor.execute(
+            self._statement(
+                """
+                INSERT INTO {schema}.learning_review_card_exclusion (
+                    original_card_id, material_id, user_id, source_key
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            (card_id, material_id, user_id, str(card["source_key"])),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_card
+                SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (card_id, user_id),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material
+                SET card_count = (
+                    SELECT COUNT(1)
+                    FROM {schema}.learning_review_card active_card
+                    WHERE active_card.material_id = %s
+                      AND active_card.user_id = %s
+                      AND active_card.active = TRUE
+                ), updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (material_id, user_id, int(card["review_material_id"]), user_id),
+        )
+        return material_id
 
     def get_or_create_settings(
         self,

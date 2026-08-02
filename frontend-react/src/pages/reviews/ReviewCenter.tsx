@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowUpRight,
   Bell,
   BellRing,
@@ -15,12 +16,18 @@ import {
   Save,
   Settings2,
   Target,
+  Trash2,
   X
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type Dispatch, type FormEvent, type MutableRefObject, type SetStateAction } from 'react';
 import { MarkdownText } from '../../components/MarkdownText';
 import {
   REVIEW_OVERVIEW_UPDATED_EVENT,
+  REVIEW_CONTENT_UPDATED_EVENT,
+  deleteReviewCard,
+  deleteReviewCards,
+  deleteReviewMaterial,
+  deleteReviewMaterials,
   fetchDueReviewGroups,
   fetchReviewCard,
   fetchReviewMaterials,
@@ -43,6 +50,11 @@ import { MATERIAL_UPLOADED_EVENT } from '../../hooks/useMaterialUpload';
 import '../../styles/ReviewCenter.css';
 
 type ReviewRating = 1 | 2 | 3 | 4;
+type ReviewDeleteTarget =
+  | { scope: 'CARD'; card: ReviewCard }
+  | { scope: 'MATERIAL'; materialId: number; title: string }
+  | { scope: 'CARD_BATCH'; cardIds: number[] }
+  | { scope: 'MATERIAL_BATCH'; materialIds: number[]; titles: string[] };
 
 const DEFAULT_SETTINGS: ReviewSettings = {
   enabled: true,
@@ -76,6 +88,12 @@ export function ReviewCenter() {
   const [gradingId, setGradingId] = useState<number | null>(null);
   const [gradeMessage, setGradeMessage] = useState('');
   const [gradeError, setGradeError] = useState('');
+  const [deleteTarget, setDeleteTarget] = useState<ReviewDeleteTarget | null>(null);
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [deleteMessage, setDeleteMessage] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [selectedCardIds, setSelectedCardIds] = useState<Record<number, boolean>>({});
+  const [selectedMaterialIds, setSelectedMaterialIds] = useState<Record<number, boolean>>({});
   const [originalCard, setOriginalCard] = useState<ReviewCard | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<ReviewSettings>(DEFAULT_SETTINGS);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -89,6 +107,8 @@ export function ReviewCenter() {
   const dueCount = overview?.actionableDueCount ?? groups.reduce((count, group) => count + group.dueCardCount, 0);
   const dailyLimit = overview?.settings.dailyLimit || settingsDraft.dailyLimit || 20;
   const reviewProgress = Math.min(100, Math.round(((overview?.todayReviewedCount || 0) / Math.max(1, dailyLimit)) * 100));
+  const selectedCardIdList = selectedIds(selectedCardIds);
+  const selectedMaterialIdList = selectedIds(selectedMaterialIds);
 
   // 同时读取概览、分组队列和资料状态，单个区域失败时保留其余数据。
   const loadData = useCallback(async () => {
@@ -152,6 +172,15 @@ export function ReviewCenter() {
     return () => {
       active = false;
     };
+  }, [loadData]);
+
+  // 上传资料完成 RAG 入库并生成卡片后，立即刷新当前复习中心，不等待定时轮询。
+  useEffect(() => {
+    const refreshGeneratedMaterial = () => {
+      void loadData().catch(() => undefined);
+    };
+    window.addEventListener(REVIEW_CONTENT_UPDATED_EVENT, refreshGeneratedMaterial);
+    return () => window.removeEventListener(REVIEW_CONTENT_UPDATED_EVENT, refreshGeneratedMaterial);
   }, [loadData]);
 
   // 到期时间和评分日志由服务端维护，页面定时或重新聚焦时刷新概览与分组队列。
@@ -225,7 +254,7 @@ export function ReviewCenter() {
         durationMs: Math.max(0, Date.now() - (reviewStartedAtRef.current[card.id] || Date.now()))
       });
       setGradeMessage(formatGradeMessage(result, rating));
-      removeCard(card.id);
+      removeCards([card.id]);
       setRevealedCards((previous) => omitKey(previous, card.id));
       setHintCardIds((previous) => omitKey(previous, card.id));
       await refreshAfterGrade();
@@ -251,10 +280,105 @@ export function ReviewCenter() {
     if (results[2].status === 'fulfilled') setMaterials(results[2].value);
   }
 
-  function removeCard(cardId: number) {
+  function removeCards(cardIds: number[]) {
+    const removed = new Set(cardIds);
     setGroups((previous) => previous
-      .map((group) => ({ ...group, cards: group.cards.filter((card) => card.id !== cardId), dueCardCount: group.cards.filter((card) => card.id !== cardId).length }))
+      .map((group) => {
+        const cards = group.cards.filter((card) => !removed.has(card.id));
+        return { ...group, cards, dueCardCount: cards.length };
+      })
       .filter((group) => group.cards.length > 0));
+  }
+
+  function removeMaterialsFromView(materialIds: number[]) {
+    const removed = new Set(materialIds);
+    setGroups((previous) => previous.filter((group) => !removed.has(group.materialId)));
+    setMaterials((previous) => previous.filter((material) => {
+      const materialId = resolveMaterialId(material);
+      return materialId == null || !removed.has(materialId);
+    }));
+    setRevealedCards((previous) => omitMaterialCards(previous, removed));
+    setSelectedMaterialIds((previous) => omitKeys(previous, materialIds));
+    setSelectedCardIds({});
+    setHintCardIds({});
+    if (originalCard && removed.has(originalCard.materialId)) setOriginalCard(null);
+  }
+
+  function requestCardDeletion(card: ReviewCard) {
+    setDeleteError('');
+    setDeleteMessage('');
+    setDeleteTarget({ scope: 'CARD', card });
+  }
+
+  function requestMaterialDeletion(materialId: number, title: string) {
+    setDeleteError('');
+    setDeleteMessage('');
+    setDeleteTarget({ scope: 'MATERIAL', materialId, title });
+  }
+
+  function requestCardBatchDeletion() {
+    if (!selectedCardIdList.length) return;
+    setDeleteError('');
+    setDeleteMessage('');
+    setDeleteTarget({ scope: 'CARD_BATCH', cardIds: selectedCardIdList });
+  }
+
+  function requestMaterialBatchDeletion() {
+    if (!selectedMaterialIdList.length) return;
+    const selected = new Set(selectedMaterialIdList);
+    const titles = materials
+      .filter((material) => {
+        const materialId = resolveMaterialId(material);
+        return materialId != null && selected.has(materialId);
+      })
+      .map((material) => material.title);
+    setDeleteError('');
+    setDeleteMessage('');
+    setDeleteTarget({ scope: 'MATERIAL_BATCH', materialIds: selectedMaterialIdList, titles });
+  }
+
+  // 删除成功后先更新本地列表，再独立刷新服务端统计，刷新失败不会误报删除失败。
+  async function confirmDeletion() {
+    const target = deleteTarget;
+    if (!target || deletingKey !== null) return;
+    const key = deletionKey(target);
+    setDeletingKey(key);
+    setDeleteError('');
+    try {
+      if (target.scope === 'CARD') {
+        await deleteReviewCard(target.card.id);
+        removeCards([target.card.id]);
+        setRevealedCards((previous) => omitKey(previous, target.card.id));
+        setHintCardIds((previous) => omitKey(previous, target.card.id));
+        setSelectedCardIds((previous) => omitKey(previous, target.card.id));
+        delete reviewStartedAtRef.current[target.card.id];
+        if (originalCard?.id === target.card.id) setOriginalCard(null);
+        setDeleteMessage('卡片已删除，后续同步不会恢复同一卡片');
+      } else if (target.scope === 'MATERIAL') {
+        await deleteReviewMaterial(target.materialId);
+        removeMaterialsFromView([target.materialId]);
+        setDeleteMessage(`“${target.title}”已移出复习中心，原始资料仍保留`);
+      } else if (target.scope === 'CARD_BATCH') {
+        const result = await deleteReviewCards(target.cardIds);
+        removeCards(result.cardIds);
+        setRevealedCards((previous) => omitKeys(previous, result.cardIds));
+        setHintCardIds((previous) => omitKeys(previous, result.cardIds));
+        setSelectedCardIds((previous) => omitKeys(previous, result.cardIds));
+        result.cardIds.forEach((cardId) => delete reviewStartedAtRef.current[cardId]);
+        if (originalCard && result.cardIds.includes(originalCard.id)) setOriginalCard(null);
+        setDeleteMessage(`已删除 ${result.deletedCount} 张卡片，后续同步不会恢复`);
+      } else {
+        const result = await deleteReviewMaterials(target.materialIds);
+        removeMaterialsFromView(result.materialIds);
+        setDeleteMessage(`已将 ${result.deletedCount} 份资料移出复习中心，原始资料仍保留`);
+      }
+      setDeleteTarget(null);
+      await refreshAfterGrade();
+    } catch (deleteFailure) {
+      setDeleteError(deleteFailure instanceof Error ? deleteFailure.message : '复习内容删除失败');
+    } finally {
+      setDeletingKey(null);
+    }
   }
 
   async function regenerateMaterial(material: ReviewMaterial) {
@@ -326,6 +450,8 @@ export function ReviewCenter() {
       {syncMessage ? <div className="review-alert"><Check size={17} />{syncMessage}</div> : null}
       {gradeMessage ? <div className="review-alert success"><Check size={17} />{gradeMessage}</div> : null}
       {gradeError ? <div className="review-alert danger"><CircleAlert size={17} />{gradeError}</div> : null}
+      {deleteMessage ? <div className="review-alert success"><Check size={17} />{deleteMessage}</div> : null}
+      {deleteError ? <div className="review-alert danger"><CircleAlert size={17} />{deleteError}</div> : null}
 
       <section className="review-stat-strip" aria-label="复习统计">
         <div className="review-stat primary"><span>今日待复习</span><strong>{dueCount}</strong><small>{overview && overview.dueCount > dueCount ? `到期积压 ${overview.dueCount} 张` : totalCards ? `当前展示 ${totalCards} 张` : '队列已清空'}</small></div>
@@ -336,7 +462,7 @@ export function ReviewCenter() {
 
       <div className="review-content-grid">
         <section className="review-queue-column" aria-labelledby="review-queue-title">
-          <div className="review-section-heading"><div><h3 id="review-queue-title">今日卡片</h3><span>{groups.length ? `${groups.length} 份资料` : '暂无到期资料'}</span></div><Clock3 size={18} /></div>
+          <div className="review-section-heading"><div><h3 id="review-queue-title">今日卡片</h3><span>{groups.length ? `${groups.length} 份资料` : '暂无到期资料'}</span></div><div className="review-section-actions">{selectedCardIdList.length ? <button className="outline-action small danger-outline" type="button" onClick={requestCardBatchDeletion} disabled={deletingKey !== null}><Trash2 size={14} />删除选中 {selectedCardIdList.length}</button> : <Clock3 size={18} />}</div></div>
           {loading ? <div className="review-loading"><Loader2 className="spin" size={22} /><span>正在读取复习队列</span></div> : null}
           {!loading && groups.length === 0 ? <EmptyReviewQueue onSync={() => void runSync()} syncing={syncing} /> : null}
           {!loading && groups.length > 0 ? groups.map((group) => (
@@ -345,13 +471,18 @@ export function ReviewCenter() {
               group={group}
               revealedCards={revealedCards}
               hintCardIds={hintCardIds}
+              selectedCardIds={selectedCardIds}
               revealLoadingId={revealLoadingId}
               gradingId={gradingId}
+              deletingKey={deletingKey}
               onReveal={(card) => void revealCard(card)}
               onToggleHint={(cardId) => setHintCardIds((previous) => ({ ...previous, [cardId]: !previous[cardId] }))}
               onHide={(cardId) => setRevealedCards((previous) => omitKey(previous, cardId))}
               onOriginal={setOriginalCard}
               onGrade={(card, rating) => void gradeCard(card, rating)}
+              onDeleteCard={requestCardDeletion}
+              onDeleteMaterial={() => requestMaterialDeletion(group.materialId, group.materialTitle)}
+              onToggleSelected={(cardId) => setSelectedCardIds((previous) => toggleSelected(previous, cardId))}
             />
           )) : null}
         </section>
@@ -373,14 +504,19 @@ export function ReviewCenter() {
 
           <section className="review-panel materials-panel">
             <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料分组</h3></div><span>{materials.length}</span></div>
+            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份</span><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null}><Trash2 size={14} />批量移出</button></div> : null}
             <div className="review-material-list">
-              {materials.length ? materials.map((material) => <ReviewMaterialRow key={resolveMaterialId(material) ?? material.title} material={material} busy={busyMaterialId === resolveMaterialId(material)} onRegenerate={() => void regenerateMaterial(material)} />) : <p className="panel-empty">暂无已索引资料</p>}
+              {materials.length ? materials.map((material) => {
+                const materialId = resolveMaterialId(material);
+                return <ReviewMaterialRow key={materialId ?? material.title} material={material} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+              }) : <p className="panel-empty">暂无已索引资料</p>}
             </div>
           </section>
         </aside>
       </div>
 
       <OriginalEvidenceDialog card={originalCard} onClose={() => setOriginalCard(null)} />
+      <ReviewDeletionDialog target={deleteTarget} deleting={deletingKey !== null} onConfirm={() => void confirmDeletion()} onClose={() => { if (deletingKey === null) setDeleteTarget(null); }} />
     </div>
   );
 }
@@ -389,33 +525,43 @@ function ReviewMaterialGroup({
   group,
   revealedCards,
   hintCardIds,
+  selectedCardIds,
   revealLoadingId,
   gradingId,
+  deletingKey,
   onReveal,
   onToggleHint,
   onHide,
   onOriginal,
-  onGrade
+  onGrade,
+  onDeleteCard,
+  onDeleteMaterial,
+  onToggleSelected
 }: {
   group: ReviewCardGroup;
   revealedCards: Record<number, ReviewCard>;
   hintCardIds: Record<number, boolean>;
+  selectedCardIds: Record<number, boolean>;
   revealLoadingId: number | null;
   gradingId: number | null;
+  deletingKey: string | null;
   onReveal: (card: ReviewCard) => void;
   onToggleHint: (cardId: number) => void;
   onHide: (cardId: number) => void;
   onOriginal: (card: ReviewCard) => void;
   onGrade: (card: ReviewCard, rating: ReviewRating) => void;
+  onDeleteCard: (card: ReviewCard) => void;
+  onDeleteMaterial: () => void;
+  onToggleSelected: (cardId: number) => void;
 }) {
   return (
     <section className="review-material-group">
       <header className="review-group-header">
         <div className="review-group-title"><span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span><div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期</span></div></div>
-        <span className="group-count">{group.cards.length}</span>
+        <div className="review-group-actions"><span className="group-count">{group.cards.length}</span><button className="icon-button tiny danger" type="button" title="将资料移出复习中心" aria-label={`将 ${group.materialTitle} 移出复习中心`} onClick={onDeleteMaterial} disabled={deletingKey !== null}>{deletingKey === `MATERIAL:${group.materialId}` ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div>
       </header>
       <div className="review-card-grid">
-        {group.cards.map((card) => <ReviewQuestionCard key={card.id} card={card} revealed={revealedCards[card.id]} showHint={Boolean(hintCardIds[card.id])} revealLoading={revealLoadingId === card.id} grading={gradingId === card.id} onReveal={() => onReveal(card)} onHide={() => onHide(card.id)} onToggleHint={() => onToggleHint(card.id)} onOriginal={() => onOriginal(revealedCards[card.id] || card)} onGrade={(rating) => onGrade(card, rating)} />)}
+        {group.cards.map((card) => <ReviewQuestionCard key={card.id} card={card} revealed={revealedCards[card.id]} selected={Boolean(selectedCardIds[card.id])} showHint={Boolean(hintCardIds[card.id])} revealLoading={revealLoadingId === card.id} grading={gradingId === card.id} deleting={deletingKey === `CARD:${card.id}`} onToggleSelected={() => onToggleSelected(card.id)} onReveal={() => onReveal(card)} onHide={() => onHide(card.id)} onToggleHint={() => onToggleHint(card.id)} onOriginal={() => onOriginal(revealedCards[card.id] || card)} onGrade={(rating) => onGrade(card, rating)} onDelete={() => onDeleteCard(card)} />)}
       </div>
     </section>
   );
@@ -424,30 +570,38 @@ function ReviewMaterialGroup({
 function ReviewQuestionCard({
   card,
   revealed,
+  selected,
   showHint,
   revealLoading,
   grading,
+  deleting,
+  onToggleSelected,
   onReveal,
   onHide,
   onToggleHint,
   onOriginal,
-  onGrade
+  onGrade,
+  onDelete
 }: {
   card: ReviewCard;
   revealed?: ReviewCard;
+  selected: boolean;
   showHint: boolean;
   revealLoading: boolean;
   grading: boolean;
+  deleting: boolean;
+  onToggleSelected: () => void;
   onReveal: () => void;
   onHide: () => void;
   onToggleHint: () => void;
   onOriginal: () => void;
   onGrade: (rating: ReviewRating) => void;
+  onDelete: () => void;
 }) {
   const isRevealed = Boolean(revealed?.answer);
   return (
-    <article className={`review-question-card${isRevealed ? ' is-revealed' : ''}`}>
-      <div className="review-card-meta"><span>知识点 {card.reviewCount > 0 ? `· 已复习 ${card.reviewCount} 次` : '· 首次复习'}</span><time>{formatDueDate(card.dueAt)}</time></div>
+    <article className={`review-question-card${isRevealed ? ' is-revealed' : ''}${selected ? ' is-selected' : ''}`}>
+      <div className="review-card-meta"><div className="review-card-meta-leading"><input type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择卡片：${card.question}`} /><span>知识点 {card.reviewCount > 0 ? `· 已复习 ${card.reviewCount} 次` : '· 首次复习'}</span></div><div className="review-card-meta-actions"><time>{formatDueDate(card.dueAt)}</time><button className="icon-button tiny danger" type="button" title="删除卡片" aria-label={`删除卡片：${card.question}`} onClick={onDelete} disabled={deleting}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div></div>
       <h5>{card.question}</h5>
       {!isRevealed ? (
         <div className="review-card-collapsed-actions">
@@ -463,6 +617,60 @@ function ReviewQuestionCard({
       )}
       {showHint && !isRevealed ? <div className="review-hint"><span>提示</span>{card.hint || '先回忆这一节的核心概念、作用和关键步骤'}</div> : null}
     </article>
+  );
+}
+
+function ReviewDeletionDialog({
+  target,
+  deleting,
+  onConfirm,
+  onClose
+}: {
+  target: ReviewDeleteTarget | null;
+  deleting: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!target) return undefined;
+    cancelButtonRef.current?.focus();
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape' && !deleting) onClose();
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [target, deleting, onClose]);
+
+  if (!target) return null;
+  const isMaterial = target.scope === 'MATERIAL' || target.scope === 'MATERIAL_BATCH';
+  const count = target.scope === 'CARD_BATCH' ? target.cardIds.length : target.scope === 'MATERIAL_BATCH' ? target.materialIds.length : 1;
+  const title = target.scope === 'CARD'
+    ? target.card.question
+    : target.scope === 'MATERIAL'
+      ? target.title
+      : target.scope === 'CARD_BATCH'
+        ? `已选择 ${count} 张复习卡片`
+        : `${target.titles.slice(0, 2).join('、')}${target.titles.length > 2 ? ` 等 ${count} 份资料` : ''}`;
+  const dialogTitle = isMaterial
+    ? count > 1 ? `将 ${count} 份资料移出复习中心？` : '将资料移出复习中心？'
+    : count > 1 ? `删除 ${count} 张复习卡片？` : '删除这张复习卡片？';
+  return (
+    <div className="review-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deleting) onClose(); }}>
+      <section className="review-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="review-delete-title" aria-describedby="review-delete-description" aria-busy={deleting}>
+        <div className="review-delete-icon"><AlertTriangle size={20} /></div>
+        <div className="review-delete-copy">
+          <h3 id="review-delete-title">{dialogTitle}</h3>
+          <strong>{title}</strong>
+          <p id="review-delete-description">{isMaterial ? '该资料的全部复习卡片将停止显示，后续同步也不会重新生成；原始文件和 RAG 索引仍会保留。' : '该卡片将停止显示，后续同步或重新生成也不会恢复同一卡片。'}</p>
+        </div>
+        <div className="review-delete-actions">
+          <button ref={cancelButtonRef} className="outline-action" type="button" onClick={onClose} disabled={deleting}>取消</button>
+          <button className="danger-action" type="button" onClick={onConfirm} disabled={deleting}>{deleting ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}{deleting ? '处理中' : isMaterial ? count > 1 ? `移出 ${count} 份` : '确认移出' : count > 1 ? `删除 ${count} 张` : '删除卡片'}</button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -507,8 +715,8 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, busy, onRegenerate }: { material: ReviewMaterial; busy: boolean; onRegenerate: () => void }) {
-  return <div className="review-material-row"><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button></div>;
+function ReviewMaterialRow({ material, selected, busy, deleting, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div></div>;
 }
 
 function EmptyReviewQueue({ onSync, syncing }: { onSync: () => void; syncing: boolean }) {
@@ -524,6 +732,34 @@ function omitKey<T>(value: Record<number, T>, key: number): Record<number, T> {
   const next = { ...value };
   delete next[key];
   return next;
+}
+
+function omitKeys<T>(value: Record<number, T>, keys: number[]): Record<number, T> {
+  const removed = new Set(keys);
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !removed.has(Number(key)))) as Record<number, T>;
+}
+
+function omitMaterialCards(value: Record<number, ReviewCard>, materialIds: ReadonlySet<number>): Record<number, ReviewCard> {
+  return Object.fromEntries(Object.entries(value).filter(([, card]) => !materialIds.has(card.materialId))) as Record<number, ReviewCard>;
+}
+
+function toggleSelected(value: Record<number, boolean>, id: number): Record<number, boolean> {
+  if (value[id]) return omitKey(value, id);
+  return { ...value, [id]: true };
+}
+
+function selectedIds(value: Record<number, boolean>): number[] {
+  return Object.entries(value)
+    .filter(([, selected]) => selected)
+    .map(([id]) => Number(id))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+}
+
+function deletionKey(target: ReviewDeleteTarget): string {
+  if (target.scope === 'CARD') return `CARD:${target.card.id}`;
+  if (target.scope === 'MATERIAL') return `MATERIAL:${target.materialId}`;
+  return target.scope;
 }
 
 function normalizeSettings(settings?: Partial<ReviewSettings> | null): ReviewSettings {

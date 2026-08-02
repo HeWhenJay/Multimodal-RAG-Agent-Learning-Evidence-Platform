@@ -14,10 +14,14 @@ from app.review.generation_guard import ReviewGenerationGuard
 from app.review.service import ReviewService
 from app.schemas.review import (
     ReviewCard,
+    ReviewBatchDeletionResult,
+    ReviewCardBatchDeleteRequest,
+    ReviewDeletionResult,
     ReviewDueGroups,
     ReviewGradeRequest,
     ReviewGradeResult,
     ReviewMaterial,
+    ReviewMaterialBatchDeleteRequest,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -96,6 +100,30 @@ def generate_review_material(
     )
 
 
+@router.post("/materials/batch-delete", response_model=Result[ReviewBatchDeletionResult])
+def batch_delete_review_materials(
+    payload: ReviewMaterialBatchDeleteRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewBatchDeletionResult]:
+    """在单个事务中批量将资料移出复习中心。"""
+    return Result.success(
+        execute("批量移出复习资料", lambda: service.delete_materials(payload.materialIds, str(current_user.id)))
+    )
+
+
+@router.delete("/materials/{material_id}", response_model=Result[ReviewDeletionResult])
+def delete_review_material(
+    material_id: int,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewDeletionResult]:
+    """将资料永久移出复习中心，但保留原始 RAG 文件与索引。"""
+    return Result.success(
+        execute("将资料移出复习中心", lambda: service.delete_material(material_id, str(current_user.id)))
+    )
+
+
 @router.get("/cards/{card_id}", response_model=Result[ReviewCard])
 def reveal_review_card(
     card_id: int,
@@ -115,6 +143,28 @@ def grade_review_card(
 ) -> Result[ReviewGradeResult]:
     """提交主动回忆评分并计算下一次复习时间。"""
     return Result.success(execute("提交复习评分", lambda: service.grade(card_id, payload, str(current_user.id))))
+
+
+@router.post("/cards/batch-delete", response_model=Result[ReviewBatchDeletionResult])
+def batch_delete_review_cards(
+    payload: ReviewCardBatchDeleteRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewBatchDeletionResult]:
+    """在单个事务中批量删除复习卡片。"""
+    return Result.success(
+        execute("批量删除复习卡片", lambda: service.delete_cards(payload.cardIds, str(current_user.id)))
+    )
+
+
+@router.delete("/cards/{card_id}", response_model=Result[ReviewDeletionResult])
+def delete_review_card(
+    card_id: int,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewDeletionResult]:
+    """删除一张复习卡片并保存稳定来源键排除记录。"""
+    return Result.success(execute("删除复习卡片", lambda: service.delete_card(card_id, str(current_user.id))))
 
 
 @router.put("/settings", response_model=Result[ReviewSettings])

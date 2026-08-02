@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchMaterial, uploadMaterial, uploadMaterialChunk } from '../api/rag';
+import { REVIEW_CONTENT_UPDATED_EVENT, REVIEW_OVERVIEW_UPDATED_EVENT, generateReviewMaterial } from '../api/reviews';
 import type { LearningMaterial } from '../api/types';
 
 export const MATERIAL_FILE_ACCEPT = '.pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp,.mp4,.mov,.m4v,.webm,.mkv,.avi';
@@ -55,6 +56,15 @@ export function useMaterialUpload({ highPrecision = false, onUploaded }: UseMate
         if (isTerminalStatus(material)) {
           shouldContinue = false;
           stopProgressPolling();
+          if (['READY', 'PARTIAL'].includes(material.status)) {
+            // 上传响应早于异步 RAG 入库完成；按资料 ID 生成，避免历史候选抢占本次上传。
+            void generateReviewMaterial(material.id)
+              .catch(() => undefined)
+              .finally(() => {
+                window.dispatchEvent(new Event(REVIEW_CONTENT_UPDATED_EVENT));
+                window.dispatchEvent(new Event(REVIEW_OVERVIEW_UPDATED_EVENT));
+              });
+          }
         }
       } catch {
         setUploadMessage(`已上传，等待 RAG 进度：${filename}`);

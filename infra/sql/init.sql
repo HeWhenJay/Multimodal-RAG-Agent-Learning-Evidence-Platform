@@ -29,6 +29,8 @@ DROP TABLE IF EXISTS learning_evidence.agent_conversation_folder;
 DROP TABLE IF EXISTS learning_evidence.rag_query_history;
 DROP TABLE IF EXISTS learning_evidence.log_error;
 DROP TABLE IF EXISTS learning_evidence.log_event;
+DROP TABLE IF EXISTS learning_evidence.learning_review_card_exclusion;
+DROP TABLE IF EXISTS learning_evidence.learning_review_material_exclusion;
 DROP TABLE IF EXISTS learning_evidence.learning_review_log;
 DROP TABLE IF EXISTS learning_evidence.learning_review_card;
 DROP TABLE IF EXISTS learning_evidence.learning_review_material;
@@ -179,6 +181,15 @@ CREATE TABLE learning_evidence.learning_review_setting (
     CONSTRAINT ck_learning_review_daily_limit CHECK (daily_limit BETWEEN 1 AND 100)
 );
 
+CREATE TABLE learning_evidence.learning_review_material_exclusion (
+    material_id BIGINT PRIMARY KEY REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_learning_review_material_exclusion_user
+    ON learning_evidence.learning_review_material_exclusion(user_id, created_at DESC);
+
 CREATE TABLE learning_evidence.learning_review_material (
     id BIGSERIAL PRIMARY KEY,
     material_id BIGINT NOT NULL REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,
@@ -232,6 +243,20 @@ CREATE INDEX idx_learning_review_card_due
 
 CREATE INDEX idx_learning_review_card_material
     ON learning_evidence.learning_review_card(material_id, active);
+
+CREATE TABLE learning_evidence.learning_review_card_exclusion (
+    id BIGSERIAL PRIMARY KEY,
+    original_card_id BIGINT NOT NULL,
+    material_id BIGINT NOT NULL REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    source_key VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_learning_review_card_exclusion_original UNIQUE (user_id, original_card_id),
+    CONSTRAINT uk_learning_review_card_exclusion_source UNIQUE (material_id, source_key)
+);
+
+CREATE INDEX idx_learning_review_card_exclusion_user
+    ON learning_evidence.learning_review_card_exclusion(user_id, created_at DESC);
 
 CREATE TABLE learning_evidence.learning_review_log (
     id BIGSERIAL PRIMARY KEY,

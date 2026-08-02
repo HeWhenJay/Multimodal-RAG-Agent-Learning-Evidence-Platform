@@ -26,7 +26,9 @@ from app.review.repository import (
 from app.schemas.rag import Evidence
 from app.schemas.review import (
     ReviewCard,
+    ReviewBatchDeletionResult,
     ReviewCardGroup,
+    ReviewDeletionResult,
     ReviewDueGroups,
     ReviewGradeRequest,
     ReviewGradeResult,
@@ -92,18 +94,58 @@ class ReviewService:
         """显式重新分类并生成当前用户的一条资料。"""
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
+            excluded = transaction.is_material_excluded(material_id, user_id)
         if material is None:
             raise BusinessError("学习资料不存在")
+        if excluded:
+            raise BusinessError("该资料已从复习中心移除")
         result = self._generate(material, user_id, force=True)
         if result is None:
+            with self.repository.transaction() as transaction:
+                if transaction.is_material_excluded(material_id, user_id):
+                    raise BusinessError("该资料已从复习中心移除")
             raise BusinessError("该资料的复习卡片正在生成，请稍后刷新")
         return result
+
+    def generate_indexed_material(self, material_id: int) -> ReviewMaterial | None:
+        """在 RAG worker 确认索引终态后，按资料真实归属幂等生成复习卡片。"""
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material_by_id(material_id)
+        if material is None or material.material_status not in {"READY", "PARTIAL"}:
+            return None
+        return self._generate(material, material.user_id, force=False)
 
     def list_materials(self, user_id: str) -> list[ReviewMaterial]:
         """读取当前用户所有资料的复习同步状态。"""
         with self.repository.transaction() as transaction:
             records = transaction.list_review_materials(user_id)
         return [material_response(record) for record in records]
+
+    def delete_material(self, material_id: int, user_id: str) -> ReviewDeletionResult:
+        """删除资料的全部复习内容并持久保存资料级排除意图。"""
+        with self.repository.transaction() as transaction:
+            deleted = transaction.exclude_material(material_id, user_id)
+        if not deleted:
+            raise BusinessError("学习资料不存在")
+        return ReviewDeletionResult(scope="MATERIAL", materialId=material_id, deleted=True)
+
+    def delete_materials(self, material_ids: list[int], user_id: str) -> ReviewBatchDeletionResult:
+        """在一个事务中按稳定顺序批量移出资料，允许重复请求保持幂等。"""
+        normalized_ids = sorted(set(material_ids))
+        with self.repository.transaction() as transaction:
+            deleted_ids = [
+                material_id
+                for material_id in normalized_ids
+                if transaction.exclude_material(material_id, user_id)
+            ]
+        if not deleted_ids:
+            raise BusinessError("学习资料不存在")
+        return ReviewBatchDeletionResult(
+            scope="MATERIAL",
+            requestedCount=len(normalized_ids),
+            deletedCount=len(deleted_ids),
+            materialIds=deleted_ids,
+        )
 
     def overview(self, user_id: str) -> ReviewOverview:
         """按用户时区计算今日评分数和实时到期统计。"""
@@ -187,6 +229,32 @@ class ReviewService:
             settings = transaction.get_or_create_settings(user_id)
         return card_response(card, FsrsReviewScheduler(settings.desired_retention), now, include_answer=True)
 
+    def delete_card(self, card_id: int, user_id: str) -> ReviewDeletionResult:
+        """软停用卡片并保留评分日志，以来源键阻止后续重新生成。"""
+        with self.repository.transaction() as transaction:
+            material_id = transaction.exclude_card(card_id, user_id)
+        if material_id is None:
+            raise BusinessError("复习卡片不存在")
+        return ReviewDeletionResult(scope="CARD", materialId=material_id, cardId=card_id, deleted=True)
+
+    def delete_cards(self, card_ids: list[int], user_id: str) -> ReviewBatchDeletionResult:
+        """在一个事务中按稳定顺序批量删除卡片，保留每张卡片的来源排除记录。"""
+        normalized_ids = sorted(set(card_ids))
+        with self.repository.transaction() as transaction:
+            deleted_ids = [
+                card_id
+                for card_id in normalized_ids
+                if transaction.exclude_card(card_id, user_id) is not None
+            ]
+        if not deleted_ids:
+            raise BusinessError("复习卡片不存在")
+        return ReviewBatchDeletionResult(
+            scope="CARD",
+            requestedCount=len(normalized_ids),
+            deletedCount=len(deleted_ids),
+            cardIds=deleted_ids,
+        )
+
     def grade(self, card_id: int, payload: ReviewGradeRequest, user_id: str) -> ReviewGradeResult:
         """在单个事务内更新 FSRS 卡片并追加一次评分日志。"""
         reviewed_at = as_utc(self.now_provider())
@@ -256,6 +324,11 @@ class ReviewService:
             raise BusinessError("学习资料不存在")
         if material.material_status not in {"READY", "PARTIAL"}:
             raise BusinessError("学习资料尚未完成索引")
+        with self.repository.transaction() as transaction:
+            if transaction.is_material_excluded(material.id, user_id):
+                if force:
+                    raise BusinessError("该资料已从复习中心移除")
+                return None
         lock = self.generation_guard.acquire(
             f"{user_id}:{material.id}:{material.index_request_version}"
         )
@@ -264,6 +337,11 @@ class ReviewService:
                 raise BusinessError("该资料的复习卡片正在生成，请稍后刷新")
             return None
         try:
+            with self.repository.transaction() as transaction:
+                if transaction.is_material_excluded(material.id, user_id):
+                    if force:
+                        raise BusinessError("该资料已从复习中心移除")
+                    return None
             if not force:
                 with self.repository.transaction() as transaction:
                     current = transaction.find_review_material(material.id, user_id)
@@ -353,7 +431,7 @@ class ReviewService:
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
-    ) -> ReviewMaterial:
+    ) -> ReviewMaterial | None:
         """保存一次完整生成结果并转换为公开响应。"""
         with self.repository.transaction() as transaction:
             record = transaction.save_generation(
@@ -365,7 +443,7 @@ class ReviewService:
                 extractor=extractor,
                 cards=cards,
             )
-        return material_response(record)
+        return material_response(record) if record is not None else None
 
 
 def card_response(

@@ -6,6 +6,7 @@ const jsonHeaders = {
 };
 
 export const REVIEW_OVERVIEW_UPDATED_EVENT = 'review-overview-updated';
+export const REVIEW_CONTENT_UPDATED_EVENT = 'review-content-updated';
 
 export interface ReviewSettings {
   enabled: boolean;
@@ -96,6 +97,21 @@ export interface ReviewGradeResult {
   retrievability: number;
 }
 
+export interface ReviewDeletionResult {
+  scope: 'CARD' | 'MATERIAL';
+  materialId: number;
+  cardId?: number | null;
+  deleted: boolean;
+}
+
+export interface ReviewBatchDeletionResult {
+  scope: 'CARD' | 'MATERIAL';
+  requestedCount: number;
+  deletedCount: number;
+  cardIds: number[];
+  materialIds: number[];
+}
+
 // 统一处理复习接口响应，并自动携带当前登录用户的令牌。
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAuthToken();
@@ -153,12 +169,44 @@ export function generateReviewMaterial(materialId: number): Promise<ReviewMateri
   });
 }
 
+// 将整份资料永久移出复习中心，原始 RAG 文件和索引保持不变。
+export function deleteReviewMaterial(materialId: number): Promise<ReviewDeletionResult> {
+  return request<ReviewDeletionResult>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}`, {
+    method: 'DELETE'
+  });
+}
+
+// 批量将资料移出复习中心，服务端在单个事务中去重并校验用户归属。
+export function deleteReviewMaterials(materialIds: number[]): Promise<ReviewBatchDeletionResult> {
+  return request<ReviewBatchDeletionResult>('/api/reviews/materials/batch-delete', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ materialIds })
+  });
+}
+
 // 提交回忆评分，让服务端使用 FSRS 计算下一次到期时间。
 export function gradeReviewCard(cardId: number, payload: ReviewGradePayload): Promise<ReviewGradeResult> {
   return request<ReviewGradeResult>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}/grade`, {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify(payload)
+  });
+}
+
+// 删除单张卡片并持久保存来源排除记录，后续生成不会恢复同一卡片。
+export function deleteReviewCard(cardId: number): Promise<ReviewDeletionResult> {
+  return request<ReviewDeletionResult>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}`, {
+    method: 'DELETE'
+  });
+}
+
+// 批量删除复习卡片，并为每个来源键保存永久排除记录。
+export function deleteReviewCards(cardIds: number[]): Promise<ReviewBatchDeletionResult> {
+  return request<ReviewBatchDeletionResult>('/api/reviews/cards/batch-delete', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ cardIds })
   });
 }
 

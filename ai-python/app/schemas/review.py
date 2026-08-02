@@ -115,3 +115,50 @@ class ReviewGradeResult(BaseModel):
     nextDueAt: datetime
     intervalDays: float = Field(ge=0.0)
     retrievability: float = Field(ge=0.0, le=1.0)
+
+
+class ReviewDeletionResult(BaseModel):
+    """卡片或资料组完成持久排除后的幂等响应。"""
+
+    scope: Literal["CARD", "MATERIAL"]
+    materialId: int
+    cardId: int | None = None
+    deleted: bool = True
+
+
+class ReviewCardBatchDeleteRequest(BaseModel):
+    """批量删除卡片请求，最多处理 100 张并自动去重。"""
+
+    cardIds: list[int] = Field(..., min_length=1, max_length=100)
+
+    @field_validator("cardIds")
+    @classmethod
+    def normalize_card_ids(cls, value: list[int]) -> list[int]:
+        """去重并排序 ID，降低批量事务锁顺序不一致造成死锁的概率。"""
+        if any(item <= 0 for item in value):
+            raise ValueError("卡片 ID 必须是正整数")
+        return sorted(set(value))
+
+
+class ReviewMaterialBatchDeleteRequest(BaseModel):
+    """批量移出资料请求，最多处理 100 份并自动去重。"""
+
+    materialIds: list[int] = Field(..., min_length=1, max_length=100)
+
+    @field_validator("materialIds")
+    @classmethod
+    def normalize_material_ids(cls, value: list[int]) -> list[int]:
+        """去重并排序资料 ID，保证批量锁定顺序稳定。"""
+        if any(item <= 0 for item in value):
+            raise ValueError("资料 ID 必须是正整数")
+        return sorted(set(value))
+
+
+class ReviewBatchDeletionResult(BaseModel):
+    """批量排除结果，忽略无归属 ID，并对已排除 ID 保持幂等成功。"""
+
+    scope: Literal["CARD", "MATERIAL"]
+    requestedCount: int = Field(ge=1, le=100)
+    deletedCount: int = Field(ge=1, le=100)
+    cardIds: list[int] = Field(default_factory=list)
+    materialIds: list[int] = Field(default_factory=list)
