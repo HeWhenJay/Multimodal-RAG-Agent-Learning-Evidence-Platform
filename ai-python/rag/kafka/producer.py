@@ -178,6 +178,7 @@ class KafkaProgressProducer:
                 "parser": parser,
                 "requestVersion": request_version,
                 "progressSequence": self.sequence,
+                "executionOwner": extra_context.get("executionOwner"),
             }
         )
         idempotency_key = f"RAG_PROGRESS:{canonical_document_id}:{job_id}:{self.sequence}:v1"
@@ -204,6 +205,7 @@ def redacted_json(payload: dict[str, Any]) -> str:
         "objectKey",
         "publicUrl",
         "sourcePath",
+        "url",
     }
     blocked_lower = {key.lower() for key in blocked}
 

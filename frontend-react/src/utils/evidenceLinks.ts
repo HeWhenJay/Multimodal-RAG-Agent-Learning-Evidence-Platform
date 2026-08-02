@@ -47,6 +47,16 @@ export function buildVideoEvidenceLink(evidence: RagEvidence) {
   const startTime = cleanValue(evidence.startTime);
   if (!startTime) return '';
 
+  const metadata = evidence.metadata || {};
+  const platformPage = firstBilibiliVideoPageUrl(
+    cleanValue(evidence.sourcePath),
+    cleanValue(evidence.source),
+    cleanValue(evidence.playbackUrl),
+    metadataText(metadata.sourcePath),
+    metadataText(metadata.playbackUrl),
+  );
+  if (platformPage) return buildBilibiliTimestampLink(platformPage, startTime);
+
   const params = new URLSearchParams();
   const playbackUrl = cleanValue(evidence.playbackUrl);
   const internalParams = playbackUrl ? parseInternalVideoPageParams(playbackUrl) : null;
@@ -64,7 +74,6 @@ export function buildVideoEvidenceLink(evidence: RagEvidence) {
     params.set('playbackUrl', stripFragment(playbackUrl));
   }
 
-  const metadata = evidence.metadata || {};
   const title = cleanValue(evidence.documentTitle) || cleanValue(evidence.title);
   const documentId = cleanValue(evidence.documentId) || cleanValue(params.get('documentId'));
   const sourcePath = browserHttpSource(cleanValue(evidence.sourcePath) || metadataText(metadata.sourcePath));
@@ -182,6 +191,37 @@ function firstConservativeVideoUrl(...values: Array<string | null>) {
 
 function firstHttpUrl(...values: Array<string | null>) {
   return values.find((value) => value && isHttpUrl(value)) || null;
+}
+
+// 远程 Bilibili 资料没有持久化媒体文件，证据应回到平台页面并携带秒级定位。
+function firstBilibiliVideoPageUrl(...values: Array<string | null>) {
+  return values.find((value) => value && isBilibiliVideoPageUrl(value)) || null;
+}
+
+function isBilibiliVideoPageUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/\.$/, '');
+    return url.protocol === 'https:'
+      && ['bilibili.com', 'www.bilibili.com', 'm.bilibili.com'].includes(host)
+      && /^\/video\/(?:BV[0-9A-Za-z]{8,20}|av[0-9]+)\/?$/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function buildBilibiliTimestampLink(value: string, startTime: string) {
+  const seconds = timestampToSeconds(startTime);
+  if (!Number.isFinite(seconds)) return value;
+  const url = new URL(value);
+  url.protocol = 'https:';
+  url.hostname = 'www.bilibili.com';
+  url.port = '';
+  url.username = '';
+  url.password = '';
+  url.hash = '';
+  url.searchParams.set('t', String(Math.max(0, Math.floor(seconds))));
+  return url.toString();
 }
 
 function isConservativeVideoUrl(value: string) {

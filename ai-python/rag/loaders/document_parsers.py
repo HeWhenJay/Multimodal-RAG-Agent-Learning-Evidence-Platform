@@ -360,7 +360,7 @@ class DocumentParserRouter:
             blocks = []
             quality = evaluate_parse_quality(QualitySignals(), high_precision)
             parser = "video-source-unavailable"
-            warnings = [f"video.source: 视频来源解析失败: {exc}"]
+            warnings = [f"video.source: 视频来源解析失败（{exc.__class__.__name__}）"]
         result = self._finalize(document_id, blocks, parser, quality, warnings)
         process_event(
             stage="parse.completed",

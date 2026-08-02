@@ -17,6 +17,12 @@ Kafka 不可用时由 PostgreSQL 耐久任务 worker 执行同一索引状态机
   requestVersion 和幂等键防止旧消息覆盖新索引。`app.workers.outbox_publisher` 对到期
   `NEW/FAILED` 和租约过期 `PUBLISHING` 记录使用 `FOR UPDATE SKIP LOCKED` 抢占，Kafka 确认成功后才写
   `PUBLISHED`。
+- Kafka consumer 的 poll 线程不执行索引业务；长任务进入受限线程池后，poll 继续维持 consumer group
+  心跳，同一 topic-partition 始终只有一条在途消息，handler 完成后才同步提交 offset。索引长任务和
+  progress/result/promote/DLQ 控制消息使用独立容量，避免长视频占满线程后阻塞自身状态收敛。
+- `rag_index_job.locked_by/lease_until` 是 Kafka 与 local 索引共用的数据库执行围栏。重复投递在租约内只等待，
+  worker 定时续租；失租后旧执行不得继续写资料元数据、staging 终态或 DLQ。local worker 每轮领取数不超过
+  当前执行槽，避免任务尚在线程池排队时租约已经过期。
 
 ## 死信规则
 
@@ -48,6 +54,9 @@ Kafka 不可用时由 PostgreSQL 耐久任务 worker 执行同一索引状态机
 | `RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS` | `1000` | Python Outbox 单轮完成后的固定等待时间 |
 | `RAG_OUTBOX_MAX_ATTEMPTS` | `8` | Python 指数退避最大指数，不限制最终重试次数 |
 | `RAG_KAFKA_PUBLISH_TIMEOUT_MS` | `3000` | Python 单条 Outbox 等待 Kafka 确认的最长时间，最小 100ms |
+| `RAG_KAFKA_HANDLER_CONCURRENCY` | `4` | 单个 Kafka worker 的索引长任务并发上限 |
+| `RAG_KAFKA_CONTROL_CONCURRENCY` | `1` | progress/result/promote/DLQ 控制消息保留线程数 |
+| `RAG_INDEX_EXECUTION_LEASE_SECONDS` | `180` | Kafka/local 索引执行令牌租约时长 |
 | `RAG_TASK_WORKER_ENABLED` | `true` | 是否启动 PostgreSQL 查询/local 索引耐久 worker |
 | `RAG_TASK_WORKER_POLL_SECONDS` | `1` | durable worker 空闲轮询间隔 |
 | `RAG_TASK_WORKER_BATCH_SIZE` | `4` | 每轮抢占的查询/local 索引任务数 |

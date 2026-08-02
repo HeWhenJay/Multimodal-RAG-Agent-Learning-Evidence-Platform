@@ -67,6 +67,7 @@ class LocalProgressProducer:
                 "parser": parser,
                 "requestVersion": int(extra_context.get("requestVersion") or 0),
                 "progressSequence": self.sequence,
+                "executionOwner": extra_context.get("executionOwner"),
             }
         )
         envelope = build_envelope(
@@ -104,7 +105,8 @@ class RagDurableTaskWorker:
         batch_size = positive_int("RAG_TASK_WORKER_BATCH_SIZE", 4)
         lease_seconds = positive_int("RAG_TASK_WORKER_LEASE_SECONDS", 120)
         worker_count = task_worker_concurrency()
-        query_tasks = list(self.query_repository.claim(worker_id=self.worker_id, batch_size=batch_size, lease_seconds=lease_seconds))
+        claim_size = min(batch_size, worker_count)
+        query_tasks = list(self.query_repository.claim(worker_id=self.worker_id, batch_size=claim_size, lease_seconds=lease_seconds))
         summary["queryClaimed"] = len(query_tasks)
         for succeeded in self._run_concurrently(query_tasks, self._run_query_task, worker_count):
             if succeeded:
@@ -114,11 +116,15 @@ class RagDurableTaskWorker:
         if local_index_enabled():
             index_jobs = list(self.index_repository.claim_local_jobs(
                 worker_id=self.worker_id,
-                batch_size=batch_size,
+                batch_size=claim_size,
                 lease_seconds=lease_seconds,
             ))
             summary["indexClaimed"] = len(index_jobs)
-            for succeeded in self._run_concurrently(index_jobs, self._run_local_index_job, worker_count):
+            for succeeded in self._run_concurrently(
+                index_jobs,
+                lambda job: self._run_local_index_job(job, lease_seconds),
+                worker_count,
+            ):
                 if succeeded:
                     summary["indexCompleted"] += 1
                 else:
@@ -168,7 +174,7 @@ class RagDurableTaskWorker:
             self.query_repository.fail(task.task_id, task.user_id, "RAG 查询失败", elapsed_ms(start))
             return False
 
-    def _run_local_index_job(self, job: RagIndexJobRecord) -> bool:
+    def _run_local_index_job(self, job: RagIndexJobRecord, lease_seconds: int = 120) -> bool:
         """执行 local staging/promote 状态机，复用与 Kafka 相同的解析和防旧版本规则。"""
         try:
             payload = IndexRequestPayload.model_validate(json.loads(job.request_json))
@@ -187,6 +193,10 @@ class RagDurableTaskWorker:
                 parser_router=self.parser_router,
                 producer=captured,
                 progress_producer=progress_producer,
+                # claim_local_jobs 会为所有资料写入 locked_by；结果必须携带同一个令牌才能通过终态围栏。
+                job_repository=self.index_repository,
+                execution_owner_id=self.worker_id,
+                execution_lease_seconds=lease_seconds,
             )
             index_worker.handle_envelope(source_envelope)
             terminal_failed = False
@@ -194,6 +204,7 @@ class RagDurableTaskWorker:
                 if envelope.messageType == "RAG_INDEX_RETRY":
                     self.index_repository.reschedule_local_job(
                         job.id,
+                        worker_id=self.worker_id,
                         not_before=parse_not_before(envelope.notBefore),
                         error_message=str(envelope.payload.get("lastErrorMessage") or "本地 RAG 索引暂时失败"),
                     )

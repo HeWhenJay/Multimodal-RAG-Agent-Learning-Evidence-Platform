@@ -607,8 +607,9 @@ def transcribe_video_input(
         if embedded_text:
             return embedded_text, "embedded-subtitle-transcript", warnings
 
-    if is_public_url(source_path):
-        if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
+    filetrans_source = source_path if is_filetrans_media_source(source_path) else None
+    if filetrans_source:
+        if client.should_call_dashscope and client.api_key and client.should_call_filetrans(filetrans_source):
             emit_model_progress(
                 progress_reporter,
                 f"目前在使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
@@ -616,12 +617,12 @@ def transcribe_video_input(
                 detail=f"目前在使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
             )
         transcript_text, filetrans_warnings = client.transcribe_source_url(
-            str(source_path),
+            filetrans_source,
             progress_callback=lambda event: emit_filetrans_progress(progress_reporter, client, event),
         )
         warnings.extend(stage_warning("video.asr", warning) for warning in filetrans_warnings)
         if transcript_text:
-            if client.should_call_dashscope and client.api_key and client.should_call_filetrans(source_path):
+            if client.should_call_dashscope and client.api_key and client.should_call_filetrans(filetrans_source):
                 emit_model_progress(
                     progress_reporter,
                     f"已使用 {client.filetrans_model} 模型完成视频异步 ASR 转写事件",
@@ -810,7 +811,7 @@ def extract_embedded_subtitle(video_input: str, tmp_dir: Path) -> tuple[str, lis
             timeout=ffmpeg_timeout_seconds(),
         )
     except Exception as exc:
-        return "", [stage_warning("video.subtitle.embedded", f"FFmpeg 未提取到内嵌字幕: {exc}")]
+        return "", [stage_warning("video.subtitle.embedded", controlled_video_error("FFmpeg 内嵌字幕提取", exc))]
     if not subtitle_path.exists() or subtitle_path.stat().st_size == 0:
         return "", [stage_warning("video.subtitle.embedded", "FFmpeg 未生成可用内嵌字幕文件")]
     try:
@@ -880,7 +881,9 @@ def extract_audio_segments(video_input: str, tmp_dir: Path) -> tuple[list[AudioS
                 timeout=ffmpeg_timeout_seconds(),
             )
         except Exception as exc:
-            warnings.append(stage_warning("video.audio.extract", f"FFmpeg 提取音频分段 {index} 失败: {exc}"))
+            warnings.append(
+                stage_warning("video.audio.extract", controlled_video_error(f"FFmpeg 音频分段 {index} 提取", exc))
+            )
         if audio_path.exists() and audio_path.stat().st_size > 0:
             segments.append(AudioSegment(audio_path, start, nominal_end, extract_start, extract_end))
         else:
@@ -1027,7 +1030,7 @@ def extract_prefix_frame_candidates(
             timeout=ffmpeg_timeout_seconds(),
         )
     except Exception as exc:
-        return [], [stage_warning("video.frame.extract", f"FFmpeg 抽取关键帧失败: {exc}")]
+        return [], [stage_warning("video.frame.extract", controlled_video_error("FFmpeg 关键帧抽取", exc))]
     return frame_candidates_from_directory(frame_dir, sample_interval), []
 
 
@@ -1075,7 +1078,7 @@ def extract_full_frame_candidates(
         )
     except Exception as exc:
         reset_directory(frame_dir)
-        return [], [stage_warning("video.frame.extract", f"FFmpeg 全时长抽取关键帧失败: {exc}")]
+        return [], [stage_warning("video.frame.extract", controlled_video_error("FFmpeg 全时长关键帧抽取", exc))]
     candidates = frame_candidates_from_directory(frame_dir, effective_interval)
     if not candidates:
         warnings.append(stage_warning("video.frame.extract", "FFmpeg 全时长模式未生成关键帧图片"))
@@ -1206,7 +1209,9 @@ def build_basic_candidate_events(
         try:
             diff_score = image_difference_score(last_event_frame.path, candidate.path)
         except Exception as exc:
-            warnings.append(stage_warning("video.slide_detect", f"{candidate.path.name} 画面差异计算失败: {exc}"))
+            warnings.append(
+                stage_warning("video.slide_detect", controlled_video_error(f"{candidate.path.name} 画面差异计算", exc))
+            )
         is_flip = diff_score is not None and diff_score >= threshold
         is_interval = candidate.time_seconds - last_event_time >= keep_interval_seconds
         if not is_flip and not is_interval:
@@ -1238,7 +1243,12 @@ def build_visual_candidate_events(
     try:
         first_hash = visual_hash_for_image(candidates[0].path)
     except Exception as exc:
-        warnings.append(stage_warning("video.visual_hash", f"视觉指纹不可用，已回退基础关键帧选择: {exc}"))
+        warnings.append(
+            stage_warning(
+                "video.visual_hash",
+                f"{controlled_video_error('视觉指纹计算', exc)}，已回退基础关键帧选择",
+            )
+        )
         return build_basic_candidate_events(candidates, keep_interval_seconds=keep_interval_seconds)
 
     first_group = VisualFrameGroup(
@@ -1275,13 +1285,17 @@ def build_visual_candidate_events(
         try:
             hash_value = visual_hash_for_image(candidate.path)
         except Exception as exc:
-            warnings.append(stage_warning("video.visual_hash", f"{candidate.path.name} 视觉指纹计算失败: {exc}"))
+            warnings.append(
+                stage_warning("video.visual_hash", controlled_video_error(f"{candidate.path.name} 视觉指纹计算", exc))
+            )
             continue
         diff_score = None
         try:
             diff_score = image_difference_score(last_event_frame.path, candidate.path)
         except Exception as exc:
-            warnings.append(stage_warning("video.slide_detect", f"{candidate.path.name} 画面差异计算失败: {exc}"))
+            warnings.append(
+                stage_warning("video.slide_detect", controlled_video_error(f"{candidate.path.name} 画面差异计算", exc))
+            )
         is_flip = diff_score is not None and diff_score >= threshold
         is_interval = candidate.time_seconds - last_event_time >= keep_interval_seconds
         closest_group, hash_distance, group_diff_score = closest_visual_group(candidate.path, hash_value, groups)
@@ -1769,8 +1783,13 @@ def probe_media_duration(video_input: str | Path) -> float:
     return 60.0
 
 
-def probe_media_duration_strict(video_input: str | Path) -> float | None:
-    """严格读取视频时长，失败返回 None，供全时长抽帧决定是否降级。"""
+def probe_media_duration_strict(
+    video_input: str | Path,
+    *,
+    timeout_seconds: float | None = None,
+) -> float | None:
+    """严格读取视频时长；远程任务可把单次探测限制在其剩余墙钟时间内。"""
+    probe_timeout = 30.0 if timeout_seconds is None else max(0.1, min(30.0, float(timeout_seconds)))
     ffprobe = os.getenv("FFPROBE_COMMAND") or shutil.which("ffprobe")
     if ffprobe:
         command = [
@@ -1791,7 +1810,7 @@ def probe_media_duration_strict(video_input: str | Path) -> float | None:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=30,
+                timeout=probe_timeout,
             )
             duration = float(result.stdout.strip())
             return max(1.0, duration) if duration > 0 else None
@@ -1807,7 +1826,7 @@ def probe_media_duration_strict(video_input: str | Path) -> float | None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=30,
+            timeout=probe_timeout,
         )
         output = f"{result.stderr}\n{result.stdout}"
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
@@ -2064,7 +2083,9 @@ def ocr_video_frames(
         try:
             ocr_result = result_future.result()
         except Exception as exc:
-            warnings.append(stage_warning(f"video.frame_ocr[{index}]", f"百炼 OCR 调用异常: {exc}"))
+            warnings.append(
+                stage_warning(f"video.frame_ocr[{index}]", controlled_video_error("百炼 OCR 调用", exc))
+            )
             ocr_result = None
         if ocr_result and ocr_result.warnings:
             warnings.extend(stage_warning(f"video.frame_ocr[{index}]", warning) for warning in ocr_result.warnings)
@@ -2152,7 +2173,7 @@ def build_video_segment_summary_blocks(
             frame_blocks=frame_blocks,
         ), []
     except Exception as exc:
-        return [], [stage_warning("video.segment_summary", f"生成视频片段摘要失败: {exc}")]
+        return [], [stage_warning("video.segment_summary", controlled_video_error("视频片段摘要生成", exc))]
 
 
 @logged_rag_method("parse.video.summary", "build_transcript_segment_summaries", "生成字幕片段摘要")
@@ -2498,7 +2519,7 @@ def tesseract_frame_text(image_bytes: bytes) -> tuple[str, str | None]:
         text = normalize_text(pytesseract.image_to_string(image, lang=os.getenv("OCR_LANG", "chi_sim+eng")))
         return text, None if text else "本地 OCR 未获得文本"
     except Exception as exc:
-        return "", f"本地 OCR 不可用: {exc}"
+        return "", controlled_video_error("本地 OCR", exc)
 
 
 def ffmpeg_executable() -> str | None:
@@ -2704,6 +2725,21 @@ def is_public_url(value: str | None) -> bool:
     return bool(value and re.match(r"^https?://", value.strip(), re.IGNORECASE))
 
 
+def is_filetrans_media_source(value: str | None) -> bool:
+    """Bilibili 页面只用于 evidence 跳转，不能作为百炼媒体文件 URL。"""
+    if not is_public_url(value):
+        return False
+    parsed = urlparse(str(value).strip())
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host in {"bilibili.com", "www.bilibili.com", "m.bilibili.com"} and re.fullmatch(
+        r"/video/(?:BV[0-9A-Za-z]{8,20}|av[0-9]+)/?",
+        parsed.path,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -2713,3 +2749,12 @@ def normalize_text(text: str) -> str:
 
 def stage_warning(stage: str, message: str) -> str:
     return f"{stage}: {message}"
+
+
+def controlled_video_error(action: str, exc: Exception) -> str:
+    """仅暴露错误类别，禁止 FFmpeg、OCR 或解析器正文携带临时路径。"""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"{action}超时"
+    if isinstance(exc, FileNotFoundError):
+        return f"{action}组件不可用"
+    return f"{action}失败（{exc.__class__.__name__}）"

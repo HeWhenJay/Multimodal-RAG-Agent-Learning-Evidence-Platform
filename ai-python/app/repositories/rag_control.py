@@ -94,6 +94,10 @@ class RagControlTransaction(Protocol):
 
     def find_material(self, material_id: int, user_id: str) -> MaterialRecord | None: ...
 
+    def find_material_by_public_url(self, public_url: str, user_id: str) -> MaterialRecord | None: ...
+
+    def remote_video_import_usage(self, user_id: str) -> tuple[int, int, int]: ...
+
     def insert_material(
         self,
         *,
@@ -264,6 +268,65 @@ class DatabaseRagControlTransaction:
             (material_id, user_id),
         )
         return self._to_material(self._cursor.fetchone())
+
+    def find_material_by_public_url(self, public_url: str, user_id: str) -> MaterialRecord | None:
+        """按规范化公开 URL 和当前用户查找可复用的链接导入资料。"""
+        # 依次获取全局、用户和 URL 事务锁，使幂等检查与配额准入在并发下保持一致。
+        for lock_key in (
+            "rag-remote-video:admission",
+            f"rag-remote-video:user:{user_id}",
+            f"rag-remote-video:url:{user_id}:{public_url}",
+        ):
+            self._cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT *
+                FROM {schema}.learning_material
+                WHERE user_id = %s
+                  AND source = 'bilibili'
+                  AND storage_type = 'remote'
+                  AND public_url = %s
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            (user_id, public_url),
+        )
+        return self._to_material(self._cursor.fetchone())
+
+    def remote_video_import_usage(self, user_id: str) -> tuple[int, int, int]:
+        """统计用户近 24 小时任务、用户活动任务和全局活动任务。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE user_id = %s
+                          AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    ) AS user_daily_count,
+                    COUNT(*) FILTER (
+                        WHERE user_id = %s
+                          AND status IN ('REQUESTED', 'RUNNING', 'INDEXED')
+                    ) AS user_active_count,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('REQUESTED', 'RUNNING', 'INDEXED')
+                    ) AS global_active_count
+                FROM {schema}.rag_index_job
+                WHERE operation = 'INDEX_REMOTE_VIDEO'
+                """
+            ),
+            (user_id, user_id),
+        )
+        row = self._cursor.fetchone() or {}
+        return (
+            int(row.get("user_daily_count") or 0),
+            int(row.get("user_active_count") or 0),
+            int(row.get("global_active_count") or 0),
+        )
 
     def enqueue_index_job(
         self,

@@ -16,6 +16,12 @@ const jsonHeaders = {
   'Content-Type': 'application/json'
 };
 
+export interface RemoteVideoImportPayload {
+  url: string;
+  highPrecision: boolean;
+  confirmedAuthorized: boolean;
+}
+
 // 统一处理 RAG 接口响应和业务错误。
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAuthToken();
@@ -72,6 +78,15 @@ export function indexText(payload: {
   content: string;
 }): Promise<LearningMaterial> {
   return request<LearningMaterial>('/api/rag/materials/text', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 提交 Bilibili 公共视频链接并创建后台下载、解析与索引任务。
+export function importRemoteVideo(payload: RemoteVideoImportPayload): Promise<LearningMaterial> {
+  return request<LearningMaterial>('/api/rag/materials/url', {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify(payload)

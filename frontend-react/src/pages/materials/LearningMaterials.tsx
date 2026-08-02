@@ -2,6 +2,7 @@ import { FileSearch, FileUp, Filter, Images, Loader2, Plus, RefreshCw, RotateCcw
 import { useCallback, useEffect, useState, type DragEvent } from 'react';
 import { fetchMaterials, indexText, reindexMaterial } from '../../api/rag';
 import type { LearningMaterial, RagProgress } from '../../api/types';
+import { RemoteVideoImport } from '../../components/RemoteVideoImport';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../../services/materialProgress';
 
@@ -166,6 +167,7 @@ export function LearningMaterials() {
             <input type="checkbox" checked={highPrecision} disabled={actionBusy} onChange={(event) => setHighPrecision(event.target.checked)} />
             <span>高精度解析</span>
           </label>
+          <RemoteVideoImport highPrecision={highPrecision} disabled={actionBusy} />
         </article>
       </section>
 
@@ -272,6 +274,7 @@ function formatSource(source: string) {
 function formatStorage(storageType?: string | null) {
   if (storageType === 'oss') return '阿里 OSS';
   if (storageType === 'manual') return '手动资料';
+  if (storageType === 'remote') return '平台链接';
   return '本地存储';
 }
 

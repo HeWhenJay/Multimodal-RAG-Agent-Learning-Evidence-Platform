@@ -27,6 +27,7 @@ from app.schemas.rag import Evidence, IndexTextRequest, ProgressEvent, QueryRequ
 from app.schemas.rag_control import (
     MaterialPreviewResponse,
     MaterialUploadChunkResponse,
+    RagIndexRemoteVideoPublicRequest,
     RagIndexTextPublicRequest,
     RagMaterialResponse,
     RagOverviewPublicResponse,
@@ -42,6 +43,12 @@ from app.storage.object_storage import (
     build_rag_object_storage,
 )
 from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
+from app.services.remote_video_import import (
+    remote_video_global_active_limit,
+    remote_video_user_active_limit,
+    remote_video_user_daily_limit,
+    validate_remote_video_url,
+)
 from app.services.material_processing_progress import build_material_processing_progress, public_progress_text
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
@@ -212,6 +219,59 @@ class RagControlService:
             )
             material = schedule.material
         return self._material_response_for_user(material, user_id)
+
+    def import_remote_video(
+        self,
+        request: RagIndexRemoteVideoPublicRequest,
+        user_id: str,
+    ) -> RagMaterialResponse:
+        """创建 Bilibili 公公开视频耐久下载和索引任务。"""
+        if not request.confirmedAuthorized:
+            raise BusinessError("请先确认你有权处理该视频内容")
+        remote = validate_remote_video_url(request.url)
+        with self.repository.transaction() as transaction:
+            existing = transaction.find_material_by_public_url(remote.canonical_url, user_id)
+            if existing is not None and existing.status != "FAILED":
+                return self._material_response(transaction, existing)
+            self._enforce_remote_video_import_quota(transaction, user_id)
+            material = existing or transaction.insert_material(
+                title=remote.placeholder_title,
+                user_id=user_id,
+                document_type="mp4",
+                source=remote.platform,
+                status="PENDING",
+                original_filename=f"{remote.video_id}.mp4",
+                original_file_path=None,
+                storage_type="remote",
+                object_key=None,
+                public_url=remote.canonical_url,
+            )
+            schedule = transaction.enqueue_index_job(
+                material=material,
+                operation="INDEX_REMOTE_VIDEO",
+                status="PENDING",
+                high_precision=request.highPrecision,
+                source_ref={
+                    "type": "REMOTE_VIDEO",
+                    "platform": remote.platform,
+                    "url": remote.canonical_url,
+                    "videoId": remote.video_id,
+                },
+                text=None,
+            )
+            material = schedule.material
+        return self._material_response_for_user(material, user_id)
+
+    @staticmethod
+    def _enforce_remote_video_import_quota(transaction: Any, user_id: str) -> None:
+        """在持有远程视频准入事务锁时执行用户和全局资源配额。"""
+        user_daily_count, user_active_count, global_active_count = transaction.remote_video_import_usage(user_id)
+        if user_daily_count >= remote_video_user_daily_limit():
+            raise BusinessError("今日公开视频接入次数已达上限，请明日再试")
+        if user_active_count >= remote_video_user_active_limit():
+            raise BusinessError("当前正在处理的公开视频较多，请等待已有任务完成")
+        if global_active_count >= remote_video_global_active_limit():
+            raise BusinessError("公开视频处理队列繁忙，请稍后再试")
 
     def upload_material(
         self,
@@ -734,27 +794,51 @@ class RagControlService:
             material = self._require_material(transaction.find_material(material_id, user_id))
             if (material.storage_type or "").lower() == "manual":
                 raise BusinessError("手动文本资料没有原始上传文件，请重新提交文本内容")
-            # 只校验受控来源，不在 API 请求进程读取并解析完整文件；OSS 由 Kafka worker 下载临时文件。
-            source_path = self.object_storage.local_path(material)
-            if source_path is None and (material.storage_type or "").lower() != "oss":
-                raise BusinessError("当前资料没有可供 Python worker 读取的原始文件")
-            source_ref_path = str(source_path) if source_path is not None else material.original_file_path
-            schedule = transaction.enqueue_index_job(
-                material=material,
-                operation="REINDEX",
-                status="REINDEXING",
-                high_precision=high_precision,
-                source_ref={
-                    "type": "STORAGE",
-                    "filename": material.original_filename or material.title,
-                    "contentType": mimetypes.guess_type(material.original_filename or material.title)[0],
-                    "storageType": material.storage_type,
-                    "sourcePath": source_ref_path,
-                    "objectKey": material.object_key,
-                    "publicUrl": material.public_url,
-                },
-                text=None,
-            )
+            if (material.storage_type or "").lower() == "remote":
+                remote = validate_remote_video_url(material.public_url or "")
+                if material.status in {"PENDING", "PARSING", "REINDEXING"}:
+                    return self._material_response(transaction, material)
+                locked_material = transaction.find_material_by_public_url(remote.canonical_url, user_id)
+                if locked_material is None or locked_material.id != material.id:
+                    raise BusinessError("远程视频资料状态已变化，请刷新后重试")
+                if locked_material.status in {"PENDING", "PARSING", "REINDEXING"}:
+                    return self._material_response(transaction, locked_material)
+                self._enforce_remote_video_import_quota(transaction, user_id)
+                schedule = transaction.enqueue_index_job(
+                    material=material,
+                    operation="INDEX_REMOTE_VIDEO",
+                    status="REINDEXING",
+                    high_precision=high_precision,
+                    source_ref={
+                        "type": "REMOTE_VIDEO",
+                        "platform": remote.platform,
+                        "url": remote.canonical_url,
+                        "videoId": remote.video_id,
+                    },
+                    text=None,
+                )
+            else:
+                # 只校验受控来源，不在 API 请求进程读取并解析完整文件；OSS 由 Kafka worker 下载临时文件。
+                source_path = self.object_storage.local_path(material)
+                if source_path is None and (material.storage_type or "").lower() != "oss":
+                    raise BusinessError("当前资料没有可供 Python worker 读取的原始文件")
+                source_ref_path = str(source_path) if source_path is not None else material.original_file_path
+                schedule = transaction.enqueue_index_job(
+                    material=material,
+                    operation="REINDEX",
+                    status="REINDEXING",
+                    high_precision=high_precision,
+                    source_ref={
+                        "type": "STORAGE",
+                        "filename": material.original_filename or material.title,
+                        "contentType": mimetypes.guess_type(material.original_filename or material.title)[0],
+                        "storageType": material.storage_type,
+                        "sourcePath": source_ref_path,
+                        "objectKey": material.object_key,
+                        "publicUrl": material.public_url,
+                    },
+                    text=None,
+                )
             material = schedule.material
         return self._material_response_for_user(material, user_id)
 

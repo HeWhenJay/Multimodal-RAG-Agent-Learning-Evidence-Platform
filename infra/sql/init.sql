@@ -160,6 +160,12 @@ CREATE INDEX idx_learning_material_user_updated
 CREATE INDEX idx_learning_material_active_index_job
     ON learning_evidence.learning_material(active_index_job_id);
 
+CREATE UNIQUE INDEX uq_learning_material_user_bilibili_url
+    ON learning_evidence.learning_material(user_id, public_url)
+    WHERE storage_type = 'remote'
+      AND source = 'bilibili'
+      AND public_url IS NOT NULL;
+
 CREATE TABLE learning_evidence.learning_review_setting (
     user_id VARCHAR(120) PRIMARY KEY,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,

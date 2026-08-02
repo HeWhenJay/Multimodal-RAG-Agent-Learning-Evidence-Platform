@@ -24,6 +24,7 @@ import type { DashboardData, LearningMaterial, RagEvidence, RagProgress, RagQuer
 import type { MaterialProcessingProgress } from '../api/materialProcessingTypes';
 import { MarkdownText } from '../components/MarkdownText';
 import { RagQueryProgress } from '../components/RagQueryProgress';
+import { RemoteVideoImport } from '../components/RemoteVideoImport';
 import { MATERIAL_FILE_ACCEPT, MATERIAL_UPLOADED_EVENT, useMaterialUpload } from '../hooks/useMaterialUpload';
 import { mergeMaterialProgress, upsertMaterialWithProgress } from '../services/materialProgress';
 import { markRagQueryProgressFailed } from '../services/ragQueryProgress';
@@ -506,6 +507,7 @@ export function Dashboard() {
             <input type="file" accept={MATERIAL_FILE_ACCEPT} disabled={uploading} onChange={handleUploadChange} />
           </label>
           {channelMessage ? <p className="form-message">{channelMessage}</p> : null}
+          <RemoteVideoImport highPrecision={highPrecisionUpload} disabled={uploading} />
           <ChannelProcessingPanel
             item={activeProcessingMaterial}
             uploading={uploading}

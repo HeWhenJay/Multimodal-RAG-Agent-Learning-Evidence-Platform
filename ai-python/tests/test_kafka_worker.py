@@ -1,14 +1,21 @@
 import os
+import sys
+import threading
+import time
+import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 os.environ["RAG_EMBEDDING_PROVIDER"] = "hash"
 
+from app.repositories.rag_job import IndexExecutionClaim
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope, StorageSourceRef
 from app.schemas.rag import DocumentBlock, ParseQuality
+from app.services.remote_video_import import RemoteVideoTaskTimeoutError
 from app.storage.object_storage import OpenedStorageObject
 from app.workers.kafka_worker import (
+    KafkaMessageDispatcher,
     KafkaWorkerConnectionError,
     kafka_auto_offset_reset,
     is_connection_exception,
@@ -17,9 +24,10 @@ from app.workers.kafka_worker import (
     positive_milliseconds,
     publish_consumer_dlq,
     reconnect_max_seconds,
+    run_consumer_loop,
     run_consumer_forever,
 )
-from rag.kafka.producer import KafkaJsonProducer, KafkaProgressThrottler, redacted_json
+from rag.kafka.producer import KafkaJsonProducer, KafkaProgressProducer, KafkaProgressThrottler, redacted_json
 from rag.kafka.worker import PermanentSourceError, RagKafkaIndexWorker, RagKafkaPromoteWorker, RagKafkaRetryScheduler, RetryNotReady, StalePromoteRequestError, open_storage_source
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import InMemoryRagStore
@@ -82,7 +90,7 @@ def test_kafka_long_task_poll_interval_has_safe_default(monkeypatch):
     monkeypatch.setenv("RAG_KAFKA_MAX_POLL_INTERVAL_MS", "1800000")
     assert positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 3_600_000) == 1_800_000
     monkeypatch.setenv("RAG_KAFKA_MAX_POLL_INTERVAL_MS", "invalid")
-    assert positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 3_600_000) == 3_600_000
+    assert positive_milliseconds("RAG_KAFKA_MAX_POLL_INTERVAL_MS", 21_600_000) == 21_600_000
 
 
 def test_kafka_auto_offset_reset_accepts_only_supported_values(monkeypatch):
@@ -125,6 +133,213 @@ def test_unhandled_consumer_message_is_redacted_into_dlq():
 
 def test_kafka_connection_classifier_recognizes_producer_timeout():
     assert is_connection_exception(RuntimeError("KafkaError{code=_MSG_TIMED_OUT,str=Local: Message timed out}")) is True
+
+
+def test_kafka_poll_continues_while_handler_runs_and_commits_after_completion(monkeypatch):
+    """长任务在线程池执行，poll 必须持续且只能在 handler 完成后提交 offset。"""
+    stop_event = threading.Event()
+    handler_started = threading.Event()
+    handler_done = threading.Event()
+    release_handler = threading.Event()
+
+    class FakeMessage:
+        def topic(self):
+            return "rag.material.index.request.v1"
+
+        def partition(self):
+            return 0
+
+        def offset(self):
+            return 3
+
+        def value(self):
+            return envelope("RAG_INDEX_REQUESTED", base_index_payload()).model_dump_json().encode("utf-8")
+
+        def error(self):
+            return None
+
+    class FakeTopicPartition:
+        def __init__(self, topic, partition, offset=None):
+            self.topic = topic
+            self.partition = partition
+            self.offset = offset
+
+    class FakeKafkaError:
+        _PARTITION_EOF = -191
+
+    class FakeKafkaException(Exception):
+        pass
+
+    class FakeConsumer:
+        instance = None
+
+        def __init__(self, _config):
+            type(self).instance = self
+            self.poll_count = 0
+            self.polled_while_handler_running = False
+            self.committed_after_done = False
+            self.paused = []
+            self.resumed = []
+
+        def subscribe(self, _topics):
+            return None
+
+        def poll(self, _timeout):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return FakeMessage()
+            if handler_started.is_set() and not handler_done.is_set():
+                self.polled_while_handler_running = True
+                release_handler.set()
+            time.sleep(0.001)
+            return None
+
+        def pause(self, partitions):
+            self.paused.extend(partitions)
+
+        def resume(self, partitions):
+            self.resumed.extend(partitions)
+
+        def commit(self, *, message, asynchronous):
+            assert message.offset() == 3
+            assert asynchronous is False
+            self.committed_after_done = handler_done.is_set()
+            stop_event.set()
+
+        def close(self):
+            return None
+
+    fake_module = types.SimpleNamespace(
+        Consumer=FakeConsumer,
+        KafkaError=FakeKafkaError,
+        KafkaException=FakeKafkaException,
+        TopicPartition=FakeTopicPartition,
+    )
+    monkeypatch.setitem(sys.modules, "confluent_kafka", fake_module)
+    monkeypatch.setattr("app.workers.kafka_worker.KafkaJsonProducer", FakeProducer)
+
+    handler_thread_ids = []
+
+    def long_handler(_event):
+        handler_thread_ids.append(threading.get_ident())
+        handler_started.set()
+        release_handler.wait(0.5)
+        handler_done.set()
+
+    poll_thread_id = threading.get_ident()
+    run_consumer_loop({"rag.material.index.request.v1": long_handler}, stop_event=stop_event)
+
+    consumer = FakeConsumer.instance
+    assert consumer is not None
+    assert consumer.polled_while_handler_running is True
+    assert consumer.committed_after_done is True
+    assert consumer.paused and consumer.resumed
+    assert handler_thread_ids and handler_thread_ids[0] != poll_thread_id
+
+
+def test_kafka_dispatcher_reserves_capacity_for_control_messages() -> None:
+    """索引线程全部繁忙时，progress/result 等控制消息仍应立即执行。"""
+    release_index = threading.Event()
+    control_started = threading.Event()
+
+    class Message:
+        def __init__(self, topic: str, partition: int, offset: int) -> None:
+            self._topic = topic
+            self._partition = partition
+            self._offset = offset
+
+        def topic(self):
+            return self._topic
+
+        def partition(self):
+            return self._partition
+
+        def offset(self):
+            return self._offset
+
+        def value(self):
+            return envelope("RAG_INDEX_REQUESTED", base_index_payload()).model_dump_json().encode("utf-8")
+
+    class Consumer:
+        def pause(self, _partitions):
+            return None
+
+        def resume(self, _partitions):
+            return None
+
+        def commit(self, **_kwargs):
+            return None
+
+    class TopicPartition:
+        def __init__(self, topic, partition):
+            self.topic = topic
+            self.partition = partition
+
+    def index_handler(_event):
+        release_index.wait(1.0)
+
+    def control_handler(_event):
+        control_started.set()
+
+    request_topic = "rag.material.index.request.v1"
+    progress_topic = "rag.material.index.progress.v1"
+    dispatcher = KafkaMessageDispatcher(
+        consumer=Consumer(),
+        handlers={request_topic: index_handler, progress_topic: control_handler},
+        topic_partition_type=TopicPartition,
+        dead_letter_producer=FakeProducer(),
+        worker_count=2,
+        control_worker_count=1,
+        retry_max_delay_seconds=1.0,
+    )
+    try:
+        dispatcher.accept(Message(request_topic, 0, 1))
+        dispatcher.accept(Message(request_topic, 1, 1))
+        dispatcher.accept(Message(progress_topic, 0, 1))
+
+        assert control_started.wait(0.5)
+    finally:
+        release_index.set()
+        while dispatcher.has_active_handlers:
+            dispatcher.advance()
+            time.sleep(0.001)
+        dispatcher.close()
+
+
+def test_index_worker_rejects_second_execution_while_database_lease_is_busy():
+    """同一 job 的重复 Kafka 投递不得绕过数据库执行权再次构建 staging 索引。"""
+    class ClaimRepository:
+        def __init__(self):
+            self.claim_count = 0
+
+        def claim_index_execution(self, *_args, **_kwargs):
+            self.claim_count += 1
+            if self.claim_count == 1:
+                return IndexExecutionClaim("ACQUIRED")
+            return IndexExecutionClaim("BUSY", 10.0)
+
+        def owns_index_execution(self, *_args):
+            return True
+
+        def renew_index_execution(self, *_args):
+            return True
+
+    repository = ClaimRepository()
+    worker = RagKafkaIndexWorker(
+        store=InMemoryRagStore(),
+        producer=FakeProducer(),
+        progress_producer=FakeProgressProducer(),
+        job_repository=repository,
+        execution_heartbeat_seconds=999,
+    )
+    source = envelope("RAG_INDEX_REQUESTED", base_index_payload())
+
+    first = worker.handle_envelope(source)
+    with pytest.raises(RetryNotReady, match="已有执行者"):
+        worker.handle_envelope(source)
+
+    assert first.status == "READY"
+    assert repository.claim_count == 2
 
 
 def envelope(message_type, payload):
@@ -176,6 +391,30 @@ def test_kafka_progress_delivery_mode_uses_only_kafka():
     reporter.emit("index.request", "Kafka 进度")
 
     assert progress_producer.events
+
+
+def test_kafka_progress_envelope_preserves_execution_owner() -> None:
+    """进度消息必须携带执行令牌，迟到事件才能被数据库终态围栏拒绝。"""
+    producer = FakeProducer()
+    progress_producer = KafkaProgressProducer(producer)
+
+    progress_producer.send_progress(
+        event=progress_event(1, 1),
+        document_id="material-1__job-job-1",
+        material_id=1,
+        user_id="7",
+        parser="unit-parser",
+        extra_context={
+            "jobId": "job-1",
+            "materialId": 1,
+            "canonicalDocumentId": "material-1",
+            "stagingDocumentId": "material-1__job-job-1",
+            "requestVersion": 1,
+            "executionOwner": "worker-token-1",
+        },
+    )
+
+    assert producer.sent[0][2].payload["executionOwner"] == "worker-token-1"
 
 
 def test_inline_text_indexes_staging_and_private_query_does_not_see_it(monkeypatch):
@@ -317,6 +556,258 @@ def test_kafka_oss_video_keeps_temp_path_out_of_index(monkeypatch, tmp_path):
     assert {chunk.metadata.get("sourcePath") for chunk in store.chunks.values()} == {public_source}
 
 
+def test_remote_bilibili_video_is_temporary_and_keeps_public_source(monkeypatch, tmp_path):
+    """远程视频解析后必须清理临时文件，并只把规范化页面 URL 写入 evidence。"""
+    from app.services.remote_video_import import OpenedRemoteVideo
+
+    class RecordingRemoteVideoParser:
+        """记录远程视频解析参数，避免读取真实媒体。"""
+
+        def __init__(self) -> None:
+            self.call: dict = {}
+
+        def parse_video_source(self, **kwargs) -> ParsedBlockDocument:
+            self.call = kwargs
+            block = DocumentBlock(
+                documentId=kwargs["document_id"],
+                blockId=f"{kwargs['document_id']}-subtitle-1",
+                fileType="mp4",
+                blockType="text",
+                startTime="00:00:01",
+                endTime="00:00:02",
+                sectionTitle="00:00:01 - 00:00:02",
+                contentText="Bilibili 视频字幕证据",
+                parseEngine="unit-video-parser",
+                sourceTitle=kwargs["title"],
+                sourcePath=kwargs["source_reference"],
+                metadata={"mediaType": "video", "evidenceChannel": "subtitle"},
+            )
+            return ParsedBlockDocument(
+                blocks=[block],
+                parser="unit-video-parser",
+                status="READY",
+                parse_quality=ParseQuality(
+                    score=1.0,
+                    nativeTextChars=len(block.contentText),
+                    messages=["FFmpeg 失败: C:\\Temp\\rag-remote-video-secret\\source.mp4"],
+                ),
+                warnings=["解析失败: C:\\Temp\\rag-remote-video-secret\\source.mp4"],
+            )
+
+    temp_video = tmp_path / "source.mp4"
+    temp_video.write_bytes(b"video")
+    public_source = "https://www.bilibili.com/video/BV1xx411c7mD"
+    cleaned: list[bool] = []
+
+    class FakeTempDirectory:
+        def cleanup(self) -> None:
+            cleaned.append(True)
+            temp_video.unlink(missing_ok=True)
+
+    class RemoteJobRepository:
+        def __init__(self) -> None:
+            self.updated: dict | None = None
+
+        def update_remote_material_source(self, material_id, job_id, request_version, **kwargs):
+            self.updated = {"materialId": material_id, "jobId": job_id, "requestVersion": request_version, **kwargs}
+            return True
+
+    opened = OpenedRemoteVideo(
+        path=temp_video,
+        filename="source.mp4",
+        title="Kafka 高可用课程",
+        content_type="video/mp4",
+        source_url=public_source,
+        duration_seconds=30,
+        _temp_directory=FakeTempDirectory(),
+    )
+    monkeypatch.setattr("rag.kafka.worker.download_bilibili_video", lambda *_args, **_kwargs: opened)
+    monkeypatch.setenv("RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED", "false")
+    parser = RecordingRemoteVideoParser()
+    store = InMemoryRagStore()
+    repository = RemoteJobRepository()
+    worker = RagKafkaIndexWorker(
+        store=store,
+        parser_router=parser,
+        producer=FakeProducer(),
+        progress_producer=FakeProgressProducer(),
+        job_repository=repository,
+    )
+    payload = IndexRequestPayload.model_validate({
+        **base_index_payload(),
+        "operation": "INDEX_REMOTE_VIDEO",
+        "documentType": "mp4",
+        "source": "bilibili",
+        "sourceRef": {
+            "type": "REMOTE_VIDEO",
+            "platform": "bilibili",
+            "url": public_source,
+            "videoId": "BV1xx411c7mD",
+        },
+    })
+
+    result = worker._index_to_staging(payload)
+
+    assert cleaned == [True]
+    assert not temp_video.exists()
+    assert repository.updated and repository.updated["source_url"] == public_source
+    assert parser.call["source_reference"] == public_source
+    assert {chunk.metadata.get("sourcePath") for chunk in store.chunks.values()} == {public_source}
+    assert "rag-remote-video-" not in result.model_dump_json()
+    assert "远程视频解析异常，临时文件信息已隐藏" in result.parseQuality.messages
+
+
+def test_remote_bilibili_video_is_cleaned_when_metadata_write_fails(monkeypatch, tmp_path):
+    """任务元数据写回异常时也必须清理已下载的临时目录。"""
+    from app.services.remote_video_import import OpenedRemoteVideo
+
+    temp_video = tmp_path / "source.mp4"
+    temp_video.write_bytes(b"video")
+    cleaned: list[bool] = []
+
+    class FakeTempDirectory:
+        def cleanup(self) -> None:
+            cleaned.append(True)
+            temp_video.unlink(missing_ok=True)
+
+    class FailingJobRepository:
+        def update_remote_material_source(self, *_args, **_kwargs):
+            raise RuntimeError("模拟数据库写入失败")
+
+    opened = OpenedRemoteVideo(
+        path=temp_video,
+        filename="source.mp4",
+        title="Kafka 高可用课程",
+        content_type="video/mp4",
+        source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+        duration_seconds=30,
+        _temp_directory=FakeTempDirectory(),
+    )
+    monkeypatch.setattr("rag.kafka.worker.download_bilibili_video", lambda *_args, **_kwargs: opened)
+    worker = RagKafkaIndexWorker(
+        store=InMemoryRagStore(),
+        parser_router=object(),
+        producer=FakeProducer(),
+        progress_producer=FakeProgressProducer(),
+        job_repository=FailingJobRepository(),
+    )
+    payload = IndexRequestPayload.model_validate({
+        **base_index_payload(),
+        "operation": "INDEX_REMOTE_VIDEO",
+        "documentType": "mp4",
+        "source": "bilibili",
+        "sourceRef": {
+            "type": "REMOTE_VIDEO",
+            "platform": "bilibili",
+            "url": opened.source_url,
+            "videoId": "BV1xx411c7mD",
+        },
+    })
+
+    with pytest.raises(RuntimeError, match="数据库写入失败"):
+        worker._index_to_staging(payload)
+
+    assert cleaned == [True]
+    assert not temp_video.exists()
+
+
+def test_remote_local_execution_stops_before_index_write_after_lease_loss(monkeypatch, tmp_path):
+    """本地远程视频任务续租失败后不得写 staging 索引或发布完成结果。"""
+    from app.services.remote_video_import import OpenedRemoteVideo
+
+    renew_attempted = threading.Event()
+    cleaned: list[bool] = []
+    temp_video = tmp_path / "lease-lost.mp4"
+    temp_video.write_bytes(b"video")
+
+    class FakeTempDirectory:
+        def cleanup(self):
+            cleaned.append(True)
+            temp_video.unlink(missing_ok=True)
+
+    class LeaseRepository:
+        def owns_index_execution(self, *_args):
+            return True
+
+        def renew_index_execution(self, *_args):
+            renew_attempted.set()
+            return False
+
+        def update_remote_material_source(self, *_args, **_kwargs):
+            return True
+
+    class WaitingParser:
+        def parse_video_source(self, **kwargs):
+            assert renew_attempted.wait(1.0)
+            block = DocumentBlock(
+                documentId=kwargs["document_id"],
+                blockId=f"{kwargs['document_id']}-subtitle-1",
+                fileType="mp4",
+                blockType="text",
+                startTime="00:00:01",
+                endTime="00:00:02",
+                sectionTitle="00:00:01 - 00:00:02",
+                contentText="租约失效后不能写入的内容",
+                parseEngine="unit-video-parser",
+                sourceTitle=kwargs["title"],
+                sourcePath=kwargs["source_reference"],
+                metadata={"mediaType": "video", "evidenceChannel": "subtitle"},
+            )
+            return ParsedBlockDocument(
+                blocks=[block],
+                parser="unit-video-parser",
+                status="READY",
+                parse_quality=ParseQuality(score=1.0, nativeTextChars=len(block.contentText)),
+            )
+
+    class RejectingStore:
+        def index_blocks(self, **_kwargs):
+            raise AssertionError("失去租约后不应进入 staging 写入")
+
+    opened = OpenedRemoteVideo(
+        path=temp_video,
+        filename="lease-lost.mp4",
+        title="Kafka 课程",
+        content_type="video/mp4",
+        source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+        duration_seconds=30,
+        _temp_directory=FakeTempDirectory(),
+    )
+    monkeypatch.setattr("rag.kafka.worker.download_bilibili_video", lambda *_args, **_kwargs: opened)
+    monkeypatch.setenv("RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED", "false")
+    producer = FakeProducer()
+    worker = RagKafkaIndexWorker(
+        store=RejectingStore(),
+        parser_router=WaitingParser(),
+        producer=producer,
+        progress_producer=FakeProgressProducer(),
+        job_repository=LeaseRepository(),
+        execution_owner_id="local-worker-1",
+        execution_lease_seconds=10,
+        execution_heartbeat_seconds=0.01,
+    )
+    payload = {
+        **base_index_payload(),
+        "operation": "INDEX_REMOTE_VIDEO",
+        "documentType": "mp4",
+        "source": "bilibili",
+        "sourceRef": {
+            "type": "REMOTE_VIDEO",
+            "platform": "bilibili",
+            "url": opened.source_url,
+            "videoId": "BV1xx411c7mD",
+        },
+    }
+
+    with pytest.raises(RetryNotReady, match="租约"):
+        worker.handle_envelope(envelope("RAG_INDEX_REQUESTED", payload))
+
+    assert renew_attempted.is_set()
+    assert producer.sent == []
+    assert cleaned == [True]
+    assert not temp_video.exists()
+
+
 def test_promote_is_idempotent_and_private_query_can_see_canonical(monkeypatch):
     monkeypatch.setenv("RAG_QUERY_EXPANSION_PROVIDER", "local")
     store = InMemoryRagStore()
@@ -410,6 +901,7 @@ def test_dlq_redaction_removes_sensitive_text():
             "sourceRef": {
                 "publicUrl": "https://oss.example.com/private?signature=secret",
                 "objectKey": "private/path.md",
+                "url": "https://www.bilibili.com/video/BV1xx411c7mD?token=secret",
             },
             "filename": "note.md",
         }
@@ -418,6 +910,7 @@ def test_dlq_redaction_removes_sensitive_text():
     assert "简历全文" not in serialized
     assert "secret" not in serialized
     assert "private/path.md" not in serialized
+    assert "token=secret" not in serialized
     assert "note.md" in serialized
 
 
@@ -439,6 +932,30 @@ def test_transient_failure_sends_retry_without_throwing(monkeypatch):
     assert fake_producer.sent[0][0] == "rag.material.index.retry.1m.v1"
     assert fake_producer.sent[0][2].messageType == "RAG_INDEX_RETRY"
     assert fake_producer.sent[0][2].idempotencyKey == "RAG_INDEX:material-1:job-1:v1"
+
+
+def test_remote_video_task_timeout_is_sent_to_durable_retry_topic(monkeypatch):
+    """远程资源总墙钟超时必须保留受控中文摘要并进入耐久重试。"""
+    monkeypatch.setenv("RAG_KAFKA_RETRY_1M_SECONDS", "0")
+    fake_producer = FakeProducer()
+
+    class TimeoutWorker(RagKafkaIndexWorker):
+        def _index_to_staging(self, payload, *, execution=None):
+            del payload, execution
+            raise RemoteVideoTaskTimeoutError("Bilibili 视频处理超过任务总时限")
+
+    worker = TimeoutWorker(
+        store=InMemoryRagStore(),
+        producer=fake_producer,
+        progress_producer=FakeProgressProducer(),
+    )
+
+    result = worker.handle_envelope(envelope("RAG_INDEX_REQUESTED", base_index_payload()))
+
+    assert result["status"] == "RETRY_SCHEDULED"
+    retry = fake_producer.sent[0][2]
+    assert retry.messageType == "RAG_INDEX_RETRY"
+    assert retry.payload["lastErrorMessage"] == "Bilibili 视频处理超过任务总时限"
 
 
 def test_permanent_failure_sends_failed_result_and_dlq_without_throwing():

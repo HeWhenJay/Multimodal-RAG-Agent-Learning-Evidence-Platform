@@ -1,0 +1,217 @@
+.remote-video-import {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.remote-video-import-head,
+.remote-video-import-title,
+.remote-video-platforms,
+.remote-video-authorization,
+.remote-video-feedback {
+  display: flex;
+  align-items: center;
+}
+
+.remote-video-import-head {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-video-import-title {
+  gap: 7px;
+  min-width: 0;
+  color: #334155;
+  font-size: 14px;
+}
+
+.remote-video-import-title svg {
+  flex: 0 0 auto;
+  color: var(--primary);
+}
+
+.remote-video-platforms {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.remote-video-platforms span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.remote-video-platforms .is-supported {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.remote-video-platforms .is-unavailable {
+  color: #64748b;
+  background: #f8fafc;
+}
+
+.remote-video-form {
+  display: grid;
+  gap: 8px;
+}
+
+.remote-video-label {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.remote-video-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.remote-video-input-shell {
+  min-width: 0;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 11px;
+  color: #64748b;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.remote-video-input-shell:focus-within {
+  color: var(--primary);
+  background: #fff;
+  border-color: #818cf8;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.remote-video-input-shell svg {
+  flex: 0 0 auto;
+}
+
+.remote-video-input-shell input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  color: #0f172a;
+  background: transparent;
+  border: 0;
+  outline: 0;
+}
+
+.remote-video-input-shell input::placeholder {
+  color: #94a3b8;
+}
+
+.remote-video-submit {
+  min-width: 116px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 13px;
+  color: #fff;
+  background: var(--primary);
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  font-weight: 700;
+}
+
+.remote-video-submit:hover:not(:disabled) {
+  background: #4338ca;
+  border-color: #4338ca;
+}
+
+.remote-video-submit:focus-visible,
+.remote-video-authorization input:focus-visible {
+  outline: 3px solid rgba(99, 102, 241, 0.2);
+  outline-offset: 2px;
+}
+
+.remote-video-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.remote-video-authorization {
+  align-items: flex-start;
+  gap: 8px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.remote-video-authorization input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 1px 0 0;
+  accent-color: var(--primary);
+}
+
+.remote-video-feedback {
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.remote-video-feedback svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.remote-video-feedback span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-video-feedback.is-success {
+  color: #047857;
+}
+
+.remote-video-feedback.is-error {
+  color: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .remote-video-import-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .remote-video-platforms {
+    justify-content: flex-start;
+  }
+
+  .remote-video-input-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .remote-video-submit {
+    width: 100%;
+  }
+}

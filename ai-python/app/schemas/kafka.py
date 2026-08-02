@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.rag import IndexResponse, ProgressEvent
 
@@ -41,9 +41,32 @@ class InlineTextSourceRef(BaseModel):
     parser: str = "python-manual-text"
 
 
+class RemoteVideoSourceRef(BaseModel):
+    """已通过公开 API 白名单校验的平台视频引用。"""
+
+    type: Literal["REMOTE_VIDEO"] = "REMOTE_VIDEO"
+    platform: Literal["bilibili"] = "bilibili"
+    url: str
+    videoId: str
+
+    @model_validator(mode="after")
+    def validate_canonical_reference(self):
+        """Kafka 内部引用也要保持 URL、平台和视频标识一致。"""
+        from app.core.result import BusinessError
+        from app.services.remote_video_import import validate_remote_video_url
+
+        try:
+            remote = validate_remote_video_url(self.url)
+        except BusinessError as exc:
+            raise ValueError(str(exc)) from exc
+        if remote.canonical_url != self.url or remote.video_id != self.videoId:
+            raise ValueError("远程视频引用不是规范化 Bilibili 地址")
+        return self
+
+
 class IndexRequestPayload(BaseModel):
     jobId: str
-    operation: Literal["INDEX_UPLOAD", "REINDEX", "INDEX_TEXT"]
+    operation: Literal["INDEX_UPLOAD", "REINDEX", "INDEX_TEXT", "INDEX_REMOTE_VIDEO"]
     materialId: int
     canonicalDocumentId: str
     stagingDocumentId: str
@@ -55,7 +78,7 @@ class IndexRequestPayload(BaseModel):
     stagingVisibilityScope: str = "staging"
     highPrecision: bool = False
     requestVersion: int
-    sourceRef: StorageSourceRef | InlineTextSourceRef
+    sourceRef: StorageSourceRef | InlineTextSourceRef | RemoteVideoSourceRef
     text: str | None = None
 
 

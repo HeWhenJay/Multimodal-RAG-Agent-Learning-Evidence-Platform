@@ -20,6 +20,7 @@ from app.schemas.rag import Evidence, QueryResponse, QueryTaskResponse
 from app.schemas.rag_control import (
     MaterialPreviewResponse,
     MaterialUploadChunkResponse,
+    RagIndexRemoteVideoPublicRequest,
     RagIndexTextPublicRequest,
     RagMaterialResponse,
     RagOverviewPublicResponse,
@@ -105,6 +106,16 @@ def index_text(
 ) -> Result[RagMaterialResponse]:
     """创建并索引当前用户粘贴的文本资料。"""
     return Result.success(execute("索引文本学习资料", lambda: service.index_text(payload, user_id)))
+
+
+@router.post("/materials/url", response_model=Result[RagMaterialResponse])
+def index_remote_video(
+    payload: RagIndexRemoteVideoPublicRequest,
+    user_id: str = Depends(current_rag_user_id),
+    service: RagControlService = Depends(get_rag_control_service),
+) -> Result[RagMaterialResponse]:
+    """校验公开平台链接并创建后台视频 RAG 任务。"""
+    return Result.success(execute("接入公开视频链接", lambda: service.import_remote_video(payload, user_id)))
 
 
 @router.post("/materials/upload", response_model=Result[RagMaterialResponse])

@@ -27,7 +27,7 @@ class FakeCursor:
         self.executed.append((" ".join(statement.split()), params))
 
     def fetchone(self):
-        # 两个迁移均视为已执行，本测试只核对启动锁顺序。
+        # 所有迁移均视为已执行，本测试只核对启动锁顺序。
         return (1,)
 
 

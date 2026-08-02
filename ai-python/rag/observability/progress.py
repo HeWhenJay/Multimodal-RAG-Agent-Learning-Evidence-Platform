@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 STAGE_LABELS = {
     "index.request": "接收索引请求",
+    "upload.remote_video": "获取公开视频",
     "parse.route": "选择解析路线",
     "parse.pdf": "解析 PDF",
     "parse.docx": "解析 Word",

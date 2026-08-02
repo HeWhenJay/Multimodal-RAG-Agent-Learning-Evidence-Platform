@@ -6,7 +6,11 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
-from app.repositories.rag_job import RagIndexJobRecord
+from app.repositories.rag_job import (
+    RagIndexJobRecord,
+    RagJobRepository,
+    build_index_completed_progress_payload,
+)
 from app.repositories.rag_task import InMemoryRagQueryTaskRepository, build_query_task_repository
 from app.schemas.kafka import KafkaEnvelope
 from app.schemas.rag import QueryResponse
@@ -128,6 +132,98 @@ def test_durable_query_worker_persists_progress_and_result(monkeypatch) -> None:
     assert len(json.loads(persisted.progress_events_json)) == 2
 
 
+def test_durable_worker_claims_no_more_than_available_execution_slots(monkeypatch) -> None:
+    """batch 配置大于线程数时，不得让排队中的任务提前进入租约倒计时。"""
+    monkeypatch.setenv("RAG_KAFKA_ENABLED", "false")
+    monkeypatch.setenv("RAG_LOCAL_INDEX_WORKER_ENABLED", "true")
+    monkeypatch.setenv("RAG_TASK_WORKER_BATCH_SIZE", "9")
+    monkeypatch.setenv("RAG_TASK_WORKER_CONCURRENCY", "2")
+    claimed_sizes: dict[str, int] = {}
+
+    class RecordingQueryRepository:
+        def claim(self, **kwargs):
+            claimed_sizes["query"] = kwargs["batch_size"]
+            return []
+
+    class RecordingIndexRepository:
+        def claim_local_jobs(self, **kwargs):
+            claimed_sizes["index"] = kwargs["batch_size"]
+            return []
+
+    worker = RagDurableTaskWorker(
+        query_repository=RecordingQueryRepository(),
+        index_repository=RecordingIndexRepository(),
+        state_writer=RagKafkaStateWriter(repository=StateRepository()),
+        store=object(),
+        worker_id="slot-test-worker",
+    )
+
+    worker.run_once()
+
+    assert claimed_sizes == {"query": 2, "index": 2}
+
+
+def test_local_index_worker_reuses_claim_owner_for_every_material_type(monkeypatch) -> None:
+    """普通文档也必须携带 claim_local_jobs 的令牌，否则终态会被数据库围栏拒绝。"""
+    captured: dict[str, object] = {}
+    payload = {
+        "jobId": "job-local-text",
+        "operation": "INDEX_TEXT",
+        "materialId": 9,
+        "canonicalDocumentId": "material-9",
+        "stagingDocumentId": "material-9__job-job-local-text",
+        "userId": "7",
+        "title": "普通文本资料",
+        "documentType": "markdown",
+        "source": "manual",
+        "visibilityScope": "private",
+        "stagingVisibilityScope": "staging",
+        "highPrecision": False,
+        "requestVersion": 1,
+        "sourceRef": {"type": "INLINE_TEXT", "parser": "python-manual-text"},
+        "text": "Kafka 高可用",
+    }
+    job = RagIndexJobRecord(
+        id="job-local-text",
+        material_id=9,
+        user_id="7",
+        operation="INDEX_TEXT",
+        request_version=1,
+        request_json=json.dumps(payload, ensure_ascii=False),
+        attempt=1,
+        delivery_mode="LOCAL",
+    )
+
+    class IndexRepository:
+        def owns_index_execution(self, job_id, owner_id):
+            return job_id == job.id and owner_id == "local-owner"
+
+        def renew_index_execution(self, *_args):
+            return True
+
+    class RecordingIndexWorker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def handle_envelope(self, _envelope):
+            return {"status": "READY"}
+
+    monkeypatch.setattr("app.workers.rag_task_worker.RagKafkaIndexWorker", RecordingIndexWorker)
+    repository = IndexRepository()
+    worker = RagDurableTaskWorker(
+        query_repository=InMemoryRagQueryTaskRepository(),
+        index_repository=repository,
+        state_writer=RagKafkaStateWriter(repository=StateRepository()),
+        store=object(),
+        worker_id="local-owner",
+    )
+
+    assert worker._run_local_index_job(job, lease_seconds=120) is True
+    assert captured["job_repository"] is repository
+    assert captured["execution_owner_id"] == "local-owner"
+    assert captured["execution_lease_seconds"] == 120
+
+
 def test_expired_query_task_cannot_be_reactivated_by_late_worker_result() -> None:
     """TTL 过期后的迟到结果不得把 `EXPIRED` 改回完成状态。"""
     tasks = InMemoryRagQueryTaskRepository()
@@ -173,6 +269,43 @@ def test_python_kafka_state_writer_routes_all_terminal_event_types() -> None:
     assert writer.handle_promote_result(event("RAG_PROMOTE_RESULT")) is True
     assert writer.handle_dlq(event("RAG_INDEX_DLQ")) is True
     assert [name for name, _message_id in repository.calls] == ["progress", "index", "promote", "dlq"]
+
+
+def test_index_terminal_result_requires_current_execution_token() -> None:
+    """已被新 worker 抢占的 job 必须拒绝无令牌或旧令牌终态。"""
+    running_job = {
+        "status": "RUNNING",
+        "locked_by": "execution-new",
+        "lease_until": datetime.now(timezone.utc) + timedelta(minutes=1),
+    }
+
+    assert RagJobRepository._execution_result_allowed(running_job, "execution-new") is True
+    assert RagJobRepository._execution_result_allowed(running_job, "execution-old") is False
+    assert RagJobRepository._execution_result_allowed(running_job, None) is False
+    assert RagJobRepository._execution_result_allowed({**running_job, "locked_by": None}, None) is True
+
+
+def test_index_result_builds_terminal_progress_without_cross_topic_ordering() -> None:
+    """result 消费必须自行生成 100% 进度，不能等待另一个 topic 的最后事件。"""
+    progress = build_index_completed_progress_payload(
+        {
+            "jobId": "job-1",
+            "materialId": 24,
+            "canonicalDocumentId": "material-24",
+            "stagingDocumentId": "material-24__job-job-1",
+            "requestVersion": 2,
+            "status": "READY",
+            "chunkCount": 14,
+            "parser": "video+bailian-asr+keyframe-ocr",
+        },
+        {"user_id": "7"},
+    )
+
+    assert progress["stageCode"] == "index.completed"
+    assert progress["status"] == "COMPLETED"
+    assert progress["percent"] == 100
+    assert progress["currentChunk"] == progress["totalChunks"] == 14
+    assert progress["message"] == "索引完成：状态 READY，共 14 个切块"
 
 
 def test_local_index_worker_consumes_durable_job_without_kafka(monkeypatch) -> None:

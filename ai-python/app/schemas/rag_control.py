@@ -31,6 +31,22 @@ class RagIndexTextPublicRequest(BaseModel):
         return value.strip()
 
 
+class RagIndexRemoteVideoPublicRequest(BaseModel):
+    """公开平台视频链接接入请求，不接受 Cookie 或用户 ID。"""
+
+    url: str = Field(min_length=1, max_length=2048)
+    highPrecision: bool = False
+    confirmedAuthorized: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def reject_blank_url(cls, value: str) -> str:
+        """拒绝空链接，平台白名单由 service 统一校验。"""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("视频链接不能为空")
+        return value.strip()
+
+
 class RagQueryPublicRequest(BaseModel):
     """公开查询请求；身份和可见范围由服务端强制注入。"""
 

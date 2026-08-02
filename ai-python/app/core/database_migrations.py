@@ -11,6 +11,7 @@ MIGRATION_DIRECTORY = REPOSITORY_ROOT / "infra" / "sql" / "alter-database"
 PYTHON_MIGRATIONS = (
     "20260721_0100_add_python_rag_durable_tasks.sql",
     "20260801_0100_create_learning_review_tables.sql",
+    "20260802_0100_add_remote_video_import_guard.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

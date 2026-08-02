@@ -75,6 +75,12 @@ class StubRagControlService:
         assert request.title == "手工资料"
         return sample_material()
 
+    def import_remote_video(self, request, user_id: str) -> RagMaterialResponse:
+        self._remember(user_id)
+        assert request.url == "https://www.bilibili.com/video/BV1xx411c7mD"
+        assert request.confirmedAuthorized is True
+        return sample_material()
+
     def upload_material(self, *, filename, content, content_type, high_precision, user_id: str) -> RagMaterialResponse:
         self._remember(user_id)
         assert filename == "note.md" and content == b"# note" and high_precision is True
@@ -192,6 +198,15 @@ def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
                 json={"title": "手工资料", "documentType": "markdown", "source": "manual", "content": "# 内容"},
             ),
             client.post(
+                "/api/rag/materials/url",
+                headers=headers,
+                json={
+                    "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                    "highPrecision": False,
+                    "confirmedAuthorized": True,
+                },
+            ),
+            client.post(
                 "/api/rag/materials/upload",
                 headers=headers,
                 data={"highPrecision": "true"},
@@ -221,7 +236,7 @@ def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
         ]
         assert all(response.status_code == 200 for response in responses)
         assert all(response.json()["code"] == 1 for response in responses)
-        assert service.users == ["42"] * 13
+        assert service.users == ["42"] * 14
     finally:
         app.dependency_overrides.clear()
 

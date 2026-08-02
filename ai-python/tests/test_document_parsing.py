@@ -261,6 +261,36 @@ def test_public_video_without_subtitle_marker_keeps_filetrans_first(tmp_path, mo
     assert warnings == []
 
 
+def test_bilibili_page_reference_uses_downloaded_local_video_for_asr(tmp_path, monkeypatch):
+    """Bilibili 页面 URL 只用于 evidence，不能误交给百炼 FileTrans。"""
+    monkeypatch.setenv("RAG_ASR_PROVIDER", "dashscope_filetrans")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    from video.asr.bailian_asr import BailianAsrClient
+    from video.chunking import video_processing
+
+    local_video = tmp_path / "downloaded.mp4"
+    local_video.write_bytes(b"fake-video")
+    monkeypatch.setattr(video_processing, "load_sidecar_subtitle", lambda *_args: ("", None, []))
+    monkeypatch.setattr(video_processing, "extract_embedded_subtitle", lambda *_args: ("", []))
+    monkeypatch.setattr(video_processing, "extract_audio_segments", lambda *_args: ([], []))
+
+    def fail_filetrans(self, source_url, progress_callback=None):
+        raise AssertionError("Bilibili 页面 URL 不应触发百炼 FileTrans")
+
+    monkeypatch.setattr(BailianAsrClient, "transcribe_source_url", fail_filetrans)
+
+    text, parser, warnings = video_processing.transcribe_video_input(
+        str(local_video),
+        tmp_path,
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+    )
+
+    assert text == ""
+    assert parser is None
+    assert warnings == []
+
+
 def test_video_ocr_retry_progress_reports_attempt_message():
     from rag.observability.progress import RagProgressReporter
     from video.chunking.video_processing import emit_ocr_retry_progress
