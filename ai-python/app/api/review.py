@@ -18,6 +18,8 @@ from app.schemas.review import (
     ReviewCardBatchDeleteRequest,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewGroupOrderRequest,
+    ReviewGroupOrderResult,
     ReviewGradeRequest,
     ReviewGradeResult,
     ReviewMaterial,
@@ -77,6 +79,21 @@ def due_review_groups(
 ) -> Result[ReviewDueGroups]:
     """按用户上传资料分组读取今日到期卡片，答案由揭示接口单独返回。"""
     return Result.success(execute("获取分组待复习卡片", lambda: service.list_due_groups(str(current_user.id), limit)))
+
+
+@router.put("/due-groups/order", response_model=Result[ReviewGroupOrderResult])
+def reorder_due_review_groups(
+    payload: ReviewGroupOrderRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewGroupOrderResult]:
+    """批量保存当前用户今日资料分组的拖拽顺序。"""
+    return Result.success(
+        execute(
+            "保存今日复习资料顺序",
+            lambda: service.reorder_due_groups(payload.materialIds, str(current_user.id)),
+        )
+    )
 
 
 @router.get("/materials", response_model=Result[list[ReviewMaterial]])

@@ -13,6 +13,8 @@ PYTHON_MIGRATIONS = (
     "20260801_0100_create_learning_review_tables.sql",
     "20260802_0100_add_remote_video_import_guard.sql",
     "20260802_0200_add_learning_review_exclusions.sql",
+    "20260802_0300_add_review_material_summary.sql",
+    "20260802_0400_add_review_material_display_order.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

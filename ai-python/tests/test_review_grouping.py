@@ -1,12 +1,17 @@
 """复习卡片分组、答案揭示与生成短锁测试。"""
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 from app.review.fsrs_scheduler import FsrsReviewScheduler
 from app.review.generation_guard import ReviewGenerationGuard
-from app.review.repository import ReviewCardRecord, ReviewOverviewStats, ReviewSettingsRecord
+from app.review.repository import (
+    DatabaseReviewTransaction,
+    ReviewCardRecord,
+    ReviewOverviewStats,
+    ReviewSettingsRecord,
+)
 from app.review.service import ReviewService
 from app.schemas.rag import Evidence
 
@@ -47,6 +52,7 @@ def card(card_id: int, material_id: int, title: str) -> ReviewCardRecord:
         active=True,
         created_at=NOW,
         updated_at=NOW,
+        material_summary=f"{title}资料摘要",
     )
 
 
@@ -63,7 +69,20 @@ class GroupingTransaction:
         return ReviewOverviewStats(3, 0, 3, 2, None)
 
     def list_due_cards(self, user_id: str, *, now: datetime, limit: int) -> list[ReviewCardRecord]:
-        return self.cards[:limit]
+        raise AssertionError("分组队列不应调用普通到期查询")
+
+    def list_due_group_cards(
+        self,
+        user_id: str,
+        *,
+        now: datetime,
+        today_start: datetime,
+        tomorrow_start: datetime,
+        limit: int,
+    ) -> list[ReviewCardRecord]:
+        """按仓储已经确定的资料优先级返回卡片。"""
+        material_ids = list(dict.fromkeys(item.material_id for item in self.cards))[:limit]
+        return [item for item in self.cards if item.material_id in material_ids]
 
     def find_card(self, card_id: int, user_id: str) -> ReviewCardRecord | None:
         return next((item for item in self.cards if item.id == card_id and item.user_id == user_id), None)
@@ -89,9 +108,97 @@ def test_due_cards_are_grouped_by_uploaded_material_without_answers() -> None:
     assert result.totalDueCount == 3
     assert [group.materialId for group in result.groups] == [12, 13]
     assert [group.dueCardCount for group in result.groups] == [2, 1]
+    assert [group.materialSummary for group in result.groups] == [
+        "Kafka 高可用资料摘要",
+        "Redis 持久化资料摘要",
+    ]
     assert all(card.answer is None for group in result.groups for card in group.cards)
     assert all(card.evidenceRefs == [] for group in result.groups for card in group.cards)
     assert result.groups[0].cards[0].hint == "先回忆核心概念"
+
+
+def test_selected_document_returns_all_six_due_cards_without_group_truncation() -> None:
+    """文档入选今日队列后必须返回全部到期卡片，不能再固定截断为四张。"""
+    repository = GroupingRepository()
+    repository.value.cards = [card(card_id, 12, "Faiss 的使用") for card_id in range(1, 7)]
+    service = ReviewService(repository=repository, now_provider=lambda: NOW)
+
+    result = service.list_due_groups("7", 1)
+
+    assert len(result.groups) == 1
+    assert result.groups[0].dueCardCount == 6
+    assert len(result.groups[0].cards) == 6
+
+
+def test_due_card_query_maps_effective_material_summary() -> None:
+    """数据库到期队列应联结资料摘要，并把最终优先摘要传给分组层。"""
+    class DueCursor:
+        """返回一张带资料摘要的数据库卡片行。"""
+
+        def execute(self, statement, params) -> None:
+            self.statement = statement
+            self.params = params
+
+        def fetchall(self):
+            return [
+                {
+                    "id": 1,
+                    "material_id": 12,
+                    "user_id": "7",
+                    "material_title": "Kafka 高可用",
+                    "material_summary": "资料原摘要",
+                    "document_type": "pdf",
+                    "question": "ISR 有什么作用？",
+                    "answer": "ISR 跟踪同步副本。",
+                    "due_at": NOW,
+                    "active": True,
+                }
+            ]
+
+    cursor = DueCursor()
+    transaction = DatabaseReviewTransaction(cursor, "learning_evidence")
+    transaction._statement = lambda query: query  # type: ignore[method-assign]
+
+    records = transaction.list_due_cards("7", now=NOW, limit=20)
+
+    assert records[0].material_summary == "资料原摘要"
+    assert "THEN lm.document_summary" in cursor.statement
+    assert "ELSE rm.summary" in cursor.statement
+    assert "display_order" not in cursor.statement
+
+
+def test_due_group_query_applies_material_order_without_changing_card_rank() -> None:
+    """分组查询应先应用资料优先级，组内仍按到期时间和卡片 ID 排序。"""
+    class DueCursor:
+        """记录分组到期查询并返回空结果。"""
+
+        def execute(self, statement, params) -> None:
+            self.statement = statement
+            self.params = params
+
+        def fetchall(self):
+            return []
+
+    cursor = DueCursor()
+    transaction = DatabaseReviewTransaction(cursor, "learning_evidence")
+    transaction._statement = lambda query: query  # type: ignore[method-assign]
+
+    today_start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    tomorrow_start = today_start + timedelta(days=1)
+    assert transaction.list_due_group_cards(
+        "7",
+        now=NOW,
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        limit=20,
+    ) == []
+    normalized_sql = " ".join(cursor.statement.split())
+    assert "rm.display_order AS material_display_order" in normalized_sql
+    assert "ORDER BY due_cards.material_display_order ASC NULLS LAST" in normalized_sql
+    assert "MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at" in normalized_sql
+    assert "material_rank <= 4" not in normalized_sql
+    assert "new_candidates.new_rank <= GREATEST" in normalized_sql
+    assert cursor.params == ("7", today_start, tomorrow_start, "7", "7", NOW, 20)
 
 
 def test_reveal_card_returns_answer_and_rag_evidence_for_current_user() -> None:

@@ -86,6 +86,8 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "llm", "timeout-seconds"): "RAG_LLM_TIMEOUT_SECONDS",
     ("rag", "llm-temperature"): "RAG_LLM_TEMPERATURE",
     ("rag", "llm", "temperature"): "RAG_LLM_TEMPERATURE",
+    ("review", "llm", "api-key"): "DEEPSEEK_API_KEY",
+    ("review", "llm", "timeout-seconds"): "REVIEW_EXTRACTION_TIMEOUT_SECONDS",
     ("rag", "progress", "console-enabled"): "RAG_CONSOLE_PROGRESS_ENABLED",
     ("rag", "process-log", "console-enabled"): "RAG_CONSOLE_PROCESS_ENABLED",
     ("rag", "kafka", "enabled"): "RAG_KAFKA_ENABLED",

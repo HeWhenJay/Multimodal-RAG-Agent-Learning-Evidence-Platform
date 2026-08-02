@@ -30,6 +30,7 @@ from app.schemas.review import (
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewGroupOrderResult,
     ReviewGradeRequest,
     ReviewGradeResult,
     ReviewMaterial,
@@ -162,7 +163,7 @@ class ReviewService:
         return overview_response(stats, settings)
 
     def list_due(self, user_id: str, limit: int = 20) -> list[ReviewCard]:
-        """读取当前到期卡片，每日上限由后端设置统一约束。"""
+        """按文档额度读取到期队列，并返回入选文档的全部卡片。"""
         now = as_utc(self.now_provider())
         with self.repository.transaction() as transaction:
             settings = transaction.get_or_create_settings(user_id)
@@ -174,10 +175,16 @@ class ReviewService:
                 tomorrow_start=tomorrow_start,
             )
             remaining_today = max(0, settings.daily_limit - stats.today_reviewed_count)
-            if remaining_today == 0:
+            material_limit = due_material_limit(limit, remaining_today, stats.started_due_material_count)
+            if material_limit == 0:
                 return []
-            effective_limit = min(max(1, limit), remaining_today, 100)
-            records = transaction.list_due_cards(user_id, now=now, limit=effective_limit)
+            records = transaction.list_due_group_cards(
+                user_id,
+                now=now,
+                today_start=today_start,
+                tomorrow_start=tomorrow_start,
+                limit=material_limit,
+            )
         scheduler = FsrsReviewScheduler(settings.desired_retention)
         return [card_response(record, scheduler, now, include_answer=False) for record in records]
 
@@ -194,10 +201,16 @@ class ReviewService:
                 tomorrow_start=tomorrow_start,
             )
             remaining_today = max(0, settings.daily_limit - stats.today_reviewed_count)
-            if remaining_today <= 0:
+            material_limit = due_material_limit(limit, remaining_today, stats.started_due_material_count)
+            if material_limit == 0:
                 return ReviewDueGroups(totalDueCount=stats.due_count, remainingToday=0, groups=[])
-            effective_limit = min(max(1, limit), remaining_today, 100)
-            records = transaction.list_due_cards(user_id, now=now, limit=effective_limit)
+            records = transaction.list_due_group_cards(
+                user_id,
+                now=now,
+                today_start=today_start,
+                tomorrow_start=tomorrow_start,
+                limit=material_limit,
+            )
         scheduler = FsrsReviewScheduler(settings.desired_retention)
         grouped: dict[int, ReviewCardGroup] = {}
         for record in records:
@@ -206,6 +219,7 @@ class ReviewService:
                 ReviewCardGroup(
                     materialId=record.material_id,
                     materialTitle=record.material_title,
+                    materialSummary=record.material_summary,
                     documentType=record.document_type,
                     dueCardCount=0,
                     cards=[],
@@ -218,6 +232,14 @@ class ReviewService:
             remainingToday=remaining_today,
             groups=list(grouped.values()),
         )
+
+    def reorder_due_groups(self, material_ids: list[int], user_id: str) -> ReviewGroupOrderResult:
+        """原子保存资料分组优先级，并拒绝任一不存在或越权资料。"""
+        with self.repository.transaction() as transaction:
+            ordered_ids = transaction.reorder_review_materials(user_id, material_ids)
+        if ordered_ids is None:
+            raise BusinessError("复习资料不存在")
+        return ReviewGroupOrderResult(materialIds=ordered_ids, orderedCount=len(ordered_ids))
 
     def get_card(self, card_id: int, user_id: str) -> ReviewCard:
         """在用户主动揭示时读取答案和完整 evidence，并再次校验资料归属。"""
@@ -273,8 +295,14 @@ class ReviewService:
                 today_start=today_start,
                 tomorrow_start=tomorrow_start,
             )
-            if daily_stats.today_reviewed_count >= settings.daily_limit:
-                raise BusinessError("今日复习上限已达到")
+            material_reviewed_today = transaction.has_material_reviewed_today(
+                card.material_id,
+                user_id,
+                today_start=today_start,
+                tomorrow_start=tomorrow_start,
+            )
+            if not material_reviewed_today and daily_stats.today_reviewed_count >= settings.daily_limit:
+                raise BusinessError("今日复习文档上限已达到")
             scheduler = FsrsReviewScheduler(settings.desired_retention)
             scheduled = scheduler.review(
                 card.fsrs_card_json,
@@ -355,6 +383,7 @@ class ReviewService:
                     material,
                     is_learning_content=True,
                     category="学习资料",
+                    summary=material.document_summary,
                     status="FAILED",
                     reason="资料暂无可用 evidence，无法生成带来源的复习卡片",
                     extractor=f"none:{REVIEW_CARD_PROMPT_VERSION}",
@@ -369,11 +398,17 @@ class ReviewService:
                 ),
                 evidences,
             )
+            summary = (
+                material.document_summary
+                if material.document_summary and material.document_summary.strip()
+                else extraction.summary
+            )
             if not extraction.is_learning_content:
                 return self._save_generation(
                     material,
                     is_learning_content=False,
                     category=extraction.category,
+                    summary=summary,
                     status="SKIPPED",
                     reason=extraction.reason,
                     extractor=extraction.extractor,
@@ -384,6 +419,7 @@ class ReviewService:
                     material,
                     is_learning_content=True,
                     category=extraction.category,
+                    summary=summary,
                     status="FAILED",
                     reason=extraction.reason,
                     extractor=extraction.extractor,
@@ -413,6 +449,7 @@ class ReviewService:
                 material,
                 is_learning_content=True,
                 category=extraction.category,
+                summary=summary,
                 status=status,
                 reason=reason,
                 extractor=extraction.extractor,
@@ -427,6 +464,7 @@ class ReviewService:
         *,
         is_learning_content: bool,
         category: str | None,
+        summary: str | None,
         status: str,
         reason: str,
         extractor: str,
@@ -438,6 +476,7 @@ class ReviewService:
                 material,
                 is_learning_content=is_learning_content,
                 category=category,
+                summary=summary,
                 status=status,
                 reason=reason,
                 extractor=extractor,
@@ -495,6 +534,7 @@ def material_response(record: ReviewMaterialRecord) -> ReviewMaterial:
     return ReviewMaterial(
         materialId=record.material_id,
         title=record.title,
+        summary=record.summary,
         documentType=record.document_type,
         materialStatus=record.material_status,
         isLearningContent=record.is_learning_content,
@@ -520,10 +560,13 @@ def settings_response(record: ReviewSettingsRecord) -> ReviewSettings:
 
 
 def overview_response(stats: ReviewOverviewStats, settings: ReviewSettingsRecord) -> ReviewOverview:
-    """组合统计和用户设置。"""
+    """组合统计，并以可复习文档数驱动每日提醒。"""
+    remaining_documents = max(0, settings.daily_limit - stats.today_reviewed_count)
+    # 兼容仍使用旧内存统计对象的调用方；数据库统计始终返回 due_material_count。
+    due_material_count = stats.due_material_count or stats.due_count
     actionable_due_count = min(
-        stats.due_count,
-        max(0, settings.daily_limit - stats.today_reviewed_count),
+        due_material_count,
+        stats.started_due_material_count + remaining_documents,
     )
     return ReviewOverview(
         dueCount=stats.due_count,
@@ -534,6 +577,14 @@ def overview_response(stats: ReviewOverviewStats, settings: ReviewSettingsRecord
         nextDueAt=stats.next_due_at,
         settings=settings_response(settings),
     )
+
+
+def due_material_limit(requested_limit: int, remaining_today: int, started_due_material_count: int) -> int:
+    """计算本次可选文档数，已开始的文档不重复消耗每日额度。"""
+    requested = min(max(1, requested_limit), 100)
+    started = max(0, started_due_material_count)
+    available_new = min(max(0, remaining_today), max(0, requested - started))
+    return started + available_new
 
 
 def local_day_bounds(now: datetime, timezone_name: str) -> tuple[datetime, datetime]:

@@ -61,6 +61,7 @@ class ReviewCardGroup(BaseModel):
 
     materialId: int
     materialTitle: str
+    materialSummary: str | None = None
     documentType: str
     dueCardCount: int = Field(default=0, ge=0)
     cards: list[ReviewCard] = Field(default_factory=list)
@@ -74,11 +75,35 @@ class ReviewDueGroups(BaseModel):
     groups: list[ReviewCardGroup] = Field(default_factory=list)
 
 
+class ReviewGroupOrderRequest(BaseModel):
+    """保存今日资料分组顺序的批量请求。"""
+
+    materialIds: list[int] = Field(..., min_length=1, max_length=100)
+
+    @field_validator("materialIds")
+    @classmethod
+    def validate_material_ids(cls, value: list[int]) -> list[int]:
+        """保留拖拽顺序，同时拒绝无法确定先后关系的非法 ID。"""
+        if any(item <= 0 for item in value):
+            raise ValueError("资料 ID 必须是正整数")
+        if len(set(value)) != len(value):
+            raise ValueError("资料 ID 不能重复")
+        return value
+
+
+class ReviewGroupOrderResult(BaseModel):
+    """成功持久化的今日资料分组顺序。"""
+
+    materialIds: list[int] = Field(..., min_length=1, max_length=100)
+    orderedCount: int = Field(ge=1, le=100)
+
+
 class ReviewMaterial(BaseModel):
     """一条资料的学习分类与卡片生成状态。"""
 
     materialId: int
     title: str
+    summary: str | None = None
     documentType: str
     materialStatus: str
     isLearningContent: bool | None = None

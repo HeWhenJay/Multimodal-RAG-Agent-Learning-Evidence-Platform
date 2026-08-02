@@ -58,6 +58,7 @@ class ReviewMaterialRecord:
     index_request_version: int
     synced_index_request_version: int | None
     updated_at: datetime | None
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ class ReviewCardRecord:
     active: bool
     created_at: datetime | None
     updated_at: datetime | None
+    material_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ class ReviewOverviewStats:
     total_card_count: int
     active_material_count: int
     next_due_at: datetime | None
+    due_material_count: int = 0
+    started_due_material_count: int = 0
 
 
 class ReviewTransaction(Protocol):
@@ -136,6 +140,7 @@ class ReviewTransaction(Protocol):
         *,
         is_learning_content: bool,
         category: str | None,
+        summary: str | None,
         status: str,
         reason: str,
         extractor: str,
@@ -180,6 +185,27 @@ class ReviewTransaction(Protocol):
     ) -> ReviewOverviewStats: ...
 
     def list_due_cards(self, user_id: str, *, now: datetime, limit: int) -> list[ReviewCardRecord]: ...
+
+    def list_due_group_cards(
+        self,
+        user_id: str,
+        *,
+        now: datetime,
+        today_start: datetime,
+        tomorrow_start: datetime,
+        limit: int,
+    ) -> list[ReviewCardRecord]: ...
+
+    def has_material_reviewed_today(
+        self,
+        material_id: int,
+        user_id: str,
+        *,
+        today_start: datetime,
+        tomorrow_start: datetime,
+    ) -> bool: ...
+
+    def reorder_review_materials(self, user_id: str, material_ids: list[int]) -> list[int] | None: ...
 
     def find_card(self, card_id: int, user_id: str) -> ReviewCardRecord | None: ...
 
@@ -305,6 +331,7 @@ class DatabaseReviewTransaction:
         *,
         is_learning_content: bool,
         category: str | None,
+        summary: str | None,
         status: str,
         reason: str,
         extractor: str,
@@ -344,14 +371,15 @@ class DatabaseReviewTransaction:
                 """
                 INSERT INTO {schema}.learning_review_material (
                     material_id, user_id, index_request_version, is_learning_content,
-                    category, status, reason, extractor, card_count, generated_at
+                    category, summary, status, reason, extractor, card_count, generated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP)
                 ON CONFLICT (material_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     index_request_version = EXCLUDED.index_request_version,
                     is_learning_content = EXCLUDED.is_learning_content,
                     category = EXCLUDED.category,
+                    summary = EXCLUDED.summary,
                     status = EXCLUDED.status,
                     reason = EXCLUDED.reason,
                     extractor = EXCLUDED.extractor,
@@ -367,6 +395,7 @@ class DatabaseReviewTransaction:
                 material.index_request_version,
                 is_learning_content,
                 category,
+                summary,
                 status,
                 reason,
                 extractor,
@@ -683,23 +712,35 @@ class DatabaseReviewTransaction:
                     COUNT(1) FILTER (WHERE active = TRUE) AS total_card_count,
                     COUNT(DISTINCT material_id) FILTER (WHERE active = TRUE) AS active_material_count,
                     COUNT(1) FILTER (WHERE active = TRUE AND due_at <= %s) AS due_count,
+                    COUNT(DISTINCT material_id) FILTER (WHERE active = TRUE AND due_at <= %s) AS due_material_count,
                     MIN(due_at) FILTER (WHERE active = TRUE AND due_at > %s) AS next_due_at
                 FROM {schema}.learning_review_card
                 WHERE user_id = %s
                 """
             ),
-            (now, now, user_id),
+            (now, now, now, user_id),
         )
         card_stats = self._cursor.fetchone() or {}
         self._cursor.execute(
             self._statement(
                 """
-                SELECT COUNT(1) AS reviewed_count
-                FROM {schema}.learning_review_log
-                WHERE user_id = %s AND reviewed_at >= %s AND reviewed_at < %s
+                SELECT
+                    COUNT(DISTINCT log.material_id) AS reviewed_count,
+                    COUNT(DISTINCT log.material_id) FILTER (
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM {schema}.learning_review_card due_card
+                            WHERE due_card.material_id = log.material_id
+                              AND due_card.user_id = log.user_id
+                              AND due_card.active = TRUE
+                              AND due_card.due_at <= %s
+                        )
+                    ) AS started_due_material_count
+                FROM {schema}.learning_review_log log
+                WHERE log.user_id = %s AND log.reviewed_at >= %s AND log.reviewed_at < %s
                 """
             ),
-            (user_id, today_start, tomorrow_start),
+            (now, user_id, today_start, tomorrow_start),
         )
         log_stats = self._cursor.fetchone() or {}
         return ReviewOverviewStats(
@@ -708,36 +749,210 @@ class DatabaseReviewTransaction:
             total_card_count=int(card_stats.get("total_card_count") or 0),
             active_material_count=int(card_stats.get("active_material_count") or 0),
             next_due_at=card_stats.get("next_due_at"),
+            due_material_count=int(card_stats.get("due_material_count") or 0),
+            started_due_material_count=int(log_stats.get("started_due_material_count") or 0),
         )
 
     def list_due_cards(self, user_id: str, *, now: datetime, limit: int) -> list[ReviewCardRecord]:
-        """按到期时间轮询资料读取当前用户卡片，避免单一资料独占每日队列。"""
+        """保留兼容的卡片级查询；公开队列使用文档级分组查询。"""
         self._cursor.execute(
             self._statement(
                 """
-                SELECT *
-                FROM (
-                    SELECT c.*, lm.title AS material_title, lm.document_type,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY c.material_id
-                               ORDER BY c.due_at ASC, c.id ASC
-                           ) AS material_rank,
-                           MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
-                    FROM {schema}.learning_review_card c
-                    JOIN {schema}.learning_material lm ON lm.id = c.material_id
-                    WHERE c.user_id = %s
-                      AND lm.user_id = %s
-                      AND c.active = TRUE
-                      AND c.due_at <= %s
-                ) due_cards
-                WHERE material_rank <= 4
-                ORDER BY group_due_at ASC, material_id ASC, material_rank ASC
+                SELECT c.*, lm.title AS material_title, lm.document_type,
+                       CASE
+                           WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
+                               THEN lm.document_summary
+                           ELSE rm.summary
+                       END AS material_summary,
+                       MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
+                FROM {schema}.learning_review_card c
+                JOIN {schema}.learning_material lm ON lm.id = c.material_id
+                LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = c.material_id
+                WHERE c.user_id = %s
+                  AND lm.user_id = %s
+                  AND c.active = TRUE
+                  AND c.due_at <= %s
+                ORDER BY group_due_at ASC, c.material_id ASC, c.due_at ASC, c.id ASC
                 LIMIT %s
                 """
             ),
             (user_id, user_id, now, limit),
         )
         return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def list_due_group_cards(
+        self,
+        user_id: str,
+        *,
+        now: datetime,
+        today_start: datetime,
+        tomorrow_start: datetime,
+        limit: int,
+    ) -> list[ReviewCardRecord]:
+        """先按文档额度选择资料组，再返回每组全部到期卡片。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                WITH reviewed_materials AS (
+                    SELECT DISTINCT material_id
+                    FROM {schema}.learning_review_log
+                    WHERE user_id = %s
+                      AND reviewed_at >= %s
+                      AND reviewed_at < %s
+                ),
+                due_cards AS (
+                    SELECT c.*, lm.title AS material_title, lm.document_type,
+                           CASE
+                               WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
+                                   THEN lm.document_summary
+                               ELSE rm.summary
+                           END AS material_summary,
+                           rm.display_order AS material_display_order,
+                           (reviewed_materials.material_id IS NOT NULL) AS started_today,
+                           MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
+                    FROM {schema}.learning_review_card c
+                    JOIN {schema}.learning_material lm ON lm.id = c.material_id
+                    LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = c.material_id
+                    LEFT JOIN reviewed_materials
+                        ON reviewed_materials.material_id = c.material_id
+                    WHERE c.user_id = %s
+                      AND lm.user_id = %s
+                      AND c.active = TRUE
+                      AND c.due_at <= %s
+                ),
+                due_materials AS (
+                    SELECT material_id,
+                           BOOL_OR(started_today) AS started_today,
+                           MIN(material_display_order) AS material_display_order,
+                           MIN(group_due_at) AS group_due_at
+                    FROM due_cards
+                    GROUP BY material_id
+                ),
+                started_count AS (
+                    SELECT COUNT(*) AS value
+                    FROM due_materials
+                    WHERE started_today = TRUE
+                ),
+                new_candidates AS (
+                    SELECT material_id,
+                           ROW_NUMBER() OVER (
+                               ORDER BY material_display_order ASC NULLS LAST,
+                                        group_due_at ASC,
+                                        material_id ASC
+                           ) AS new_rank
+                    FROM due_materials
+                    WHERE started_today = FALSE
+                ),
+                selected_materials AS (
+                    SELECT material_id
+                    FROM due_materials
+                    WHERE started_today = TRUE
+                    UNION ALL
+                    SELECT new_candidates.material_id
+                    FROM new_candidates
+                    CROSS JOIN started_count
+                    WHERE new_candidates.new_rank <= GREATEST(0, %s - started_count.value)
+                )
+                SELECT due_cards.*
+                FROM due_cards
+                JOIN selected_materials
+                    ON selected_materials.material_id = due_cards.material_id
+                ORDER BY due_cards.material_display_order ASC NULLS LAST,
+                         due_cards.group_due_at ASC,
+                         due_cards.material_id ASC,
+                         due_cards.due_at ASC,
+                         due_cards.id ASC
+                """
+            ),
+            (user_id, today_start, tomorrow_start, user_id, user_id, now, limit),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def has_material_reviewed_today(
+        self,
+        material_id: int,
+        user_id: str,
+        *,
+        today_start: datetime,
+        tomorrow_start: datetime,
+    ) -> bool:
+        """判断当前资料是否已在今天占用过一个文档额度。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {schema}.learning_review_log
+                    WHERE material_id = %s
+                      AND user_id = %s
+                      AND reviewed_at >= %s
+                      AND reviewed_at < %s
+                ) AS reviewed_today
+                """
+            ),
+            (material_id, user_id, today_start, tomorrow_start),
+        )
+        row = self._cursor.fetchone() or {}
+        return bool(row.get("reviewed_today"))
+
+    def reorder_review_materials(self, user_id: str, material_ids: list[int]) -> list[int] | None:
+        """锁定用户复习资料并以单次集合更新保存稳定的拖拽顺序。"""
+        # 用户设置行作为轻量级用户锁，使同一用户的并发排序按请求完成顺序串行化。
+        self.get_or_create_settings(user_id, for_update=True)
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT rm.material_id
+                FROM {schema}.learning_review_material rm
+                JOIN {schema}.learning_material lm ON lm.id = rm.material_id
+                WHERE rm.user_id = %s
+                  AND lm.user_id = %s
+                  AND rm.is_learning_content IS TRUE
+                  AND rm.status = 'GENERATED'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_card active_card
+                      WHERE active_card.material_id = rm.material_id
+                        AND active_card.user_id = %s
+                        AND active_card.active = TRUE
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = rm.material_id
+                        AND excluded_material.user_id = %s
+                  )
+                ORDER BY rm.display_order ASC NULLS LAST, rm.material_id ASC
+                FOR UPDATE OF rm
+                """
+            ),
+            (user_id, user_id, user_id, user_id),
+        )
+        stable_ids = [int(row["material_id"]) for row in self._cursor.fetchall()]
+        requested_set = set(material_ids)
+        if not requested_set.issubset(stable_ids):
+            return None
+
+        # 本次可见资料前置，未参与拖拽的资料沿用事务开始时的相对顺序。
+        complete_order = [*material_ids, *(item for item in stable_ids if item not in requested_set)]
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material rm
+                SET display_order = ordered.position,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT material_id, CAST(ordinality - 1 AS INTEGER) AS position
+                    FROM UNNEST(%s::BIGINT[]) WITH ORDINALITY AS values_with_order(material_id, ordinality)
+                ) ordered
+                WHERE rm.material_id = ordered.material_id
+                  AND rm.user_id = %s
+                  AND rm.display_order IS DISTINCT FROM ordered.position
+                """
+            ),
+            (complete_order, user_id),
+        )
+        return list(material_ids)
 
     def find_card(self, card_id: int, user_id: str) -> ReviewCardRecord | None:
         """读取当前用户的活动卡片，供用户主动揭示答案。"""
@@ -857,6 +1072,11 @@ class DatabaseReviewTransaction:
                 COALESCE(rm.status, 'PENDING') AS review_status,
                 rm.reason, COALESCE(rm.card_count, 0) AS card_count,
                 rm.extractor,
+                CASE
+                    WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
+                        THEN lm.document_summary
+                    ELSE rm.summary
+                END AS material_summary,
                 COALESCE(rm.updated_at, lm.updated_at) AS review_updated_at
             FROM {{schema}}.learning_material lm
             LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = lm.id
@@ -868,9 +1088,15 @@ class DatabaseReviewTransaction:
         """构造卡片与资料标题的统一 SELECT。"""
         return self._statement(
             f"""
-            SELECT c.*, lm.title AS material_title, lm.document_type
+            SELECT c.*, lm.title AS material_title, lm.document_type,
+                   CASE
+                       WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
+                           THEN lm.document_summary
+                       ELSE rm.summary
+                   END AS material_summary
             FROM {{schema}}.learning_review_card c
             JOIN {{schema}}.learning_material lm ON lm.id = c.material_id
+            LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = c.material_id
             {suffix}
             """
         )
@@ -916,6 +1142,7 @@ class DatabaseReviewTransaction:
                 else None
             ),
             updated_at=row.get("review_updated_at"),
+            summary=row.get("material_summary"),
         )
 
     @staticmethod
@@ -939,6 +1166,7 @@ class DatabaseReviewTransaction:
             active=bool(row.get("active")),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
+            material_summary=row.get("material_summary"),
         )
 
     @staticmethod

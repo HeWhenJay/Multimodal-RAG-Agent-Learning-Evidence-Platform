@@ -4,9 +4,13 @@
 
 ## 变更摘要
 
-新增 `/api/reviews/*` 公开控制面。系统在资料完成 RAG 入库后识别八股背诵、面经、课程讲解、技术原理、学习笔记等学习型内容，从已有 RAG evidence 提炼短小的关键知识点卡片，并使用 FSRS 间隔重复算法计算下次复习时间。每日队列以用户上传资料为 group，每个 group 最多包含该资料当前到期的 4 张小卡片，避免单份资料占满全天额度。
+新增 `/api/reviews/*` 公开控制面。系统在资料完成 RAG 入库后识别八股背诵、面经、课程讲解、技术原理、学习笔记等学习型内容，从已有 RAG evidence 提炼短小的关键知识点卡片，并使用 FSRS 间隔重复算法计算下次复习时间。每日队列以用户上传资料为 group；每日上限按资料份数计算，被选中的资料会返回该资料全部当前到期的小卡片，不再按 group 截断卡片数量。
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
+
+每份复习资料新增摘要。若 `learning_material.document_summary` 已有内容，接口和页面必须原样优先使用资料摘要，不再调用模型改写；只有资料摘要为空时，才在同一次“分类 + 卡片生成”LLM 请求中生成复习摘要并持久化，不能为摘要额外发起第二次模型请求。每日卡片 group 与资料列表都返回并展示同一份摘要。
+
+今日复习资料 group 支持用户拖拽排序。排序以“当前用户 + 复习资料”为持久化单位保存在 PostgreSQL；前端提交当前可见 group 的完整顺序后，服务端将这些资料置于用户队列前部，其余复习资料保持原有相对顺序。该顺序影响 `GET /api/reviews/due` 与 `GET /api/reviews/due-groups` 的资料选择顺序，但不改变卡片组内到期顺序、FSRS 状态或评分算法。
 
 复习卡片不得要求用户重新阅读整篇文档或观看整段视频。每张卡片必须保留 `evidenceRefs`，字段与现有 RAG `Evidence` 一致；视频 evidence 必须保留 `startTime/endTime/playbackUrl` 并复用 `/videos` 时间段跳转，其他格式复用 `/preview/material/{id}` 展示原始文本或带章节位置的 RAG 提取视图。
 
@@ -17,15 +21,30 @@
 - 排程算法：`FSRS`，默认目标记忆率 `0.90`，支持用户设置 `0.80-0.97`。
 - 评分：`1=忘记`、`2=困难`、`3=记得`、`4=轻松`。忘记必须与“困难”分开，避免排程间隔被错误拉长。
 - 首次卡片立即进入待复习队列；首次作答后由 FSRS 直接计算后续间隔，不使用固定的“第 1/2/4/7/15/30 天”硬编码表。
-- 默认每日上限 `20` 张。待复习计数由持久化 `dueAt` 实时计算，服务重启后不丢失。
-- `dueCount` 表示全部到期积压，`actionableDueCount` 表示扣除今日已完成数量后当前真正可复习的数量；顶部徽标和浏览器通知只使用后者。
+- 默认每日上限 `20` 份资料。待复习计数由持久化 `dueAt` 实时计算，服务重启后不丢失；同一资料当天首次评分即占用一份额度。
+- `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt/本地降级规则升级后，只按资料分批刷新知识点正文和 evidence，不清空已有卡片的 FSRS 学习状态。
-- 同一资料的同一 `indexRequestVersion` 最多执行一次 LLM 请求，一次请求生成该 group 的全部卡片；模型提炼失败或未配置模型时使用确定性本地提炼，不能因为外部模型不可用而阻断复习提醒。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v3`；业务模块只负责组装已清洗的动态输入并调用模型。
+- 同一资料的同一 `indexRequestVersion` 最多执行一次 LLM 请求，一次请求完成资料分类、缺失摘要补齐和该 group 的全部卡片生成；模型提炼失败或未配置模型时使用确定性本地提炼，不能因为外部模型不可用而阻断复习提醒。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v4`；业务模块只负责组装已清洗的动态输入并调用模型。
+- 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
+- 视频、面经和讲解类资料在送模前先从 evidence 抽取原始问句候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion`；服务端校验后使用原问句作为卡片问题。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - evidence 进入模型前会移除纯时间码、重复字幕水印和无事实内容的口头转场；清洗后没有有效知识点的资料不会创建卡片，历史旧版本卡片会在增量同步时停用并重建。
 - 用户删除使用 PostgreSQL tombstone 作为唯一事实来源。`learning_review_card_exclusion` 按 `materialId + sourceKey` 阻止同一卡片复活，`learning_review_material_exclusion` 按 `materialId` 永久阻止整份资料再次进入复习中心；不能只依赖前端隐藏或 Redis 缓存。
 - 删除接口必须幂等并校验当前用户归属。卡片删除与并发评分使用行锁串行化；资料删除与并发生成共同锁定 `learning_material`，保证最终状态要么完整生成、随后被删除，要么生成结果在保存前被排除。
 - PostgreSQL 的 `dueAt` 和评分日志是唯一事实来源，不缓存卡片排程；配置 `REDIS_URL` 时只使用带 TTL 的生成短锁，防止多实例对同一资料重复调用 LLM。
+- 资料拖拽顺序保存在 `learning_review_material.display_order`。批量排序先锁定当前用户仍在复习中心的资料行并校验全部 ID，再在同一事务中连续重编号；重复提交同一顺序不改写未变化的行。未设置顺序的新资料追加在已排序资料之后，并保留现有到期时间兜底顺序。
+
+## 模型运行配置
+
+DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务固定请求 `deepseek-v4-flash`。官方说明该模型标识会滚动指向最新正式版本；思考模式请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`。参数依据：[首次 API 调用](https://api-docs.deepseek.com/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON 输出](https://api-docs.deepseek.com/guides/json_mode)。
+
+密钥只从进程环境变量 `DEEPSEEK_API_KEY` 读取。Windows 用户级配置示例：
+
+```powershell
+[Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', '<your-key>', 'User')
+```
+
+设置后需要重新启动 PyCharm 和 `run.py`，让新进程继承用户环境变量。配置文件、接口响应和日志均不得记录密钥值。
 
 ## 公开端点
 
@@ -35,6 +54,7 @@
 | GET | `/api/reviews/overview` | 获取待复习数、今日完成数、下次到期时间和用户设置 |
 | GET | `/api/reviews/due?limit=20` | 获取当前到期的关键知识点卡片 |
 | GET | `/api/reviews/due-groups?limit=20` | 按上传资料 group 获取今日到期卡片，列表不返回答案正文 |
+| PUT | `/api/reviews/due-groups/order` | 批量保存当前用户今日资料 group 的拖拽顺序 |
 | GET | `/api/reviews/materials` | 获取资料分类、生成状态和卡片数 |
 | POST | `/api/reviews/materials/{materialId}/generate` | 对一条当前用户资料重新分类并生成卡片 |
 | POST | `/api/reviews/materials/batch-delete` | 批量将多份资料移出复习中心 |
@@ -107,8 +127,9 @@
     {
       "materialId": 12,
       "materialTitle": "Kafka 的高可用性（视频讲解）",
+      "materialSummary": "视频围绕 Kafka Broker 集群、分区副本、Leader/Follower 与 ISR 故障转移说明高可用机制。",
       "documentType": "mp4",
-      "dueCardCount": 3,
+      "dueCardCount": 1,
       "cards": [
         {
           "id": 81,
@@ -126,6 +147,53 @@
       ]
     }
   ]
+}
+```
+
+`materialSummary` 优先取资料自身的 `document_summary`；资料未提供摘要时，取复习提炼阶段生成并持久化的摘要。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+
+### 保存资料 group 顺序
+
+```http
+PUT /api/reviews/due-groups/order
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{"materialIds": [12, 8, 21]}
+```
+
+`materialIds` 必须包含 1 到 100 个互不重复的正整数资料 ID，并保持用户拖拽后的顺序。服务端不会信任前端用户 ID：它会在一个事务中锁定当前认证用户仍处于复习中心的资料，要求请求中的每个 ID 都命中后才更新；任一资料不存在、已移除或属于其他用户时，整次请求返回“复习资料不存在”且不做部分更新。命中的资料会按请求顺序置前，未出现在本次请求中的资料保持原有相对顺序并稳定追加。并发排序请求通过用户设置行和资料行锁串行化，最后完成的完整请求生效；重复提交同一顺序不会改写未变化的行。
+
+排序只影响队列资料优先级，不改变卡片的 FSRS 状态、到期时间或资料原始 RAG 内容；成功响应返回本次接受的 ID 顺序。
+
+`groups` 数组已按用户保存的资料优先级返回。每个 group 内的 `cards` 仍按 `dueAt`、卡片 ID 的原有稳定规则排序，排序接口不会修改卡片字段。
+
+### `ReviewGroupOrderResult`
+
+```json
+{
+  "materialIds": [13, 12],
+  "orderedCount": 2
+}
+```
+
+`materialIds` 原样返回本次已接受的资料顺序，`orderedCount` 表示参与本次前置排序的资料数。重复提交相同顺序返回同一结果。
+
+### `ReviewMaterial`
+
+```json
+{
+  "materialId": 12,
+  "title": "Kafka 的高可用性（视频讲解）",
+  "summary": "视频围绕 Kafka Broker 集群、分区副本、Leader/Follower 与 ISR 故障转移说明高可用机制。",
+  "documentType": "mp4",
+  "materialStatus": "READY",
+  "isLearningContent": true,
+  "category": "面试复习",
+  "status": "GENERATED",
+  "cardCount": 4,
+  "indexRequestVersion": 1,
+  "syncedIndexRequestVersion": 1
 }
 ```
 
@@ -295,25 +363,29 @@ Authorization: Bearer <token>
 | --- | --- |
 | 未登录或 token 失效 | 沿用认证模块中文错误 |
 | 评分不在 `1-4` | `复习评分必须是 1 到 4` |
-| 当日评分达到每日上限 | `今日复习上限已达到` |
+| 当日评分尝试开启新资料且达到每日资料上限 | `今日复习文档上限已达到` |
 | 资料或卡片越权 | `学习资料不存在` / `复习卡片不存在` |
 | 重复删除本人已经删除的卡片或资料 | 幂等返回 `deleted=true` |
 | 批量 ID 超过 100 个、为空或含非正整数 | 返回请求校验错误，不执行任何批量操作 |
 | 批量 ID 包含不存在或不属于当前用户的记录 | 其余命中项仍返回成功，`deletedCount` 小于 `requestedCount` |
+| 排序列表为空、超过 100 个、包含非正整数或重复 ID | 返回请求校验错误，不修改既有顺序 |
+| 排序列表包含不存在、已移除或不属于当前用户的资料 | `复习资料不存在`，整次排序不做部分更新 |
 | 手动生成已移出复习中心的资料 | `该资料已从复习中心移除` |
 | 同一资料正在由其他请求生成 | `该资料的复习卡片正在生成，请稍后刷新` |
 | 资料尚未完成索引 | `学习资料尚未完成索引` |
 | 无可用 evidence | 分类记录为 `FAILED`，不生成无来源卡片 |
-| 百炼模型未配置、超时或返回非法 JSON | 自动使用本地关键知识点提炼，并保留原 evidence |
+| `DEEPSEEK_API_KEY` 未配置 | 不调用外部模型，使用本地摘要与关键知识点提炼，并保留原 evidence |
+| DeepSeek 请求超时或返回非法 JSON | 自动使用本地摘要与关键知识点提炼，并保留原 evidence |
 | FSRS 状态损坏 | 使用当前卡片创建时间重建初始状态并记录受控日志，不回显内部状态 |
 
 ## 前端影响
 
-- 新增 `/reviews` 复习中心，按上传资料展示每日 group；每个 group 内展示多张独立小卡片、答案揭示、四档评分、来源 evidence 和下一次复习时间。
+- 新增 `/reviews` 复习中心，按上传资料展示每日 group；每个 group 与右侧资料列表都展示资料摘要，group 内展示该资料全部到期卡片、答案揭示、四档评分、来源 evidence 和下一次复习时间。今日资料支持拖拽手柄、键盘方向键/Home/End，以及移动端上移/下移按钮调整优先级。
 - 侧栏新增“复习中心”；顶部通知按钮展示到期数量并跳转到复习中心。
 - 页面打开时调用一次 `POST /api/reviews/sync`，之后定时刷新 `overview`；文件上传后会在 RAG 状态进入 `READY/PARTIAL` 时按 `materialId` 调用生成接口，避免上传响应早于 evidence 入库而漏生成卡片，也避免历史候选抢占本次上传。资料同步失败不阻断其他页面。
 - 卡片右上角提供图标删除操作；资料 group 标题和右侧资料列表提供“移出复习中心”操作。两种操作都先显示明确确认对话框，资料确认文案必须说明原始 RAG 文件不会删除且移除后不会重新生成。
 - 今日卡片支持复选框多选并批量删除，资料列表支持复选框多选并批量移出；批量操作按钮仅在有选中项时出现，并显示选中数量与对应影响范围。
+- 今日资料 group 支持通过拖拽手柄调整优先级；前端拖拽结束后一次提交当前可见 group 的完整 `materialIds` 顺序，成功后沿用本地顺序，失败时恢复服务端最近一次顺序并显示错误。
 - 删除成功后前端立即移除对应卡片或 group，并分别刷新 `overview`、`due-groups` 和 `materials`；刷新失败不能把已经成功的删除误报为删除失败。
 - 浏览器通知只在用户主动授权后启用；后端持久化到期时间是唯一事实来源，前端不能自行计算 FSRS 间隔。
 - 浏览器通知会等待用户设置时区中的 `reminderTime`，同一自然日最多发送一次；浏览器关闭后的系统级通知仍需后续接入 Web Push 或邮件基础设施。

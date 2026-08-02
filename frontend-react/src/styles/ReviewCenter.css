@@ -326,6 +326,25 @@
   min-height: 32px;
 }
 
+.review-order-saving {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.review-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .review-loading {
   display: flex;
   align-items: center;
@@ -345,9 +364,17 @@
   background: #f7f8fb;
   border: 1px solid #e2e6ed;
   border-radius: 8px;
+  transition: border-color .16s ease, box-shadow .16s ease, opacity .16s ease;
+}
+
+.review-material-group.is-dragging {
+  opacity: .7;
+  border-color: #818cf8;
+  box-shadow: 0 7px 20px rgba(79, 70, 229, .13);
 }
 
 .review-group-header {
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   min-height: 62px;
@@ -357,14 +384,53 @@
 
 .review-group-title {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  flex: 1;
   min-width: 0;
   gap: 10px;
   overflow: hidden;
 }
 
 .review-group-title > div {
+  flex: 1;
   min-width: 0;
+}
+
+.review-group-drag-handle {
+  display: inline-grid;
+  width: 30px;
+  height: 34px;
+  padding: 0;
+  place-items: center;
+  flex: 0 0 30px;
+  color: #94a3b8;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.review-group-drag-handle:hover:not(:disabled) {
+  color: #4338ca;
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+
+.review-group-drag-handle:focus-visible {
+  color: #4338ca;
+  border-color: #818cf8;
+  outline: 3px solid rgba(99, 102, 241, .16);
+  outline-offset: 1px;
+}
+
+.review-group-drag-handle:active:not(:disabled) {
+  cursor: grabbing;
+}
+
+.review-group-drag-handle:disabled {
+  cursor: not-allowed;
+  opacity: .45;
 }
 
 .material-type-icon,
@@ -380,6 +446,7 @@
 .material-type-icon {
   width: 34px;
   height: 34px;
+  margin-top: 1px;
 }
 
 .review-group-title h4 {
@@ -396,6 +463,19 @@
 .review-group-title span {
   color: #7c8798;
   font-size: 12px;
+}
+
+.review-group-summary {
+  display: -webkit-box;
+  max-width: 880px;
+  margin: 7px 0 0;
+  overflow: hidden;
+  color: #526174;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .group-count {
@@ -418,6 +498,12 @@
   align-items: center;
   flex-shrink: 0;
   gap: 4px;
+}
+
+.review-group-step-actions {
+  display: none;
+  align-items: center;
+  gap: 2px;
 }
 
 .review-card-grid {
@@ -781,8 +867,8 @@
   grid-template-columns: 16px 28px minmax(0, 1fr) auto 60px;
   align-items: center;
   gap: 8px;
-  min-height: 60px;
-  padding: 8px 12px;
+  min-height: 84px;
+  padding: 10px 12px;
   border-bottom: 1px solid #f0f2f5;
 }
 
@@ -828,6 +914,20 @@
   margin-top: 3px;
   color: #94a3b8;
   font-size: 10px;
+}
+
+.material-row-summary {
+  display: -webkit-box;
+  grid-column: 3 / -1;
+  min-width: 0;
+  margin: -2px 0 0;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .material-status {
@@ -1105,6 +1205,13 @@
   .review-stat small { line-height: 1.35; }
   .progress-stat { grid-column: span 2; }
   .review-card-grid { grid-template-columns: 1fr; padding: 9px; }
+  .review-group-header { gap: 7px; padding: 10px; }
+  .review-group-title { gap: 7px; }
+  .review-group-drag-handle { display: none; }
+  .review-group-step-actions { display: flex; }
+  .material-type-icon { width: 30px; height: 30px; }
+  .review-group-title h4 { white-space: normal; line-height: 1.35; }
+  .review-group-summary { margin-top: 5px; -webkit-line-clamp: 2; }
   .review-side-column { display: flex; }
   .review-settings-form input[type="number"],
   .review-settings-form input[type="time"],
@@ -1118,9 +1225,15 @@
   .review-delete-dialog { width: 100%; border-radius: 8px 8px 0 0; }
 }
 
+@media (hover: none), (pointer: coarse) {
+  .review-group-drag-handle { display: none; }
+  .review-group-step-actions { display: flex; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .spin,
   .review-progress i,
+  .review-material-group,
   .outline-action,
   .danger-action,
   .rating-button { animation: none; transition: none; }

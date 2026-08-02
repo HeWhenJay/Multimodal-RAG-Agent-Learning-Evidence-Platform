@@ -197,6 +197,8 @@ CREATE TABLE learning_evidence.learning_review_material (
     index_request_version INTEGER NOT NULL DEFAULT 0,
     is_learning_content BOOLEAN,
     category VARCHAR(80),
+    summary TEXT,
+    display_order INTEGER,
     status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
     reason VARCHAR(500),
     extractor VARCHAR(40),
@@ -213,6 +215,10 @@ CREATE INDEX idx_learning_review_material_user_status
 
 CREATE INDEX idx_learning_review_material_sync
     ON learning_evidence.learning_review_material(user_id, index_request_version);
+
+CREATE INDEX idx_learning_review_material_user_order
+    ON learning_evidence.learning_review_material(user_id, display_order, material_id)
+    WHERE is_learning_content IS TRUE AND status = 'GENERATED';
 
 CREATE TABLE learning_evidence.learning_review_card (
     id BIGSERIAL PRIMARY KEY,

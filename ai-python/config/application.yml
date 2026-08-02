@@ -91,6 +91,16 @@ rag:
   staging-retention-hours: ${RAG_STAGING_RETENTION_HOURS:24}
   staging-failed-retention-hours: ${RAG_STAGING_FAILED_RETENTION_HOURS:168}
 
+review:
+  llm:
+    # 固定使用 DeepSeek 官方最新正式版别名与最高思考强度，不继承通用 RAG 配置。
+    model: deepseek-v4-flash
+    reasoning-effort: max
+    thinking-enabled: true
+    base-url: https://api.deepseek.com
+    api-key: ${DEEPSEEK_API_KEY:}
+    timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:120}
+
 workers:
   # run.py 统一监督 API、cron、RAG、Agent 和 Kafka worker；worker 均不在 Web 进程内执行。
   cron:

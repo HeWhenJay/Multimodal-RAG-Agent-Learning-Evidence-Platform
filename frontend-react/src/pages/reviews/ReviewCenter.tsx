@@ -1,5 +1,7 @@
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   ArrowUpRight,
   Bell,
   BellRing,
@@ -11,6 +13,7 @@ import {
   EyeOff,
   FileText,
   FileVideo2,
+  GripVertical,
   Loader2,
   RefreshCw,
   Save,
@@ -19,7 +22,7 @@ import {
   Trash2,
   X
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type Dispatch, type FormEvent, type MutableRefObject, type SetStateAction } from 'react';
+import { useCallback, useEffect, useRef, useState, type Dispatch, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MutableRefObject, type SetStateAction } from 'react';
 import { MarkdownText } from '../../components/MarkdownText';
 import {
   REVIEW_OVERVIEW_UPDATED_EVENT,
@@ -35,6 +38,7 @@ import {
   generateReviewMaterial,
   gradeReviewCard,
   syncReviewMaterials,
+  updateDueReviewGroupOrder,
   updateReviewSettings,
   type ReviewCard,
   type ReviewCardGroup,
@@ -100,18 +104,40 @@ export function ReviewCenter() {
   const [settingsMessage, setSettingsMessage] = useState('');
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(readNotificationPermission());
   const [busyMaterialId, setBusyMaterialId] = useState<number | null>(null);
+  const [draggingMaterialId, setDraggingMaterialId] = useState<number | null>(null);
+  const [orderSaving, setOrderSaving] = useState(false);
+  const [orderMessage, setOrderMessage] = useState('');
+  const [orderError, setOrderError] = useState('');
   const settingsDirtyRef = useRef(false);
   const syncPromiseRef = useRef<Promise<ReviewSyncResult> | null>(null);
   const reviewStartedAtRef = useRef<Record<number, number>>({});
+  const groupsRef = useRef<ReviewCardGroup[]>([]);
+  const groupReadVersionRef = useRef(0);
+  const orderInteractionRef = useRef(false);
+  const dragSourceIdRef = useRef<number | null>(null);
+  const dragSnapshotOrderRef = useRef<number[]>([]);
+  const dragDropHandledRef = useRef(false);
 
-  const dueCount = overview?.actionableDueCount ?? groups.reduce((count, group) => count + group.dueCardCount, 0);
+  // 服务端的 actionableDueCount 表示当前还能进入队列的资料份数，而非卡片数。
+  const dueMaterialCount = overview?.actionableDueCount ?? groups.length;
   const dailyLimit = overview?.settings.dailyLimit || settingsDraft.dailyLimit || 20;
   const reviewProgress = Math.min(100, Math.round(((overview?.todayReviewedCount || 0) / Math.max(1, dailyLimit)) * 100));
   const selectedCardIdList = selectedIds(selectedCardIds);
   const selectedMaterialIdList = selectedIds(selectedMaterialIds);
 
+  // 同步维护可立即读取的 group 引用，拖拽事件无需等待 React 批量提交状态。
+  const updateGroups = useCallback((update: SetStateAction<ReviewCardGroup[]>) => {
+    const next = typeof update === 'function'
+      ? (update as (value: ReviewCardGroup[]) => ReviewCardGroup[])(groupsRef.current)
+      : update;
+    groupsRef.current = next;
+    setGroups(next);
+  }, []);
+
   // 同时读取概览、分组队列和资料状态，单个区域失败时保留其余数据。
   const loadData = useCallback(async () => {
+    const groupReadVersion = ++groupReadVersionRef.current;
+    const groupsMayApply = !orderInteractionRef.current;
     const results = await Promise.allSettled([
       fetchReviewOverview(),
       fetchDueReviewGroups(100),
@@ -128,10 +154,10 @@ export function ReviewCenter() {
     } else {
       failures.push('复习概览');
     }
-    if (groupsResult.status === 'fulfilled') {
-      setGroups(groupsResult.value.groups);
+    if (groupsResult.status === 'fulfilled' && groupsMayApply && groupReadVersion === groupReadVersionRef.current && !orderInteractionRef.current) {
+      updateGroups(groupsResult.value.groups);
     } else {
-      failures.push('复习卡片');
+      if (groupsResult.status === 'rejected') failures.push('复习卡片');
     }
     if (materialsResult.status === 'fulfilled') {
       setMaterials(materialsResult.value);
@@ -140,7 +166,7 @@ export function ReviewCenter() {
     }
     if (failures.length === 3) throw new Error('复习数据加载失败，请稍后重试');
     setError(failures.length ? `${failures.join('、')}暂时不可用` : '');
-  }, []);
+  }, [updateGroups]);
 
   // 页面首次打开时增量同步已完成 RAG 入库的资料，再读取最新队列。
   useEffect(() => {
@@ -186,12 +212,16 @@ export function ReviewCenter() {
   // 到期时间和评分日志由服务端维护，页面定时或重新聚焦时刷新概览与分组队列。
   useEffect(() => {
     const refresh = () => {
+      const groupReadVersion = ++groupReadVersionRef.current;
+      const groupsMayApply = !orderInteractionRef.current;
       void Promise.allSettled([fetchReviewOverview(), fetchDueReviewGroups(100)]).then(([overviewResult, groupsResult]) => {
         if (overviewResult.status === 'fulfilled') {
           setOverview(overviewResult.value);
           if (!settingsDirtyRef.current) setSettingsDraft(normalizeSettings(overviewResult.value.settings));
         }
-        if (groupsResult.status === 'fulfilled') setGroups(groupsResult.value.groups);
+        if (groupsResult.status === 'fulfilled' && groupsMayApply && groupReadVersion === groupReadVersionRef.current && !orderInteractionRef.current) {
+          updateGroups(groupsResult.value.groups);
+        }
       });
     };
     const timer = window.setInterval(refresh, 60_000);
@@ -200,7 +230,7 @@ export function ReviewCenter() {
       window.clearInterval(timer);
       window.removeEventListener('focus', refresh);
     };
-  }, []);
+  }, [updateGroups]);
 
   // 上传新资料后只触发一次增量同步，不在普通概览轮询中重复调用模型。
   useEffect(() => {
@@ -222,6 +252,128 @@ export function ReviewCenter() {
     } finally {
       setSyncing(false);
     }
+  }
+
+  // 开始一次排序交互，并使更早发出的 group 查询结果失效。
+  function beginOrderInteraction() {
+    if (orderInteractionRef.current || loading || deletingKey !== null || deleteTarget !== null || groupsRef.current.length < 2) return false;
+    orderInteractionRef.current = true;
+    groupReadVersionRef.current += 1;
+    setOrderMessage('');
+    setOrderError('');
+    return true;
+  }
+
+  // 结束排序时再次推进读取版本，丢弃排序期间开始的旧顺序请求。
+  function finishOrderInteraction() {
+    orderInteractionRef.current = false;
+    groupReadVersionRef.current += 1;
+    setOrderSaving(false);
+    setDraggingMaterialId(null);
+  }
+
+  // 乐观顺序提交失败时只恢复资料次序，保留期间发生的卡片评分等内容变化。
+  async function persistGroupOrder(previousOrder: number[], successMessage: string) {
+    const materialIds = materialOrder(groupsRef.current);
+    if (sameNumberOrder(previousOrder, materialIds)) {
+      finishOrderInteraction();
+      return;
+    }
+    setOrderSaving(true);
+    try {
+      const saved = await updateDueReviewGroupOrder(materialIds);
+      updateGroups((current) => orderGroupsByMaterialIds(current, saved.materialIds));
+      setOrderMessage(successMessage);
+    } catch (orderFailure) {
+      updateGroups((current) => orderGroupsByMaterialIds(current, previousOrder));
+      setOrderError(orderFailure instanceof Error ? `优先级保存失败，已恢复原顺序：${orderFailure.message}` : '优先级保存失败，已恢复原顺序');
+    } finally {
+      finishOrderInteraction();
+    }
+  }
+
+  // 触摸按钮和键盘共用同一移动入口，每次移动立即保存完整可见顺序。
+  function moveGroupToIndex(materialId: number, targetIndex: number) {
+    if (!beginOrderInteraction()) return;
+    const previousOrder = materialOrder(groupsRef.current);
+    const currentIndex = groupsRef.current.findIndex((group) => group.materialId === materialId);
+    const boundedTarget = Math.max(0, Math.min(groupsRef.current.length - 1, targetIndex));
+    if (currentIndex < 0 || currentIndex === boundedTarget) {
+      finishOrderInteraction();
+      return;
+    }
+    const moved = moveGroup(groupsRef.current, materialId, boundedTarget);
+    updateGroups(moved);
+    const title = moved[boundedTarget]?.materialTitle || '资料';
+    void persistGroupOrder(previousOrder, `已将“${title}”调整到第 ${boundedTarget + 1} 位`);
+  }
+
+  // 桌面端只允许从标题手柄开始拖拽，并保存拖拽前的稳定顺序用于失败回滚。
+  function handleGroupDragStart(event: ReactDragEvent<HTMLButtonElement>, materialId: number) {
+    if (!beginOrderInteraction()) {
+      event.preventDefault();
+      return;
+    }
+    dragSourceIdRef.current = materialId;
+    dragSnapshotOrderRef.current = materialOrder(groupsRef.current);
+    dragDropHandledRef.current = false;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(materialId));
+    setDraggingMaterialId(materialId);
+  }
+
+  // 指针进入其他资料组时立即重排，用户无需等待松手才看到目标位置。
+  function handleGroupDragEnter(targetMaterialId: number) {
+    const sourceMaterialId = dragSourceIdRef.current;
+    if (sourceMaterialId == null || sourceMaterialId === targetMaterialId) return;
+    const targetIndex = groupsRef.current.findIndex((group) => group.materialId === targetMaterialId);
+    if (targetIndex < 0) return;
+    updateGroups(moveGroup(groupsRef.current, sourceMaterialId, targetIndex));
+  }
+
+  function handleGroupDragOver(event: ReactDragEvent<HTMLElement>) {
+    if (dragSourceIdRef.current == null) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }
+
+  // 松手后只发一次批量排序请求，避免拖动过程产生请求风暴。
+  function handleGroupDrop(event: ReactDragEvent<HTMLElement>) {
+    if (dragSourceIdRef.current == null) return;
+    event.preventDefault();
+    dragDropHandledRef.current = true;
+    dragSourceIdRef.current = null;
+    setDraggingMaterialId(null);
+    void persistGroupOrder(dragSnapshotOrderRef.current, '今日资料优先级已保存');
+  }
+
+  // 拖拽被 Esc 或移出列表取消时恢复拖拽前顺序，不向服务端写入。
+  function handleGroupDragEnd() {
+    if (dragDropHandledRef.current) {
+      dragDropHandledRef.current = false;
+      return;
+    }
+    if (dragSourceIdRef.current != null) {
+      updateGroups((current) => orderGroupsByMaterialIds(current, dragSnapshotOrderRef.current));
+    }
+    dragSourceIdRef.current = null;
+    finishOrderInteraction();
+  }
+
+  // 手柄获得焦点后支持方向键逐项移动，Home/End 可快速置顶或置底。
+  function handleGroupOrderKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, materialId: number, currentIndex: number) {
+    const targetIndex = event.key === 'ArrowUp'
+      ? currentIndex - 1
+      : event.key === 'ArrowDown'
+        ? currentIndex + 1
+        : event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? groupsRef.current.length - 1
+            : null;
+    if (targetIndex == null) return;
+    event.preventDefault();
+    moveGroupToIndex(materialId, targetIndex);
   }
 
   // 用户主动揭示单张卡片的答案和原文 evidence。
@@ -266,6 +418,8 @@ export function ReviewCenter() {
   }
 
   async function refreshAfterGrade() {
+    const groupReadVersion = ++groupReadVersionRef.current;
+    const groupsMayApply = !orderInteractionRef.current;
     const results = await Promise.allSettled([
       fetchReviewOverview(),
       fetchDueReviewGroups(100),
@@ -276,13 +430,16 @@ export function ReviewCenter() {
       if (!settingsDirtyRef.current) setSettingsDraft(normalizeSettings(results[0].value.settings));
       publishOverviewEvent();
     }
-    if (results[1].status === 'fulfilled') setGroups(results[1].value.groups);
+    if (results[1].status === 'fulfilled' && groupsMayApply && groupReadVersion === groupReadVersionRef.current && !orderInteractionRef.current) {
+      updateGroups(results[1].value.groups);
+    }
     if (results[2].status === 'fulfilled') setMaterials(results[2].value);
   }
 
   function removeCards(cardIds: number[]) {
     const removed = new Set(cardIds);
-    setGroups((previous) => previous
+    groupReadVersionRef.current += 1;
+    updateGroups((previous) => previous
       .map((group) => {
         const cards = group.cards.filter((card) => !removed.has(card.id));
         return { ...group, cards, dueCardCount: cards.length };
@@ -292,7 +449,8 @@ export function ReviewCenter() {
 
   function removeMaterialsFromView(materialIds: number[]) {
     const removed = new Set(materialIds);
-    setGroups((previous) => previous.filter((group) => !removed.has(group.materialId)));
+    groupReadVersionRef.current += 1;
+    updateGroups((previous) => previous.filter((group) => !removed.has(group.materialId)));
     setMaterials((previous) => previous.filter((material) => {
       const materialId = resolveMaterialId(material);
       return materialId == null || !removed.has(materialId);
@@ -426,6 +584,8 @@ export function ReviewCenter() {
   }
 
   const totalCards = groups.reduce((count, group) => count + group.cards.length, 0);
+  const orderBusy = draggingMaterialId !== null || orderSaving;
+  const orderControlsDisabled = loading || orderSaving || deletingKey !== null || deleteTarget !== null || groups.length < 2;
 
   return (
     <div className="review-center-page">
@@ -436,11 +596,11 @@ export function ReviewCenter() {
           <p>按资料整理的到期知识点</p>
         </div>
         <div className="review-header-actions">
-          <button className="outline-action" type="button" onClick={() => void runSync()} disabled={syncing}>
+          <button className="outline-action" type="button" onClick={() => void runSync()} disabled={syncing || orderBusy}>
             {syncing ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
             {syncing ? '同步中' : '同步资料'}
           </button>
-          <button className="icon-button compact" type="button" title="刷新复习数据" aria-label="刷新复习数据" onClick={() => void loadData()}>
+          <button className="icon-button compact" type="button" title="刷新复习数据" aria-label="刷新复习数据" onClick={() => void loadData()} disabled={orderBusy}>
             <RefreshCw size={17} />
           </button>
         </div>
@@ -452,23 +612,31 @@ export function ReviewCenter() {
       {gradeError ? <div className="review-alert danger"><CircleAlert size={17} />{gradeError}</div> : null}
       {deleteMessage ? <div className="review-alert success"><Check size={17} />{deleteMessage}</div> : null}
       {deleteError ? <div className="review-alert danger"><CircleAlert size={17} />{deleteError}</div> : null}
+      {orderMessage ? <div className="review-alert success" role="status"><Check size={17} />{orderMessage}</div> : null}
+      {orderError ? <div className="review-alert danger" role="alert"><CircleAlert size={17} />{orderError}</div> : null}
 
       <section className="review-stat-strip" aria-label="复习统计">
-        <div className="review-stat primary"><span>今日待复习</span><strong>{dueCount}</strong><small>{overview && overview.dueCount > dueCount ? `到期积压 ${overview.dueCount} 张` : totalCards ? `当前展示 ${totalCards} 张` : '队列已清空'}</small></div>
-        <div className="review-stat"><span>今日已完成</span><strong>{overview?.todayReviewedCount ?? '--'}</strong><small>每日上限 {dailyLimit} 张</small></div>
+        <div className="review-stat primary"><span>今日待复习资料</span><strong>{dueMaterialCount}</strong><small>{overview && overview.dueCount > totalCards ? `到期积压 ${overview.dueCount} 张卡片` : totalCards ? `当前展示 ${groups.length} 份资料 · ${totalCards} 张卡片` : '队列已清空'}</small></div>
+        <div className="review-stat"><span>今日已复习资料</span><strong>{overview?.todayReviewedCount ?? '--'}</strong><small>每日上限 {dailyLimit} 份资料</small></div>
         <div className="review-stat"><span>学习资料</span><strong>{overview?.activeMaterialCount ?? '--'}</strong><small>已生成复习卡片的资料</small></div>
-        <div className="review-stat progress-stat"><div><span>今日进度</span><strong>{reviewProgress}%</strong></div><div className="review-progress"><i style={{ width: `${reviewProgress}%` }} /></div><small>{overview?.nextDueAt ? `下一张 ${formatTime(overview.nextDueAt)}` : '暂无下一张'}</small></div>
+        <div className="review-stat progress-stat"><div><span>今日进度</span><strong>{reviewProgress}%</strong></div><div className="review-progress"><i style={{ width: `${reviewProgress}%` }} /></div><small>{overview?.nextDueAt ? `下一张卡片 ${formatTime(overview.nextDueAt)}` : '暂无下一张'}</small></div>
       </section>
 
       <div className="review-content-grid">
         <section className="review-queue-column" aria-labelledby="review-queue-title">
-          <div className="review-section-heading"><div><h3 id="review-queue-title">今日卡片</h3><span>{groups.length ? `${groups.length} 份资料` : '暂无到期资料'}</span></div><div className="review-section-actions">{selectedCardIdList.length ? <button className="outline-action small danger-outline" type="button" onClick={requestCardBatchDeletion} disabled={deletingKey !== null}><Trash2 size={14} />删除选中 {selectedCardIdList.length}</button> : <Clock3 size={18} />}</div></div>
+          <div className="review-section-heading"><div><h3 id="review-queue-title">今日复习资料</h3><span>{groups.length ? `${groups.length} 份资料 · ${totalCards} 张卡片` : '暂无到期资料'}</span></div><div className="review-section-actions">{orderSaving ? <span className="review-order-saving" role="status"><Loader2 className="spin" size={14} />保存排序</span> : selectedCardIdList.length ? <button className="outline-action small danger-outline" type="button" onClick={requestCardBatchDeletion} disabled={deletingKey !== null || orderBusy}><Trash2 size={14} />删除选中 {selectedCardIdList.length}</button> : <Clock3 size={18} />}</div></div>
+          <p className="review-visually-hidden" id="review-order-instructions">拖动手柄调整资料优先级；键盘可使用上下方向键移动，Home 置顶，End 置底。</p>
           {loading ? <div className="review-loading"><Loader2 className="spin" size={22} /><span>正在读取复习队列</span></div> : null}
           {!loading && groups.length === 0 ? <EmptyReviewQueue onSync={() => void runSync()} syncing={syncing} /> : null}
-          {!loading && groups.length > 0 ? groups.map((group) => (
+          {!loading && groups.length > 0 ? groups.map((group, groupIndex) => (
             <ReviewMaterialGroup
               key={group.materialId}
               group={group}
+              position={groupIndex}
+              groupCount={groups.length}
+              dragging={draggingMaterialId === group.materialId}
+              ordering={orderBusy}
+              orderDisabled={orderControlsDisabled}
               revealedCards={revealedCards}
               hintCardIds={hintCardIds}
               selectedCardIds={selectedCardIds}
@@ -483,6 +651,13 @@ export function ReviewCenter() {
               onDeleteCard={requestCardDeletion}
               onDeleteMaterial={() => requestMaterialDeletion(group.materialId, group.materialTitle)}
               onToggleSelected={(cardId) => setSelectedCardIds((previous) => toggleSelected(previous, cardId))}
+              onMove={(targetIndex) => moveGroupToIndex(group.materialId, targetIndex)}
+              onOrderKeyDown={(event) => handleGroupOrderKeyDown(event, group.materialId, groupIndex)}
+              onDragStart={(event) => handleGroupDragStart(event, group.materialId)}
+              onDragEnter={() => handleGroupDragEnter(group.materialId)}
+              onDragOver={handleGroupDragOver}
+              onDrop={handleGroupDrop}
+              onDragEnd={handleGroupDragEnd}
             />
           )) : null}
         </section>
@@ -493,7 +668,7 @@ export function ReviewCenter() {
             <form onSubmit={saveSettings} className="review-settings-form">
               <label className="review-toggle-row"><span><strong>每日提醒</strong><small>到期后显示浏览器提醒</small></span><input type="checkbox" checked={settingsDraft.enabled} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { enabled: event.target.checked })} /></label>
               <label><span>目标记忆率</span><div className="input-with-suffix"><input type="number" min="0.8" max="0.97" step="0.01" value={settingsDraft.desiredRetention} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { desiredRetention: Number(event.target.value) })} /><em>{formatRetention(settingsDraft.desiredRetention)}</em></div></label>
-              <label><span>每日上限</span><div className="input-with-suffix"><input type="number" min="1" max="100" step="1" value={settingsDraft.dailyLimit} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { dailyLimit: Number(event.target.value) })} /><em>张</em></div></label>
+              <label><span>每日文档上限</span><div className="input-with-suffix"><input type="number" min="1" max="100" step="1" value={settingsDraft.dailyLimit} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { dailyLimit: Number(event.target.value) })} /><em>份</em></div></label>
               <label><span>提醒时间</span><input type="time" value={settingsDraft.reminderTime} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { reminderTime: event.target.value })} /></label>
               <label><span>时区</span><select value={settingsDraft.timezone} onChange={(event) => updateDraft(setSettingsDraft, settingsDirtyRef, { timezone: event.target.value })}>{TIMEZONE_OPTIONS.map((timezone) => <option key={timezone} value={timezone}>{timezone}</option>)}</select></label>
               <button className="primary-action full" type="submit" disabled={settingsSaving}>{settingsSaving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}{settingsSaving ? '保存中' : '保存设置'}</button>
@@ -504,11 +679,11 @@ export function ReviewCenter() {
 
           <section className="review-panel materials-panel">
             <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料分组</h3></div><span>{materials.length}</span></div>
-            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份</span><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null}><Trash2 size={14} />批量移出</button></div> : null}
+            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份</span><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy}><Trash2 size={14} />批量移出</button></div> : null}
             <div className="review-material-list">
               {materials.length ? materials.map((material) => {
                 const materialId = resolveMaterialId(material);
-                return <ReviewMaterialRow key={materialId ?? material.title} material={material} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+                return <ReviewMaterialRow key={materialId ?? material.title} material={material} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
               }) : <p className="panel-empty">暂无已索引资料</p>}
             </div>
           </section>
@@ -523,6 +698,11 @@ export function ReviewCenter() {
 
 function ReviewMaterialGroup({
   group,
+  position,
+  groupCount,
+  dragging,
+  ordering,
+  orderDisabled,
   revealedCards,
   hintCardIds,
   selectedCardIds,
@@ -536,9 +716,21 @@ function ReviewMaterialGroup({
   onGrade,
   onDeleteCard,
   onDeleteMaterial,
-  onToggleSelected
+  onToggleSelected,
+  onMove,
+  onOrderKeyDown,
+  onDragStart,
+  onDragEnter,
+  onDragOver,
+  onDrop,
+  onDragEnd
 }: {
   group: ReviewCardGroup;
+  position: number;
+  groupCount: number;
+  dragging: boolean;
+  ordering: boolean;
+  orderDisabled: boolean;
   revealedCards: Record<number, ReviewCard>;
   hintCardIds: Record<number, boolean>;
   selectedCardIds: Record<number, boolean>;
@@ -553,15 +745,54 @@ function ReviewMaterialGroup({
   onDeleteCard: (card: ReviewCard) => void;
   onDeleteMaterial: () => void;
   onToggleSelected: (cardId: number) => void;
+  onMove: (targetIndex: number) => void;
+  onOrderKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
+  onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void;
+  onDragEnter: () => void;
+  onDragOver: (event: ReactDragEvent<HTMLElement>) => void;
+  onDrop: (event: ReactDragEvent<HTMLElement>) => void;
+  onDragEnd: () => void;
 }) {
+  const summary = materialSummary(group.materialSummary);
   return (
-    <section className="review-material-group">
+    <section
+      className={`review-material-group${dragging ? ' is-dragging' : ''}`}
+      aria-label={`${group.materialTitle}，优先级第 ${position + 1} 位`}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <header className="review-group-header">
-        <div className="review-group-title"><span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span><div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期</span></div></div>
-        <div className="review-group-actions"><span className="group-count">{group.cards.length}</span><button className="icon-button tiny danger" type="button" title="将资料移出复习中心" aria-label={`将 ${group.materialTitle} 移出复习中心`} onClick={onDeleteMaterial} disabled={deletingKey !== null}>{deletingKey === `MATERIAL:${group.materialId}` ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div>
+        <div className="review-group-title">
+          <button
+            className="review-group-drag-handle"
+            type="button"
+            draggable={!orderDisabled}
+            disabled={orderDisabled}
+            title="拖拽调整优先级；键盘使用方向键"
+            aria-label={`调整 ${group.materialTitle} 的优先级，当前第 ${position + 1} 位`}
+            aria-describedby="review-order-instructions"
+            aria-keyshortcuts="ArrowUp ArrowDown Home End"
+            onKeyDown={onOrderKeyDown}
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
+          >
+            <GripVertical size={17} />
+          </button>
+          <span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span>
+          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · 优先级 {position + 1}</span><p className="review-group-summary" title={summary}>{summary}</p></div>
+        </div>
+        <div className="review-group-actions">
+          <div className="review-group-step-actions" aria-label="调整资料优先级">
+            <button className="icon-button tiny" type="button" title="上移资料" aria-label={`上移 ${group.materialTitle}`} onClick={() => onMove(position - 1)} disabled={orderDisabled || ordering || position === 0}><ArrowUp size={14} /></button>
+            <button className="icon-button tiny" type="button" title="下移资料" aria-label={`下移 ${group.materialTitle}`} onClick={() => onMove(position + 1)} disabled={orderDisabled || ordering || position === groupCount - 1}><ArrowDown size={14} /></button>
+          </div>
+          <span className="group-count">{group.cards.length}</span>
+          <button className="icon-button tiny danger" type="button" title="将资料移出复习中心" aria-label={`将 ${group.materialTitle} 移出复习中心`} onClick={onDeleteMaterial} disabled={deletingKey !== null || ordering}>{deletingKey === `MATERIAL:${group.materialId}` ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
+        </div>
       </header>
       <div className="review-card-grid">
-        {group.cards.map((card) => <ReviewQuestionCard key={card.id} card={card} revealed={revealedCards[card.id]} selected={Boolean(selectedCardIds[card.id])} showHint={Boolean(hintCardIds[card.id])} revealLoading={revealLoadingId === card.id} grading={gradingId === card.id} deleting={deletingKey === `CARD:${card.id}`} onToggleSelected={() => onToggleSelected(card.id)} onReveal={() => onReveal(card)} onHide={() => onHide(card.id)} onToggleHint={() => onToggleHint(card.id)} onOriginal={() => onOriginal(revealedCards[card.id] || card)} onGrade={(rating) => onGrade(card, rating)} onDelete={() => onDeleteCard(card)} />)}
+        {group.cards.map((card) => <ReviewQuestionCard key={card.id} card={card} revealed={revealedCards[card.id]} selected={Boolean(selectedCardIds[card.id])} showHint={Boolean(hintCardIds[card.id])} revealLoading={revealLoadingId === card.id} grading={gradingId === card.id} deleting={deletingKey === `CARD:${card.id}`} locked={ordering} onToggleSelected={() => onToggleSelected(card.id)} onReveal={() => onReveal(card)} onHide={() => onHide(card.id)} onToggleHint={() => onToggleHint(card.id)} onOriginal={() => onOriginal(revealedCards[card.id] || card)} onGrade={(rating) => onGrade(card, rating)} onDelete={() => onDeleteCard(card)} />)}
       </div>
     </section>
   );
@@ -575,6 +806,7 @@ function ReviewQuestionCard({
   revealLoading,
   grading,
   deleting,
+  locked,
   onToggleSelected,
   onReveal,
   onHide,
@@ -590,6 +822,7 @@ function ReviewQuestionCard({
   revealLoading: boolean;
   grading: boolean;
   deleting: boolean;
+  locked: boolean;
   onToggleSelected: () => void;
   onReveal: () => void;
   onHide: () => void;
@@ -601,7 +834,7 @@ function ReviewQuestionCard({
   const isRevealed = Boolean(revealed?.answer);
   return (
     <article className={`review-question-card${isRevealed ? ' is-revealed' : ''}${selected ? ' is-selected' : ''}`}>
-      <div className="review-card-meta"><div className="review-card-meta-leading"><input type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择卡片：${card.question}`} /><span>知识点 {card.reviewCount > 0 ? `· 已复习 ${card.reviewCount} 次` : '· 首次复习'}</span></div><div className="review-card-meta-actions"><time>{formatDueDate(card.dueAt)}</time><button className="icon-button tiny danger" type="button" title="删除卡片" aria-label={`删除卡片：${card.question}`} onClick={onDelete} disabled={deleting}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div></div>
+      <div className="review-card-meta"><div className="review-card-meta-leading"><input type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择卡片：${card.question}`} /><span>知识点 {card.reviewCount > 0 ? `· 已复习 ${card.reviewCount} 次` : '· 首次复习'}</span></div><div className="review-card-meta-actions"><time>{formatDueDate(card.dueAt)}</time><button className="icon-button tiny danger" type="button" title="删除卡片" aria-label={`删除卡片：${card.question}`} onClick={onDelete} disabled={deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div></div>
       <h5>{card.question}</h5>
       {!isRevealed ? (
         <div className="review-card-collapsed-actions">
@@ -715,8 +948,14 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, selected, busy, deleting, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div></div>;
+function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
+  const summary = materialSummary(material.summary);
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
+}
+
+// 统一压缩接口摘要中的空白，未生成时保持稳定、简洁的占位状态。
+function materialSummary(summary?: string | null): string {
+  return summary?.replace(/\s+/g, ' ').trim() || '摘要生成中';
 }
 
 function EmptyReviewQueue({ onSync, syncing }: { onSync: () => void; syncing: boolean }) {
@@ -754,6 +993,34 @@ function selectedIds(value: Record<number, boolean>): number[] {
     .map(([id]) => Number(id))
     .filter(Number.isFinite)
     .sort((left, right) => left - right);
+}
+
+// 提取当前可见 group 的资料顺序，作为排序接口的完整批量载荷。
+function materialOrder(groups: ReviewCardGroup[]): number[] {
+  return groups.map((group) => group.materialId);
+}
+
+// 将一个资料组移动到指定索引，卡片内容和对象引用保持不变。
+function moveGroup(groups: ReviewCardGroup[], materialId: number, targetIndex: number): ReviewCardGroup[] {
+  const sourceIndex = groups.findIndex((group) => group.materialId === materialId);
+  if (sourceIndex < 0 || sourceIndex === targetIndex) return groups;
+  const next = [...groups];
+  const [moved] = next.splice(sourceIndex, 1);
+  next.splice(Math.max(0, Math.min(next.length, targetIndex)), 0, moved);
+  return next;
+}
+
+// 按服务端最近一次稳定顺序重排现有 group，未知或新出现的资料保持在末尾。
+function orderGroupsByMaterialIds(groups: ReviewCardGroup[], materialIds: number[]): ReviewCardGroup[] {
+  const rank = new Map(materialIds.map((materialId, index) => [materialId, index]));
+  return groups
+    .map((group, index) => ({ group, index }))
+    .sort((left, right) => (rank.get(left.group.materialId) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.group.materialId) ?? Number.MAX_SAFE_INTEGER) || left.index - right.index)
+    .map(({ group }) => group);
+}
+
+function sameNumberOrder(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function deletionKey(target: ReviewDeleteTarget): string {

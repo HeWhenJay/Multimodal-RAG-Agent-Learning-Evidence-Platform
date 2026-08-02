@@ -44,6 +44,7 @@ export interface ReviewOverview {
 export interface ReviewCardGroup {
   materialId: number;
   materialTitle: string;
+  materialSummary?: string | null;
   documentType: string;
   dueCardCount: number;
   cards: ReviewCard[];
@@ -67,6 +68,7 @@ export interface ReviewMaterial {
   id?: number;
   materialTitle?: string | null;
   title: string;
+  summary?: string | null;
   documentType: string;
   materialStatus?: string | null;
   isLearningContent?: boolean | null;
@@ -112,6 +114,11 @@ export interface ReviewBatchDeletionResult {
   materialIds: number[];
 }
 
+export interface ReviewGroupOrderResult {
+  materialIds: number[];
+  orderedCount: number;
+}
+
 // 统一处理复习接口响应，并自动携带当前登录用户的令牌。
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAuthToken();
@@ -150,6 +157,15 @@ export function fetchDueReviewCards(limit = 20): Promise<ReviewCard[]> {
 // 按上传资料读取每日到期卡片，页面以 group 展示同一份文档的多个知识点。
 export function fetchDueReviewGroups(limit = 20): Promise<ReviewDueGroups> {
   return request<ReviewDueGroups>(`/api/reviews/due-groups?limit=${encodeURIComponent(String(limit))}`);
+}
+
+// 一次提交当前可见资料组的完整顺序，服务端按用户持久保存优先级。
+export function updateDueReviewGroupOrder(materialIds: number[]): Promise<ReviewGroupOrderResult> {
+  return request<ReviewGroupOrderResult>('/api/reviews/due-groups/order', {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify({ materialIds })
+  });
 }
 
 // 用户主动揭示时读取答案和完整原文 evidence，避免到期列表提前暴露答案。

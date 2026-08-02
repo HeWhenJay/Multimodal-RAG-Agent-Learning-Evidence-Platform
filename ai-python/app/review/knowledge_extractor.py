@@ -19,6 +19,9 @@ from prompts.review import (
 
 
 logger = logging.getLogger(__name__)
+REVIEW_LLM_MODEL = "deepseek-v4-flash"
+REVIEW_LLM_REASONING_EFFORT = "max"
+REVIEW_LLM_BASE_URL = "https://api.deepseek.com"
 TIMECODE_TOKEN_PATTERN = r"\d{1,2}:\d{2}(?::\d{2})?(?:[,.]\d{1,3})?"
 TIMECODE_RANGE_PATTERN = (
     rf"\s*[\[(]?{TIMECODE_TOKEN_PATTERN}"
@@ -94,6 +97,7 @@ class ExtractionResult:
     reason: str
     knowledge_points: tuple[KnowledgePoint, ...]
     extractor: str
+    summary: str | None = None
 
 
 class KnowledgePointExtractor:
@@ -103,21 +107,14 @@ class KnowledgePointExtractor:
         self,
         *,
         provider: str | None = None,
-        api_key: str | None = None,
-        model: str | None = None,
-        base_url: str | None = None,
     ) -> None:
-        # 默认自动选择模型；未配置密钥时仍保留本地确定性降级。
+        # 复习模型固定走 DeepSeek 官方入口，避免误继承通用 RAG 或代理配置。
         self.provider = (provider or os.getenv("REVIEW_EXTRACTION_PROVIDER") or "auto").strip().lower()
-        self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
-        self.model = model or os.getenv("REVIEW_EXTRACTION_MODEL") or os.getenv("RAG_LLM_MODEL") or "qwen-plus"
-        self.timeout_seconds = float(os.getenv("REVIEW_EXTRACTION_TIMEOUT_SECONDS", "30"))
-        self.base_url = (
-            base_url
-            or os.getenv("REVIEW_EXTRACTION_BASE_URL")
-            or os.getenv("DASHSCOPE_BASE_URL")
-            or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        ).rstrip("/")
+        self.api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        self.model = REVIEW_LLM_MODEL
+        self.reasoning_effort = REVIEW_LLM_REASONING_EFFORT
+        self.timeout_seconds = float(os.getenv("REVIEW_EXTRACTION_TIMEOUT_SECONDS", "120"))
+        self.base_url = REVIEW_LLM_BASE_URL
 
     def extract(
         self,
@@ -133,14 +130,15 @@ class KnowledgePointExtractor:
                 "资料清洗后仅剩时间码、字幕水印、重复字幕或口头语等无效内容",
                 (),
                 f"none:{REVIEW_CARD_PROMPT_VERSION}",
+                existing_material_summary(material),
             )
-        if self.provider in {"auto", "dashscope"} and self.api_key:
+        if self.provider in {"auto", "deepseek"} and self.api_key:
             try:
                 modeled = self._extract_with_model(material, usable)
                 if modeled is not None:
                     return modeled
             except Exception:
-                logger.exception("模型提炼复习知识点失败，已降级为本地确定性提炼")
+                logger.exception("DeepSeek 提炼复习知识点失败，已降级为本地确定性提炼")
         return self._extract_locally(material, usable)
 
     def _extract_with_model(
@@ -148,22 +146,24 @@ class KnowledgePointExtractor:
         material: LearningMaterialContext,
         evidences: list[Evidence],
     ) -> ExtractionResult | None:
-        """调用兼容 OpenAI 协议的百炼模型并校验 evidence 引用。"""
+        """调用 DeepSeek 官方 OpenAI 兼容接口并校验摘要、问句与 evidence 引用。"""
         from openai import OpenAI
 
+        source_questions = extract_source_question_candidates(evidences)
         evidence_payload = [
             {
                 "evidenceId": item.evidenceId,
                 "sectionName": item.sectionName,
                 "snippet": item.snippet,
             }
-            for item in evidences[:12]
+            for item in evidences[:16]
         ]
         prompt = review_card_user_prompt(
             title=material.title,
             document_type=material.document_type,
             summary=material.summary or "",
             evidences=evidence_payload,
+            source_questions=source_questions,
         )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
@@ -172,30 +172,51 @@ class KnowledgePointExtractor:
                 {"role": "system", "content": review_card_system_prompt()},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
+            reasoning_effort=self.reasoning_effort,
             response_format={"type": "json_object"},
+            extra_body={"thinking": {"type": "enabled"}},
             timeout=self.timeout_seconds,
         )
         content = response.choices[0].message.content or ""
         payload = parse_json_object(content)
-        return self._validate_model_result(material, evidences, payload)
+        return self._validate_model_result(
+            material,
+            evidences,
+            payload,
+            source_questions=source_questions,
+        )
 
     def _validate_model_result(
         self,
         material: LearningMaterialContext,
         evidences: list[Evidence],
         payload: dict[str, Any],
+        *,
+        source_questions: list[dict[str, str]] | None = None,
     ) -> ExtractionResult | None:
-        """过滤空卡、虚假引用和超长正文，保留稳定的来源键。"""
+        """过滤虚假引用并仅采纳可追溯到原 evidence 的 sourceQuestion。"""
         raw_learning = payload.get("isLearningContent")
         if not isinstance(raw_learning, bool):
             return None
         is_learning = raw_learning
         reason = compact_text(payload.get("reason"), 240) or "模型完成学习内容判定"
         category = compact_text(payload.get("category"), 60) or ("学习资料" if is_learning else None)
+        summary = resolve_material_summary(material, payload.get("summary"), evidences)
         if not is_learning:
-            return ExtractionResult(False, category, reason, (), f"model:{REVIEW_CARD_PROMPT_VERSION}")
+            return ExtractionResult(
+                False,
+                category,
+                reason,
+                (),
+                f"model:{REVIEW_CARD_PROMPT_VERSION}",
+                summary,
+            )
         evidence_by_id = {item.evidenceId: item for item in evidences}
+        question_candidates = (
+            extract_source_question_candidates(evidences)
+            if source_questions is None
+            else source_questions
+        )
         points: list[KnowledgePoint] = []
         seen_questions: set[str] = set()
         raw_cards = payload.get("cards")
@@ -204,9 +225,8 @@ class KnowledgePointExtractor:
         for index, raw in enumerate(raw_cards, start=1):
             if not isinstance(raw, dict):
                 continue
-            question = compact_text(raw.get("question"), 180)
             answer = normalize_answer_text(raw.get("answer"), 600)
-            if not question or not answer:
+            if not answer:
                 continue
             raw_evidence_ids = raw.get("evidenceIds")
             evidence_ids = raw_evidence_ids if isinstance(raw_evidence_ids, list) else []
@@ -219,8 +239,17 @@ class KnowledgePointExtractor:
                 continue
             if is_noise_fragment(answer):
                 continue
+            source_question = validated_source_question(
+                raw.get("sourceQuestion"),
+                refs,
+                question_candidates,
+            )
+            question = source_question or compact_text(raw.get("question"), 180)
+            if not question:
+                continue
             section = clean_section_name(refs[0].sectionName, material.title)
-            question = normalize_model_question(question, section, answer, index)
+            if source_question is None:
+                question = normalize_model_question(question, section, answer, index)
             question_key = normalized_sentence(question)
             if not question_key or question_key in seen_questions:
                 continue
@@ -242,6 +271,7 @@ class KnowledgePointExtractor:
             reason,
             tuple(points[:8]),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
+            summary,
         )
 
     def _extract_locally(
@@ -249,23 +279,50 @@ class KnowledgePointExtractor:
         material: LearningMaterialContext,
         evidences: list[Evidence],
     ) -> ExtractionResult:
-        """按标题、章节和句子边界生成可复现的本地卡片。"""
+        """优先沿用原始问句，再按重点陈述生成可复现的本地卡片。"""
         is_learning, category, reason = classify_learning_content(material, evidences)
+        summary = resolve_material_summary(material, None, evidences)
         if not is_learning:
-            return ExtractionResult(False, category, reason, (), f"local:{REVIEW_CARD_PROMPT_VERSION}")
+            return ExtractionResult(
+                False,
+                category,
+                reason,
+                (),
+                f"local:{REVIEW_CARD_PROMPT_VERSION}",
+                summary,
+            )
 
-        candidates: list[tuple[Evidence, str]] = []
+        candidates: list[tuple[Evidence, str | None, str]] = []
+        seen_answers: set[str] = set()
+        # 视频讲解和面经中的原始提问优先于自动改写的泛化问题。
         for evidence in evidences:
-            for sentence in split_knowledge_sentences(evidence.snippet):
-                if is_noise_fragment(sentence):
+            for question in extract_source_questions(evidence):
+                answer = answer_for_source_question(evidence.snippet, question)
+                answer_key = normalized_sentence(answer or "")
+                if not answer or not answer_key or answer_key in seen_answers:
                     continue
-                if normalized_sentence(sentence) in {normalized_sentence(item[1]) for item in candidates}:
-                    continue
-                candidates.append((evidence, sentence))
+                seen_answers.add(answer_key)
+                candidates.append((evidence, question, answer))
                 if len(candidates) >= 8:
                     break
             if len(candidates) >= 8:
                 break
+
+        # 只要资料存在可回答的原始问句，本地降级就不再用陈述句凑泛化问题。
+        if not candidates:
+            for evidence in evidences:
+                for sentence in split_knowledge_sentences(evidence.snippet):
+                    if is_noise_fragment(sentence) or looks_like_question(sentence):
+                        continue
+                    sentence_key = normalized_sentence(sentence)
+                    if not sentence_key or sentence_key in seen_answers:
+                        continue
+                    seen_answers.add(sentence_key)
+                    candidates.append((evidence, None, sentence))
+                    if len(candidates) >= 8:
+                        break
+                if len(candidates) >= 8:
+                    break
         if not candidates:
             return ExtractionResult(
                 True,
@@ -273,11 +330,12 @@ class KnowledgePointExtractor:
                 "已识别为学习资料，但未提炼出有效知识点",
                 (),
                 f"local:{REVIEW_CARD_PROMPT_VERSION}",
+                summary,
             )
 
         points: list[KnowledgePoint] = []
         section_counts: dict[str, int] = {}
-        for evidence, sentence in candidates:
+        for evidence, source_question, sentence in candidates:
             section = clean_section_name(evidence.sectionName, material.title)
             section_counts[section] = section_counts.get(section, 0) + 1
             ordinal = section_counts[section]
@@ -287,13 +345,20 @@ class KnowledgePointExtractor:
             points.append(
                 KnowledgePoint(
                     source_key=stable_source_key(section, (evidence,), answer),
-                    question=build_question(section, answer, ordinal),
+                    question=source_question or build_question(section, answer, ordinal),
                     answer=answer,
                     hint=build_hint(section, answer),
                     evidence_refs=(evidence,),
                 )
             )
-        return ExtractionResult(True, category, reason, tuple(points[:8]), f"local:{REVIEW_CARD_PROMPT_VERSION}")
+        return ExtractionResult(
+            True,
+            category,
+            reason,
+            tuple(points[:8]),
+            f"local:{REVIEW_CARD_PROMPT_VERSION}",
+            summary,
+        )
 
 
 def classify_learning_content(
@@ -370,6 +435,180 @@ def sanitize_evidences(evidences: list[Evidence]) -> list[Evidence]:
         if cleaned:
             result.append(item.model_copy(update={"snippet": cleaned}))
     return result[:16]
+
+
+def extract_source_question_candidates(evidences: list[Evidence]) -> list[dict[str, str]]:
+    """提取带 evidence 归属的原始问句，供模型选择和服务端校验。"""
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for evidence in evidences:
+        for question in extract_source_questions(evidence):
+            key = (evidence.evidenceId, normalized_sentence(question))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"evidenceId": evidence.evidenceId, "question": question})
+            if len(result) >= 32:
+                return result
+    return result
+
+
+def extract_source_questions(evidence: Evidence) -> list[str]:
+    """从正文和疑问式章节名中保留资料已经提出的原始问题。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    cleaned = clean_content_text(evidence.snippet)
+    for match in re.finditer(r"(?:^|(?<=[。！？!?；;]))\s*([^。！？!?；;]{2,180}[？?])", cleaned):
+        question = compact_text(match.group(1), 180)
+        if not question or not is_meaningful_source_question(question):
+            continue
+        key = normalized_sentence(question)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(question)
+
+    # ASR 有时把疑问语气转写成逗号，保留带明确疑问词且不是“本节介绍……”的原始短句。
+    for clause in re.split(r"[，,。；;！？!?]", cleaned):
+        question = compact_text(clause, 180)
+        if not question or not looks_like_question(question) or not is_meaningful_source_question(question):
+            continue
+        key = normalized_sentence(question)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(question)
+
+    section = compact_text(evidence.sectionName, 180)
+    if section and looks_like_question(section) and is_meaningful_source_question(section):
+        key = normalized_sentence(section)
+        if key not in seen:
+            result.append(section)
+    return result[:6]
+
+
+def is_meaningful_source_question(value: str) -> bool:
+    """排除寒暄、确认和无知识目标的反问。"""
+    compact = " ".join(value.split()).strip()
+    normalized = normalized_sentence(compact)
+    if len(normalized) < 5 or is_noise_fragment(compact):
+        return False
+    return not bool(
+        re.fullmatch(
+            r"(?:大家)?(?:明白|懂|清楚|记住|学会|看懂)(?:了)?(?:吗|没有|没)|"
+            r"(?:是不是|对不对|好不好|可以吗|行不行|有没有问题)",
+            normalized,
+        )
+    )
+
+
+def looks_like_question(value: str) -> bool:
+    """识别带问号或明确疑问句式的短文本。"""
+    compact = " ".join(str(value or "").split()).strip()
+    if compact.endswith(("?", "？")):
+        return True
+    if len(compact) > 100:
+        return False
+    question_cue = re.search(
+        r"什么是|为什么|为何|如何|怎么|怎样|哪些|哪种|哪个|是否|能否|有何|有什么|"
+        r"区别是什么|作用是什么",
+        compact,
+    )
+    if question_cue is None:
+        return False
+    # “介绍为什么……/讲解如何……”是内容描述，不是资料向学习者提出的问题。
+    reporting_prefix = compact[: question_cue.start()]
+    return not bool(re.search(r"(?:介绍|讲解|说明|分析|讨论|解释)\s*$", reporting_prefix))
+
+
+def answer_for_source_question(snippet: str, question: str) -> str | None:
+    """优先取原问句之后的事实陈述作为本地降级答案。"""
+    cleaned = clean_content_text(snippet)
+    question_index = cleaned.find(question)
+    search_spaces = [
+        cleaned[question_index + len(question) :].lstrip("，,：:。；; ")
+    ] if question_index >= 0 else []
+    search_spaces.append(cleaned)
+    for text in search_spaces:
+        answers: list[str] = []
+        for sentence in split_knowledge_sentences(text):
+            if looks_like_question(sentence) or is_noise_fragment(sentence):
+                continue
+            if normalized_sentence(sentence) == normalized_sentence(question):
+                continue
+            answers.append(sentence)
+            if len(answers) >= 2:
+                break
+        answer = compact_text("".join(answers), 360)
+        if answer:
+            return answer
+    return None
+
+
+def validated_source_question(
+    value: object,
+    evidence_refs: tuple[Evidence, ...],
+    candidates: list[dict[str, str]],
+) -> str | None:
+    """只接受模型逐字指向所引用 evidence 的候选，并返回候选原文。"""
+    requested = compact_text(value, 180)
+    if not requested:
+        return None
+    requested_key = normalized_sentence(requested)
+    evidence_ids = {reference.evidenceId for reference in evidence_refs}
+    for candidate in candidates:
+        question = compact_text(candidate.get("question"), 180)
+        evidence_id = candidate.get("evidenceId")
+        if (
+            question
+            and evidence_id in evidence_ids
+            and normalized_sentence(question) == requested_key
+            and is_meaningful_source_question(question)
+        ):
+            return question
+    return None
+
+
+def existing_material_summary(material: LearningMaterialContext) -> str | None:
+    """资料已有摘要时原样返回，模型与本地降级均不得改写。"""
+    if isinstance(material.summary, str) and material.summary.strip():
+        return material.summary
+    return None
+
+
+def resolve_material_summary(
+    material: LearningMaterialContext,
+    generated_summary: object,
+    evidences: list[Evidence],
+) -> str | None:
+    """已有摘要优先；仅在缺失时采纳同次模型结果或本地摘要。"""
+    existing = existing_material_summary(material)
+    if existing is not None:
+        return existing
+    generated = compact_text(generated_summary, 500) if isinstance(generated_summary, str) else None
+    if generated:
+        cleaned = compact_text(clean_content_text(generated), 500)
+        if cleaned and not is_noise_fragment(cleaned):
+            return cleaned
+    return build_local_material_summary(evidences)
+
+
+def build_local_material_summary(evidences: list[Evidence]) -> str | None:
+    """模型不可用时从多条 evidence 的事实陈述拼出保守摘要。"""
+    statements: list[str] = []
+    seen: set[str] = set()
+    for evidence in evidences:
+        for sentence in split_knowledge_sentences(evidence.snippet):
+            key = normalized_sentence(sentence)
+            if not key or key in seen or looks_like_question(sentence) or is_noise_fragment(sentence):
+                continue
+            seen.add(key)
+            statements.append(sentence)
+            if len(statements) >= 4:
+                break
+        if len(statements) >= 4:
+            break
+    return compact_text("".join(statements), 500)
 
 
 def split_knowledge_sentences(text: str) -> list[str]:

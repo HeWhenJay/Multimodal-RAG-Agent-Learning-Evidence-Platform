@@ -15,6 +15,7 @@ from app.schemas.review import (
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewGroupOrderResult,
     ReviewGradeResult,
     ReviewMaterial,
     ReviewOverview,
@@ -78,6 +79,7 @@ class StubReviewService:
                 ReviewCardGroup(
                     materialId=12,
                     materialTitle="Kafka 高可用",
+                    materialSummary="资料讲解 Kafka 分区副本与 ISR 故障转移机制。",
                     documentType="mp4",
                     dueCardCount=1,
                     cards=[card],
@@ -89,6 +91,12 @@ class StubReviewService:
         self.remember(user_id)
         assert card_id == 81
         return sample_card()
+
+    def reorder_due_groups(self, material_ids: list[int], user_id: str) -> ReviewGroupOrderResult:
+        """记录排序接口使用的认证用户与拖拽顺序。"""
+        self.remember(user_id)
+        assert material_ids == [13, 12]
+        return ReviewGroupOrderResult(materialIds=material_ids, orderedCount=2)
 
     def list_materials(self, user_id: str) -> list[ReviewMaterial]:
         self.remember(user_id)
@@ -164,6 +172,7 @@ def sample_material() -> ReviewMaterial:
     return ReviewMaterial(
         materialId=12,
         title="Kafka 高可用",
+        summary="资料讲解 Kafka 分区副本与 ISR 故障转移机制。",
         documentType="mp4",
         materialStatus="READY",
         isLearningContent=True,
@@ -176,7 +185,7 @@ def sample_material() -> ReviewMaterial:
 
 
 def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
-    """13 个公开端点只能使用认证用户并保持 Result 信封。"""
+    """14 个公开端点只能使用认证用户并保持 Result 信封。"""
     service = StubReviewService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_review_service] = lambda: service
@@ -188,6 +197,7 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
             client.get("/api/reviews/overview", headers=headers),
             client.get("/api/reviews/due?limit=20", headers=headers),
             client.get("/api/reviews/due-groups?limit=20", headers=headers),
+            client.put("/api/reviews/due-groups/order", headers=headers, json={"materialIds": [13, 12]}),
             client.get("/api/reviews/materials", headers=headers),
             client.post("/api/reviews/materials/12/generate", headers=headers),
             client.post("/api/reviews/materials/batch-delete", headers=headers, json={"materialIds": [13, 12]}),
@@ -201,7 +211,12 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
 
         assert all(response.status_code == 200 for response in responses)
         assert all(response.json()["code"] == 1 for response in responses)
-        assert service.users == ["42"] * 13
+        assert responses[3].json()["data"]["groups"][0]["materialSummary"] == (
+            "资料讲解 Kafka 分区副本与 ISR 故障转移机制。"
+        )
+        assert responses[4].json()["data"] == {"materialIds": [13, 12], "orderedCount": 2}
+        assert responses[5].json()["data"][0]["summary"] == "资料讲解 Kafka 分区副本与 ISR 故障转移机制。"
+        assert service.users == ["42"] * 14
     finally:
         app.dependency_overrides.clear()
 
@@ -237,6 +252,25 @@ def test_empty_batch_delete_uses_result_envelope() -> None:
         )
         assert response.status_code == 200
         assert response.json()["code"] == 0
+        assert service.users == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_duplicate_group_order_ids_are_rejected_before_service_call() -> None:
+    """拖拽顺序含重复资料时不得进入业务事务。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/api/reviews/due-groups/order",
+            headers={"Authorization": "Bearer review-token"},
+            json={"materialIds": [12, 12]},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"code": 0, "msg": "请求参数不合法", "data": None}
         assert service.users == []
     finally:
         app.dependency_overrides.clear()

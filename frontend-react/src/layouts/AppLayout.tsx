@@ -215,7 +215,7 @@ function notifyDueReviews(overview: ReviewOverview, actionableDueCount: number) 
   }
   try {
     new Notification('\u5b66\u4e60\u590d\u4e60\u63d0\u9192', {
-      body: `\u4f60\u4eca\u5929\u6709 ${actionableDueCount} \u4e2a\u5173\u952e\u77e5\u8bc6\u70b9\u5f85\u590d\u4e60\u3002`,
+      body: `\u4f60\u4eca\u5929\u6709 ${actionableDueCount} \u4efd\u8d44\u6599\u5f85\u590d\u4e60\u3002`,
       tag: 'learning-evidence-review'
     });
     try {
@@ -228,7 +228,7 @@ function notifyDueReviews(overview: ReviewOverview, actionableDueCount: number) 
   }
 }
 
-// 顶部徽标只展示今日额度内真正可操作的到期卡片。
+// 顶部徽标只展示今日文档额度内真正可操作的到期资料。
 function resolveActionableDueCount(overview: ReviewOverview) {
   if (Number.isFinite(overview.actionableDueCount)) {
     return Math.max(0, overview.actionableDueCount);

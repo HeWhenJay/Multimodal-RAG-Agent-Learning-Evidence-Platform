@@ -8,8 +8,12 @@ import pytest
 from app.review.knowledge_extractor import (
     KnowledgePointExtractor,
     LearningMaterialContext,
+    REVIEW_LLM_BASE_URL,
+    REVIEW_LLM_MODEL,
+    REVIEW_LLM_REASONING_EFFORT,
     build_question,
     clean_section_name,
+    extract_source_questions,
     is_generic_speech_cue,
     is_noise_fragment,
     is_repetitive_noise,
@@ -91,12 +95,14 @@ def test_structured_meeting_notes_are_not_learning_content() -> None:
 
 
 def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypatch: pytest.MonkeyPatch) -> None:
-    """一份资料的全部卡片必须由一次模型调用生成，并使用集中管理的系统 Prompt。"""
+    """一份资料只调用一次复习专用模型，并固定模型与思考强度。"""
     calls: list[dict] = []
+    clients: list[dict] = []
     payload = {
         "isLearningContent": True,
         "category": "技术原理",
         "reason": "包含 Kafka 高可用知识点",
+        "summary": "模型不得覆盖已有摘要",
         "cards": [
             {
                 "question": f"Kafka 高可用知识点 {index} 是什么？",
@@ -118,8 +124,9 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
             )
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-    monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: fake_client)
-    extractor = KnowledgePointExtractor(provider="dashscope", api_key="test-key")
+    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: clients.append(kwargs) or fake_client)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    extractor = KnowledgePointExtractor(provider="deepseek")
 
     result = extractor.extract(
         LearningMaterialContext(12, "Kafka 的高可用性", "pdf", "Kafka 面试八股"),
@@ -127,10 +134,163 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v4"
+    assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
+    assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
+    assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
+    assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "temperature" not in calls[0]
     assert calls[0]["messages"][0]["content"] == review_card_system_prompt()
     assert calls[0]["messages"][1]["role"] == "user"
     assert result.extractor == f"model:{REVIEW_CARD_PROMPT_VERSION}"
     assert len(result.knowledge_points) == 3
+    assert result.summary == "Kafka 面试八股"
+
+
+def test_model_uses_validated_original_question_and_generates_missing_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺失摘要与卡片应同次生成，命中候选后必须采用 evidence 中的原问句。"""
+    calls: list[dict] = []
+    original_question = "Kafka 为什么能够在 Broker 故障后继续提供服务？"
+    payload = {
+        "isLearningContent": True,
+        "category": "课程复习",
+        "reason": "视频明确讲解 Kafka 故障转移",
+        "summary": "视频重点说明 Kafka 通过分区副本、ISR 和 Leader 选举完成故障转移。",
+        "cards": [
+            {
+                "question": "Kafka 是如何实现高可用的？",
+                "sourceQuestion": original_question,
+                "answer": "Leader 故障后会优先从 ISR 中选举新的 Leader。",
+                "hint": "回忆 ISR",
+                "evidenceIds": ["material-12-question"],
+            }
+        ],
+    }
+
+    class FakeCompletions:
+        """返回包含 sourceQuestion 的单次结构化响应。"""
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: fake_client)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    extractor = KnowledgePointExtractor(provider="deepseek")
+    result = extractor.extract(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [
+            evidence(
+                "material-12-question",
+                "故障转移",
+                f"{original_question}Leader 故障后会优先从 ISR 中选举新的 Leader。",
+            )
+        ],
+    )
+
+    assert len(calls) == 1
+    assert original_question in calls[0]["messages"][1]["content"]
+    assert result.summary == payload["summary"]
+    assert result.knowledge_points[0].question == original_question
+
+
+def test_model_rejects_source_question_from_unreferenced_evidence() -> None:
+    """sourceQuestion 与卡片引用不一致时不得冒充资料原问句。"""
+    extractor = KnowledgePointExtractor(provider="local")
+    first = evidence(
+        "material-12-first",
+        "副本",
+        "Kafka 为什么需要多个副本？多个副本用于在节点故障时保留分区数据。",
+    )
+    second = evidence(
+        "material-12-second",
+        "ISR",
+        "ISR 为什么影响 Leader 选举？ISR 保存与 Leader 保持同步的副本集合。",
+    )
+    result = extractor._validate_model_result(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [first, second],
+        {
+            "isLearningContent": True,
+            "category": "课程复习",
+            "reason": "包含核心机制",
+            "summary": "讲解 Kafka 的副本和 ISR。",
+            "cards": [
+                {
+                    "question": "Kafka 的副本机制有什么作用？",
+                    "sourceQuestion": "ISR 为什么影响 Leader 选举？",
+                    "answer": "多个副本用于在节点故障时保留分区数据。",
+                    "evidenceIds": ["material-12-first"],
+                }
+            ],
+        },
+    )
+
+    assert result is not None
+    assert result.knowledge_points[0].question == "Kafka 的副本机制有什么作用？"
+
+
+def test_local_fallback_prioritizes_original_question_and_builds_summary() -> None:
+    """模型不可用时也应沿用视频原问句，并从其后原文生成答案与摘要。"""
+    original_question = "Faiss 的 IndexFlatL2 为什么不需要训练？"
+    source = evidence(
+        "material-12-faiss",
+        "IndexFlatL2",
+        f"{original_question}因为它直接保存原始向量，并使用精确的 L2 距离进行检索。",
+    )
+
+    assert extract_source_questions(source) == [original_question]
+    result = KnowledgePointExtractor(provider="local").extract(
+        LearningMaterialContext(12, "Faiss 向量检索算法课程", "mp4"),
+        [source],
+    )
+
+    assert result.is_learning_content is True
+    assert len(result.knowledge_points) == 1
+    assert result.knowledge_points[0].question == original_question
+    assert "直接保存原始向量" in result.knowledge_points[0].answer
+    assert result.summary is not None
+    assert "直接保存原始向量" in result.summary
+
+
+def test_source_question_extraction_handles_asr_comma_instead_of_question_mark() -> None:
+    """ASR 把问号转成逗号时，明确疑问句仍应作为原问句候选。"""
+    source = evidence(
+        "material-12-asr-question",
+        "故障恢复",
+        "Kafka 为什么能够在 Broker 故障后继续提供服务呢，因为 ISR 可以参与新的 Leader 选举。",
+    )
+
+    assert extract_source_questions(source) == ["Kafka 为什么能够在 Broker 故障后继续提供服务呢"]
+
+
+def test_review_model_does_not_inherit_rag_or_dashscope_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺少复习专用地址或密钥时必须本地降级，不能借用其他模型配置。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("SUBAI_BASE_URL", "https://proxy.example/v1")
+    monkeypatch.setenv("SU_BAI_API_KEY", "proxy-key")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://dashscope.example/v1")
+    monkeypatch.setenv("RAG_LLM_MODEL", "qwen-plus")
+    monkeypatch.setenv("REVIEW_EXTRACTION_MODEL", "another-model")
+    extractor = KnowledgePointExtractor()
+
+    result = extractor.extract(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [evidence("material-12-1", "副本", "Kafka 通过分区副本和 Leader 选举提升可用性。")],
+    )
+
+    assert extractor.api_key == ""
+    assert extractor.base_url == REVIEW_LLM_BASE_URL
+    assert extractor.model == "deepseek-v4-flash"
+    assert result.extractor == f"local:{REVIEW_CARD_PROMPT_VERSION}"
 
 
 def test_source_key_uses_evidence_and_content_instead_of_card_order() -> None:
@@ -273,7 +433,8 @@ def test_noise_only_evidence_skips_model_call(monkeypatch: pytest.MonkeyPatch) -
             calls += 1
 
     monkeypatch.setattr("openai.OpenAI", UnexpectedOpenAI)
-    extractor = KnowledgePointExtractor(provider="dashscope", api_key="test-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    extractor = KnowledgePointExtractor(provider="deepseek")
     result = extractor.extract(
         LearningMaterialContext(12, "技术课程", "mp4", "课程视频"),
         [evidence("noise", "00:03:15,000 --> 00:03:20,000", "字幕由 Amara.org 社区提供")],

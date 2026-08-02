@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from app.review.repository import (
     ReviewSettingsRecord,
 )
 from app.review.service import ReviewService, material_generation_is_current, overview_response
+from app.schemas.rag import Evidence
 from app.schemas.review import ReviewGradeRequest
 
 
@@ -24,19 +26,36 @@ NOW = datetime(2026, 8, 1, 1, 0, tzinfo=timezone.utc)
 
 
 class FakeReviewTransaction:
-    """只实现待复习列表所需的仓储操作。"""
+    """只实现文档额度队列测试所需的仓储操作。"""
 
-    def __init__(self, reviewed_today: int) -> None:
+    def __init__(self, reviewed_today: int, started_due_materials: int = 0) -> None:
         self.reviewed_today = reviewed_today
+        self.started_due_materials = started_due_materials
         self.requested_limit: int | None = None
 
     def get_or_create_settings(self, user_id: str, *, for_update: bool = False) -> ReviewSettingsRecord:
         return ReviewSettingsRecord(user_id, True, 0.90, 20, "09:00", "Asia/Shanghai")
 
     def overview_stats(self, user_id: str, **_kwargs) -> ReviewOverviewStats:
-        return ReviewOverviewStats(4, self.reviewed_today, 30, 3, None)
+        return ReviewOverviewStats(
+            4,
+            self.reviewed_today,
+            30,
+            3,
+            None,
+            due_material_count=3,
+            started_due_material_count=self.started_due_materials,
+        )
 
-    def list_due_cards(self, user_id: str, *, now: datetime, limit: int):
+    def list_due_group_cards(
+        self,
+        user_id: str,
+        *,
+        now: datetime,
+        today_start: datetime,
+        tomorrow_start: datetime,
+        limit: int,
+    ):
         self.requested_limit = limit
         return []
 
@@ -53,7 +72,7 @@ class FakeReviewRepository:
 
 
 def test_due_queue_subtracts_reviews_already_completed_today() -> None:
-    """每日 20 张且已完成 18 张时，本轮最多再返回 2 张。"""
+    """每日 20 份资料且已复习 18 份时，本轮最多选择 2 份资料。"""
     transaction = FakeReviewTransaction(reviewed_today=18)
     service = ReviewService(repository=FakeReviewRepository(transaction), now_provider=lambda: NOW)
 
@@ -62,12 +81,21 @@ def test_due_queue_subtracts_reviews_already_completed_today() -> None:
 
 
 def test_due_queue_stops_after_daily_limit_is_reached() -> None:
-    """达到每日上限后不再读取到期卡片。"""
+    """达到每日文档上限且没有已开始资料时不再读取新资料。"""
     transaction = FakeReviewTransaction(reviewed_today=20)
     service = ReviewService(repository=FakeReviewRepository(transaction), now_provider=lambda: NOW)
 
     assert service.list_due("7", 20) == []
     assert transaction.requested_limit is None
+
+
+def test_due_queue_keeps_a_started_document_when_new_document_quota_is_full() -> None:
+    """文档额度用尽后，仍需读取当天已开始资料的剩余到期卡片。"""
+    transaction = FakeReviewTransaction(reviewed_today=20, started_due_materials=1)
+    service = ReviewService(repository=FakeReviewRepository(transaction), now_provider=lambda: NOW)
+
+    assert service.list_due("7", 20) == []
+    assert transaction.requested_limit == 1
 
 
 class GradeTransaction:
@@ -78,6 +106,8 @@ class GradeTransaction:
 
         self.lock_requested = False
         self.saved = False
+        self.material_reviewed_today = False
+        self.reviewed_today = 0
         self.card = ReviewCardRecord(
             id=41,
             material_id=12,
@@ -106,7 +136,11 @@ class GradeTransaction:
         return self.card if self.card.id == card_id and self.card.user_id == user_id else None
 
     def overview_stats(self, user_id: str, **_kwargs) -> ReviewOverviewStats:
-        return ReviewOverviewStats(1, 0, 1, 1, None)
+        return ReviewOverviewStats(1, self.reviewed_today, 1, 1, None)
+
+    def has_material_reviewed_today(self, material_id: int, user_id: str, **_kwargs) -> bool:
+        """返回测试资料是否已经占用当天文档额度。"""
+        return self.material_reviewed_today
 
     def save_grade(self, card, **kwargs):
         self.saved = True
@@ -143,6 +177,30 @@ def test_grade_rejects_a_future_card_before_writing_state() -> None:
     assert transaction.saved is False
 
 
+def test_grade_allows_remaining_cards_from_a_document_already_started_today() -> None:
+    """同一文档当天已开始复习后，即使文档额度已满也允许完成该文档卡片。"""
+    transaction = GradeTransaction(NOW)
+    transaction.reviewed_today = 20
+    transaction.material_reviewed_today = True
+    service = ReviewService(repository=GradeRepository(transaction), now_provider=lambda: NOW)
+
+    service.grade(41, ReviewGradeRequest(rating=3), "7")
+
+    assert transaction.saved is True
+
+
+def test_grade_rejects_a_new_document_after_daily_document_limit() -> None:
+    """当天文档额度已满时，新文档卡片不能绕过服务端限制。"""
+    transaction = GradeTransaction(NOW)
+    transaction.reviewed_today = 20
+    service = ReviewService(repository=GradeRepository(transaction), now_provider=lambda: NOW)
+
+    with pytest.raises(BusinessError, match="今日复习文档上限已达到"):
+        service.grade(41, ReviewGradeRequest(rating=3), "7")
+
+    assert transaction.saved is False
+
+
 def test_sync_candidates_include_outdated_extractor_versions() -> None:
     """Prompt 版本升级后应分批刷新旧卡片，同时继续使用参数化 SQL。"""
     class RecordingCursor:
@@ -163,6 +221,113 @@ def test_sync_candidates_include_outdated_extractor_versions() -> None:
     assert "rm.extractor NOT IN (%s, %s, %s)" in cursor.statement
     assert "learning_review_material_exclusion" in cursor.statement
     assert cursor.params == ("7", *CURRENT_REVIEW_EXTRACTORS, 3)
+
+
+def test_material_queries_prefer_source_summary_before_generated_summary() -> None:
+    """资料自带摘要存在时必须覆盖复习提炼摘要，并保留空摘要降级分支。"""
+    class RecordingCursor:
+        """记录资料列表查询。"""
+
+        def execute(self, statement, _params):
+            self.statement = statement
+
+        def fetchall(self):
+            return []
+
+    cursor = RecordingCursor()
+    transaction = DatabaseReviewTransaction(cursor, "learning_evidence")
+    transaction._statement = lambda query: query  # type: ignore[method-assign]
+
+    assert transaction.list_review_materials("7") == []
+    assert "THEN lm.document_summary" in cursor.statement
+    assert "ELSE rm.summary" in cursor.statement
+
+
+class SummaryGenerationTransaction:
+    """记录生成服务传给仓储的资料摘要。"""
+
+    def __init__(self) -> None:
+        self.saved: dict | None = None
+
+    def is_material_excluded(self, material_id: int, user_id: str) -> bool:
+        return False
+
+    def list_evidences(self, material: MaterialSourceRecord):
+        return [
+            Evidence(
+                evidenceId=f"material-{material.id}-1",
+                documentId=f"material-{material.id}",
+                documentTitle=material.title,
+                title=material.title,
+                sectionName="核心原理",
+                snippet="Kafka 使用 ISR 跟踪与 Leader 保持同步的副本。",
+                source="upload",
+                documentType="pdf",
+                score=1.0,
+                retrievalSource="summary",
+            )
+        ]
+
+    def save_generation(self, material: MaterialSourceRecord, **kwargs):
+        self.saved = kwargs
+        return ReviewMaterialRecord(
+            material_id=material.id,
+            title=material.title,
+            document_type=material.document_type,
+            material_status=material.material_status,
+            is_learning_content=kwargs["is_learning_content"],
+            category=kwargs["category"],
+            status=kwargs["status"],
+            reason=kwargs["reason"],
+            extractor=kwargs["extractor"],
+            card_count=0,
+            index_request_version=material.index_request_version,
+            synced_index_request_version=material.index_request_version,
+            updated_at=NOW,
+            summary=kwargs["summary"],
+        )
+
+
+class SummaryExtractor:
+    """提供可区分的提炼摘要，便于验证资料摘要优先级。"""
+
+    def __init__(self, summary: str) -> None:
+        self.summary = summary
+
+    def extract(self, _material, _evidences):
+        return SimpleNamespace(
+            is_learning_content=False,
+            category="待确认",
+            reason="测试摘要优先级",
+            knowledge_points=(),
+            extractor=CURRENT_REVIEW_EXTRACTORS[0],
+            summary=self.summary,
+        )
+
+
+@pytest.mark.parametrize(
+    ("document_summary", "expected_summary"),
+    [(None, "提炼生成的摘要"), ("资料原有摘要", "资料原有摘要")],
+)
+def test_generation_persists_extracted_summary_but_prefers_material_summary(
+    document_summary: str | None,
+    expected_summary: str,
+) -> None:
+    """同一次分类请求应保存摘要，资料原摘要不得被模型结果改写。"""
+    transaction = SummaryGenerationTransaction()
+    service = ReviewService(
+        repository=FakeReviewRepository(transaction),
+        extractor=SummaryExtractor("提炼生成的摘要"),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+    material = MaterialSourceRecord(12, "Kafka 高可用", "7", "pdf", "READY", document_summary, 1, NOW)
+
+    result = service._generate(material, "7", force=True)
+
+    assert result is not None
+    assert result.summary == expected_summary
+    assert transaction.saved is not None
+    assert transaction.saved["summary"] == expected_summary
 
 
 class DeletionTransaction:
@@ -265,14 +430,25 @@ def test_current_index_with_legacy_extractor_still_requires_regeneration() -> No
     ) is True
 
 
-def test_overview_exposes_only_cards_actionable_within_daily_limit() -> None:
-    """顶部提醒数量必须扣除今日已完成额度，避免继续提醒不可操作卡片。"""
+def test_overview_exposes_actionable_documents_within_daily_limit() -> None:
+    """顶部提醒按资料计数，并包含当天已开始但仍有到期卡片的资料。"""
     settings = ReviewSettingsRecord("7", True, 0.90, 20, "09:00", "Asia/Shanghai")
 
-    result = overview_response(ReviewOverviewStats(10, 18, 30, 3, NOW), settings)
+    result = overview_response(
+        ReviewOverviewStats(
+            10,
+            18,
+            30,
+            5,
+            NOW,
+            due_material_count=5,
+            started_due_material_count=1,
+        ),
+        settings,
+    )
 
     assert result.dueCount == 10
-    assert result.actionableDueCount == 2
+    assert result.actionableDueCount == 3
 
 
 def test_stale_generation_is_discarded_after_material_index_version_changes() -> None:
@@ -316,6 +492,7 @@ def test_stale_generation_is_discarded_after_material_index_version_changes() ->
         material,
         is_learning_content=True,
         category="技术原理",
+        summary="Kafka 高可用摘要",
         status="GENERATED",
         reason="模型完成提炼",
         extractor="model:review-card-v2",

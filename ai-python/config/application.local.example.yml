@@ -33,6 +33,16 @@ rag:
   answer-guard:
     min-top-score-dashscope: ${RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE:0.55}
 
+review:
+  llm:
+    # 只在用户环境变量中配置 DEEPSEEK_API_KEY；请求固定走 DeepSeek 官方入口。
+    model: deepseek-v4-flash
+    reasoning-effort: max
+    thinking-enabled: true
+    base-url: https://api.deepseek.com
+    api-key: ${DEEPSEEK_API_KEY:}
+    timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:120}
+
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}
 

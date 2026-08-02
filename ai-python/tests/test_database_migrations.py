@@ -6,7 +6,9 @@ import sys
 from types import SimpleNamespace
 
 from app.core.database_migrations import (
+    MIGRATION_DIRECTORY,
     PYTHON_MIGRATION_LOCK_KEY,
+    PYTHON_MIGRATIONS,
     apply_python_schema_migrations,
 )
 
@@ -58,3 +60,22 @@ def test_migrations_take_transaction_lock_before_schema_checks(monkeypatch) -> N
     assert "pg_advisory_xact_lock" in cursor.executed[0][0]
     assert cursor.executed[0][1] == (PYTHON_MIGRATION_LOCK_KEY,)
     assert "CREATE SCHEMA" in cursor.executed[1][0]
+
+
+def test_review_material_summary_migration_is_registered_and_idempotent() -> None:
+    """复习摘要列必须进入启动迁移，并允许多实例或重复启动安全执行。"""
+    filename = "20260802_0300_add_review_material_summary.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = (MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS summary TEXT" in " ".join(sql.split())
+
+
+def test_review_material_order_migration_is_registered_and_idempotent() -> None:
+    """资料拖拽顺序列和查询索引必须进入启动迁移。"""
+    filename = "20260802_0400_add_review_material_display_order.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "ADD COLUMN IF NOT EXISTS display_order INTEGER" in sql
+    assert "CREATE INDEX IF NOT EXISTS idx_learning_review_material_user_order" in sql

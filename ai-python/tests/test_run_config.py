@@ -78,6 +78,30 @@ def test_answer_guard_config_env_mapping_is_effective():
     assert env_defaults["RAG_ANSWER_STRICT_MODE"] == "true"
 
 
+def test_review_llm_config_uses_dedicated_environment_variables():
+    """复习模型只映射 DeepSeek 密钥，官方 URL 与模型不允许环境覆盖。"""
+    env_defaults = build_env_defaults(
+        {
+            "review": {
+                "llm": {
+                    "base-url": "https://api.deepseek.com",
+                    "model": "deepseek-v4-flash",
+                    "reasoning-effort": "max",
+                    "api-key": "test-review-key",
+                    "timeout-seconds": 45,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["DEEPSEEK_API_KEY"] == "test-review-key"
+    assert env_defaults["REVIEW_EXTRACTION_TIMEOUT_SECONDS"] == "45"
+    assert "SUBAI_BASE_URL" not in env_defaults
+    assert "SU_BAI_API_KEY" not in env_defaults
+    assert "DASHSCOPE_API_KEY" not in env_defaults
+    assert "RAG_LLM_BASE_URL" not in env_defaults
+
+
 def test_model_dynamic_batch_config_env_mapping_is_effective():
     """校验 OCR/ASR/embedding 动态批处理配置可由 YAML 统一映射。"""
     env_defaults = build_env_defaults(
