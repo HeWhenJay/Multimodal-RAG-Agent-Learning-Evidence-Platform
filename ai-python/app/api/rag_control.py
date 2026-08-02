@@ -20,12 +20,14 @@ from app.schemas.rag import Evidence, QueryResponse, QueryTaskResponse
 from app.schemas.rag_control import (
     MaterialPreviewResponse,
     MaterialUploadChunkResponse,
+    RagIndexRemoteVideoBatchPublicRequest,
     RagIndexRemoteVideoPublicRequest,
     RagIndexTextPublicRequest,
     RagMaterialResponse,
     RagOverviewPublicResponse,
     RagQueryHistoryResponse,
     RagQueryPublicRequest,
+    RagRemoteVideoBatchResponse,
 )
 from app.services.rag_control_service import RagControlService
 
@@ -116,6 +118,16 @@ def index_remote_video(
 ) -> Result[RagMaterialResponse]:
     """校验公开平台链接并创建后台视频 RAG 任务。"""
     return Result.success(execute("接入公开视频链接", lambda: service.import_remote_video(payload, user_id)))
+
+
+@router.post("/materials/url/batch", response_model=Result[RagRemoteVideoBatchResponse])
+def index_remote_videos(
+    payload: RagIndexRemoteVideoBatchPublicRequest,
+    user_id: str = Depends(current_rag_user_id),
+    service: RagControlService = Depends(get_rag_control_service),
+) -> Result[RagRemoteVideoBatchResponse]:
+    """提取批量分享文本中的链接，并创建可排队的后台视频 RAG 任务。"""
+    return Result.success(execute("批量接入公开视频链接", lambda: service.import_remote_videos(payload, user_id)))
 
 
 @router.post("/materials/upload", response_model=Result[RagMaterialResponse])

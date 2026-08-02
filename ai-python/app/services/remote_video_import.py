@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}
 DOUYIN_HOSTS = {"douyin.com", "www.douyin.com", "v.douyin.com", "iesdouyin.com"}
 BILIBILI_VIDEO_PATTERN = re.compile(r"^(?:BV[0-9A-Za-z]{8,20}|av[0-9]+)$", re.IGNORECASE)
+REMOTE_VIDEO_URL_CANDIDATE_PATTERN = re.compile(
+    r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+",
+    re.IGNORECASE,
+)
+REMOTE_VIDEO_URL_TRAILING_PUNCTUATION = ".,;:!?，。！？、；：)]）】》」』}>"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 REMOTE_VIDEO_PRIVATE_MESSAGE = "远程视频解析异常，临时文件信息已隐藏"
 
@@ -44,6 +49,14 @@ class RemoteVideoUrl:
         """在后台元数据尚未获取时生成资料标题。"""
         page_suffix = f" P{self.page}" if self.page and self.page > 1 else ""
         return f"Bilibili 视频 {self.video_id}{page_suffix}"
+
+
+@dataclass(frozen=True)
+class ExtractedRemoteVideoUrl:
+    """从批量分享原文中提取的 URL 及其起始行号。"""
+
+    value: str
+    line_number: int
 
 
 @dataclass
@@ -148,6 +161,8 @@ def validate_remote_video_url(value: str) -> RemoteVideoUrl:
     raw = str(value or "").strip()
     if not raw:
         raise BusinessError("视频链接不能为空")
+    if len(raw) > 2048:
+        raise BusinessError("视频链接长度不能超过 2048 个字符")
     try:
         parsed = urlsplit(raw)
         port = parsed.port
@@ -174,6 +189,32 @@ def validate_remote_video_url(value: str) -> RemoteVideoUrl:
     query = urlencode({"p": page}) if page and page > 1 else ""
     canonical = urlunsplit(("https", "www.bilibili.com", f"/video/{video_id}", query, ""))
     return RemoteVideoUrl("bilibili", canonical, video_id, page)
+
+
+def extract_remote_video_urls(text: str) -> list[ExtractedRemoteVideoUrl]:
+    """从中文分享文案或多行输入中提取 HTTP(S) URL，并清理常见结尾标点。"""
+    source = str(text or "")
+    extracted: list[ExtractedRemoteVideoUrl] = []
+    current_line = 1
+    scanned_until = 0
+    for match in REMOTE_VIDEO_URL_CANDIDATE_PATTERN.finditer(source):
+        current_line += source.count("\n", scanned_until, match.start())
+        scanned_until = match.end()
+        candidate = trim_remote_video_url_candidate(match.group(0))
+        if not candidate:
+            continue
+        extracted.append(ExtractedRemoteVideoUrl(candidate, current_line))
+    return extracted
+
+
+def trim_remote_video_url_candidate(value: str) -> str:
+    """去掉平台文案和 Markdown 链接常见的尾部标点，同时保留 URL 查询字符。"""
+    candidate = str(value or "").strip()
+    while candidate and candidate[-1] in REMOTE_VIDEO_URL_TRAILING_PUNCTUATION:
+        if candidate[-1] == ")" and candidate.count("(") >= candidate.count(")"):
+            break
+        candidate = candidate[:-1]
+    return candidate
 
 
 def download_bilibili_video(
@@ -620,18 +661,6 @@ def remote_video_task_timeout_seconds() -> int:
 def remote_video_temp_ttl_seconds() -> int:
     configured = positive_env("RAG_REMOTE_VIDEO_TEMP_TTL_SECONDS", 48 * 60 * 60, minimum=24 * 60 * 60)
     return max(configured, remote_video_max_duration_seconds() + 12 * 60 * 60)
-
-
-def remote_video_user_daily_limit() -> int:
-    return positive_env("RAG_REMOTE_VIDEO_USER_DAILY_LIMIT", 10, minimum=1, maximum=100)
-
-
-def remote_video_user_active_limit() -> int:
-    return positive_env("RAG_REMOTE_VIDEO_USER_ACTIVE_LIMIT", 2, minimum=1, maximum=10)
-
-
-def remote_video_global_active_limit() -> int:
-    return positive_env("RAG_REMOTE_VIDEO_GLOBAL_ACTIVE_LIMIT", 32, minimum=1, maximum=500)
 
 
 def positive_env(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:

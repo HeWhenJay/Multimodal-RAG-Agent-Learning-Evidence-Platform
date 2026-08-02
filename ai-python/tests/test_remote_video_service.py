@@ -9,7 +9,11 @@ import pytest
 
 from app.core.result import BusinessError
 from app.repositories.rag_control import DatabaseRagControlTransaction, IndexJobSchedule, MaterialRecord
-from app.schemas.rag_control import RagIndexRemoteVideoPublicRequest
+from app.schemas.rag_control import (
+    RagIndexRemoteVideoBatchPublicRequest,
+    RagIndexRemoteVideoPublicRequest,
+    RagMaterialResponse,
+)
 from app.services.rag_control_service import RagControlService
 
 
@@ -43,10 +47,8 @@ class RemoteVideoTransaction:
     def __init__(
         self,
         existing: MaterialRecord | None = None,
-        usage: tuple[int, int, int] = (0, 0, 0),
     ) -> None:
         self.current = existing
-        self.usage = usage
         self.inserted: dict | None = None
         self.enqueued: dict | None = None
 
@@ -54,10 +56,6 @@ class RemoteVideoTransaction:
         assert public_url == "https://www.bilibili.com/video/BV1xx411c7mD"
         assert user_id == "7"
         return self.current
-
-    def remote_video_import_usage(self, user_id: str):
-        assert user_id == "7"
-        return self.usage
 
     def insert_material(self, **kwargs):
         self.inserted = kwargs
@@ -171,29 +169,64 @@ def test_failed_remote_video_reuses_material_for_retry() -> None:
     assert transaction.enqueued and transaction.enqueued["material"].id == 31
 
 
-@pytest.mark.parametrize(
-    ("usage", "message"),
-    [
-        ((10, 0, 0), "今日公开视频接入次数已达上限"),
-        ((0, 2, 0), "正在处理的公开视频较多"),
-        ((0, 0, 32), "公开视频处理队列繁忙"),
-    ],
-)
-def test_remote_video_import_enforces_resource_quotas(usage, message) -> None:
-    """用户日额度、用户并发和全局队列上限均在建档前执行。"""
-    transaction = RemoteVideoTransaction(usage=usage)
+def test_remote_video_batch_accepts_more_than_two_urls_and_reports_partial_results(monkeypatch) -> None:
+    """批量接入不受两条限制，重复和不支持链接只影响各自结果。"""
+    service = service_for(RemoteVideoTransaction())
+    enqueued_urls: list[str] = []
 
-    with pytest.raises(BusinessError, match=message):
-        service_for(transaction).import_remote_video(
-            RagIndexRemoteVideoPublicRequest(
-                url="https://www.bilibili.com/video/BV1xx411c7mD",
-                confirmedAuthorized=True,
+    def enqueue(remote, high_precision: bool, user_id: str):
+        """记录规范化 URL，避免批量服务测试访问数据库。"""
+        enqueued_urls.append(remote.canonical_url)
+        material = RagMaterialResponse(
+            id=len(enqueued_urls),
+            title=remote.placeholder_title,
+            userId=user_id,
+            documentType="mp4",
+            source="bilibili",
+            status="PENDING",
+            storageType="remote",
+            publicUrl=remote.canonical_url,
+        )
+        return material, True
+
+    monkeypatch.setattr(service, "_enqueue_remote_video", enqueue)
+    response = service.import_remote_videos(
+        RagIndexRemoteVideoBatchPublicRequest(
+            text=(
+                "【Java 面试】https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=tracking\n"
+                "https://www.bilibili.com/video/BV1xx411c7mD\n"
+                "https://www.bilibili.com/video/BV1nx411u79K\n"
+                "https://m.bilibili.com/video/BV1yT411H7YK?p=32&spm_id_from=duplicate\n"
+                "https://www.douyin.com/video/6961737553342991651"
             ),
+            highPrecision=True,
+            confirmedAuthorized=True,
+        ),
+        "7",
+    )
+
+    assert len(enqueued_urls) == 3
+    assert enqueued_urls[0] == "https://www.bilibili.com/video/BV1yT411H7YK?p=32"
+    assert response.candidateCount == 5
+    assert response.queuedCount == 3
+    assert response.duplicateCount == 1
+    assert response.rejectedCount == 1
+    assert [item.status for item in response.items] == [
+        "QUEUED",
+        "QUEUED",
+        "QUEUED",
+        "DUPLICATE",
+        "REJECTED",
+    ]
+
+
+def test_remote_video_batch_requires_an_extracted_url() -> None:
+    """只有标题而没有链接的批次不能创建空任务。"""
+    with pytest.raises(BusinessError, match="未识别到"):
+        service_for(RemoteVideoTransaction()).import_remote_videos(
+            RagIndexRemoteVideoBatchPublicRequest(text="这里只是一段标题", confirmedAuthorized=True),
             "7",
         )
-
-    assert transaction.inserted is None
-    assert transaction.enqueued is None
 
 
 def test_remote_video_lookup_uses_transaction_advisory_lock() -> None:
@@ -216,11 +249,9 @@ def test_remote_video_lookup_uses_transaction_advisory_lock() -> None:
         "https://www.bilibili.com/video/BV1xx411c7mD",
         "7",
     ) is None
-    assert len(cursor.executed) == 4
+    assert len(cursor.executed) == 2
     assert "pg_advisory_xact_lock" in str(cursor.executed[0][0])
-    assert cursor.executed[0][1] == ("rag-remote-video:admission",)
-    assert cursor.executed[1][1] == ("rag-remote-video:user:7",)
-    assert cursor.executed[2][1] == (
+    assert cursor.executed[0][1] == (
         "rag-remote-video:url:7:https://www.bilibili.com/video/BV1xx411c7mD",
     )
 
@@ -243,17 +274,4 @@ def test_active_remote_video_reindex_reuses_current_job() -> None:
     response = service_for(transaction).reindex_material(31, True, "7")
 
     assert response.status == "REINDEXING"
-    assert transaction.enqueued is None
-
-
-def test_remote_video_reindex_enforces_daily_quota() -> None:
-    """远程资料重建同样计入近 24 小时任务配额。"""
-    transaction = RemoteVideoTransaction(
-        existing=material_record(status="READY"),
-        usage=(10, 0, 0),
-    )
-
-    with pytest.raises(BusinessError, match="今日公开视频接入次数已达上限"):
-        service_for(transaction).reindex_material(31, True, "7")
-
     assert transaction.enqueued is None

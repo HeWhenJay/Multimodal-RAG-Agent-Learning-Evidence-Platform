@@ -22,6 +22,32 @@ export interface RemoteVideoImportPayload {
   confirmedAuthorized: boolean;
 }
 
+export interface RemoteVideoBatchImportPayload {
+  text: string;
+  highPrecision: boolean;
+  confirmedAuthorized: boolean;
+}
+
+export type RemoteVideoBatchItemStatus = 'QUEUED' | 'REUSED' | 'DUPLICATE' | 'REJECTED';
+
+export interface RemoteVideoBatchItem {
+  lineNumber: number;
+  url: string;
+  canonicalUrl: string | null;
+  status: RemoteVideoBatchItemStatus;
+  message: string;
+  material: LearningMaterial | null;
+}
+
+export interface RemoteVideoBatchResponse {
+  candidateCount: number;
+  queuedCount: number;
+  reusedCount: number;
+  duplicateCount: number;
+  rejectedCount: number;
+  items: RemoteVideoBatchItem[];
+}
+
 // 统一处理 RAG 接口响应和业务错误。
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getStoredAuthToken();
@@ -87,6 +113,15 @@ export function indexText(payload: {
 // 提交 Bilibili 公共视频链接并创建后台下载、解析与索引任务。
 export function importRemoteVideo(payload: RemoteVideoImportPayload): Promise<LearningMaterial> {
   return request<LearningMaterial>('/api/rag/materials/url', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 批量提交多行链接或平台分享文案，具体任务由服务端耐久队列异步处理。
+export function importRemoteVideos(payload: RemoteVideoBatchImportPayload): Promise<RemoteVideoBatchResponse> {
+  return request<RemoteVideoBatchResponse>('/api/rag/materials/url/batch', {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify(payload)

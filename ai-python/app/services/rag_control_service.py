@@ -27,12 +27,15 @@ from app.schemas.rag import Evidence, IndexTextRequest, ProgressEvent, QueryRequ
 from app.schemas.rag_control import (
     MaterialPreviewResponse,
     MaterialUploadChunkResponse,
+    RagIndexRemoteVideoBatchPublicRequest,
     RagIndexRemoteVideoPublicRequest,
     RagIndexTextPublicRequest,
     RagMaterialResponse,
     RagOverviewPublicResponse,
     RagQueryHistoryResponse,
     RagQueryPublicRequest,
+    RagRemoteVideoBatchItemResponse,
+    RagRemoteVideoBatchResponse,
 )
 from app.storage.object_storage import (
     LocalRagObjectStorage,
@@ -43,12 +46,7 @@ from app.storage.object_storage import (
     build_rag_object_storage,
 )
 from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
-from app.services.remote_video_import import (
-    remote_video_global_active_limit,
-    remote_video_user_active_limit,
-    remote_video_user_daily_limit,
-    validate_remote_video_url,
-)
+from app.services.remote_video_import import RemoteVideoUrl, extract_remote_video_urls, validate_remote_video_url
 from app.services.material_processing_progress import build_material_processing_progress, public_progress_text
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
@@ -229,11 +227,92 @@ class RagControlService:
         if not request.confirmedAuthorized:
             raise BusinessError("请先确认你有权处理该视频内容")
         remote = validate_remote_video_url(request.url)
+        material, _queued = self._enqueue_remote_video(remote, request.highPrecision, user_id)
+        return material
+
+    def import_remote_videos(
+        self,
+        request: RagIndexRemoteVideoBatchPublicRequest,
+        user_id: str,
+    ) -> RagRemoteVideoBatchResponse:
+        """从批量分享原文提取 URL，并将合法且不重复的资料逐条写入耐久队列。"""
+        if not request.confirmedAuthorized:
+            raise BusinessError("请先确认你有权处理该视频内容")
+        candidates = extract_remote_video_urls(request.text)
+        if not candidates:
+            raise BusinessError("未识别到 HTTP(S) 视频链接")
+
+        items: list[RagRemoteVideoBatchItemResponse] = []
+        seen_urls: set[str] = set()
+        for candidate in candidates:
+            try:
+                remote = validate_remote_video_url(candidate.value)
+            except BusinessError as exc:
+                items.append(
+                    RagRemoteVideoBatchItemResponse(
+                        lineNumber=candidate.line_number,
+                        url=candidate.value,
+                        status="REJECTED",
+                        message=exc.message,
+                    )
+                )
+                continue
+            if remote.canonical_url in seen_urls:
+                items.append(
+                    RagRemoteVideoBatchItemResponse(
+                        lineNumber=candidate.line_number,
+                        url=candidate.value,
+                        canonicalUrl=remote.canonical_url,
+                        status="DUPLICATE",
+                        message="批次内链接重复，已跳过",
+                    )
+                )
+                continue
+            seen_urls.add(remote.canonical_url)
+            try:
+                material, queued = self._enqueue_remote_video(remote, request.highPrecision, user_id)
+            except BusinessError as exc:
+                items.append(
+                    RagRemoteVideoBatchItemResponse(
+                        lineNumber=candidate.line_number,
+                        url=candidate.value,
+                        canonicalUrl=remote.canonical_url,
+                        status="REJECTED",
+                        message=exc.message,
+                    )
+                )
+                continue
+            items.append(
+                RagRemoteVideoBatchItemResponse(
+                    lineNumber=candidate.line_number,
+                    url=candidate.value,
+                    canonicalUrl=remote.canonical_url,
+                    status="QUEUED" if queued else "REUSED",
+                    message="已加入 RAG 处理队列" if queued else "资料已存在，已复用当前状态",
+                    material=material,
+                )
+            )
+
+        return RagRemoteVideoBatchResponse(
+            candidateCount=len(candidates),
+            queuedCount=sum(item.status == "QUEUED" for item in items),
+            reusedCount=sum(item.status == "REUSED" for item in items),
+            duplicateCount=sum(item.status == "DUPLICATE" for item in items),
+            rejectedCount=sum(item.status == "REJECTED" for item in items),
+            items=items,
+        )
+
+    def _enqueue_remote_video(
+        self,
+        remote: RemoteVideoUrl,
+        high_precision: bool,
+        user_id: str,
+    ) -> tuple[RagMaterialResponse, bool]:
+        """幂等创建单条远程资料任务，返回资料及本次是否真正投递新任务。"""
         with self.repository.transaction() as transaction:
             existing = transaction.find_material_by_public_url(remote.canonical_url, user_id)
             if existing is not None and existing.status != "FAILED":
-                return self._material_response(transaction, existing)
-            self._enforce_remote_video_import_quota(transaction, user_id)
+                return self._material_response(transaction, existing), False
             material = existing or transaction.insert_material(
                 title=remote.placeholder_title,
                 user_id=user_id,
@@ -250,7 +329,7 @@ class RagControlService:
                 material=material,
                 operation="INDEX_REMOTE_VIDEO",
                 status="PENDING",
-                high_precision=request.highPrecision,
+                high_precision=high_precision,
                 source_ref={
                     "type": "REMOTE_VIDEO",
                     "platform": remote.platform,
@@ -260,18 +339,7 @@ class RagControlService:
                 text=None,
             )
             material = schedule.material
-        return self._material_response_for_user(material, user_id)
-
-    @staticmethod
-    def _enforce_remote_video_import_quota(transaction: Any, user_id: str) -> None:
-        """在持有远程视频准入事务锁时执行用户和全局资源配额。"""
-        user_daily_count, user_active_count, global_active_count = transaction.remote_video_import_usage(user_id)
-        if user_daily_count >= remote_video_user_daily_limit():
-            raise BusinessError("今日公开视频接入次数已达上限，请明日再试")
-        if user_active_count >= remote_video_user_active_limit():
-            raise BusinessError("当前正在处理的公开视频较多，请等待已有任务完成")
-        if global_active_count >= remote_video_global_active_limit():
-            raise BusinessError("公开视频处理队列繁忙，请稍后再试")
+            return self._material_response(transaction, material), True
 
     def upload_material(
         self,
@@ -803,7 +871,6 @@ class RagControlService:
                     raise BusinessError("远程视频资料状态已变化，请刷新后重试")
                 if locked_material.status in {"PENDING", "PARSING", "REINDEXING"}:
                     return self._material_response(transaction, locked_material)
-                self._enforce_remote_video_import_quota(transaction, user_id)
                 schedule = transaction.enqueue_index_job(
                     material=material,
                     operation="INDEX_REMOTE_VIDEO",

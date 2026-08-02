@@ -19,6 +19,8 @@ from app.schemas.rag_control import (
     RagMaterialResponse,
     RagOverviewPublicResponse,
     RagQueryHistoryResponse,
+    RagRemoteVideoBatchItemResponse,
+    RagRemoteVideoBatchResponse,
 )
 from app.services.rag_control_service import RagControlService
 
@@ -80,6 +82,27 @@ class StubRagControlService:
         assert request.url == "https://www.bilibili.com/video/BV1xx411c7mD"
         assert request.confirmedAuthorized is True
         return sample_material()
+
+    def import_remote_videos(self, request, user_id: str) -> RagRemoteVideoBatchResponse:
+        """断言批量分享原文同样只使用认证用户。"""
+        self._remember(user_id)
+        assert "【课程】https://www.bilibili.com/video/BV1xx411c7mD" in request.text
+        assert request.confirmedAuthorized is True
+        material = sample_material()
+        return RagRemoteVideoBatchResponse(
+            candidateCount=1,
+            queuedCount=1,
+            items=[
+                RagRemoteVideoBatchItemResponse(
+                    lineNumber=1,
+                    url="https://www.bilibili.com/video/BV1xx411c7mD",
+                    canonicalUrl="https://www.bilibili.com/video/BV1xx411c7mD",
+                    status="QUEUED",
+                    message="已加入 RAG 处理队列",
+                    material=material,
+                )
+            ],
+        )
 
     def upload_material(self, *, filename, content, content_type, high_precision, user_id: str) -> RagMaterialResponse:
         self._remember(user_id)
@@ -179,7 +202,7 @@ def sample_history() -> RagQueryHistoryResponse:
 
 
 def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
-    """13 个公开路径均使用认证用户并保持 Java `Result` 信封。"""
+    """15 个公开路径均使用认证用户并保持 Java `Result` 信封。"""
     service = StubRagControlService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_rag_control_service] = lambda: service
@@ -202,6 +225,15 @@ def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
                 headers=headers,
                 json={
                     "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                    "highPrecision": False,
+                    "confirmedAuthorized": True,
+                },
+            ),
+            client.post(
+                "/api/rag/materials/url/batch",
+                headers=headers,
+                json={
+                    "text": "【课程】https://www.bilibili.com/video/BV1xx411c7mD",
                     "highPrecision": False,
                     "confirmedAuthorized": True,
                 },
@@ -236,7 +268,7 @@ def test_public_rag_routes_keep_result_contract_and_auth_ownership() -> None:
         ]
         assert all(response.status_code == 200 for response in responses)
         assert all(response.json()["code"] == 1 for response in responses)
-        assert service.users == ["42"] * 14
+        assert service.users == ["42"] * 15
     finally:
         app.dependency_overrides.clear()
 

@@ -69,6 +69,68 @@ Content-Type: application/json
 
 同一用户重复提交相同规范化 URL 时，如果已有活动或已完成资料，直接返回既有资料；已有 `FAILED` 资料时复用原资料并创建更高 `requestVersion` 的重试任务。数据库通过部分唯一索引保证同一用户不会重复创建相同远程资料。
 
+### 批量创建链接导入任务
+
+```http
+POST /api/rag/materials/url/batch
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+请求体使用一段可直接粘贴的文本，支持一行一个链接，也支持平台“复制分享文案”中夹带中文标题、Markdown 括号或多个链接：
+
+```json
+{
+  "text": "【新版 Java 面试专题】https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=tracking\nhttps://www.bilibili.com/video/BV1xx411c7mD",
+  "highPrecision": false,
+  "confirmedAuthorized": true
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `text` | 是 | 多行 URL 或平台分享原文，最多 1,000,000 个字符；不另设 URL 条数上限 |
+| `highPrecision` | 否 | 是否为本批次新建任务启用高精度视频解析 |
+| `confirmedAuthorized` | 是 | 用户统一确认有权为学习目的处理本批次内容 |
+
+服务端先用 URL 正则提取所有 `http://` 或 `https://` 候选，再逐条执行现有平台白名单校验和规范化；追踪参数会被删除，合法 `p` 分 P 参数会保留。批次内相同规范化 URL 只入队一次。单条校验失败不会阻断同批次其他 URL，返回 `REJECTED` 项供前端展示。
+
+成功响应仍使用 `Result<T>`，资料任务已经写入耐久队列后立即返回：
+
+```json
+{
+  "code": 1,
+  "msg": null,
+  "data": {
+    "candidateCount": 2,
+    "queuedCount": 2,
+    "reusedCount": 0,
+    "duplicateCount": 0,
+    "rejectedCount": 0,
+    "items": [
+      {
+        "lineNumber": 1,
+        "url": "https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=tracking",
+        "canonicalUrl": "https://www.bilibili.com/video/BV1yT411H7YK?p=32",
+        "status": "QUEUED",
+        "message": "已加入 RAG 处理队列",
+        "material": { "id": 31, "status": "PENDING" }
+      },
+      {
+        "lineNumber": 2,
+        "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+        "canonicalUrl": "https://www.bilibili.com/video/BV1xx411c7mD",
+        "status": "QUEUED",
+        "message": "已加入 RAG 处理队列",
+        "material": { "id": 32, "status": "PENDING" }
+      }
+    ]
+  }
+}
+```
+
+`status` 取值为 `QUEUED`（新建任务）、`REUSED`（复用已有资料）、`DUPLICATE`（批次内重复）或 `REJECTED`（候选链接不合法/平台不支持）。批量请求不设置“每次最多 2 条”的业务条数限制；文本长度只受 HTTP 请求体和服务端安全配置约束，任务会按照 Worker 可用槽位自动排队。批次完成后只广播一次 `MATERIAL_UPLOADED_EVENT`，由已有资料进度轮询统一刷新，避免 N 条链接触发 N 轮列表查询。
+
 ## 异步生命周期
 
 ```text
@@ -88,7 +150,7 @@ Content-Type: application/json
 - URL 必须使用 HTTPS，禁止用户名密码、非默认端口、IP 地址、任意域名和开放重定向输入。
 - 只允许 `bilibili.com`、`www.bilibili.com`、`m.bilibili.com` 的 `/video/BV...` 或 `/video/av...` 路径；`b23.tv` 短链接要求用户先展开。
 - 默认最大 `512 MiB`、最长 `4 小时`、网络超时 `20 秒`、下载重试 `2` 次、单次远程资源获取总墙钟时限 `5 小时`，单链接单视频，不处理播放列表、直播和未知时长视频。DASH 音视频分流按任务累计字节，下载后再次检查媒体文件与整个临时目录占用。
-- 默认每用户同时处理 `2` 个、近 24 小时最多创建 `10` 个任务；全局同时活动任务上限为 `32`，超限在建档前拒绝。
+- 不设置单用户每日接入次数或活动任务数限制；提交只负责把任务写入耐久队列，不因排队深度拒绝。实际下载、解析和索引并发由 Kafka/本地 Worker 槽位控制，超出槽位的任务等待领取。
 - 不将第三方响应正文、临时路径、Cookie 或签名 URL 写入日志、Kafka、evidence 或前端。
 - 元数据读取、媒体下载、DASH 合并和字幕等后处理共用同一个绝对截止时间；watchdog 在到期时取消 downloader，下载与后处理 hook 也会拒绝继续执行，FFmpeg 子进程使用任务剩余时间作为超时并在到期后终止。超时使用受控中文错误进入既有耐久重试。
 - 下载失败时临时目录必须清理；网络瞬时错误和平台 `exceeded the rate limit. Try again later` 等限流提示进入既有耐久重试，权限/会员/删除/格式不支持直接失败。
@@ -108,18 +170,19 @@ Content-Type: application/json
 | `RAG_REMOTE_VIDEO_TASK_TIMEOUT_SECONDS` | `18000` | 元数据、下载和 yt-dlp 后处理共用的单次任务总墙钟时限；长任务在线程池执行并由租约/看门狗约束，不要求小于 Kafka `max.poll.interval.ms` |
 | `RAG_REMOTE_VIDEO_TEMP_ROOT` | 系统临时目录 | 受控临时下载目录 |
 | `RAG_REMOTE_VIDEO_TEMP_TTL_SECONDS` | `172800` | 崩溃遗留临时目录清理 TTL |
-| `RAG_REMOTE_VIDEO_USER_DAILY_LIMIT` | `10` | 单用户近 24 小时任务上限 |
-| `RAG_REMOTE_VIDEO_USER_ACTIVE_LIMIT` | `2` | 单用户活动任务上限 |
-| `RAG_REMOTE_VIDEO_GLOBAL_ACTIVE_LIMIT` | `32` | 全局活动任务上限 |
 | `RAG_KAFKA_HANDLER_CONCURRENCY` | `4` | 单个 Kafka worker 的索引长任务并发上限 |
+| `RAG_TASK_WORKER_CONCURRENCY` | `2` | 未启用 Kafka 时本地耐久 worker 的并发槽位；其余任务留在 PostgreSQL 队列 |
 | `RAG_KAFKA_CONTROL_CONCURRENCY` | `1` | 为 progress/result/promote/DLQ 保留的控制消息线程数 |
 | `RAG_INDEX_EXECUTION_LEASE_SECONDS` | `180` | Kafka 索引执行令牌租约时长，worker 按不高于三分之一租期续租 |
+
+Kafka 模式的真实长任务并发数为 `min(RAG_KAFKA_HANDLER_CONCURRENCY, 索引请求 topic 分区数)`；由于同一分区必须保持顺序，部署时应将 `rag.material.index.request.v1` 配置为至少 `4` 个分区，才能用满默认 4 个 handler。扩大既有 topic 分区不可回退，且会改变 key 到分区的映射，生产环境应在索引积压清空后由运维显式执行；本地未启用 Kafka 时不受该分区数影响，由 PostgreSQL local worker 线程池并发领取。
 
 ## 错误契约
 
 | 场景 | 中文错误或终态 |
 | --- | --- |
 | 未确认内容处理权 | `请先确认你有权处理该视频内容` |
+| 批量原文没有 HTTP(S) URL | `未识别到 HTTP(S) 视频链接` |
 | 抖音链接 | `抖音链接暂不支持：平台要求动态 Cookie 和挑战签名，本系统不绕过访问限制` |
 | Bilibili 短链接 | `请粘贴展开后的 Bilibili 完整视频链接` |
 | 任意其他 URL / HTTP / 非默认端口 | `当前仅支持 Bilibili 完整公开视频链接` |
@@ -133,8 +196,12 @@ Content-Type: application/json
 ## 前端影响
 
 - 工作台“多模态数据接入通道”和“学习资料”页新增公开视频链接输入。
+- 输入改为多行文本框，支持一行一个 URL 或整段分享文案；前端显示识别、重复、排队和失败的逐条状态，不限制批次只能包含 2 条。
+- 新增批量 API 客户端类型与 `POST /api/rag/materials/url/batch` 调用；批量响应只触发一次 `MATERIAL_UPLOADED_EVENT` 刷新资料列表。
 - 提交成功后复用现有资料进度轮询和 `MATERIAL_UPLOADED_EVENT`，不新增第二套状态机。
 - 页面明确展示 Bilibili 可用、抖音暂不支持；不提供 Cookie 上传或登录态导入入口。
 - 视频 evidence 使用规范化 Bilibili 页面 URL，并通过 `t` 参数跳到命中的秒点；不会把平台网页 URL 交给站内 HTML5 播放器。
 
-当前仓库的公开控制面由 Python FastAPI 承载。若后续恢复 Java 业务壳，Java 只需按原样代理该接口、从认证会话注入用户身份，并保持 `Result<T>` 契约；远程解析和下载仍归 Python worker。
+## Java/Python 集成说明
+
+当前仓库的公开控制面由 Python FastAPI 承载，批量接口不在 HTTP 请求中执行下载、ASR、OCR 或 embedding。若后续恢复 Java 业务壳，Java 只需透传本节请求/响应并注入认证用户；Python 继续通过 PostgreSQL durable job、Kafka 或 local worker 负责排队和受控线程并发。阻塞式 `yt-dlp`/FFmpeg 调用运行在 Worker 线程池中，不占用 FastAPI 事件循环。

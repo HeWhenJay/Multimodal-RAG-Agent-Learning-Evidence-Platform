@@ -20,6 +20,9 @@ Kafka 不可用时由 PostgreSQL 耐久任务 worker 执行同一索引状态机
 - Kafka consumer 的 poll 线程不执行索引业务；长任务进入受限线程池后，poll 继续维持 consumer group
   心跳，同一 topic-partition 始终只有一条在途消息，handler 完成后才同步提交 offset。索引长任务和
   progress/result/promote/DLQ 控制消息使用独立容量，避免长视频占满线程后阻塞自身状态收敛。
+- 索引实际并发取 handler 数与 `rag.material.index.request.v1` 分区数的较小值；默认 4 个 handler 时，
+  topic 也必须至少 4 个分区。扩大既有 topic 分区会改变 key 映射且不可回退，应在积压清空后显式执行，
+  不由 worker 启动过程自动修改 Broker 元数据。
 - `rag_index_job.locked_by/lease_until` 是 Kafka 与 local 索引共用的数据库执行围栏。重复投递在租约内只等待，
   worker 定时续租；失租后旧执行不得继续写资料元数据、staging 终态或 DLQ。local worker 每轮领取数不超过
   当前执行槽，避免任务尚在线程池排队时租约已经过期。

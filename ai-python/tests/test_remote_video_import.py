@@ -20,6 +20,7 @@ from app.services.remote_video_import import (
     cleanup_stale_remote_video_directories,
     download_bilibili_video,
     download_options,
+    extract_remote_video_urls,
     extract_public_metadata,
     is_transient_download_failure,
     run_ytdlp_ffmpeg_with_deadline,
@@ -38,6 +39,40 @@ def test_bilibili_url_is_canonicalized_without_tracking_parameters() -> None:
     assert remote.video_id == "BV1xx411c7mD"
     assert remote.page == 2
     assert remote.canonical_url == "https://www.bilibili.com/video/BV1xx411c7mD?p=2"
+
+
+def test_share_text_extracts_bilibili_url_and_preserves_page() -> None:
+    """平台复制出的中文标题和追踪参数不能妨碍提取正确的分 P 链接。"""
+    text = (
+        "【新版Java面试专题视频教程，java八股文面试全套真题+深度详解（含大厂高频面试真题）】"
+        "https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=2fdd0f5bf8a8fb91092ac355f273d485"
+    )
+
+    extracted = extract_remote_video_urls(text)
+    remote = validate_remote_video_url(extracted[0].value)
+
+    assert extracted[0].line_number == 1
+    assert extracted[0].value.endswith("vd_source=2fdd0f5bf8a8fb91092ac355f273d485")
+    assert remote.canonical_url == "https://www.bilibili.com/video/BV1yT411H7YK?p=32"
+
+
+def test_url_extraction_handles_markdown_chinese_punctuation_and_multiple_lines() -> None:
+    """批量提取应清理 Markdown/中文尾标点，并保留每条候选的原始行号。"""
+    extracted = extract_remote_video_urls(
+        "第一条 [课程](https://www.bilibili.com/video/BV1xx411c7mD)。\n"
+        "第二条https://m.bilibili.com/video/BV1nx411u79K?p=2，后续说明"
+    )
+
+    assert [(item.line_number, item.value) for item in extracted] == [
+        (1, "https://www.bilibili.com/video/BV1xx411c7mD"),
+        (2, "https://m.bilibili.com/video/BV1nx411u79K?p=2"),
+    ]
+
+
+def test_remote_video_url_rejects_an_oversized_candidate() -> None:
+    """批量文本不限制 URL 条数，但单条异常超长候选必须在访问网络前拒绝。"""
+    with pytest.raises(BusinessError, match="2048"):
+        validate_remote_video_url("https://www.bilibili.com/video/BV1xx411c7mD?x=" + "a" * 2048)
 
 
 @pytest.mark.parametrize(

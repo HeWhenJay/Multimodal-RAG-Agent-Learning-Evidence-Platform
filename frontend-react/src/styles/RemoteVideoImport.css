@@ -1,6 +1,6 @@
 .remote-video-import {
   display: grid;
-  gap: 10px;
+  gap: 12px;
   margin-top: 14px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
@@ -10,12 +10,18 @@
 .remote-video-import-title,
 .remote-video-platforms,
 .remote-video-authorization,
-.remote-video-feedback {
+.remote-video-feedback,
+.remote-video-preview-head,
+.remote-video-results-head,
+.remote-video-result-meta,
+.remote-video-result-main {
   display: flex;
   align-items: center;
 }
 
-.remote-video-import-head {
+.remote-video-import-head,
+.remote-video-preview-head,
+.remote-video-results-head {
   justify-content: space-between;
   gap: 12px;
 }
@@ -76,16 +82,17 @@
 .remote-video-input-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 8px;
 }
 
 .remote-video-input-shell {
   min-width: 0;
-  height: 40px;
+  min-height: 118px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
-  padding: 0 11px;
+  padding: 10px 11px;
   color: #64748b;
   background: #f8fafc;
   border: 1px solid var(--line);
@@ -102,36 +109,42 @@
 
 .remote-video-input-shell svg {
   flex: 0 0 auto;
+  margin-top: 2px;
 }
 
-.remote-video-input-shell input {
+.remote-video-input-shell textarea {
   width: 100%;
   min-width: 0;
-  height: 100%;
+  min-height: 96px;
   padding: 0;
+  resize: vertical;
   color: #0f172a;
   background: transparent;
   border: 0;
   outline: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
-.remote-video-input-shell input::placeholder {
+.remote-video-input-shell textarea::placeholder {
   color: #94a3b8;
 }
 
 .remote-video-submit {
-  min-width: 116px;
-  height: 40px;
+  min-width: 142px;
+  min-height: 40px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 7px;
-  padding: 0 13px;
+  padding: 9px 13px;
   color: #fff;
   background: var(--primary);
   border: 1px solid var(--primary);
   border-radius: 8px;
   font-weight: 700;
+  line-height: 1.2;
 }
 
 .remote-video-submit:hover:not(:disabled) {
@@ -140,7 +153,8 @@
 }
 
 .remote-video-submit:focus-visible,
-.remote-video-authorization input:focus-visible {
+.remote-video-authorization input:focus-visible,
+.remote-video-result-list:focus-visible {
   outline: 3px solid rgba(99, 102, 241, 0.2);
   outline-offset: 2px;
 }
@@ -151,6 +165,139 @@
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.remote-video-preview {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.remote-video-preview-head strong,
+.remote-video-results-head strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.remote-video-preview-head > span,
+.remote-video-results-head > span {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.remote-video-preview-stats,
+.remote-video-result-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remote-video-preview-stats span,
+.remote-video-result-stats span {
+  padding: 3px 7px;
+  color: #475569;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.remote-video-preview-stats .is-ready,
+.remote-video-result-stats .is-reused {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.remote-video-preview-stats .is-duplicate,
+.remote-video-result-stats .is-duplicate {
+  color: #a16207;
+  background: #fefce8;
+  border-color: #fde68a;
+}
+
+.remote-video-preview-stats .is-unsupported,
+.remote-video-result-stats .is-rejected {
+  color: #b91c1c;
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.remote-video-result-stats .is-queued {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.remote-video-preview-list,
+.remote-video-result-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.remote-video-preview-list {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  background: #e2e8f0;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+
+.remote-video-preview-list li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #fff;
+  font-size: 11px;
+}
+
+.remote-video-preview-line {
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.remote-video-preview-url {
+  min-width: 0;
+  overflow: hidden;
+  color: #334155;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-video-preview-state {
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.remote-video-preview-list .is-ready .remote-video-preview-state {
+  color: #047857;
+}
+
+.remote-video-preview-list .is-duplicate .remote-video-preview-state {
+  color: #a16207;
+}
+
+.remote-video-preview-list .is-unsupported .remote-video-preview-state {
+  color: #b91c1c;
+}
+
+.remote-video-preview-empty,
+.remote-video-preview-more,
+.remote-video-result-more {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .remote-video-authorization {
@@ -193,8 +340,123 @@
   color: #047857;
 }
 
+.remote-video-feedback.is-warning {
+  color: #a16207;
+}
+
 .remote-video-feedback.is-error {
   color: var(--danger);
+}
+
+.remote-video-results {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed #cbd5e1;
+}
+
+.remote-video-result-list {
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  scrollbar-gutter: stable;
+}
+
+.remote-video-result-item {
+  padding: 9px 10px;
+  background: #fff;
+  border-left: 3px solid #cbd5e1;
+}
+
+.remote-video-result-item + .remote-video-result-item {
+  border-top: 1px solid #e2e8f0;
+}
+
+.remote-video-result-item.is-queued {
+  border-left-color: #3b82f6;
+}
+
+.remote-video-result-item.is-reused {
+  border-left-color: #10b981;
+}
+
+.remote-video-result-item.is-duplicate {
+  border-left-color: #eab308;
+}
+
+.remote-video-result-item.is-rejected {
+  border-left-color: #ef4444;
+}
+
+.remote-video-result-main {
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.remote-video-result-main > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: #64748b;
+}
+
+.remote-video-result-item.is-queued .remote-video-result-main > svg {
+  color: #2563eb;
+}
+
+.remote-video-result-item.is-reused .remote-video-result-main > svg {
+  color: #059669;
+}
+
+.remote-video-result-item.is-duplicate .remote-video-result-main > svg {
+  color: #ca8a04;
+}
+
+.remote-video-result-item.is-rejected .remote-video-result-main > svg {
+  color: #dc2626;
+}
+
+.remote-video-result-main > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.remote-video-result-meta {
+  gap: 6px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.remote-video-status-code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-weight: 750;
+}
+
+.remote-video-result-main strong {
+  color: #334155;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.remote-video-result-main p {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.remote-video-result-main code {
+  min-width: 0;
+  overflow: hidden;
+  color: #475569;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 @media (max-width: 640px) {
@@ -213,5 +475,30 @@
 
   .remote-video-submit {
     width: 100%;
+  }
+
+  .remote-video-preview-head,
+  .remote-video-results-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .remote-video-preview-list li {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .remote-video-preview-state {
+    grid-column: 2;
+  }
+
+  .remote-video-result-list {
+    max-height: 420px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .remote-video-input-shell {
+    transition: none;
   }
 }

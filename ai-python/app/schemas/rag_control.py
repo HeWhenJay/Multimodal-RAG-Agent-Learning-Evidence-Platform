@@ -47,6 +47,22 @@ class RagIndexRemoteVideoPublicRequest(BaseModel):
         return value.strip()
 
 
+class RagIndexRemoteVideoBatchPublicRequest(BaseModel):
+    """批量公开视频接入原文，允许直接粘贴平台分享文案。"""
+
+    text: str = Field(min_length=1, max_length=1_000_000)
+    highPrecision: bool = False
+    confirmedAuthorized: bool = False
+
+    @field_validator("text")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        """拒绝空批次，具体 URL 由 service 正则提取并逐条校验。"""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("链接文本不能为空")
+        return value.strip()
+
+
 class RagQueryPublicRequest(BaseModel):
     """公开查询请求；身份和可见范围由服务端强制注入。"""
 
@@ -95,6 +111,31 @@ class RagMaterialResponse(BaseModel):
     processingProgress: MaterialProcessingProgress | None = None
     createdAt: datetime | None = None
     updatedAt: datetime | None = None
+
+
+RemoteVideoBatchItemStatus = Literal["QUEUED", "REUSED", "DUPLICATE", "REJECTED"]
+
+
+class RagRemoteVideoBatchItemResponse(BaseModel):
+    """批量链接中一条候选 URL 的排队或校验结果。"""
+
+    lineNumber: int
+    url: str
+    canonicalUrl: str | None = None
+    status: RemoteVideoBatchItemStatus
+    message: str
+    material: RagMaterialResponse | None = None
+
+
+class RagRemoteVideoBatchResponse(BaseModel):
+    """批量链接提取、去重和耐久入队汇总。"""
+
+    candidateCount: int = 0
+    queuedCount: int = 0
+    reusedCount: int = 0
+    duplicateCount: int = 0
+    rejectedCount: int = 0
+    items: list[RagRemoteVideoBatchItemResponse] = Field(default_factory=list)
 
 
 class MaterialPreviewResponse(BaseModel):
