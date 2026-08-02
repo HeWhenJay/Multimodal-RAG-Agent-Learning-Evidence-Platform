@@ -15,6 +15,7 @@ PYTHON_MIGRATIONS = (
     "20260802_0200_add_learning_review_exclusions.sql",
     "20260802_0300_add_review_material_summary.sql",
     "20260802_0400_add_review_material_display_order.sql",
+    "20260802_0500_guard_review_extractor_downgrade.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

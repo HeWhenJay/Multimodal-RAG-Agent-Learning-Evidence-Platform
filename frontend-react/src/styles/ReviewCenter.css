@@ -465,19 +465,6 @@
   font-size: 12px;
 }
 
-.review-group-summary {
-  display: -webkit-box;
-  max-width: 880px;
-  margin: 7px 0 0;
-  overflow: hidden;
-  color: #526174;
-  font-size: 12px;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-}
-
 .group-count {
   display: inline-grid;
   place-items: center;
@@ -511,6 +498,70 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 11px;
   padding: 12px;
+}
+
+.review-material-summary-card {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  align-items: start;
+  min-width: 0;
+  gap: 20px;
+  padding: 16px;
+  color: #334155;
+  background: #fff;
+  border: 1px solid #d9e2ea;
+  border-left: 3px solid #0f766e;
+  border-radius: 7px;
+  box-shadow: 0 2px 7px rgba(31, 41, 55, .035);
+}
+
+.review-material-summary-heading {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  gap: 10px;
+}
+
+.review-material-summary-icon {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  flex: 0 0 32px;
+  color: #0f766e;
+  background: #dff7f2;
+  border-radius: 6px;
+}
+
+.review-material-summary-heading h5 {
+  margin: 1px 0 4px;
+  color: #1f2937;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.review-material-summary-heading span {
+  display: block;
+  color: #7c8798;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.review-material-summary-card > .markdown-text {
+  min-width: 0;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.review-material-summary-card > .markdown-text > :first-child {
+  margin-top: 0;
+}
+
+.review-material-summary-card > .markdown-text > :last-child {
+  margin-bottom: 0;
 }
 
 .review-question-card {
@@ -1205,13 +1256,13 @@
   .review-stat small { line-height: 1.35; }
   .progress-stat { grid-column: span 2; }
   .review-card-grid { grid-template-columns: 1fr; padding: 9px; }
+  .review-material-summary-card { grid-template-columns: 1fr; gap: 12px; padding: 14px; }
   .review-group-header { gap: 7px; padding: 10px; }
   .review-group-title { gap: 7px; }
   .review-group-drag-handle { display: none; }
   .review-group-step-actions { display: flex; }
   .material-type-icon { width: 30px; height: 30px; }
   .review-group-title h4 { white-space: normal; line-height: 1.35; }
-  .review-group-summary { margin-top: 5px; -webkit-line-clamp: 2; }
   .review-side-column { display: flex; }
   .review-settings-form input[type="number"],
   .review-settings-form input[type="time"],

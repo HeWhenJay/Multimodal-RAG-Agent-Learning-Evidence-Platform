@@ -780,7 +780,7 @@ function ReviewMaterialGroup({
             <GripVertical size={17} />
           </button>
           <span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span>
-          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · 优先级 {position + 1}</span><p className="review-group-summary" title={summary}>{summary}</p></div>
+          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · 优先级 {position + 1}</span></div>
         </div>
         <div className="review-group-actions">
           <div className="review-group-step-actions" aria-label="调整资料优先级">
@@ -792,9 +792,27 @@ function ReviewMaterialGroup({
         </div>
       </header>
       <div className="review-card-grid">
+        <ReviewMaterialSummary materialId={group.materialId} summary={summary} />
         {group.cards.map((card) => <ReviewQuestionCard key={card.id} card={card} revealed={revealedCards[card.id]} selected={Boolean(selectedCardIds[card.id])} showHint={Boolean(hintCardIds[card.id])} revealLoading={revealLoadingId === card.id} grading={gradingId === card.id} deleting={deletingKey === `CARD:${card.id}`} locked={ordering} onToggleSelected={() => onToggleSelected(card.id)} onReveal={() => onReveal(card)} onHide={() => onHide(card.id)} onToggleHint={() => onToggleHint(card.id)} onOriginal={() => onOriginal(revealedCards[card.id] || card)} onGrade={(rating) => onGrade(card, rating)} onDelete={() => onDeleteCard(card)} />)}
       </div>
     </section>
+  );
+}
+
+// 资料摘要独立占据卡片网格首行，帮助用户先建立整体脉络，再进入逐题回忆。
+function ReviewMaterialSummary({ materialId, summary }: { materialId: number; summary: string }) {
+  const headingId = `review-summary-${materialId}`;
+  return (
+    <article className="review-material-summary-card" aria-labelledby={headingId}>
+      <header className="review-material-summary-heading">
+        <span className="review-material-summary-icon" aria-hidden="true"><BookOpen size={16} /></span>
+        <div>
+          <h5 id={headingId}>资料总结</h5>
+          <span>先掌握本资料的核心脉络，再开始知识点回忆</span>
+        </div>
+      </header>
+      <MarkdownText content={summary} />
+    </article>
   );
 }
 

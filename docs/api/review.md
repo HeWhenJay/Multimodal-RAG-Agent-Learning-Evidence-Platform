@@ -8,7 +8,7 @@
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
 
-每份复习资料新增摘要。若 `learning_material.document_summary` 已有内容，接口和页面必须原样优先使用资料摘要，不再调用模型改写；只有资料摘要为空时，才在同一次“分类 + 卡片生成”LLM 请求中生成复习摘要并持久化，不能为摘要额外发起第二次模型请求。每日卡片 group 与资料列表都返回并展示同一份摘要。
+每份复习资料新增一份由 DeepSeek 生成的复习摘要。`learning_material.document_summary` 是 RAG 索引摘要，可能只是截断后的开头内容，不能直接作为复习总结展示；它只作为本地前置过滤和模型判断资料范围的辅助输入。本地只判断资料是否值得进入复习中心并分配内部类别；通过过滤后的复习摘要、问题、答案和提示必须在同一次 DeepSeek 请求中完整生成并持久化，不能由本地规则拼写、补齐或降级生成。每日卡片 group 与资料列表都返回同一份模型摘要。
 
 今日复习资料 group 支持用户拖拽排序。排序以“当前用户 + 复习资料”为持久化单位保存在 PostgreSQL；前端提交当前可见 group 的完整顺序后，服务端将这些资料置于用户队列前部，其余复习资料保持原有相对顺序。该顺序影响 `GET /api/reviews/due` 与 `GET /api/reviews/due-groups` 的资料选择顺序，但不改变卡片组内到期顺序、FSRS 状态或评分算法。
 
@@ -23,12 +23,13 @@
 - 首次卡片立即进入待复习队列；首次作答后由 FSRS 直接计算后续间隔，不使用固定的“第 1/2/4/7/15/30 天”硬编码表。
 - 默认每日上限 `20` 份资料。待复习计数由持久化 `dueAt` 实时计算，服务重启后不丢失；同一资料当天首次评分即占用一份额度。
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
-- 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt/本地降级规则升级后，只按资料分批刷新知识点正文和 evidence，不清空已有卡片的 FSRS 学习状态。
-- 同一资料的同一 `indexRequestVersion` 最多执行一次 LLM 请求，一次请求完成资料分类、缺失摘要补齐和该 group 的全部卡片生成；模型提炼失败或未配置模型时使用确定性本地提炼，不能因为外部模型不可用而阻断复习提醒。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v4`；业务模块只负责组装已清洗的动态输入并调用模型。
+- 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
+- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，一份资料的一次生成尝试只执行一次 LLM 请求，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。`DEEPSEEK_API_KEY` 缺失、DeepSeek 请求失败、响应不是合法 JSON 或结果未通过质量门禁时，整次生成写入 `FAILED` 并停用该资料当前活跃卡片，禁止回退到本地摘要或规则问答。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v7`；v7 保留本地学习内容前置过滤与 DeepSeek-only 内容生成边界，并把答案忠实度门禁升级为逐论断核验：句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
-- 视频、面经和讲解类资料在送模前先从 evidence 抽取原始问句候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion`；服务端校验后使用原问句作为卡片问题。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
-- evidence 进入模型前会移除纯时间码、重复字幕水印和无事实内容的口头转场；清洗后没有有效知识点的资料不会创建卡片，历史旧版本卡片会在增量同步时停用并重建。
+- 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
+- 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
+- evidence 在本地前置过滤阶段会移除纯时间码、重复字幕水印和无事实内容的口头转场；未通过学习内容过滤的资料直接跳过且不创建卡片，历史旧版本卡片会在增量同步时停用并重建。本地过滤不得生成或改写资料总结、问题、答案和提示。
 - 用户删除使用 PostgreSQL tombstone 作为唯一事实来源。`learning_review_card_exclusion` 按 `materialId + sourceKey` 阻止同一卡片复活，`learning_review_material_exclusion` 按 `materialId` 永久阻止整份资料再次进入复习中心；不能只依赖前端隐藏或 Redis 缓存。
 - 删除接口必须幂等并校验当前用户归属。卡片删除与并发评分使用行锁串行化；资料删除与并发生成共同锁定 `learning_material`，保证最终状态要么完整生成、随后被删除，要么生成结果在保存前被排除。
 - PostgreSQL 的 `dueAt` 和评分日志是唯一事实来源，不缓存卡片排程；配置 `REDIS_URL` 时只使用带 TTL 的生成短锁，防止多实例对同一资料重复调用 LLM。
@@ -38,7 +39,7 @@
 
 DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务固定请求 `deepseek-v4-flash`。官方说明该模型标识会滚动指向最新正式版本；思考模式请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`。参数依据：[首次 API 调用](https://api-docs.deepseek.com/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON 输出](https://api-docs.deepseek.com/guides/json_mode)。
 
-密钥只从进程环境变量 `DEEPSEEK_API_KEY` 读取。Windows 用户级配置示例：
+密钥只从进程环境变量 `DEEPSEEK_API_KEY` 读取。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
 
 ```powershell
 [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', '<your-key>', 'User')
@@ -150,7 +151,7 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 }
 ```
 
-`materialSummary` 优先取资料自身的 `document_summary`；资料未提供摘要时，取复习提炼阶段生成并持久化的摘要。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+`materialSummary` 只取当前 `review-card-v7` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
 
 ### 保存资料 group 顺序
 
@@ -357,7 +358,7 @@ Authorization: Bearer <token>
 {"materialIds": [12, 13]}
 ```
 
-## 错误与降级
+## 错误与失败处理
 
 | 场景 | 对外错误或行为 |
 | --- | --- |
@@ -374,13 +375,15 @@ Authorization: Bearer <token>
 | 同一资料正在由其他请求生成 | `该资料的复习卡片正在生成，请稍后刷新` |
 | 资料尚未完成索引 | `学习资料尚未完成索引` |
 | 无可用 evidence | 分类记录为 `FAILED`，不生成无来源卡片 |
-| `DEEPSEEK_API_KEY` 未配置 | 不调用外部模型，使用本地摘要与关键知识点提炼，并保留原 evidence |
-| DeepSeek 请求超时或返回非法 JSON | 自动使用本地摘要与关键知识点提炼，并保留原 evidence |
+| evidence 清洗后只剩字幕水印、时间码或口头噪声 | 本地过滤记录为 `SKIPPED`，不调用 DeepSeek，不生成卡片 |
+| `DEEPSEEK_API_KEY` 未配置 | 分类记录为 `FAILED`，停用当前活跃卡片，显示“未配置 DeepSeek 密钥”，等待重新生成 |
+| DeepSeek 请求超时、限流或服务异常 | 分类记录为 `FAILED`，停用当前活跃卡片，不发布本地降级内容，后续可重试 |
+| DeepSeek 返回非法 JSON 或未通过质量门禁 | 分类记录为 `FAILED`，记录不含模型隐私内容的中文原因，不发布部分坏卡 |
 | FSRS 状态损坏 | 使用当前卡片创建时间重建初始状态并记录受控日志，不回显内部状态 |
 
 ## 前端影响
 
-- 新增 `/reviews` 复习中心，按上传资料展示每日 group；每个 group 与右侧资料列表都展示资料摘要，group 内展示该资料全部到期卡片、答案揭示、四档评分、来源 evidence 和下一次复习时间。今日资料支持拖拽手柄、键盘方向键/Home/End，以及移动端上移/下移按钮调整优先级。
+- 新增 `/reviews` 复习中心，按上传资料展示每日 group；资料总结以卡片网格首位的全宽独立 box 展示，不参与回忆评分，标题区只保留资料元信息。group 内展示该资料全部到期卡片、答案揭示、四档评分、来源 evidence 和下一次复习时间。今日资料支持拖拽手柄、键盘方向键/Home/End，以及移动端上移/下移按钮调整优先级。
 - 侧栏新增“复习中心”；顶部通知按钮展示到期数量并跳转到复习中心。
 - 页面打开时调用一次 `POST /api/reviews/sync`，之后定时刷新 `overview`；文件上传后会在 RAG 状态进入 `READY/PARTIAL` 时按 `materialId` 调用生成接口，避免上传响应早于 evidence 入库而漏生成卡片，也避免历史候选抢占本次上传。资料同步失败不阻断其他页面。
 - 卡片右上角提供图标删除操作；资料 group 标题和右侧资料列表提供“移出复习中心”操作。两种操作都先显示明确确认对话框，资料确认文案必须说明原始 RAG 文件不会删除且移除后不会重新生成。

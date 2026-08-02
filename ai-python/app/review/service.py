@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.core.result import BusinessError
 from app.review.fsrs_scheduler import FsrsReviewScheduler, as_utc
 from app.review.generation_guard import ReviewGenerationGuard
-from app.review.knowledge_extractor import KnowledgePointExtractor, LearningMaterialContext
+from app.review.knowledge_extractor import (
+    KnowledgePointExtractor,
+    LearningMaterialContext,
+    ReviewExtractionError,
+)
 from app.review.repository import (
     CURRENT_REVIEW_EXTRACTORS,
     MaterialSourceRecord,
@@ -381,28 +385,37 @@ class ReviewService:
             if not evidences:
                 return self._save_generation(
                     material,
-                    is_learning_content=True,
-                    category="学习资料",
-                    summary=material.document_summary,
+                    is_learning_content=None,
+                    category=None,
+                    summary=None,
                     status="FAILED",
-                    reason="资料暂无可用 evidence，无法生成带来源的复习卡片",
-                    extractor=f"none:{REVIEW_CARD_PROMPT_VERSION}",
+                    reason="资料暂无可用 evidence，无法调用 DeepSeek 生成复习内容",
+                    extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
                     cards=[],
                 )
-            extraction = self.extractor.extract(
-                LearningMaterialContext(
-                    material_id=material.id,
-                    title=material.title,
-                    document_type=material.document_type,
-                    summary=material.document_summary,
-                ),
-                evidences,
-            )
-            summary = (
-                material.document_summary
-                if material.document_summary and material.document_summary.strip()
-                else extraction.summary
-            )
+            try:
+                extraction = self.extractor.extract(
+                    LearningMaterialContext(
+                        material_id=material.id,
+                        title=material.title,
+                        document_type=material.document_type,
+                        summary=material.document_summary,
+                    ),
+                    evidences,
+                )
+            except ReviewExtractionError as exc:
+                # 失败结果会停用旧卡片，避免继续展示本地降级或旧 Prompt 的坏内容。
+                return self._save_generation(
+                    material,
+                    is_learning_content=None,
+                    category=None,
+                    summary=None,
+                    status="FAILED",
+                    reason=str(exc),
+                    extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
+                    cards=[],
+                )
+            summary = extraction.summary
             if not extraction.is_learning_content:
                 return self._save_generation(
                     material,
@@ -462,7 +475,7 @@ class ReviewService:
         self,
         material: MaterialSourceRecord,
         *,
-        is_learning_content: bool,
+        is_learning_content: bool | None,
         category: str | None,
         summary: str | None,
         status: str,

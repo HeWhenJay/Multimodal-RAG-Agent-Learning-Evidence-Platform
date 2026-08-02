@@ -9,6 +9,7 @@ import pytest
 
 from app.core.result import BusinessError
 from app.review.fsrs_scheduler import FsrsReviewScheduler
+from app.review.knowledge_extractor import ReviewExtractionError
 from app.review.repository import (
     CURRENT_REVIEW_EXTRACTORS,
     DatabaseReviewTransaction,
@@ -218,13 +219,14 @@ def test_sync_candidates_include_outdated_extractor_versions() -> None:
     transaction._statement = lambda query: query  # type: ignore[method-assign]
 
     assert transaction.list_sync_candidates("7", 3) == []
-    assert "rm.extractor NOT IN (%s, %s, %s)" in cursor.statement
+    assert "rm.extractor NOT IN (%s, %s)" in cursor.statement
+    assert "INTERVAL '5 minutes'" in cursor.statement
     assert "learning_review_material_exclusion" in cursor.statement
     assert cursor.params == ("7", *CURRENT_REVIEW_EXTRACTORS, 3)
 
 
-def test_material_queries_prefer_source_summary_before_generated_summary() -> None:
-    """资料自带摘要存在时必须覆盖复习提炼摘要，并保留空摘要降级分支。"""
+def test_material_queries_only_expose_deepseek_review_summary() -> None:
+    """复习资料列表只展示复习提炼摘要，不回退到 RAG 截断摘要。"""
     class RecordingCursor:
         """记录资料列表查询。"""
 
@@ -239,8 +241,9 @@ def test_material_queries_prefer_source_summary_before_generated_summary() -> No
     transaction._statement = lambda query: query  # type: ignore[method-assign]
 
     assert transaction.list_review_materials("7") == []
-    assert "THEN lm.document_summary" in cursor.statement
-    assert "ELSE rm.summary" in cursor.statement
+    assert "THEN rm.summary" in cursor.statement
+    assert "ELSE NULL" in cursor.statement
+    assert "lm.document_summary" not in cursor.statement
 
 
 class SummaryGenerationTransaction:
@@ -289,7 +292,7 @@ class SummaryGenerationTransaction:
 
 
 class SummaryExtractor:
-    """提供可区分的提炼摘要，便于验证资料摘要优先级。"""
+    """提供可区分的 DeepSeek 提炼摘要，验证 RAG 摘要不会覆盖它。"""
 
     def __init__(self, summary: str) -> None:
         self.summary = summary
@@ -306,14 +309,13 @@ class SummaryExtractor:
 
 
 @pytest.mark.parametrize(
-    ("document_summary", "expected_summary"),
-    [(None, "提炼生成的摘要"), ("资料原有摘要", "资料原有摘要")],
+    "document_summary",
+    [None, "RAG 截断摘要"],
 )
-def test_generation_persists_extracted_summary_but_prefers_material_summary(
+def test_generation_always_persists_deepseek_review_summary(
     document_summary: str | None,
-    expected_summary: str,
 ) -> None:
-    """同一次分类请求应保存摘要，资料原摘要不得被模型结果改写。"""
+    """无论 RAG 索引摘要是否存在，复习中心都保存同次 DeepSeek 总结。"""
     transaction = SummaryGenerationTransaction()
     service = ReviewService(
         repository=FakeReviewRepository(transaction),
@@ -325,9 +327,37 @@ def test_generation_persists_extracted_summary_but_prefers_material_summary(
     result = service._generate(material, "7", force=True)
 
     assert result is not None
-    assert result.summary == expected_summary
+    assert result.summary == "提炼生成的摘要"
     assert transaction.saved is not None
-    assert transaction.saved["summary"] == expected_summary
+    assert transaction.saved["summary"] == "提炼生成的摘要"
+
+
+def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
+    """密钥、请求或质量失败必须保存 FAILED + 空卡片，不能继续展示旧坏卡。"""
+    class FailingExtractor:
+        """模拟 DeepSeek 质量门禁失败。"""
+
+        def extract(self, _material, _evidences):
+            raise ReviewExtractionError("DeepSeek 生成的卡片未通过质量门禁")
+
+    transaction = SummaryGenerationTransaction()
+    service = ReviewService(
+        repository=FakeReviewRepository(transaction),
+        extractor=FailingExtractor(),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+    material = MaterialSourceRecord(12, "MVCC 面试课程", "7", "mp4", "READY", "RAG 开头截断", 1, NOW)
+
+    result = service._generate(material, "7", force=True)
+
+    assert result is not None
+    assert result.status == "FAILED"
+    assert result.cardCount == 0
+    assert result.summary is None
+    assert result.reason == "DeepSeek 生成的卡片未通过质量门禁"
+    assert transaction.saved is not None
+    assert transaction.saved["extractor"] == "failed:review-card-v7"
+    assert transaction.saved["cards"] == []
 
 
 class DeletionTransaction:

@@ -130,8 +130,8 @@ def test_selected_document_returns_all_six_due_cards_without_group_truncation() 
     assert len(result.groups[0].cards) == 6
 
 
-def test_due_card_query_maps_effective_material_summary() -> None:
-    """数据库到期队列应联结资料摘要，并把最终优先摘要传给分组层。"""
+def test_due_card_query_maps_deepseek_review_summary() -> None:
+    """数据库到期队列只联结当前已生成的 DeepSeek 复习摘要。"""
     class DueCursor:
         """返回一张带资料摘要的数据库卡片行。"""
 
@@ -146,7 +146,7 @@ def test_due_card_query_maps_effective_material_summary() -> None:
                     "material_id": 12,
                     "user_id": "7",
                     "material_title": "Kafka 高可用",
-                    "material_summary": "资料原摘要",
+                    "material_summary": "DeepSeek 复习总结",
                     "document_type": "pdf",
                     "question": "ISR 有什么作用？",
                     "answer": "ISR 跟踪同步副本。",
@@ -161,9 +161,10 @@ def test_due_card_query_maps_effective_material_summary() -> None:
 
     records = transaction.list_due_cards("7", now=NOW, limit=20)
 
-    assert records[0].material_summary == "资料原摘要"
-    assert "THEN lm.document_summary" in cursor.statement
-    assert "ELSE rm.summary" in cursor.statement
+    assert records[0].material_summary == "DeepSeek 复习总结"
+    assert "rm.summary AS material_summary" in cursor.statement
+    assert "rm.status = 'GENERATED'" in cursor.statement
+    assert "lm.document_summary" not in cursor.statement
     assert "display_order" not in cursor.statement
 
 

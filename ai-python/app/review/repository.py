@@ -21,10 +21,12 @@ from rag.retrievers.retrieval import as_optional_int, as_optional_str, build_pla
 DEFAULT_SCHEMA = "learning_evidence"
 SCHEMA_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CURRENT_REVIEW_EXTRACTORS = (
-    f"local:{REVIEW_CARD_PROMPT_VERSION}",
     f"model:{REVIEW_CARD_PROMPT_VERSION}",
-    f"none:{REVIEW_CARD_PROMPT_VERSION}",
+    f"filter:{REVIEW_CARD_PROMPT_VERSION}",
 )
+CURRENT_REVIEW_MODEL_EXTRACTOR = CURRENT_REVIEW_EXTRACTORS[0]
+CURRENT_REVIEW_EMPTY_EXTRACTOR = CURRENT_REVIEW_EXTRACTORS[1]
+CURRENT_REVIEW_FAILED_EXTRACTOR = f"failed:{REVIEW_CARD_PROMPT_VERSION}"
 
 
 @dataclass(frozen=True)
@@ -132,13 +134,13 @@ class ReviewTransaction(Protocol):
 
     def find_material_by_id(self, material_id: int) -> MaterialSourceRecord | None: ...
 
-    def list_evidences(self, material: MaterialSourceRecord, limit: int = 24) -> list[Evidence]: ...
+    def list_evidences(self, material: MaterialSourceRecord, limit: int = 320) -> list[Evidence]: ...
 
     def save_generation(
         self,
         material: MaterialSourceRecord,
         *,
-        is_learning_content: bool,
+        is_learning_content: bool | None,
         category: str | None,
         summary: str | None,
         status: str,
@@ -261,7 +263,13 @@ class DatabaseReviewTransaction:
                       rm.material_id IS NULL
                       OR rm.index_request_version < lm.index_request_version
                       OR rm.extractor IS NULL
-                      OR rm.extractor NOT IN (%s, %s, %s)
+                      OR (
+                          rm.extractor NOT IN (%s, %s)
+                          AND (
+                              rm.status <> 'FAILED'
+                              OR rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                          )
+                      )
                   )
                 ORDER BY lm.updated_at ASC, lm.id ASC
                 LIMIT %s
@@ -301,8 +309,8 @@ class DatabaseReviewTransaction:
         row = self._cursor.fetchone()
         return self._to_material(row) if row else None
 
-    def list_evidences(self, material: MaterialSourceRecord, limit: int = 24) -> list[Evidence]:
-        """读取 canonical RAG 切块，并保留视频时间段和文本预览链接。"""
+    def list_evidences(self, material: MaterialSourceRecord, limit: int = 320) -> list[Evidence]:
+        """读取整份资料的原始 RAG 切块，由提炼器再做全局均匀抽样。"""
         document_id = f"material-{material.id}"
         self._cursor.execute(
             self._statement(
@@ -316,7 +324,13 @@ class DatabaseReviewTransaction:
                   AND d.user_id = %s
                   AND d.visibility_scope = 'private'
                 ORDER BY
-                    CASE WHEN c.metadata ->> 'childKind' = 'summary' THEN 0 ELSE 1 END,
+                    CASE
+                        WHEN COALESCE(c.metadata ->> 'childKind', '') NOT IN ('summary', 'video_segment_summary', 'ocr_occurrence')
+                             AND COALESCE(c.metadata ->> 'evidenceChannel', '') <> 'frame_ocr' THEN 0
+                        WHEN COALESCE(c.metadata ->> 'evidenceChannel', '') = 'frame_ocr'
+                             OR c.metadata ->> 'childKind' = 'ocr_occurrence' THEN 1
+                        ELSE 2
+                    END,
                     c.chunk_position ASC
                 LIMIT %s
                 """
@@ -329,7 +343,7 @@ class DatabaseReviewTransaction:
         self,
         material: MaterialSourceRecord,
         *,
-        is_learning_content: bool,
+        is_learning_content: bool | None,
         category: str | None,
         summary: str | None,
         status: str,
@@ -709,13 +723,18 @@ class DatabaseReviewTransaction:
             self._statement(
                 """
                 SELECT
-                    COUNT(1) FILTER (WHERE active = TRUE) AS total_card_count,
-                    COUNT(DISTINCT material_id) FILTER (WHERE active = TRUE) AS active_material_count,
-                    COUNT(1) FILTER (WHERE active = TRUE AND due_at <= %s) AS due_count,
-                    COUNT(DISTINCT material_id) FILTER (WHERE active = TRUE AND due_at <= %s) AS due_material_count,
-                    MIN(due_at) FILTER (WHERE active = TRUE AND due_at > %s) AS next_due_at
-                FROM {schema}.learning_review_card
-                WHERE user_id = %s
+                    COUNT(1) FILTER (WHERE c.active = TRUE) AS total_card_count,
+                    COUNT(DISTINCT c.material_id) FILTER (WHERE c.active = TRUE) AS active_material_count,
+                    COUNT(1) FILTER (WHERE c.active = TRUE AND c.due_at <= %s) AS due_count,
+                    COUNT(DISTINCT c.material_id) FILTER (WHERE c.active = TRUE AND c.due_at <= %s) AS due_material_count,
+                    MIN(c.due_at) FILTER (WHERE c.active = TRUE AND c.due_at > %s) AS next_due_at
+                FROM {schema}.learning_review_card c
+                JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = c.material_id
+                 AND rm.user_id = c.user_id
+                 AND rm.status = 'GENERATED'
+                 AND rm.extractor = {current_model_extractor}
+                WHERE c.user_id = %s
                 """
             ),
             (now, now, now, user_id),
@@ -730,6 +749,11 @@ class DatabaseReviewTransaction:
                         WHERE EXISTS (
                             SELECT 1
                             FROM {schema}.learning_review_card due_card
+                            JOIN {schema}.learning_review_material due_material
+                              ON due_material.material_id = due_card.material_id
+                             AND due_material.user_id = due_card.user_id
+                             AND due_material.status = 'GENERATED'
+                             AND due_material.extractor = {current_model_extractor}
                             WHERE due_card.material_id = log.material_id
                               AND due_card.user_id = log.user_id
                               AND due_card.active = TRUE
@@ -759,15 +783,15 @@ class DatabaseReviewTransaction:
             self._statement(
                 """
                 SELECT c.*, lm.title AS material_title, lm.document_type,
-                       CASE
-                           WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
-                               THEN lm.document_summary
-                           ELSE rm.summary
-                       END AS material_summary,
+                       rm.summary AS material_summary,
                        MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                 FROM {schema}.learning_review_card c
                 JOIN {schema}.learning_material lm ON lm.id = c.material_id
-                LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = c.material_id
+                JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = c.material_id
+                 AND rm.user_id = c.user_id
+                 AND rm.status = 'GENERATED'
+                 AND rm.extractor = {current_model_extractor}
                 WHERE c.user_id = %s
                   AND lm.user_id = %s
                   AND c.active = TRUE
@@ -802,17 +826,17 @@ class DatabaseReviewTransaction:
                 ),
                 due_cards AS (
                     SELECT c.*, lm.title AS material_title, lm.document_type,
-                           CASE
-                               WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
-                                   THEN lm.document_summary
-                               ELSE rm.summary
-                           END AS material_summary,
+                           rm.summary AS material_summary,
                            rm.display_order AS material_display_order,
                            (reviewed_materials.material_id IS NOT NULL) AS started_today,
                            MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                     FROM {schema}.learning_review_card c
                     JOIN {schema}.learning_material lm ON lm.id = c.material_id
-                    LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = c.material_id
+                    JOIN {schema}.learning_review_material rm
+                      ON rm.material_id = c.material_id
+                     AND rm.user_id = c.user_id
+                     AND rm.status = 'GENERATED'
+                     AND rm.extractor = {current_model_extractor}
                     LEFT JOIN reviewed_materials
                         ON reviewed_materials.material_id = c.material_id
                     WHERE c.user_id = %s
@@ -1068,14 +1092,38 @@ class DatabaseReviewTransaction:
                 lm.id AS material_id, lm.title, lm.document_type,
                 lm.status AS material_status, lm.index_request_version,
                 rm.index_request_version AS synced_index_request_version,
-                rm.is_learning_content, rm.category,
-                COALESCE(rm.status, 'PENDING') AS review_status,
-                rm.reason, COALESCE(rm.card_count, 0) AS card_count,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN rm.is_learning_content
+                    ELSE NULL
+                END AS is_learning_content,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN rm.category
+                    ELSE NULL
+                END AS category,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN COALESCE(rm.status, 'PENDING')
+                    ELSE 'PENDING'
+                END AS review_status,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN rm.reason
+                    WHEN rm.material_id IS NOT NULL
+                        THEN '复习生成规则已升级，等待 DeepSeek 重新生成'
+                    ELSE NULL
+                END AS reason,
+                CASE
+                    WHEN rm.extractor = {{current_model_extractor}}
+                        THEN COALESCE(rm.card_count, 0)
+                    ELSE 0
+                END AS card_count,
                 rm.extractor,
                 CASE
-                    WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
-                        THEN lm.document_summary
-                    ELSE rm.summary
+                    WHEN rm.extractor = {{current_model_extractor}}
+                        THEN rm.summary
+                    ELSE NULL
                 END AS material_summary,
                 COALESCE(rm.updated_at, lm.updated_at) AS review_updated_at
             FROM {{schema}}.learning_material lm
@@ -1089,14 +1137,14 @@ class DatabaseReviewTransaction:
         return self._statement(
             f"""
             SELECT c.*, lm.title AS material_title, lm.document_type,
-                   CASE
-                       WHEN NULLIF(BTRIM(lm.document_summary), '') IS NOT NULL
-                           THEN lm.document_summary
-                       ELSE rm.summary
-                   END AS material_summary
+                   rm.summary AS material_summary
             FROM {{schema}}.learning_review_card c
             JOIN {{schema}}.learning_material lm ON lm.id = c.material_id
-            LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = c.material_id
+            JOIN {{schema}}.learning_review_material rm
+              ON rm.material_id = c.material_id
+             AND rm.user_id = c.user_id
+             AND rm.status = 'GENERATED'
+             AND rm.extractor = {{current_model_extractor}}
             {suffix}
             """
         )
@@ -1105,7 +1153,12 @@ class DatabaseReviewTransaction:
         """使用 psycopg 标识符拼接 schema，拒绝配置值注入。"""
         from psycopg import sql
 
-        return sql.SQL(query).format(schema=sql.Identifier(self._schema))
+        return sql.SQL(query).format(
+            schema=sql.Identifier(self._schema),
+            current_model_extractor=sql.Literal(CURRENT_REVIEW_MODEL_EXTRACTOR),
+            current_empty_extractor=sql.Literal(CURRENT_REVIEW_EMPTY_EXTRACTOR),
+            current_failed_extractor=sql.Literal(CURRENT_REVIEW_FAILED_EXTRACTOR),
+        )
 
     @staticmethod
     def _to_material(row: dict[str, Any]) -> MaterialSourceRecord:
