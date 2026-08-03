@@ -30,7 +30,7 @@ planner -> actor -> observer
 ## 循环与失败控制
 
 - LangGraph 调用固定使用 `recursion_limit=999`，为多节点循环留出足够空间。
-- 真实模型尝试默认最多 6 次，由 `REVIEW_GENERATION_MAX_ATTEMPTS` 配置并限制在安全范围内；递归限制与模型调用预算相互独立。
+- 真实质量修复默认最多 8 次，由 `REVIEW_GENERATION_MAX_ATTEMPTS` 配置并限制在安全范围内；空响应或非法 JSON 在当前质量轮内短程重试，不额外消耗质量修复轮次。递归限制与模型调用预算相互独立。
 - 缺少 `DEEPSEEK_API_KEY`、资料无 evidence 等无法通过修复 Prompt 解决的问题直接保存为 `FAILED`。
 - 质量门禁耗尽或 `GraphRecursionError` 保存为 `NEEDS_REVIEW`。用户提交 `userFeedback` 后启动一轮新的图执行，尝试次数按本轮重新计算，历史持久化反馈作为界面诊断，不污染原始 evidence。
 - 任一失败终态都停用旧卡片，禁止继续展示旧 Prompt 或未通过门禁的内容。

@@ -142,7 +142,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v9"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v10"
     assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
     assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
     assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
@@ -364,6 +364,50 @@ def test_source_question_extraction_handles_asr_comma_instead_of_question_mark()
     assert extract_source_questions(source) == ["Kafka 为什么能够在 Broker 故障后继续提供服务呢"]
 
 
+def test_source_question_extraction_filters_kafka_speech_rhetorical_noise() -> None:
+    """Kafka 真实失败样例中的确认句、承接句和无主题追问不能触发完整覆盖门禁。"""
+    source = evidence(
+        "material-12-kafka-speech",
+        "Kafka 高性能设计",
+        (
+            "Kafka 中实现高性能的设计有了解过吗？"
+            "第一个是消息分区，分区的好处是不受单台服务器限制，能处理更多数据，对吧？"
+            "是不是很方便的？我们再来看下面这个图，如果也要找一二三四五六七，该怎么办呢？"
+            "首先是一，然后是二，再到三，它们是不是不连续啊？然后是四、五，你看又跳了对不对？"
+            "该怎么办呢？在缓存中操作数据，是不是就提升了性能呢？"
+            "零拷贝为什么能减少磁盘 IO 和网络 IO？它到底是怎么做的呢？"
+            "在 Linux 系统中主要划分用户空间和内核空间，对吧？"
+        ),
+    )
+
+    assert extract_source_questions(source) == [
+        "Kafka 中实现高性能的设计有了解过吗？",
+        "零拷贝为什么能减少磁盘 IO 和网络 IO？",
+    ]
+
+
+def test_kafka_speech_questions_do_not_trigger_structured_full_coverage() -> None:
+    """大量上下文依赖追问即使超过 8 个，也不能被误判成必须逐项覆盖的问题清单。"""
+    questions = [
+        {"evidenceId": f"speech-{index}", "question": question}
+        for index, question in enumerate(
+            [
+                "这个问的是 Kafka 中实现高性能的设计有了解过吗？",
+                "那这个怎么做呢？",
+                "消费者要消费这个消息怎么办呢？",
+                "现在需要把这个消息发送给消费者，怎么做呢？",
+                "大家回想一下刚才数据拷贝了几次呢？",
+                "这个流程拷贝了几次呢？",
+                "是不是只有两次啊？",
+                "数据拷贝变少后性能更高，这个没问题吧？",
+                "面试官问的是：Kafka 中实现高性能的设计有了解过吗？",
+            ]
+        )
+    ]
+
+    assert review_card_limit(questions) == 8
+
+
 def test_review_model_does_not_inherit_proxy_or_other_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """缺少 DeepSeek 密钥时必须失败，不能借用代理、百炼或通用 RAG 配置。"""
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -398,6 +442,65 @@ def test_invalid_model_content_structure_raises_instead_of_falling_back() -> Non
             [evidence("material-12-1", "核心", "Kafka 副本机制用于保障可用性。")],
             {"cards": []},
         )
+
+
+def test_quality_gate_keeps_valid_cards_when_other_cards_are_invalid() -> None:
+    """非结构化资料应采用部分成功，少量坏卡不能拖死整份已通过门禁的卡片。"""
+    extractor = KnowledgePointExtractor(provider="deepseek")
+    reference = evidence(
+        "material-12-7",
+        "ISR",
+        "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。",
+    )
+    payload = valid_payload()
+    payload["cards"].append(
+        {
+            "question": "那到底怎么办？",
+            "sourceQuestion": None,
+            "answer": "ISR 采用量子退火算法预测消费者扩缩容。",
+            "hint": "回忆一下",
+            "evidenceIds": [],
+        }
+    )
+
+    result = extractor._validate_model_result(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [reference],
+        payload,
+    )
+
+    assert len(result.knowledge_points) == 1
+    assert result.knowledge_points[0].question == payload["cards"][0]["question"]
+    assert any("卡片 2" in item for item in result.quality_feedback)
+
+
+def test_empty_json_response_retries_without_spending_graph_quality_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """空响应应在当前模型轮内重试，不能直接消耗一次 LangGraph 质量修复。"""
+    calls = 0
+
+    class FakeCompletions:
+        """先返回空内容，再返回合法结果。"""
+
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            content = "" if calls == 1 else json.dumps(valid_payload(), ensure_ascii=False)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr("app.review.knowledge_extractor.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    result = KnowledgePointExtractor(provider="deepseek").extract(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。")],
+    )
+
+    assert calls == 2
+    assert result.generation_attempts == 1
+    assert result.knowledge_points
 
 
 def test_representative_evidence_sampling_covers_whole_video_and_prefers_raw() -> None:

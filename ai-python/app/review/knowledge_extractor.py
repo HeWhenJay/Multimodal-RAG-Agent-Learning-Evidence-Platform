@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
@@ -16,6 +17,7 @@ from app.review.generation_graph import (
     ReviewManualReviewRequired,
     emit_progress,
     run_review_generation_graph,
+    unique_feedback,
 )
 from app.schemas.rag import Evidence
 from prompts.review import (
@@ -59,6 +61,7 @@ MAX_STRUCTURED_REVIEW_CARD_LIMIT = 32
 STANDARD_EVIDENCE_LIMIT = 16
 STRUCTURED_EVIDENCE_LIMIT = 48
 SOURCE_QUESTION_LIMIT = 64
+REVIEW_RESPONSE_PARSE_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,7 @@ class KnowledgePointExtractor:
             raise ReviewExtractionError("未配置 DEEPSEEK_API_KEY，无法生成复习内容")
         try:
             source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
+            required_questions = required_structured_source_questions(source_questions)
             usable = select_review_prompt_evidences(cleaned, source_questions)
             emit_progress(
                 progress_callback,
@@ -165,16 +169,20 @@ class KnowledgePointExtractor:
                 percent=12,
                 attempt=0,
                 maxAttempts=None,
-                detail=f"清洗后保留 {len(cleaned)} 条 evidence，选取 {len(usable)} 条，识别 {len(source_questions)} 个原始问题",
+                detail=(
+                    f"清洗后保留 {len(cleaned)} 条 evidence，选取 {len(usable)} 条，"
+                    f"识别 {len(source_questions)} 个候选问题，其中 {len(required_questions)} 个属于必须完整覆盖的问题清单"
+                ),
             )
             outcome = run_review_generation_graph(
-                actor=lambda attempt, feedback: self._generate_model_payload(
+                actor=lambda attempt, feedback, previous_candidate: self._generate_model_payload(
                     material,
                     usable,
                     source_questions=source_questions,
                     attempt=attempt,
                     quality_feedback=feedback,
                     user_feedback=user_feedback,
+                    previous_candidate=previous_candidate,
                 ),
                 observer=lambda payload: self._validate_model_result(
                     material,
@@ -185,7 +193,8 @@ class KnowledgePointExtractor:
                 plan={
                     "materialId": material.material_id,
                     "title": material.title,
-                    "structuredQuestionCount": len(source_questions),
+                    "sourceQuestionCount": len(source_questions),
+                    "structuredQuestionCount": len(required_questions),
                     "maxCards": review_card_limit(source_questions),
                     "hasUserFeedback": bool((user_feedback or "").strip()),
                 },
@@ -198,7 +207,9 @@ class KnowledgePointExtractor:
                 category=category,
                 reason=reason,
                 generation_attempts=outcome.attempts,
-                quality_feedback=outcome.quality_feedback,
+                quality_feedback=tuple(
+                    unique_feedback([*modeled.quality_feedback, *outcome.quality_feedback])
+                ),
             )
         except ReviewManualReviewRequired:
             raise
@@ -240,8 +251,9 @@ class KnowledgePointExtractor:
         attempt: int = 1,
         quality_feedback: list[str] | None = None,
         user_feedback: str | None = None,
+        previous_candidate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """调用 DeepSeek 官方入口并返回待观察节点校验的原始 JSON。"""
+        """调用 DeepSeek；空响应或非法 JSON 在当前质量轮内短程重试。"""
         from openai import OpenAI
 
         source_questions = source_questions or extract_source_question_candidates(evidences)
@@ -259,25 +271,48 @@ class KnowledgePointExtractor:
             summary=material.summary or "",
             evidences=evidence_payload,
             source_questions=source_questions,
+            required_source_questions=required_structured_source_questions(source_questions),
             max_cards=review_card_limit(source_questions),
             attempt=attempt,
             quality_feedback=quality_feedback,
             user_feedback=user_feedback,
+            previous_candidate=previous_candidate,
         )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": review_card_system_prompt()},
-                {"role": "user", "content": prompt},
+        last_error: Exception | None = None
+        for transport_attempt in range(1, REVIEW_RESPONSE_PARSE_ATTEMPTS + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": review_card_system_prompt()},
+                        {"role": "user", "content": prompt},
+                    ],
+                    reasoning_effort=self.reasoning_effort,
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "enabled"}},
+                    timeout=self.timeout_seconds,
+                )
+                choices = getattr(response, "choices", None) or []
+                content = choices[0].message.content if choices else ""
+                return parse_json_object(content or "")
+            except (json.JSONDecodeError, IndexError, AttributeError, TypeError, ValueError) as exc:
+                last_error = exc
+                logger.warning(
+                    "DeepSeek 复习内容第 %s 轮的响应解析失败，传输重试 %s/%s：%s",
+                    attempt,
+                    transport_attempt,
+                    REVIEW_RESPONSE_PARSE_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                if transport_attempt < REVIEW_RESPONSE_PARSE_ATTEMPTS:
+                    time.sleep(0.25 * transport_attempt)
+        raise ReviewExtractionError(
+            "DeepSeek 连续返回空响应或非法 JSON",
+            diagnostics=[
+                f"模型响应连续 {REVIEW_RESPONSE_PARSE_ATTEMPTS} 次为空或不是合法 JSON，下一轮将重新请求完整 JSON 对象"
             ],
-            reasoning_effort=self.reasoning_effort,
-            response_format={"type": "json_object"},
-            extra_body={"thinking": {"type": "enabled"}},
-            timeout=self.timeout_seconds,
-        )
-        content = response.choices[0].message.content or ""
-        return parse_json_object(content)
+        ) from last_error
 
     def _validate_model_result(
         self,
@@ -381,12 +416,24 @@ class KnowledgePointExtractor:
                 f"应覆盖 {len(expected_structured)} 个，已覆盖 {len(expected_structured) - len(missing_structured)} 个；"
                 f"缺少：{'；'.join(missing_structured[:12])}"
             )
-        if not points and not diagnostics:
-            diagnostics.append("cards 为空，没有生成任何可发布的复习卡片")
-        if diagnostics:
+        if not points:
+            if not diagnostics:
+                diagnostics.append("cards 为空，没有生成任何可发布的复习卡片")
             raise ReviewExtractionError(
                 "DeepSeek 生成的卡片未通过问题完整性与 evidence 质量门禁",
                 diagnostics=diagnostics[:80],
+            )
+        if missing_structured:
+            raise ReviewExtractionError(
+                "DeepSeek 生成的卡片未完整覆盖资料已有的问题清单",
+                diagnostics=diagnostics[:80],
+            )
+        if diagnostics:
+            logger.info(
+                "复习卡片采用部分成功结果：material_id=%s accepted=%s discarded=%s",
+                material.material_id,
+                len(points),
+                len(diagnostics),
             )
         return ExtractionResult(
             True,
@@ -395,6 +442,7 @@ class KnowledgePointExtractor:
             tuple(points[: review_card_limit(question_candidates)]),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
             summary,
+            quality_feedback=tuple(diagnostics[:80]),
         )
 
 
@@ -486,11 +534,12 @@ def select_review_prompt_evidences(
     source_questions: list[dict[str, str]],
 ) -> list[Evidence]:
     """结构化资料优先保留问题片段和相邻答案片段，再补充整篇均匀采样。"""
-    if len(source_questions) <= STANDARD_REVIEW_CARD_LIMIT:
+    required_questions = required_structured_source_questions(source_questions)
+    if not required_questions:
         return select_representative_evidences(evidences, limit=STANDARD_EVIDENCE_LIMIT)
 
     ordered = sorted(evidences, key=evidence_position)
-    preferred_ids = {str(item.get("evidenceId") or "") for item in source_questions}
+    preferred_ids = {str(item.get("evidenceId") or "") for item in required_questions}
     expanded_ids = set(preferred_ids)
     for index, evidence in enumerate(ordered[:-1]):
         if evidence.evidenceId in preferred_ids:
@@ -621,14 +670,10 @@ def extract_source_questions(evidence: Evidence) -> list[str]:
 
 def review_card_limit(source_questions: list[dict[str, str]]) -> int:
     """普通资料保持精炼，明确列出问题清单时按原始问题数动态放宽。"""
-    unique_questions = {
-        normalized_sentence(str(item.get("question") or ""))
-        for item in source_questions
-        if normalized_sentence(str(item.get("question") or ""))
-    }
-    if len(unique_questions) <= STANDARD_REVIEW_CARD_LIMIT:
+    required_questions = required_structured_source_questions(source_questions)
+    if not required_questions:
         return STANDARD_REVIEW_CARD_LIMIT
-    return min(MAX_STRUCTURED_REVIEW_CARD_LIMIT, len(unique_questions))
+    return min(MAX_STRUCTURED_REVIEW_CARD_LIMIT, len(required_questions))
 
 
 def structured_source_questions(source_questions: list[dict[str, str]]) -> list[tuple[str, str]]:
@@ -638,7 +683,7 @@ def structured_source_questions(source_questions: list[dict[str, str]]) -> list[
     for item in source_questions:
         question = compact_text(item.get("question"), 180)
         key = normalized_sentence(question)
-        if not key or key in seen:
+        if not key or key in seen or not is_structured_source_question(question):
             continue
         seen.add(key)
         result.append((key, question))
@@ -647,11 +692,50 @@ def structured_source_questions(source_questions: list[dict[str, str]]) -> list[
     return result[:MAX_STRUCTURED_REVIEW_CARD_LIMIT]
 
 
+def required_structured_source_questions(
+    source_questions: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """只在自包含问题超过普通卡片上限时返回必须完整覆盖的清单。"""
+    required_keys = {key for key, _question in structured_source_questions(source_questions)}
+    if not required_keys:
+        return []
+    return [
+        item
+        for item in source_questions
+        if normalized_sentence(str(item.get("question") or "")) in required_keys
+    ][:MAX_STRUCTURED_REVIEW_CARD_LIMIT]
+
+
+def is_structured_source_question(value: str | None) -> bool:
+    """结构化清单只接受无需口播上下文即可独立理解的专业问题。"""
+    question = compact_text(value, 180) or ""
+    if not is_high_quality_review_question(question):
+        return False
+    return not bool(
+        re.search(
+            r"(?:这个|那个|这些|它们|他们|刚才|下面这个图|这个消息|该怎么办|"
+            r"大家|同学们|我们|你来看|回想一下|面试官问的是)",
+            question,
+        )
+    )
+
+
 def is_meaningful_source_question(value: str) -> bool:
     """排除寒暄、确认和无知识目标的反问。"""
     compact = " ".join(value.split()).strip()
     normalized = normalized_sentence(compact)
     if len(normalized) < 5 or is_noise_fragment(compact):
+        return False
+    if re.search(r"(?:对吧|对不对|是吧|没错吧|有没有问题)$", normalized):
+        return False
+    if re.search(r"是不是(?:就|很|也|又|已经|还)", normalized):
+        return False
+    if re.fullmatch(
+        r"(?:该|那|这|它|他们|它们|这些|这样|这种|那它)?(?:到底)?(?:是|该)?(?:怎么办|怎么做)(?:的)?(?:呢)?",
+        normalized,
+    ):
+        return False
+    if re.search(r"(?:下面这个图|找一二三四五六七|它们是不是|是不是很方便)", normalized):
         return False
     return not bool(
         re.fullmatch(
@@ -678,7 +762,12 @@ def looks_like_question(value: str) -> bool:
         return False
     # “介绍为什么……/讲解如何……”是内容描述，不是资料向学习者提出的问题。
     reporting_prefix = compact[: question_cue.start()]
-    return not bool(re.search(r"(?:介绍|讲解|说明|分析|讨论|解释)\s*$", reporting_prefix))
+    return not bool(
+        re.search(
+            r"(?:介绍|讲解|说明|分析|讨论|解释|判断|检查|确认|验证|查看|取决于)\s*$",
+            reporting_prefix,
+        )
+    )
 
 
 def validated_source_question(

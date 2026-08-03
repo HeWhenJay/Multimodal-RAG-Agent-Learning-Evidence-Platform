@@ -11,7 +11,7 @@ from langgraph.graph import END, StateGraph
 
 
 REVIEW_GRAPH_RECURSION_LIMIT = 999
-DEFAULT_REVIEW_GRAPH_MAX_ATTEMPTS = 6
+DEFAULT_REVIEW_GRAPH_MAX_ATTEMPTS = 8
 MAX_REVIEW_GRAPH_MODEL_ATTEMPTS = 20
 
 
@@ -47,7 +47,7 @@ class ReviewManualReviewRequired(RuntimeError):
         self.quality_feedback = tuple(unique_feedback(quality_feedback))
 
 
-Actor = Callable[[int, list[str]], dict[str, Any]]
+Actor = Callable[[int, list[str], dict[str, Any]], dict[str, Any]]
 Observer = Callable[[dict[str, Any]], Any]
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -84,11 +84,15 @@ def run_review_generation_graph(
     }
     attempts_seen = 0
 
-    def tracked_actor(attempt: int, feedback: list[str]) -> dict[str, Any]:
+    def tracked_actor(
+        attempt: int,
+        feedback: list[str],
+        previous_candidate: dict[str, Any],
+    ) -> dict[str, Any]:
         """记录递归异常发生前实际进入 actor 的尝试次数。"""
         nonlocal attempts_seen
         attempts_seen = max(attempts_seen, attempt)
-        return actor(attempt, feedback)
+        return actor(attempt, feedback, previous_candidate)
 
     try:
         state = build_review_generation_graph(tracked_actor, observer, on_progress=on_progress).invoke(
@@ -332,11 +336,12 @@ def planner_node(state: ReviewGenerationState) -> ReviewGenerationState:
 
 
 def actor_node(state: ReviewGenerationState, actor: Actor) -> ReviewGenerationState:
-    """调用一次 DeepSeek，并把请求或解析失败转换为观察反馈。"""
+    """调用一次 DeepSeek，并把上一版候选交给模型做定向修复。"""
     attempt = int(state.get("attempt") or 0) + 1
     feedback = list(state.get("repair_feedback") or [])
+    previous_candidate = dict(state.get("candidate") or {})
     try:
-        candidate = actor(attempt, feedback)
+        candidate = actor(attempt, feedback, previous_candidate)
         return {
             "attempt": attempt,
             "candidate": candidate,
@@ -346,7 +351,7 @@ def actor_node(state: ReviewGenerationState, actor: Actor) -> ReviewGenerationSt
     except Exception as exc:  # noqa: BLE001 - 图必须把模型错误收敛为可审计状态。
         return {
             "attempt": attempt,
-            "candidate": {},
+            "candidate": previous_candidate,
             "attempt_feedback": diagnostics_from_exception(exc),
             "status": "REJECTED",
         }

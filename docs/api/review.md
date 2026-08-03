@@ -30,11 +30,11 @@
 - 默认每日上限 `20` 份资料。待复习计数由持久化 `dueAt` 实时计算，服务重启后不丢失；同一资料当天首次评分即占用一份额度。
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
-- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—生成—质量观察—修复”循环，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。图的 `recursion_limit` 固定为 `999`，真实模型调用默认最多 `6` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
+- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—生成—质量观察—修复”循环，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。图的 `recursion_limit` 固定为 `999`，真实模型调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
 - `DEEPSEEK_API_KEY` 缺失等不可执行错误写入 `FAILED`。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
 - `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
 - 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、DeepSeek 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v9`；v9 保留本地学习内容前置过滤、DeepSeek-only 内容生成边界、结构化原始问题完整保留和逐论断答案忠实度门禁，并新增当前尝试轮次、上一轮质量反馈与用户补充说明。句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v10`。v10 会确定性过滤“对吧”“是不是很方便”“该怎么办”“它到底怎么做”等无主题口语反问，只有真正的结构化问题清单才启用完整覆盖；Repair 会携带上一版候选结果，保留合格卡并定向替换坏卡。非结构化资料允许采用通过全部门禁的部分成功卡片，坏卡会被丢弃并写入 `qualityFeedback`；真正的结构化问题缺失或没有任何合格卡时才继续下一轮。DeepSeek 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
@@ -166,7 +166,7 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 }
 ```
 
-`materialSummary` 只取当前 `review-card-v9` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+`materialSummary` 只取当前 `review-card-v10` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
 
 ### 保存资料 group 顺序
 

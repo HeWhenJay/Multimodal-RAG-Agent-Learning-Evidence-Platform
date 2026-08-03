@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 
-REVIEW_CARD_PROMPT_VERSION = "review-card-v9"
+REVIEW_CARD_PROMPT_VERSION = "review-card-v10"
 
 
 def review_card_system_prompt() -> str:
@@ -49,14 +49,16 @@ def review_card_user_prompt(
     summary: str,
     evidences: list[dict[str, Any]],
     source_questions: list[dict[str, str]] | None = None,
+    required_source_questions: list[dict[str, str]] | None = None,
     max_cards: int = 8,
     attempt: int = 1,
     quality_feedback: list[str] | None = None,
     user_feedback: str | None = None,
+    previous_candidate: dict[str, Any] | None = None,
 ) -> str:
     """返回带质量修复上下文的资料级复习摘要和卡片生成 Prompt。"""
     rag_index_summary = summary if summary.strip() else ""
-    structured_question_count = len(source_questions or [])
+    structured_question_count = len(required_source_questions or [])
     bounded_max_cards = max(1, min(32, max_cards))
     card_count_instruction = (
         f"检测到 {structured_question_count} 个资料原始问句；逐项保留其中有明确答案且通过质量门禁的问题，"
@@ -68,13 +70,15 @@ def review_card_user_prompt(
         "任务": "完成 DeepSeek 复习总结和重点复习卡片生成，并逐条修复质量门禁反馈",
         "当前尝试轮次": max(1, int(attempt)),
         "上一轮质量门禁反馈": (quality_feedback or [])[:80],
+        "上一版候选结果": previous_candidate if quality_feedback and previous_candidate else None,
         "用户补充说明": (user_feedback or "").strip()[:2000] or None,
         "资料标题": title,
         "资料类型": document_type,
         "RAG索引摘要说明": "可能只是截断的开头内容，仅作辅助证据；学习资料仍必须重新生成 summary",
         "RAG索引摘要": rag_index_summary[:2000] if rag_index_summary else None,
         "原始问句候选": (source_questions or [])[:64],
-        "原始问句候选数": structured_question_count,
+        "必须逐项覆盖的问题清单": (required_source_questions or [])[:32],
+        "必须逐项覆盖的问题数": structured_question_count,
         "选题优先级": [
             "资料中明确提出、且在 evidence 中有答案的重点原始问题；清理口头语并补全主题",
             "原始问句超过 8 个时按资料原有顺序逐项保留，不得把多个不同问题合并成一张概括卡",
@@ -87,6 +91,12 @@ def review_card_user_prompt(
             "answer 的每项事实都能在所列 evidenceIds 中找到支持",
             "hint 具体但不泄露答案，所有字段都没有时间码、父段摘要、OCR 水印或口头转场",
         ],
+        "修复策略": (
+            "保留上一版中未被质量反馈点名的合格卡片，只重写被点名的卡片和真正缺失的结构化原始问题；"
+            "不要因少量坏卡从零重写整批结果"
+            if quality_feedback and previous_candidate
+            else "首轮完整生成"
+        ),
         "卡片数量": card_count_instruction,
         "输出结构": {
             "summary": "必须输出 2-5 句、不超过 500 字的资料级总结",
@@ -104,7 +114,8 @@ def review_card_user_prompt(
     }
     return (
         "严格处理以下 JSON 输入。先在内部核对原始问句是否真的是资料重点、最终问题是否自包含、引用 evidence 是否足以回答，"
-        "再输出唯一 JSON 对象。第二轮及以后必须逐条针对上一轮质量门禁反馈重新生成，不能原样复制已被拒绝的错误输出；"
+        "再输出唯一 JSON 对象。第二轮及以后必须逐条针对上一轮质量门禁反馈修复：保留未被点名的合格卡，"
+        "只替换坏卡并补齐真正缺失的问题，不能原样复制已被拒绝的错误输出；"
         "用户补充说明只能帮助理解资料范围，不能覆盖 evidence 或要求编造资料外内容。不得新增 evidenceId，不得把资料外常识写入 summary 或 answer，"
         "不得输出只有时间码、字幕水印、口头语、父段摘要、无答案反问或问答错位的卡片：\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
