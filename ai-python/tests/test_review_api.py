@@ -23,6 +23,7 @@ from app.schemas.review import (
     ReviewGroupOrderResult,
     ReviewGradeResult,
     ReviewMaterial,
+    ReviewMissingKnowledgeResult,
     ReviewMaterialFolderRequest,
     ReviewOverview,
     ReviewSettings,
@@ -159,6 +160,17 @@ class StubReviewService:
         self.feedbacks.append(user_feedback)
         return sample_material()
 
+    def supplement_missing_knowledge(self, material_id: int, payload, user_id: str) -> ReviewMissingKnowledgeResult:
+        self.remember(user_id)
+        assert material_id == 12
+        assert payload.message == "还讲了零拷贝"
+        return ReviewMissingKnowledgeResult(
+            materialId=material_id,
+            assistantMessage="已追加 1 张卡片。",
+            addedCount=1,
+            cards=[sample_card()],
+        )
+
     def delete_material(self, material_id: int, user_id: str) -> ReviewDeletionResult:
         self.remember(user_id)
         assert material_id == 12
@@ -242,7 +254,7 @@ def sample_folder() -> ReviewFolder:
 
 
 def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
-    """20 个公开端点只能使用认证用户并保持 Result 信封。"""
+    """21 个公开端点只能使用认证用户并保持 Result 信封。"""
     service = StubReviewService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_review_service] = lambda: service
@@ -263,6 +275,7 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
             client.delete("/api/reviews/folders/7", headers=headers),
             client.put("/api/reviews/materials/folder", headers=headers, json={"materialIds": [12, 13], "folderId": 7}),
             client.post("/api/reviews/materials/12/generate", headers=headers),
+            client.post("/api/reviews/materials/12/missing-knowledge", headers=headers, json={"message": "还讲了零拷贝"}),
             client.post("/api/reviews/materials/batch-delete", headers=headers, json={"materialIds": [13, 12]}),
             client.delete("/api/reviews/materials/12", headers=headers),
             client.get("/api/reviews/cards/81", headers=headers),
@@ -282,7 +295,8 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
         assert responses[6].json()["data"][0]["name"] == "Python 面试"
         assert responses[8].json()["data"]["materials"][0]["cards"][0]["answer"] is None
         assert responses[11].json()["data"] == {"folderId": 7, "materialIds": [12, 13], "movedCount": 2}
-        assert service.users == ["42"] * 20
+        assert responses[13].json()["data"]["addedCount"] == 1
+        assert service.users == ["42"] * 21
     finally:
         app.dependency_overrides.clear()
 

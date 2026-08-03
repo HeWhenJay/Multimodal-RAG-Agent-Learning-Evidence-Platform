@@ -31,6 +31,8 @@ from app.schemas.review import (
     ReviewMaterialBatchDeleteRequest,
     ReviewMaterialFolderRequest,
     ReviewGenerationRequest,
+    ReviewMissingKnowledgeRequest,
+    ReviewMissingKnowledgeResult,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -204,6 +206,25 @@ def generate_review_material(
         execute(
             "生成学习资料复习卡片",
             action,
+        )
+    )
+
+
+@router.post(
+    "/materials/{material_id}/missing-knowledge",
+    response_model=Result[ReviewMissingKnowledgeResult],
+)
+def supplement_review_missing_knowledge(
+    material_id: int,
+    payload: ReviewMissingKnowledgeRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewMissingKnowledgeResult]:
+    """根据用户提示从当前文档 evidence 中只追加遗漏卡片。"""
+    return Result.success(
+        execute(
+            "查找遗漏复习知识点",
+            lambda: service.supplement_missing_knowledge(material_id, payload, str(current_user.id)),
         )
     )
 

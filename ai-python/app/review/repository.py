@@ -154,6 +154,14 @@ class ReviewTransaction(Protocol):
 
     def list_evidences(self, material: MaterialSourceRecord, limit: int = 320) -> list[Evidence]: ...
 
+    def list_active_cards_for_material(self, material_id: int, user_id: str) -> list[ReviewCardRecord]: ...
+
+    def append_review_cards(
+        self,
+        material: MaterialSourceRecord,
+        cards: list[ReviewCardDraft],
+    ) -> list[ReviewCardRecord]: ...
+
     def save_generation(
         self,
         material: MaterialSourceRecord,
@@ -412,6 +420,147 @@ class DatabaseReviewTransaction:
             (document_id, material.user_id, limit),
         )
         return [self._to_evidence(row, material.id) for row in self._cursor.fetchall()]
+
+    def list_active_cards_for_material(self, material_id: int, user_id: str) -> list[ReviewCardRecord]:
+        """读取单份资料的全部活动卡片，作为补漏模型和服务端去重基线。"""
+        self._cursor.execute(
+            self._card_select(
+                "WHERE c.material_id = %s AND c.user_id = %s AND lm.user_id = %s AND c.active = TRUE ORDER BY c.id ASC"
+            ),
+            (material_id, user_id, user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def append_review_cards(
+        self,
+        material: MaterialSourceRecord,
+        cards: list[ReviewCardDraft],
+    ) -> list[ReviewCardRecord]:
+        """只插入补漏卡片，绝不更新、停用或替换任何既有卡片状态。"""
+        if not cards:
+            return []
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.index_request_version,
+                       rm.id AS review_material_id,
+                       rm.status AS review_status,
+                       rm.extractor,
+                       EXISTS (
+                           SELECT 1
+                           FROM {schema}.learning_review_material_exclusion excluded_material
+                           WHERE excluded_material.material_id = lm.id
+                             AND excluded_material.user_id = lm.user_id
+                       ) AS review_excluded
+                FROM {schema}.learning_material lm
+                LEFT JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = lm.id AND rm.user_id = lm.user_id
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        current = self._cursor.fetchone()
+        if current is None:
+            raise RuntimeError("追加复习卡片时资料已不存在")
+        if bool(current.get("review_excluded")):
+            return []
+        if int(current.get("index_request_version") or 0) != material.index_request_version:
+            raise RuntimeError("追加复习卡片时资料索引版本已变化，请重新查找遗漏知识点")
+        if current.get("review_status") != "GENERATED" or current.get("extractor") != CURRENT_REVIEW_MODEL_EXTRACTOR:
+            raise RuntimeError("只有已成功生成的复习资料才能追加遗漏知识点")
+        review_material_id = int(current["review_material_id"])
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT source_key
+                FROM {schema}.learning_review_card_exclusion
+                WHERE material_id = %s AND user_id = %s
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        excluded_source_keys = {str(row["source_key"]) for row in self._cursor.fetchall()}
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT source_key, question
+                FROM {schema}.learning_review_card
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                FOR UPDATE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        existing_rows = self._cursor.fetchall()
+        existing_source_keys = {str(row["source_key"]) for row in existing_rows}
+        existing_question_keys = {normalized_question_key(str(row["question"])) for row in existing_rows}
+        inserted_ids: list[int] = []
+        for card in cards:
+            question_key = normalized_question_key(card.question)
+            if (
+                card.source_key in excluded_source_keys
+                or card.source_key in existing_source_keys
+                or question_key in existing_question_keys
+            ):
+                continue
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_card (
+                        review_material_id, material_id, user_id, source_key,
+                        question, answer, hint, evidence_refs, fsrs_card_json,
+                        due_at, retrievability, review_count, lapse_count, active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 0, 0, 0, TRUE)
+                    ON CONFLICT (material_id, source_key) DO NOTHING
+                    RETURNING id
+                    """
+                ),
+                (
+                    review_material_id,
+                    material.id,
+                    material.user_id,
+                    card.source_key,
+                    card.question,
+                    card.answer,
+                    card.hint,
+                    card.evidence_refs_json,
+                    card.fsrs_card_json,
+                    card.due_at,
+                ),
+            )
+            inserted = self._cursor.fetchone()
+            if inserted is not None:
+                inserted_ids.append(int(inserted["id"]))
+                existing_source_keys.add(card.source_key)
+                existing_question_keys.add(question_key)
+        if not inserted_ids:
+            return []
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material
+                SET card_count = (
+                    SELECT COUNT(1)
+                    FROM {schema}.learning_review_card active_card
+                    WHERE active_card.material_id = %s
+                      AND active_card.user_id = %s
+                      AND active_card.active = TRUE
+                )
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (material.id, material.user_id, review_material_id, material.user_id),
+        )
+        self._cursor.execute(
+            self._card_select(
+                "WHERE c.id = ANY(%s::BIGINT[]) AND c.user_id = %s AND lm.user_id = %s ORDER BY c.id ASC"
+            ),
+            (inserted_ids, material.user_id, material.user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
 
     def save_generation_progress(
         self,
@@ -1888,6 +2037,11 @@ def validate_schema(value: str) -> str:
     if not SCHEMA_PATTERN.fullmatch(value):
         raise RuntimeError("RAG_DATABASE_SCHEMA 必须是合法的 PostgreSQL schema 标识符")
     return value
+
+
+def normalized_question_key(value: str) -> str:
+    """生成数据库事务内使用的确定性问题去重键。"""
+    return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
 
 
 def json_text(value: object, default: str) -> str:

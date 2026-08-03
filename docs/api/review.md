@@ -1,12 +1,14 @@
 # 学习复习与提醒接口文档
 
-更新日期：2026-08-03
+更新日期：2026-08-04
 
 ## 变更摘要
 
 新增 `/api/reviews/*` 公开控制面。系统在资料完成 RAG 入库后识别八股背诵、面经、课程讲解、技术原理、学习笔记等学习型内容，从已有 RAG evidence 提炼短小的关键知识点卡片，并使用 FSRS 间隔重复算法计算下次复习时间。每日队列以用户上传资料为 group；每日上限按资料份数计算，被选中的资料会返回该资料全部当前到期的小卡片，不再按 group 截断卡片数量。
 
 新增用户自定义复习文件夹。用户以整份文档为最小归档单位，把一份资料及其全部复习卡片移动到一个文件夹；点击文件夹进入独立详情页，按文档查看该文件夹中的全部活动卡片。归档不改变 FSRS 到期时间、RAG 索引或资料排除状态，但已归档资料会从复习中心主页面的资料列表和今日到期队列隐藏，只在文件夹详情中展示。删除文件夹或“移出文件夹”只解除文档归档，资料会重新回到主页面。
+
+新增按文档“对话补漏”。用户可以用自然语言指出疑似遗漏主题，例如“还讲了页缓存和零拷贝”，服务只在该文档的 RAG evidence 中寻找有原文支撑、且未被现有活动卡片覆盖的知识点。补漏使用独立的 add-only 写入路径：只插入新卡片，不重新生成资料，不停用、更新或替换任何既有卡片，也不改变既有 `fsrs_card_json`、到期时间、评分次数、遗忘次数和复习日志。没有找到合格新知识点时返回正常的零新增结果，不把资料标记为失败。
 
 今日资料标题上的拖拽手柄同时支持文件夹投放。用户把整份文档拖到文件夹卡片并松手后，前端调用既有批量归档接口，只改变该文档的文件夹归属；拖拽经过今日队列造成的临时排序会恢复，不额外写入资料优先级。主页面资料归档区支持逐份勾选和“全选未归档资料”，选择目标文件夹后一次批量进入；触屏与键盘用户无需使用拖拽也能完成批量归档。
 
@@ -68,6 +70,7 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 | GET | `/api/reviews/materials` | 获取主页面未归档资料的分类、生成状态和卡片数；已归档资料仅在文件夹详情返回 |
 | PUT | `/api/reviews/materials/folder` | 以文档为单位批量移入指定文件夹，`folderId=null` 时移出文件夹 |
 | POST | `/api/reviews/materials/{materialId}/generate` | 对一条当前用户资料重新分类并生成卡片，可携带人工补充说明 |
+| POST | `/api/reviews/materials/{materialId}/missing-knowledge` | 根据用户对话提示从当前文档 evidence 中寻找遗漏知识点，只追加新卡片 |
 | POST | `/api/reviews/materials/batch-delete` | 批量将多份资料移出复习中心 |
 | DELETE | `/api/reviews/materials/{materialId}` | 将整份资料永久移出复习中心，保留原始 RAG 文件 |
 | GET | `/api/reviews/folders` | 获取当前用户的文件夹及文档、卡片和到期统计 |
@@ -80,6 +83,51 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 | POST | `/api/reviews/cards/batch-delete` | 批量删除多张复习卡片 |
 | DELETE | `/api/reviews/cards/{cardId}` | 删除一张卡片并阻止同一稳定来源卡片再次生成 |
 | PUT | `/api/reviews/settings` | 更新复习提醒开关、目标记忆率、每日上限和提醒时间 |
+
+### 对话补充遗漏知识点
+
+```http
+POST /api/reviews/materials/12/missing-knowledge
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "message": "视频后半段还讲了页缓存和零拷贝，请找出漏掉的知识点",
+  "conversation": [
+    {"role": "USER", "content": "先检查 Kafka 高性能相关内容"},
+    {"role": "ASSISTANT", "content": "已补充 1 张顺序写相关卡片。"}
+  ]
+}
+```
+
+`message` 为本轮用户提示，长度 1-2000 字；`conversation` 是前端会话级上下文，最多携带最近 12 条用户或助手消息。服务端不会信任请求中的用户 ID，只读取当前认证用户拥有的资料、evidence 和活动卡片。对话历史默认不持久化；刷新页面后可以丢失，但已成功追加的卡片永久保存。
+
+```json
+{
+  "materialId": 12,
+  "assistantMessage": "找到并追加了 2 个有原文支撑、且未被现有卡片覆盖的知识点。",
+  "addedCount": 2,
+  "skippedCount": 1,
+  "cards": [
+    {
+      "id": 91,
+      "materialId": 12,
+      "materialTitle": "Kafka 高性能设计",
+      "documentType": "mp4",
+      "question": "Kafka 的零拷贝为什么能够提升数据传输性能？",
+      "answer": "……",
+      "hint": "从磁盘 IO、内核空间和用户空间之间的数据流转回忆",
+      "evidenceRefs": [],
+      "dueAt": "2026-08-04T09:00:00+08:00",
+      "retrievability": 0,
+      "reviewCount": 0,
+      "lapseCount": 0
+    }
+  ]
+}
+```
+
+补漏模型只能引用当前文档中 1-2 个真实 `evidenceId`，答案逐论断通过现有 evidence 忠实度门禁。模型会看到现有问题、答案和来源作为禁止重复基线；服务端还会执行问题规范化、文本相似度、来源键、永久排除记录和数据库唯一约束去重。即使并发提交相同提示，也只能插入尚不存在且未被排除的新卡片。
 
 ## 数据结构
 

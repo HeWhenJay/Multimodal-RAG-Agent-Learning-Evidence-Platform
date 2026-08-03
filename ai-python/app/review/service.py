@@ -17,6 +17,7 @@ from app.review.knowledge_extractor import (
     LearningMaterialContext,
     ReviewExtractionError,
 )
+from app.review.missing_knowledge import MissingKnowledgeExtractor
 from app.review.repository import (
     CURRENT_REVIEW_EXTRACTORS,
     MaterialSourceRecord,
@@ -47,6 +48,8 @@ from app.schemas.review import (
     ReviewGenerationProgress,
     ReviewMaterial,
     ReviewMaterialFolderRequest,
+    ReviewMissingKnowledgeRequest,
+    ReviewMissingKnowledgeResult,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -67,11 +70,13 @@ class ReviewService:
         *,
         now_provider: Callable[[], datetime] | None = None,
         generation_guard: ReviewGenerationGuard | None = None,
+        missing_knowledge_extractor: MissingKnowledgeExtractor | None = None,
     ) -> None:
         self.repository = repository or ReviewRepository()
         self.extractor = extractor or KnowledgePointExtractor()
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self.generation_guard = generation_guard or ReviewGenerationGuard()
+        self.missing_knowledge_extractor = missing_knowledge_extractor or MissingKnowledgeExtractor()
 
     def sync(self, user_id: str, limit: int = 1) -> ReviewSyncResult:
         """按索引版本扫描尚未同步的资料，每条资料独立完成分类。"""
@@ -133,6 +138,97 @@ class ReviewService:
         if material is None or material.material_status not in {"READY", "PARTIAL"}:
             return None
         return self._generate(material, material.user_id, force=False)
+
+    def supplement_missing_knowledge(
+        self,
+        material_id: int,
+        payload: ReviewMissingKnowledgeRequest,
+        user_id: str,
+    ) -> ReviewMissingKnowledgeResult:
+        """按用户提示查找遗漏知识点，并通过独立 add-only 事务追加新卡。"""
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material(material_id, user_id)
+            excluded = transaction.is_material_excluded(material_id, user_id)
+            review_material = transaction.find_review_material(material_id, user_id)
+        if material is None:
+            raise BusinessError("学习资料不存在")
+        if excluded:
+            raise BusinessError("该资料已从复习中心移除")
+        if material.material_status not in {"READY", "PARTIAL"}:
+            raise BusinessError("学习资料尚未完成索引")
+        if review_material is None or not material_generation_is_current(
+            review_material,
+            material.index_request_version,
+        ) or review_material.status != "GENERATED":
+            raise BusinessError("请先成功生成该资料的复习卡片，再查找遗漏知识点")
+        lock = self.generation_guard.acquire(f"{user_id}:{material.id}:{material.index_request_version}")
+        if lock is None:
+            raise BusinessError("该资料正在处理复习卡片，请稍后再试")
+        try:
+            with self.repository.transaction() as transaction:
+                evidences = transaction.list_evidences(material)
+                existing_cards = transaction.list_active_cards_for_material(material.id, user_id)
+            extraction = self.missing_knowledge_extractor.extract(
+                LearningMaterialContext(
+                    material_id=material.id,
+                    title=material.title,
+                    document_type=material.document_type,
+                    summary=material.document_summary,
+                ),
+                evidences,
+                message=payload.message,
+                conversation=payload.conversation,
+                existing_cards=existing_cards,
+            )
+            if not extraction.knowledge_points:
+                return ReviewMissingKnowledgeResult(
+                    materialId=material.id,
+                    assistantMessage=extraction.assistant_message or "没有找到同时满足原文支撑和去重要求的新知识点。",
+                    addedCount=0,
+                    skippedCount=extraction.skipped_count,
+                    cards=[],
+                )
+            now = as_utc(self.now_provider())
+            scheduler = FsrsReviewScheduler()
+            drafts = [
+                ReviewCardDraft(
+                    source_key=point.source_key,
+                    question=point.question,
+                    answer=point.answer,
+                    hint=point.hint,
+                    evidence_refs_json=json.dumps(
+                        [reference.model_dump(mode="json") for reference in point.evidence_refs],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    fsrs_card_json=scheduler.new_card_json(now),
+                    due_at=now,
+                )
+                for point in extraction.knowledge_points
+            ]
+            with self.repository.transaction() as transaction:
+                inserted = transaction.append_review_cards(material, drafts)
+            skipped_count = extraction.skipped_count + len(drafts) - len(inserted)
+            added_count = len(inserted)
+            added_topics = "；".join(card.question for card in inserted[:3])
+            message = (
+                f"找到并追加了 {added_count} 个有原文支撑、且未被现有卡片覆盖的知识点：{added_topics}"
+                if added_count
+                else "候选知识点已被现有卡片覆盖或曾被删除，本次没有新增卡片。"
+            )
+            return ReviewMissingKnowledgeResult(
+                materialId=material.id,
+                assistantMessage=message,
+                addedCount=added_count,
+                skippedCount=skipped_count,
+                cards=[card_response(card, scheduler, now, include_answer=True) for card in inserted],
+            )
+        except ReviewExtractionError as exc:
+            raise BusinessError(str(exc)) from exc
+        except RuntimeError as exc:
+            raise BusinessError(str(exc)) from exc
+        finally:
+            lock.release()
 
     def list_materials(self, user_id: str) -> list[ReviewMaterial]:
         """读取当前用户所有资料的复习同步状态。"""

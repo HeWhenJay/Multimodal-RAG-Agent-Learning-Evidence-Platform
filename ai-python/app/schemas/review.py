@@ -111,6 +111,51 @@ class ReviewGenerationRequest(BaseModel):
         return normalized or None
 
 
+class ReviewMissingKnowledgeConversationMessage(BaseModel):
+    """补漏对话中由前端携带的一条会话级消息。"""
+
+    role: Literal["USER", "ASSISTANT"]
+    content: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        """压缩空白，避免空消息或无意义上下文进入模型。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("对话内容不能为空")
+        return normalized
+
+
+class ReviewMissingKnowledgeRequest(BaseModel):
+    """用户针对单份文档指出遗漏知识点的补充请求。"""
+
+    message: str = Field(..., min_length=1, max_length=2000)
+    conversation: list[ReviewMissingKnowledgeConversationMessage] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        """去掉本轮提示的多余空白，空提示在调用模型前拒绝。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("遗漏知识点提示不能为空")
+        return normalized
+
+
+class ReviewMissingKnowledgeResult(BaseModel):
+    """只追加新卡片后的对话答复与实际写入结果。"""
+
+    materialId: int = Field(ge=1)
+    assistantMessage: str
+    addedCount: int = Field(default=0, ge=0)
+    skippedCount: int = Field(default=0, ge=0)
+    cards: list[ReviewCard] = Field(default_factory=list)
+
+
 class ReviewGenerationProgressEvent(BaseModel):
     """复习生成图的一条阶段事件，供前端展示真实处理进度。"""
 

@@ -11,7 +11,8 @@ import {
   FileVideo2,
   FolderOpen,
   FolderX,
-  Loader2
+  Loader2,
+  MessageCirclePlus
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
@@ -19,6 +20,7 @@ import { assignReviewMaterialsToFolder, fetchReviewCard, fetchReviewFolder, grad
 import { MarkdownText } from '../../components/MarkdownText';
 import { buildEvidenceOpenHref } from '../../utils/evidenceLinks';
 import '../../styles/ReviewCenter.css';
+import { ReviewMissingKnowledgeDialog, type MissingKnowledgeTarget } from './ReviewMissingKnowledgeDialog';
 
 type ReviewRating = 1 | 2 | 3 | 4;
 const RATING_OPTIONS: Array<{ rating: ReviewRating; label: string; detail: string }> = [
@@ -43,6 +45,7 @@ export function ReviewFolderDetail() {
   const [movingMaterialId, setMovingMaterialId] = useState<number | null>(null);
   const [gradingId, setGradingId] = useState<number | null>(null);
   const [gradeMessage, setGradeMessage] = useState('');
+  const [missingKnowledgeTarget, setMissingKnowledgeTarget] = useState<MissingKnowledgeTarget | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -148,7 +151,10 @@ export function ReviewFolderDetail() {
                 <span className="review-folder-document-copy"><strong>{material.title}</strong><small>{formatDocumentType(material.documentType)} · {material.cardCount} 张复习卡片</small></span>
                 {expanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
               </button>
-              <button className="outline-action small review-folder-remove" type="button" onClick={() => void removeFromFolder(material.materialId, material.title)} disabled={movingMaterialId !== null}><FolderX size={14} />{movingMaterialId === material.materialId ? '移出中' : '移出文件夹'}</button>
+              <div className="review-folder-document-actions">
+                <button className="outline-action small" type="button" onClick={() => setMissingKnowledgeTarget({ materialId: material.materialId, title: material.title, cardCount: material.cardCount })} disabled={movingMaterialId !== null}><MessageCirclePlus size={14} />补充遗漏</button>
+                <button className="outline-action small review-folder-remove" type="button" onClick={() => void removeFromFolder(material.materialId, material.title)} disabled={movingMaterialId !== null}><FolderX size={14} />{movingMaterialId === material.materialId ? '移出中' : '移出文件夹'}</button>
+              </div>
             </div>
             {expanded ? (
               <div className="review-folder-document-body">
@@ -177,6 +183,7 @@ export function ReviewFolderDetail() {
           </section>
         );
       })}</div> : null}
+      <ReviewMissingKnowledgeDialog target={missingKnowledgeTarget} onClose={() => setMissingKnowledgeTarget(null)} onCardsAdded={async (addedCount) => { const refreshed = await fetchReviewFolder(resolvedFolderId); setDetail(refreshed); setGradeMessage(`已追加 ${addedCount} 张遗漏知识点卡片`); setMissingKnowledgeTarget((previous) => previous ? { ...previous, cardCount: previous.cardCount + addedCount } : null); }} />
     </div>
   );
 }

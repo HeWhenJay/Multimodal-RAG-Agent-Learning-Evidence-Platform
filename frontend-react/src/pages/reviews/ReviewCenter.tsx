@@ -19,6 +19,7 @@ import {
   FolderX,
   GripVertical,
   Loader2,
+  MessageCirclePlus,
   MoveRight,
   Pencil,
   RefreshCw,
@@ -66,6 +67,7 @@ import { buildEvidenceOpenHref } from '../../utils/evidenceLinks';
 import type { RagEvidence } from '../../api/types';
 import { MATERIAL_UPLOADED_EVENT } from '../../hooks/useMaterialUpload';
 import '../../styles/ReviewCenter.css';
+import { ReviewMissingKnowledgeDialog, type MissingKnowledgeTarget } from './ReviewMissingKnowledgeDialog';
 
 type ReviewRating = 1 | 2 | 3 | 4;
 type ReviewDeleteTarget =
@@ -137,6 +139,7 @@ export function ReviewCenter() {
   const [reviewFeedbackTarget, setReviewFeedbackTarget] = useState<ReviewMaterial | null>(null);
   const [reviewFeedbackText, setReviewFeedbackText] = useState('');
   const [reviewFeedbackBusy, setReviewFeedbackBusy] = useState(false);
+  const [missingKnowledgeTarget, setMissingKnowledgeTarget] = useState<MissingKnowledgeTarget | null>(null);
   const settingsDirtyRef = useRef(false);
   const syncPromiseRef = useRef<Promise<ReviewSyncResult> | null>(null);
   const reviewStartedAtRef = useRef<Record<number, number>>({});
@@ -952,7 +955,7 @@ export function ReviewCenter() {
             {materials.length ? materials.map((material) => {
               const materialId = resolveMaterialId(material);
               const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
-              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
             }) : <p className="panel-empty">暂无已索引资料</p>}
           </div>
         </section>
@@ -963,6 +966,7 @@ export function ReviewCenter() {
       <ReviewFolderEditorDialog target={folderEditorTarget} name={folderEditorName} busy={folderBusy} onNameChange={setFolderEditorName} onSubmit={saveFolder} onClose={() => { if (!folderBusy) setFolderEditorTarget(null); }} />
       <ReviewFolderDeleteDialog folder={folderDeleteTarget} busy={folderBusy} onConfirm={() => void confirmFolderDeletion()} onClose={() => { if (!folderBusy) setFolderDeleteTarget(null); }} />
       <ReviewGenerationFeedbackDialog target={reviewFeedbackTarget} feedback={reviewFeedbackText} busy={reviewFeedbackBusy || busyMaterialId !== null} onFeedbackChange={setReviewFeedbackText} onSubmit={submitReviewFeedback} onClose={() => { if (!reviewFeedbackBusy && busyMaterialId === null) setReviewFeedbackTarget(null); }} />
+      <ReviewMissingKnowledgeDialog target={missingKnowledgeTarget} onClose={() => setMissingKnowledgeTarget(null)} onCardsAdded={async (addedCount) => { setMissingKnowledgeTarget((previous) => previous ? { ...previous, cardCount: previous.cardCount + addedCount } : null); setFolderMessage(`已追加 ${addedCount} 张遗漏知识点卡片`); await loadData(); window.dispatchEvent(new CustomEvent(REVIEW_CONTENT_UPDATED_EVENT)); }} />
     </div>
   );
 }
@@ -1379,7 +1383,7 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
+function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy, deleting, locked, onToggleSelected, onFindMissing, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onFindMissing: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
   const showProgress = ['PENDING', 'GENERATING', 'FAILED', 'NEEDS_REVIEW'].includes((material.status || '').toUpperCase());
@@ -1395,6 +1399,7 @@ function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy
       </div>
       <div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div>
       <div className="material-row-actions">
+        {material.status === 'GENERATED' ? <button className="icon-button tiny" type="button" title="对话补充遗漏知识点" aria-label={`为 ${material.title} 补充遗漏知识点`} onClick={onFindMissing} disabled={busy || deleting || locked}><MessageCirclePlus size={14} /></button> : null}
         <button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button>
         <button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
       </div>

@@ -81,6 +81,19 @@ export interface ReviewGenerationProgress extends ReviewGenerationProgressEvent 
   events: ReviewGenerationProgressEvent[];
 }
 
+export interface ReviewMissingKnowledgeMessage {
+  role: 'USER' | 'ASSISTANT';
+  content: string;
+}
+
+export interface ReviewMissingKnowledgeResult {
+  materialId: number;
+  assistantMessage: string;
+  addedCount: number;
+  skippedCount: number;
+  cards: ReviewCard[];
+}
+
 export interface ReviewMaterial {
   materialId: number;
   id?: number;
@@ -290,6 +303,19 @@ export function generateReviewMaterial(materialId: number, userFeedback?: string
   return request<ReviewMaterial>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/generate`, {
     method: 'POST',
     ...(feedback ? { headers: jsonHeaders, body: JSON.stringify({ userFeedback: feedback }) } : {})
+  });
+}
+
+// 用户指出遗漏主题后，只从当前文档 evidence 中追加新卡片，不重建既有卡片。
+export function supplementReviewMissingKnowledge(
+  materialId: number,
+  message: string,
+  conversation: ReviewMissingKnowledgeMessage[] = []
+): Promise<ReviewMissingKnowledgeResult> {
+  return request<ReviewMissingKnowledgeResult>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/missing-knowledge`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ message, conversation })
   });
 }
 
