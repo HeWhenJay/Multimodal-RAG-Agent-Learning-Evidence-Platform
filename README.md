@@ -32,8 +32,10 @@ npm run dev
 
 - 多模态资料入库：文本、PDF、Office 文档、图片、字幕与视频；PDF 优先 MinerU，失败时走本地降级解析。
 - 可追溯 RAG：结构化解析、递归切块、文档/章节摘要、元数据隔离、BM25 与 pgvector 向量召回、Multi-Query、RRF/RAG-Fusion、重排和 evidence 引用。
-- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；每个资料索引版本通过一次 LLM 调用提炼多张关键知识点卡片，并用 FSRS 根据四档回忆结果安排下一次复习。
-- Prompt 统一管理：复习功能的 LLM Prompt 集中在 `ai-python/prompts/`，答案只在用户主动揭示后返回，并保留 RAG evidence 原文定位。
+- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；结构化视频会优先保留原始问题清单，普通资料最多 8 张，明确问题清单最多 32 张。
+- 复习质量闭环：独立 LangGraph 按 Planner → Actor → Observer → Repair 循环调用 DeepSeek；质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`，允许用户补充说明后继续生成。
+- 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
+- Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示都由 DeepSeek 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
 - 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
 - Agent 工作台：LangGraph PAE/ReAct 编排、受控工具、记忆、审批、撤销、任务消息、事件投影与 SSE。
 - 统一业务边界：所有公开接口保持 React 既有 `/api/*` 路径、Bearer Token、camelCase 字段和 `{code,msg,data}` 响应信封。
@@ -50,6 +52,7 @@ flowchart TB
         API["FastAPI 公开控制面\nAuth / PageData / Logs\nRAG / Agent / Memory / SSE"]
         AGW["Agent durable worker\nLangGraph PAE/ReAct"]
         RAGW["RAG durable worker\n查询任务 + LOCAL 索引"]
+        REVIEW["复习领域服务\nDeepSeek PAE/ReAct\nFSRS + 文件夹"]
         CRON["cron\nOutbox / staging 清理"]
         KAFKAW["Kafka worker\n仅 Kafka 模式"]
         SUP --> API
@@ -59,9 +62,14 @@ flowchart TB
         SUP -. "RAG_KAFKA_ENABLED=true" .-> KAFKAW
     end
 
+    API --> REVIEW
+    RAGW -->|"READY / PARTIAL 后幂等触发"| REVIEW
+    KAFKAW -->|"READY / PARTIAL 后幂等触发"| REVIEW
+
     API <--> DB[("PostgreSQL + pgvector\n业务数据、任务、日志、记忆\nRAG canonical / staging 索引")]
     AGW <--> DB
     RAGW <--> DB
+    REVIEW <--> DB
     CRON <--> DB
     KAFKAW <--> DB
 
@@ -70,6 +78,7 @@ flowchart TB
     KAFKAW <--> STORE
     RAGW --> MODEL["MinerU / OCR / ASR\nEmbedding / Rerank / LLM"]
     KAFKAW --> MODEL
+    REVIEW --> DEEPSEEK["DeepSeek 官方 API\ndeepseek-v4-flash\nthinking + max reasoning"]
 
     CRON -->|"可选 Outbox 发布"| KAFKA[("Kafka")]
     KAFKA <--> KAFKAW
@@ -106,8 +115,14 @@ flowchart TB
     INDEX --> CHECK["校验 active job 与 requestVersion\n拒绝过期结果覆盖"]
     CHECK --> PROMOTE["staging promote -> canonical private 索引"]
     PROMOTE --> RESULT["写回 READY / PARTIAL / FAILED\n进度、切块数、受控错误摘要"]
-    RESULT --> DB[("PostgreSQL + pgvector")]
-    RESULT --> FE
+    RESULT --> STATUS{"索引终态"}
+    STATUS --> DB[("PostgreSQL + pgvector")]
+    STATUS -->|"READY / PARTIAL"| REVIEW_SYNC["按 materialId + indexRequestVersion\n幂等触发复习生成"]
+    STATUS -->|"FAILED"| FE
+    FE -. "上传完成轮询兜底触发" .-> REVIEW_SYNC
+    REVIEW_SYNC --> REVIEW_FLOW["DeepSeek PAE/ReAct 质量闭环\n见复习生成章节"]
+    REVIEW_FLOW --> DB
+    REVIEW_FLOW --> FE
 ```
 
 `--without-kafka` 是完整的本地模式开关：它会同时关闭 `RAG_KAFKA_ENABLED` 和 `AI_KAFKA_WORKER_ENABLED`，新资料一定创建 `LOCAL` 任务并由 RAG durable worker 消费。这样不会出现“API 投递 Kafka 任务，但 Kafka worker 没有启动”的悬挂任务。`--with-kafka` 则同时启用 Kafka 投递和 Kafka worker。
@@ -172,6 +187,54 @@ flowchart TB
 ```
 
 RAG 检索设计采用 Multi-Query 扩展召回范围，再对每个查询的 BM25 与向量排名执行 RRF 融合。这样既保留关键词精确匹配，也保留语义召回，并能在 evidence guard 前保留可解释的检索诊断。
+
+## 复习生成、文件夹与 FSRS 闭环
+
+RAG 索引进入 `READY` 或 `PARTIAL` 后，LOCAL worker 与 Kafka worker 都会按 `materialId + indexRequestVersion + extractorVersion` 幂等触发复习生成；前端上传完成轮询也会按 `materialId` 兜底触发同一服务。系统先做确定性的 evidence 清洗和学习内容过滤，只有通过过滤的资料才交给独立复习 LangGraph，面向用户的摘要、问题、答案和提示始终由 DeepSeek 基于当前 evidence 生成。
+
+### DeepSeek PAE/ReAct 生成质量闭环
+
+```mermaid
+flowchart TB
+    INDEXED["索引 READY / PARTIAL"] --> CLEAN["evidence 去重、噪声清洗\n本地学习内容过滤"]
+    CLEAN --> LEARNING{"是否为可复习资料"}
+    LEARNING -->|"否"| SKIPPED["SKIPPED\n不调用模型"]
+    LEARNING -->|"是"| CONFIG{"DeepSeek 配置与 evidence\n是否可执行"}
+    CONFIG -->|"否"| FAILED["FAILED\n保存可诊断原因"]
+    CONFIG -->|"是"| QUESTIONS["提取原始问题清单\n普通资料 3-8 张\n明确问题清单最多 32 张"]
+    QUESTIONS --> PLANNER["planner\n固定目标、覆盖范围和完成标准"]
+    PLANNER --> ACTOR["actor\nDeepSeek 生成唯一 JSON"]
+    ACTOR --> OBSERVER{"observer 质量门禁\n摘要、完整问句、hint、sourceQuestion\nevidenceId、逐论断忠实度、问题覆盖率"}
+    OBSERVER -->|"通过"| GENERATED["GENERATED\n持久化卡片并继承或初始化 FSRS"]
+    OBSERVER -->|"拒绝"| REPAIR["repair\n整理逐项中文诊断并写入下一轮 Prompt"]
+    REPAIR --> BUDGET{"模型尝试预算是否耗尽"}
+    BUDGET -->|"否"| ACTOR
+    BUDGET -->|"是"| MANUAL["human_review\nNEEDS_REVIEW"]
+    MANUAL --> FEEDBACK["用户查看失败原因\n补充说明后重新生成"]
+    FEEDBACK --> PLANNER
+```
+
+LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制每轮真实模型预算，默认 6 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。缺少密钥或 evidence 等无法靠修复 Prompt 解决的问题直接进入 `FAILED`。
+
+### 文件夹归档与文件夹内复习
+
+```mermaid
+flowchart LR
+    HOME["复习中心主页面\n仅展示未归档资料"] --> SELECT{"组织方式"}
+    SELECT -->|"拖拽整份文档"| ASSIGN["PUT /api/reviews/materials/folder"]
+    SELECT -->|"逐份勾选 / 全选\n批量选择目标文件夹"| ASSIGN
+    ASSIGN --> RELATION[("learning_review_folder_material\n一份文档至多属于一个文件夹")]
+    RELATION --> HIDDEN["从主页面资料、到期队列\n和主页面到期统计中隐藏"]
+    HIDDEN --> DETAIL["点击文件夹进入详情\n按文档展示全部活动卡片"]
+    DETAIL --> REVEAL["主动揭示答案、hint\n和原文 evidence"]
+    REVEAL --> GRADE["四档评分\n忘记 / 困难 / 记得 / 轻松"]
+    GRADE --> FSRS["FSRS 更新 stability、difficulty\n和下一次 dueAt"]
+    FSRS --> DETAIL
+    DETAIL -->|"移出文件夹或删除文件夹"| UNFILE["解除归档关系\n保留资料、卡片和评分日志"]
+    UNFILE --> HOME
+```
+
+文件夹只改变资料的展示归属，不修改 RAG 索引、资料优先级或 FSRS 排程。归档资料不再出现在主页面；文件夹详情仍能逐张揭示、查看 evidence 并评分。PostgreSQL 中的卡片状态、`dueAt` 和评分日志始终是排程事实源，移出文件夹后资料恢复到主页面。
 
 ## Agent、记忆与审批闭环
 
@@ -321,12 +384,14 @@ flowchart TB
 | --- | --- |
 | `frontend-react/` | React + Vite 管理后台，开发端口 `5178` |
 | `ai-python/app/` | FastAPI 公开 API、认证、页面数据、日志、持久任务、对象存储和 worker |
+| `ai-python/app/review/` | 复习领域服务、独立 PAE/ReAct 生成图、质量门禁、文件夹仓储与 FSRS 排程 |
 | `ai-python/rag/` | 解析、递归切块、摘要、pgvector、混合检索、融合、重排与 evidence |
 | `ai-python/agents/` | LangGraph 编排与进程内 Agent gateway |
+| `ai-python/prompts/review.py` | DeepSeek 复习摘要与卡片生成 Prompt 的唯一维护入口 |
 | `ai-python/run.py` | FastAPI 与所有受管 Python worker 的唯一启动入口 |
 | `infra/sql/` | PostgreSQL/pgvector 初始化脚本与增量迁移 |
-| `docs/api/` | Auth、PageData、Logs、RAG、Agent 和 Memory API 契约 |
-| `docs/architecture/` | 纯 Python 后端迁移与 RAG 架构说明 |
+| `docs/api/` | Auth、PageData、Logs、RAG、Review、Agent 和 Memory API 契约 |
+| `docs/architecture/` | 纯 Python 后端、RAG、复习生成图、文件夹与 FSRS 架构说明 |
 
 ## 首次初始化与数据库
 
@@ -364,7 +429,9 @@ conda run -n learning-evidence-rag python -B ai-python/run.py --bootstrap-databa
 | `MINERU_COMMAND` | 可选 MinerU 命令模板，使用 `{input}` 与 `{output}` 占位符 |
 | `EVIDENCE_STORAGE_PROVIDER` | `local` 或 `oss` 原始文件存储 |
 | `RAG_KAFKA_ENABLED` | 启用 Kafka 索引通道；默认 `false` |
-| `REVIEW_EXTRACTION_PROVIDER` / `REVIEW_EXTRACTION_MODEL` | 复习卡片模型提供方和模型；默认 `auto` / `qwen-plus`，模型失败时自动本地降级 |
+| `DEEPSEEK_API_KEY` | 复习摘要与卡片生成密钥；只调用 DeepSeek 官方 `deepseek-v4-flash`，不继承通用 RAG 模型配置 |
+| `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | 单次复习模型请求超时秒数，默认 `120` |
+| `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮真实模型调用上限，默认 `6`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
 | `REDIS_URL` | 可选复习资料生成短锁和 Agent 运行态缓存；PostgreSQL 仍是复习排程事实源 |
 | `REVIEW_GENERATION_LOCK_TTL_SECONDS` | 复习资料级生成锁 TTL，默认 `180` 秒 |
 | `TAVILY_API_KEY` | 预留配置；当前纯 Python Agent 尚未启用联网搜索，默认留空 |
@@ -427,6 +494,8 @@ conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_
 - [RAG 接口契约](docs/api/rag.md)
 - [学习复习接口契约](docs/api/review.md)
 - [FSRS 复习排程设计](docs/architecture/learning-review-scheduling.md)
+- [复习卡片 PAE/ReAct 生成图](docs/architecture/review-pae-react-generation.md)
+- [复习文件夹与结构化卡片保真设计](docs/architecture/review-folder-and-structured-card-preservation.md)
 - [Agent 接口契约](docs/api/agent.md)
 - [日志接口契约](docs/api/logs.md)
 - [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)
