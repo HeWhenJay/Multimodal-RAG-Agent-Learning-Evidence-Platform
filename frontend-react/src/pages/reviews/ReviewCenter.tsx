@@ -940,21 +940,22 @@ export function ReviewCenter() {
             <button className="notification-action" type="button" onClick={() => void requestBrowserNotification()} disabled={notificationPermission === 'granted'}>{notificationPermission === 'granted' ? <BellRing size={16} /> : <Bell size={16} />}{notificationPermission === 'granted' ? '浏览器提醒已开启' : '开启浏览器提醒'}</button>
           </section>
 
-          <section className="review-panel materials-panel">
-            <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料归档</h3></div><span>{materials.length}</span></div>
-            <div className="review-material-bulkbar">
-              <label className="review-material-select-all"><input type="checkbox" checked={allMaterialsSelected} onChange={toggleAllMaterials} disabled={!selectableMaterialIdList.length || folderBusy || orderBusy} /><span>{allMaterialsSelected ? '已全选' : '全选未归档资料'}</span></label>
-              {selectedMaterialIdList.length ? <><span className="review-material-selected-count">已选 {selectedMaterialIdList.length} 份文档</span><div className="review-material-folder-controls"><select aria-label="目标复习文件夹" value={folderTargetValue} onChange={(event) => setFolderTargetValue(event.target.value)} disabled={folderBusy}><option value="unfiled">未归档</option>{folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}</select><button className="outline-action small" type="button" onClick={() => void moveSelectedMaterialsToFolder()} disabled={folderBusy}><MoveRight size={14} />{folderTargetValue === 'unfiled' ? '批量移出文件夹' : '批量进入文件夹'}</button><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy || folderBusy}><Trash2 size={14} />移出中心</button></div></> : <span className="review-material-select-hint">选择多份文档后可批量进入文件夹</span>}
-            </div>
-            <div className="review-material-list">
-              {materials.length ? materials.map((material) => {
-                const materialId = resolveMaterialId(material);
-                const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
-                return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
-              }) : <p className="panel-empty">暂无已索引资料</p>}
-            </div>
-          </section>
         </aside>
+
+        <section className="review-panel materials-panel" aria-labelledby="review-materials-title">
+          <div className="review-panel-heading"><div><BookOpen size={17} /><h3 id="review-materials-title">资料归档</h3></div><span>{materials.length} 份</span></div>
+          <div className="review-material-bulkbar">
+            <label className="review-material-select-all"><input type="checkbox" checked={allMaterialsSelected} onChange={toggleAllMaterials} disabled={!selectableMaterialIdList.length || folderBusy || orderBusy} /><span>{allMaterialsSelected ? '已全选' : '全选未归档资料'}</span></label>
+            {selectedMaterialIdList.length ? <><span className="review-material-selected-count">已选 {selectedMaterialIdList.length} 份文档</span><div className="review-material-folder-controls"><select aria-label="目标复习文件夹" value={folderTargetValue} onChange={(event) => setFolderTargetValue(event.target.value)} disabled={folderBusy}><option value="unfiled">未归档</option>{folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}</select><button className="outline-action small" type="button" onClick={() => void moveSelectedMaterialsToFolder()} disabled={folderBusy}><MoveRight size={14} />{folderTargetValue === 'unfiled' ? '批量移出文件夹' : '批量进入文件夹'}</button><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy || folderBusy}><Trash2 size={14} />移出中心</button></div></> : <span className="review-material-select-hint">选择多份文档后可批量进入文件夹</span>}
+          </div>
+          <div className="review-material-list">
+            {materials.length ? materials.map((material) => {
+              const materialId = resolveMaterialId(material);
+              const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
+              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+            }) : <p className="panel-empty">暂无已索引资料</p>}
+          </div>
+        </section>
       </div>
 
       <OriginalEvidenceDialog card={originalCard} onClose={() => setOriginalCard(null)} />
@@ -1382,7 +1383,26 @@ function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
   const showProgress = ['PENDING', 'GENERATING', 'FAILED', 'NEEDS_REVIEW'].includes((material.status || '').toUpperCase());
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /></label><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p>{showProgress ? <ReviewGenerationProgressPanel material={material} queuePosition={queuePosition} queueTotal={queueTotal} /> : null}</div>;
+  return (
+    <article className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}>
+      <label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}>
+        <input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} />
+      </label>
+      <div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</div>
+      <div className="material-row-copy">
+        <strong title={material.title}>{material.title}</strong>
+        <span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span>
+      </div>
+      <div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div>
+      <div className="material-row-actions">
+        <button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button>
+        <button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
+      </div>
+      {showProgress
+        ? <ReviewGenerationProgressPanel material={material} queuePosition={queuePosition} queueTotal={queueTotal} />
+        : <p className="material-row-summary" title={summary}>{summary}</p>}
+    </article>
+  );
 }
 
 function ReviewGenerationProgressPanel({ material, queuePosition, queueTotal }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number }) {
@@ -1395,6 +1415,7 @@ function ReviewGenerationProgressPanel({ material, queuePosition, queueTotal }: 
   const queueLabel = queuePosition && queueTotal ? `当前位于队列第 ${queuePosition}/${queueTotal} 位` : '已进入串行生成队列';
   const message = progress?.message || (pending ? `${queueLabel}，前一份资料完成后会自动开始` : material.reason || '等待后端更新生成阶段');
   const events = (progress?.events || []).slice(-6).reverse();
+  const detail = progress?.detail || (pending ? material.reason : null);
   const progressState = normalizedStatus === 'FAILED'
     ? 'failed'
     : normalizedStatus === 'NEEDS_REVIEW'
@@ -1417,13 +1438,11 @@ function ReviewGenerationProgressPanel({ material, queuePosition, queueTotal }: 
         {typeof progress?.attempt === 'number' && progress.maxAttempts ? <span>模型轮次 {progress.attempt}/{progress.maxAttempts}</span> : null}
         {progress?.createdAt ? <span>更新于 {formatTime(progress.createdAt)}</span> : null}
       </div>
-      {progress?.detail ? <small className="review-generation-progress-detail">{progress.detail}</small> : pending && material.reason ? <small className="review-generation-progress-detail">{material.reason}</small> : null}
-      {events.length > 1 ? (
+      {detail || events.length ? (
         <details className="review-generation-progress-events">
-          <summary>查看最近流程（{events.length}）</summary>
-          <ol>
-            {events.map((event, index) => <ReviewGenerationProgressEventRow key={`${event.stageCode}-${event.createdAt || index}-${index}`} event={event} />)}
-          </ol>
+          <summary>查看详细流程{events.length ? `（${events.length}）` : ''}</summary>
+          {detail ? <p className="review-generation-progress-detail">{detail}</p> : null}
+          {events.length ? <ol>{events.map((event, index) => <ReviewGenerationProgressEventRow key={`${event.stageCode}-${event.createdAt || index}-${index}`} event={event} />)}</ol> : null}
         </details>
       ) : null}
     </section>
