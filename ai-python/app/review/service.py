@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.result import BusinessError
 from app.review.fsrs_scheduler import FsrsReviewScheduler, as_utc
+from app.review.generation_graph import ReviewManualReviewRequired
 from app.review.generation_guard import ReviewGenerationGuard
 from app.review.knowledge_extractor import (
     KnowledgePointExtractor,
@@ -102,8 +103,13 @@ class ReviewService:
             failedMaterialCount=failed,
         )
 
-    def generate_material(self, material_id: int, user_id: str) -> ReviewMaterial:
-        """显式重新分类并生成当前用户的一条资料。"""
+    def generate_material(
+        self,
+        material_id: int,
+        user_id: str,
+        user_feedback: str | None = None,
+    ) -> ReviewMaterial:
+        """携带可选人工说明，显式重新生成当前用户的一条资料。"""
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
             excluded = transaction.is_material_excluded(material_id, user_id)
@@ -111,7 +117,7 @@ class ReviewService:
             raise BusinessError("学习资料不存在")
         if excluded:
             raise BusinessError("该资料已从复习中心移除")
-        result = self._generate(material, user_id, force=True)
+        result = self._generate(material, user_id, force=True, user_feedback=user_feedback)
         if result is None:
             with self.repository.transaction() as transaction:
                 if transaction.is_material_excluded(material_id, user_id):
@@ -454,8 +460,15 @@ class ReviewService:
             )
         return settings_response(record)
 
-    def _generate(self, material: MaterialSourceRecord, user_id: str, *, force: bool) -> ReviewMaterial | None:
-        """读取 evidence 后提炼卡片，再用资料级短锁和短事务更新分类。"""
+    def _generate(
+        self,
+        material: MaterialSourceRecord,
+        user_id: str,
+        *,
+        force: bool,
+        user_feedback: str | None = None,
+    ) -> ReviewMaterial | None:
+        """读取 evidence 后运行复习生成图，再用资料级短事务更新结果。"""
         if material.user_id != user_id:
             raise BusinessError("学习资料不存在")
         if material.material_status not in {"READY", "PARTIAL"}:
@@ -496,16 +509,34 @@ class ReviewService:
                     reason="资料暂无可用 evidence，无法调用 DeepSeek 生成复习内容",
                     extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
                     cards=[],
+                    generation_attempts=0,
+                    quality_feedback=["资料暂无可用 evidence，无法执行模型生成与质量校验"],
                 )
             try:
-                extraction = self.extractor.extract(
-                    LearningMaterialContext(
-                        material_id=material.id,
-                        title=material.title,
-                        document_type=material.document_type,
-                        summary=material.document_summary,
-                    ),
-                    evidences,
+                context = LearningMaterialContext(
+                    material_id=material.id,
+                    title=material.title,
+                    document_type=material.document_type,
+                    summary=material.document_summary,
+                )
+                # 无人工说明时保留旧测试替身和扩展提取器的双参数兼容性。
+                extraction = (
+                    self.extractor.extract(context, evidences, user_feedback=user_feedback)
+                    if (user_feedback or "").strip()
+                    else self.extractor.extract(context, evidences)
+                )
+            except ReviewManualReviewRequired as exc:
+                return self._save_generation(
+                    material,
+                    is_learning_content=True,
+                    category=None,
+                    summary=None,
+                    status="NEEDS_REVIEW",
+                    reason=str(exc),
+                    extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
+                    cards=[],
+                    generation_attempts=exc.attempts,
+                    quality_feedback=list(exc.quality_feedback),
                 )
             except ReviewExtractionError as exc:
                 # 失败结果会停用旧卡片，避免继续展示本地降级或旧 Prompt 的坏内容。
@@ -518,7 +549,11 @@ class ReviewService:
                     reason=str(exc),
                     extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
                     cards=[],
+                    generation_attempts=0,
+                    quality_feedback=list(exc.diagnostics),
                 )
+            generation_attempts = max(0, int(getattr(extraction, "generation_attempts", 0) or 0))
+            quality_feedback = list(getattr(extraction, "quality_feedback", ()) or ())
             summary = extraction.summary
             if not extraction.is_learning_content:
                 return self._save_generation(
@@ -530,6 +565,8 @@ class ReviewService:
                     reason=extraction.reason,
                     extractor=extraction.extractor,
                     cards=[],
+                    generation_attempts=generation_attempts,
+                    quality_feedback=quality_feedback,
                 )
             if not extraction.knowledge_points:
                 return self._save_generation(
@@ -541,6 +578,8 @@ class ReviewService:
                     reason=extraction.reason,
                     extractor=extraction.extractor,
                     cards=[],
+                    generation_attempts=generation_attempts,
+                    quality_feedback=quality_feedback,
                 )
             scheduler = FsrsReviewScheduler()
             cards = [
@@ -571,6 +610,8 @@ class ReviewService:
                 reason=reason,
                 extractor=extraction.extractor,
                 cards=cards,
+                generation_attempts=generation_attempts,
+                quality_feedback=quality_feedback,
             )
         finally:
             lock.release()
@@ -586,6 +627,8 @@ class ReviewService:
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
+        generation_attempts: int = 0,
+        quality_feedback: list[str] | None = None,
     ) -> ReviewMaterial | None:
         """保存一次完整生成结果并转换为公开响应。"""
         with self.repository.transaction() as transaction:
@@ -598,6 +641,8 @@ class ReviewService:
                 reason=reason,
                 extractor=extractor,
                 cards=cards,
+                generation_attempts=generation_attempts,
+                quality_feedback=quality_feedback or [],
             )
         return material_response(record) if record is not None else None
 
@@ -664,6 +709,9 @@ def material_response(record: ReviewMaterialRecord) -> ReviewMaterial:
         indexRequestVersion=record.index_request_version,
         syncedIndexRequestVersion=record.synced_index_request_version,
         updatedAt=record.updated_at,
+        generationAttempts=record.generation_attempts,
+        qualityFeedback=list(record.quality_feedback),
+        needsManualReview=record.status == "NEEDS_REVIEW",
     )
 
 

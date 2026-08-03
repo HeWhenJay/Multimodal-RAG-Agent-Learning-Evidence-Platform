@@ -232,11 +232,13 @@ CREATE TABLE learning_evidence.learning_review_material (
     reason VARCHAR(500),
     extractor VARCHAR(40),
     card_count INTEGER NOT NULL DEFAULT 0,
+    generation_attempts INTEGER NOT NULL DEFAULT 0,
+    quality_feedback JSONB NOT NULL DEFAULT '[]'::jsonb,
     generated_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uk_learning_review_material UNIQUE (material_id),
-    CONSTRAINT ck_learning_review_material_status CHECK (status IN ('PENDING', 'GENERATED', 'SKIPPED', 'FAILED'))
+    CONSTRAINT ck_learning_review_material_status CHECK (status IN ('PENDING', 'GENERATING', 'GENERATED', 'SKIPPED', 'FAILED', 'NEEDS_REVIEW'))
 );
 
 CREATE INDEX idx_learning_review_material_user_status

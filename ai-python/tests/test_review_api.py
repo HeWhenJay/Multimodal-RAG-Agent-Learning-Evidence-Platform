@@ -48,6 +48,7 @@ class StubReviewService:
 
     def __init__(self) -> None:
         self.users: list[str] = []
+        self.feedbacks: list[str | None] = []
 
     def remember(self, user_id: str) -> None:
         """记录一次服务调用。"""
@@ -152,9 +153,10 @@ class StubReviewService:
         assert payload.materialIds == [12, 13] and payload.folderId == 7
         return ReviewFolderAssignmentResult(folderId=7, materialIds=payload.materialIds, movedCount=2)
 
-    def generate_material(self, material_id: int, user_id: str) -> ReviewMaterial:
+    def generate_material(self, material_id: int, user_id: str, user_feedback: str | None = None) -> ReviewMaterial:
         self.remember(user_id)
         assert material_id == 12
+        self.feedbacks.append(user_feedback)
         return sample_material()
 
     def delete_material(self, material_id: int, user_id: str) -> ReviewDeletionResult:
@@ -298,6 +300,25 @@ def test_invalid_review_rating_uses_chinese_result_envelope() -> None:
         )
         assert response.status_code == 200
         assert response.json() == {"code": 0, "msg": "复习评分必须是 1 到 4", "data": None}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_generate_review_accepts_optional_human_feedback() -> None:
+    """人工处理终态可以通过请求体把补充说明传入服务层。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/reviews/materials/12/generate",
+            headers={"Authorization": "Bearer review-token"},
+            json={"userFeedback": "只保留视频中的 Kafka 原始问题"},
+        )
+        assert response.status_code == 200
+        assert response.json()["code"] == 1
+        assert service.feedbacks == ["只保留视频中的 Kafka 原始问题"]
     finally:
         app.dependency_overrides.clear()
 

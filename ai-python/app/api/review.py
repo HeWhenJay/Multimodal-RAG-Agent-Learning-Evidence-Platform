@@ -30,6 +30,7 @@ from app.schemas.review import (
     ReviewMaterial,
     ReviewMaterialBatchDeleteRequest,
     ReviewMaterialFolderRequest,
+    ReviewGenerationRequest,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -191,11 +192,19 @@ def delete_review_folder(
 def generate_review_material(
     material_id: int,
     current_user: CurrentUser,
+    payload: ReviewGenerationRequest | None = None,
     service: ReviewService = Depends(get_review_service),
 ) -> Result[ReviewMaterial]:
-    """对一条当前用户资料重新分类并生成关键知识点。"""
+    """对一条当前用户资料重新分类并生成关键知识点，可携带人工补充说明。"""
+    if payload and payload.userFeedback:
+        action = lambda: service.generate_material(material_id, str(current_user.id), payload.userFeedback)
+    else:
+        action = lambda: service.generate_material(material_id, str(current_user.id))
     return Result.success(
-        execute("生成学习资料复习卡片", lambda: service.generate_material(material_id, str(current_user.id)))
+        execute(
+            "生成学习资料复习卡片",
+            action,
+        )
     )
 
 

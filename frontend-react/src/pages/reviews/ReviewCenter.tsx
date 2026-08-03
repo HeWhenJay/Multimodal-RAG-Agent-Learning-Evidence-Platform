@@ -131,6 +131,10 @@ export function ReviewCenter() {
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderMessage, setFolderMessage] = useState('');
   const [folderError, setFolderError] = useState('');
+  const [folderDropTargetId, setFolderDropTargetId] = useState<number | null>(null);
+  const [reviewFeedbackTarget, setReviewFeedbackTarget] = useState<ReviewMaterial | null>(null);
+  const [reviewFeedbackText, setReviewFeedbackText] = useState('');
+  const [reviewFeedbackBusy, setReviewFeedbackBusy] = useState(false);
   const settingsDirtyRef = useRef(false);
   const syncPromiseRef = useRef<Promise<ReviewSyncResult> | null>(null);
   const reviewStartedAtRef = useRef<Record<number, number>>({});
@@ -285,8 +289,8 @@ export function ReviewCenter() {
   }
 
   // 开始一次排序交互，并使更早发出的 group 查询结果失效。
-  function beginOrderInteraction() {
-    if (orderInteractionRef.current || loading || deletingKey !== null || deleteTarget !== null || groupsRef.current.length < 2) return false;
+  function beginOrderInteraction(allowSingleGroup = false) {
+    if (orderInteractionRef.current || loading || deletingKey !== null || deleteTarget !== null || (!allowSingleGroup && groupsRef.current.length < 2) || (allowSingleGroup && groupsRef.current.length < 1)) return false;
     orderInteractionRef.current = true;
     groupReadVersionRef.current += 1;
     setOrderMessage('');
@@ -340,7 +344,7 @@ export function ReviewCenter() {
 
   // 桌面端只允许从标题手柄开始拖拽，并保存拖拽前的稳定顺序用于失败回滚。
   function handleGroupDragStart(event: ReactDragEvent<HTMLButtonElement>, materialId: number) {
-    if (!beginOrderInteraction()) {
+    if (!beginOrderInteraction(true)) {
       event.preventDefault();
       return;
     }
@@ -349,6 +353,7 @@ export function ReviewCenter() {
     dragDropHandledRef.current = false;
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.setData('text/plain', String(materialId));
+    event.dataTransfer.setData('application/x-review-material-id', String(materialId));
     setDraggingMaterialId(materialId);
   }
 
@@ -387,7 +392,43 @@ export function ReviewCenter() {
       updateGroups((current) => orderGroupsByMaterialIds(current, dragSnapshotOrderRef.current));
     }
     dragSourceIdRef.current = null;
+    setFolderDropTargetId(null);
     finishOrderInteraction();
+  }
+
+  // 文件夹是文档拖拽目标；投放时恢复队列的临时排序，不写入优先级接口。
+  function handleFolderDragEnter(folderId: number) {
+    if (dragSourceIdRef.current != null) setFolderDropTargetId(folderId);
+  }
+
+  function handleFolderDragOver(event: ReactDragEvent<HTMLElement>) {
+    if (dragSourceIdRef.current == null) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }
+
+  async function handleFolderDrop(event: ReactDragEvent<HTMLElement>, folder: ReviewFolder) {
+    const materialId = dragSourceIdRef.current;
+    if (materialId == null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDropHandledRef.current = true;
+    updateGroups((current) => orderGroupsByMaterialIds(current, dragSnapshotOrderRef.current));
+    dragSourceIdRef.current = null;
+    setFolderDropTargetId(null);
+    finishOrderInteraction();
+    setFolderBusy(true);
+    setFolderError('');
+    try {
+      const result = await assignReviewMaterialsToFolder([materialId], folder.id);
+      setFolderMessage(`已将 1 份资料移入“${folder.name}”`);
+      setSelectedMaterialIds((previous) => omitKey(previous, materialId));
+      if (result.movedCount) await loadData();
+    } catch (folderFailure) {
+      setFolderError(folderFailure instanceof Error ? folderFailure.message : '拖拽归档失败');
+    } finally {
+      setFolderBusy(false);
+    }
   }
 
   // 手柄获得焦点后支持方向键逐项移动，Home/End 可快速置顶或置底。
@@ -571,19 +612,48 @@ export function ReviewCenter() {
     }
   }
 
-  async function regenerateMaterial(material: ReviewMaterial) {
+  async function regenerateMaterial(material: ReviewMaterial, userFeedback?: string) {
     const materialId = resolveMaterialId(material);
     if (materialId == null || busyMaterialId !== null) return;
+    const needsContext = material.status === 'FAILED' || material.status === 'NEEDS_REVIEW' || material.needsManualReview;
+    if (!userFeedback && needsContext) {
+      setReviewFeedbackTarget(material);
+      setReviewFeedbackText('');
+      return;
+    }
     setBusyMaterialId(materialId);
     setError('');
     try {
-      await generateReviewMaterial(materialId);
-      setSyncMessage(`“${material.title}”已重新生成复习卡片`);
+      const result = await generateReviewMaterial(materialId, userFeedback);
+      if (result.status === 'NEEDS_REVIEW' || result.needsManualReview) {
+        setReviewFeedbackTarget(result);
+        setSyncMessage(`“${material.title}”自动修复仍未通过，请补充说明后再试`);
+      } else if (result.status === 'FAILED') {
+        setReviewFeedbackTarget(result);
+        setSyncMessage(`“${material.title}”暂时生成失败，可补充说明后重试`);
+      } else {
+        setReviewFeedbackTarget(null);
+        setSyncMessage(`“${material.title}”已重新生成复习卡片`);
+      }
       await loadData();
     } catch (generateError) {
       setError(generateError instanceof Error ? generateError.message : '复习卡片生成失败');
     } finally {
       setBusyMaterialId(null);
+    }
+  }
+
+  async function submitReviewFeedback(event: FormEvent) {
+    event.preventDefault();
+    const target = reviewFeedbackTarget;
+    if (!target || reviewFeedbackBusy) return;
+    const feedback = reviewFeedbackText.trim();
+    setReviewFeedbackBusy(true);
+    try {
+      await regenerateMaterial(target, feedback || undefined);
+      setReviewFeedbackText('');
+    } finally {
+      setReviewFeedbackBusy(false);
     }
   }
 
@@ -693,7 +763,7 @@ export function ReviewCenter() {
   const totalCards = groups.reduce((count, group) => count + group.cards.length, 0);
   const unfiledMaterialCount = materials.filter((material) => material.cardCount > 0 && !material.folderId).length;
   const orderBusy = draggingMaterialId !== null || orderSaving;
-  const orderControlsDisabled = loading || orderSaving || deletingKey !== null || deleteTarget !== null || groups.length < 2;
+  const orderControlsDisabled = loading || orderSaving || deletingKey !== null || deleteTarget !== null || groups.length < 1;
 
   return (
     <div className="review-center-page">
@@ -736,10 +806,17 @@ export function ReviewCenter() {
         folders={folders}
         unfiledMaterialCount={unfiledMaterialCount}
         busy={folderBusy}
+        dropTargetId={folderDropTargetId}
         onCreate={openCreateFolder}
         onOpen={(folder) => navigate(`/reviews/folders/${folder.id}`)}
         onRename={openRenameFolder}
         onDelete={setFolderDeleteTarget}
+        onDragEnter={handleFolderDragEnter}
+        onDragOver={handleFolderDragOver}
+        onDrop={(event, folder) => void handleFolderDrop(event, folder)}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFolderDropTargetId(null);
+        }}
       />
 
       <div className="review-content-grid">
@@ -814,6 +891,7 @@ export function ReviewCenter() {
       <ReviewDeletionDialog target={deleteTarget} deleting={deletingKey !== null} onConfirm={() => void confirmDeletion()} onClose={() => { if (deletingKey === null) setDeleteTarget(null); }} />
       <ReviewFolderEditorDialog target={folderEditorTarget} name={folderEditorName} busy={folderBusy} onNameChange={setFolderEditorName} onSubmit={saveFolder} onClose={() => { if (!folderBusy) setFolderEditorTarget(null); }} />
       <ReviewFolderDeleteDialog folder={folderDeleteTarget} busy={folderBusy} onConfirm={() => void confirmFolderDeletion()} onClose={() => { if (!folderBusy) setFolderDeleteTarget(null); }} />
+      <ReviewGenerationFeedbackDialog target={reviewFeedbackTarget} feedback={reviewFeedbackText} busy={reviewFeedbackBusy || busyMaterialId !== null} onFeedbackChange={setReviewFeedbackText} onSubmit={submitReviewFeedback} onClose={() => { if (!reviewFeedbackBusy && busyMaterialId === null) setReviewFeedbackTarget(null); }} />
     </div>
   );
 }
@@ -822,18 +900,28 @@ function ReviewFolderLibrary({
   folders,
   unfiledMaterialCount,
   busy,
+  dropTargetId,
   onCreate,
   onOpen,
   onRename,
-  onDelete
+  onDelete,
+  onDragEnter,
+  onDragOver,
+  onDrop,
+  onDragLeave
 }: {
   folders: ReviewFolder[];
   unfiledMaterialCount: number;
   busy: boolean;
+  dropTargetId: number | null;
   onCreate: () => void;
   onOpen: (folder: ReviewFolder) => void;
   onRename: (folder: ReviewFolder) => void;
   onDelete: (folder: ReviewFolder) => void;
+  onDragEnter: (folderId: number) => void;
+  onDragOver: (event: ReactDragEvent<HTMLElement>) => void;
+  onDrop: (event: ReactDragEvent<HTMLElement>, folder: ReviewFolder) => void;
+  onDragLeave: (event: ReactDragEvent<HTMLElement>) => void;
 }) {
   return (
     <section className="review-folder-library" aria-labelledby="review-folder-title">
@@ -844,12 +932,13 @@ function ReviewFolderLibrary({
       {folders.length ? (
         <div className="review-folder-grid">
           {folders.map((folder) => (
-            <article className="review-folder-card" key={folder.id}>
+            <article className={`review-folder-card${dropTargetId === folder.id ? ' is-drop-target' : ''}`} key={folder.id} onDragEnter={() => onDragEnter(folder.id)} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={(event) => onDrop(event, folder)}>
               <button className="review-folder-open" type="button" onClick={() => onOpen(folder)} disabled={busy} aria-label={`进入文件夹 ${folder.name}`}>
                 <span className="review-folder-icon"><Folder size={24} /></span>
                 <span className="review-folder-copy"><strong>{folder.name}</strong><small>{folder.materialCount} 份文档 · {folder.cardCount} 张卡片</small></span>
                 <span className={`review-folder-due${folder.dueCardCount ? ' has-due' : ''}`}>{folder.dueCardCount ? `${folder.dueCardCount} 张到期` : '暂无到期'}</span>
               </button>
+              {dropTargetId === folder.id ? <span className="review-folder-drop-hint" role="status">松开移入此文件夹</span> : null}
               <div className="review-folder-actions">
                 <button className="icon-button tiny" type="button" title="重命名文件夹" aria-label={`重命名 ${folder.name}`} onClick={() => onRename(folder)} disabled={busy}><Pencil size={14} /></button>
                 <button className="icon-button tiny danger" type="button" title="删除文件夹" aria-label={`删除 ${folder.name}`} onClick={() => onDelete(folder)} disabled={busy}><FolderX size={14} /></button>
@@ -899,6 +988,52 @@ function ReviewFolderDeleteDialog({ folder, busy, onConfirm, onClose }: { folder
         <div className="review-delete-copy"><h3 id="review-folder-delete-title">删除文件夹？</h3><strong>{folder.name}</strong><p id="review-folder-delete-description">文件夹中的 {folder.materialCount} 份文档会回到未归档，原始资料、复习卡片和学习记录都不会删除。</p></div>
         <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-action" type="button" onClick={onConfirm} disabled={busy}>{busy ? <Loader2 className="spin" size={16} /> : <FolderX size={16} />}{busy ? '处理中' : '删除文件夹'}</button></div>
       </section>
+    </div>
+  );
+}
+
+function ReviewGenerationFeedbackDialog({
+  target,
+  feedback,
+  busy,
+  onFeedbackChange,
+  onSubmit,
+  onClose
+}: {
+  target: ReviewMaterial | null;
+  feedback: string;
+  busy: boolean;
+  onFeedbackChange: (value: string) => void;
+  onSubmit: (event: FormEvent) => void;
+  onClose: () => void;
+}) {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (target) inputRef.current?.focus();
+  }, [target]);
+  useEffect(() => {
+    if (!target) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [target, busy, onClose]);
+  if (!target) return null;
+  const diagnostics = target.qualityFeedback || [];
+  return (
+    <div className="review-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+      <form className="review-generation-dialog" role="dialog" aria-modal="true" aria-labelledby="review-generation-title" onSubmit={onSubmit}>
+        <div className="review-generation-dialog-icon"><AlertTriangle size={20} /></div>
+        <div className="review-generation-dialog-copy">
+          <h3 id="review-generation-title">需要人工补充后再生成</h3>
+          <p className="review-generation-title" title={target.title}>{target.title}</p>
+          <p>自动修复会把下面的质量反馈交给下一轮 DeepSeek。你可以指出本节真正的重点、问题范围或需要保留的原始问句。</p>
+          {diagnostics.length ? <div className="review-generation-feedback"><strong>最近质量反馈</strong><ul>{diagnostics.slice(-8).map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></div> : null}
+          <label><span>补充说明（可选）</span><textarea ref={inputRef} value={feedback} maxLength={2000} onChange={(event) => onFeedbackChange(event.target.value)} placeholder="例如：本节只讲 Kafka delete 与 compact 两类清理策略，请逐条保留视频中的原始问题。" disabled={busy} /></label>
+        </div>
+        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={busy}>稍后处理</button><button className="primary-action" type="submit" disabled={busy}>{busy ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}{busy ? '修复生成中' : '带说明重新生成'}</button></div>
+      </form>
     </div>
   );
 }
@@ -1175,7 +1310,8 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
 
 function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
+  const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
 }
 
 // 优先展示 DeepSeek 摘要；失败或跳过时直接展示后端原因，避免“摘要生成中”掩盖真实状态。
@@ -1183,8 +1319,8 @@ function materialSummary(summary?: string | null, reason?: string | null, status
   const normalizedSummary = summary?.replace(/\s+/g, ' ').trim();
   if (normalizedSummary) return normalizedSummary;
   const normalizedReason = reason?.replace(/\s+/g, ' ').trim();
-  if (normalizedReason && (status === 'FAILED' || status === 'SKIPPED')) {
-    return `${status === 'FAILED' ? '失败原因' : '跳过原因'}：${normalizedReason}`;
+  if (normalizedReason && (status === 'FAILED' || status === 'NEEDS_REVIEW' || status === 'SKIPPED')) {
+    return `${status === 'SKIPPED' ? '跳过原因' : status === 'NEEDS_REVIEW' ? '人工处理原因' : '失败原因'}：${normalizedReason}`;
   }
   return '摘要生成中';
 }
@@ -1342,12 +1478,14 @@ function formatGenerationStatus(value?: string | null) {
   if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING' || normalized === 'PENDING') return '生成中';
   if (normalized === 'SKIPPED') return '已跳过';
   if (normalized === 'FAILED') return '失败';
+  if (normalized === 'NEEDS_REVIEW') return '待人工处理';
   return value || '待处理';
 }
 
 function statusClass(value?: string | null) {
   const normalized = (value || '').toUpperCase();
   if (normalized === 'FAILED') return 'failed';
+  if (normalized === 'NEEDS_REVIEW') return 'manual-review';
   if (normalized === 'SKIPPED') return 'warning';
   if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING' || normalized === 'PENDING') return 'running';
   return 'indexed';

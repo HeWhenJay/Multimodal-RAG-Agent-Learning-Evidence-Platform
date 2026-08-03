@@ -10,6 +10,7 @@ import pytest
 from app.core.result import BusinessError
 from app.review.fsrs_scheduler import FsrsReviewScheduler
 from app.review.knowledge_extractor import ReviewExtractionError
+from app.review.generation_graph import ReviewManualReviewRequired
 from app.review.repository import (
     CURRENT_REVIEW_EXTRACTORS,
     DatabaseReviewTransaction,
@@ -244,6 +245,7 @@ def test_material_queries_only_expose_deepseek_review_summary() -> None:
     assert "THEN rm.summary" in cursor.statement
     assert "ELSE NULL" in cursor.statement
     assert "lm.document_summary" not in cursor.statement
+    assert "learning_review_folder_material" in cursor.statement
 
 
 class SummaryGenerationTransaction:
@@ -356,8 +358,38 @@ def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert result.summary is None
     assert result.reason == "DeepSeek 生成的卡片未通过质量门禁"
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v8"
+    assert transaction.saved["extractor"] == "failed:review-card-v9"
     assert transaction.saved["cards"] == []
+
+
+def test_quality_retry_exhaustion_is_persisted_as_manual_review() -> None:
+    """复习图耗尽自动修复后，服务必须保存 NEEDS_REVIEW 和质量反馈。"""
+    class ManualReviewExtractor:
+        """模拟 LangGraph 自动修复耗尽。"""
+
+        def extract(self, _material, _evidences):
+            raise ReviewManualReviewRequired(
+                "自动修复 6 次后仍未通过复习卡片质量门禁",
+                attempts=6,
+                quality_feedback=["结构化原始问题覆盖不足：应覆盖 20 个，已覆盖 6 个"],
+            )
+
+    transaction = SummaryGenerationTransaction()
+    service = ReviewService(
+        repository=FakeReviewRepository(transaction),
+        extractor=ManualReviewExtractor(),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+    material = MaterialSourceRecord(12, "Kafka 面试课程", "7", "mp4", "READY", None, 1, NOW)
+
+    result = service._generate(material, "7", force=True)
+
+    assert result is not None
+    assert result.status == "NEEDS_REVIEW"
+    assert result.needsManualReview is True
+    assert transaction.saved is not None
+    assert transaction.saved["generation_attempts"] == 6
+    assert transaction.saved["quality_feedback"]
 
 
 class DeletionTransaction:

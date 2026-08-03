@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
@@ -11,6 +11,10 @@ import re
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
+from app.review.generation_graph import (
+    ReviewManualReviewRequired,
+    run_review_generation_graph,
+)
 from app.schemas.rag import Evidence
 from prompts.review import (
     REVIEW_CARD_PROMPT_VERSION,
@@ -86,10 +90,16 @@ class ExtractionResult:
     knowledge_points: tuple[KnowledgePoint, ...]
     extractor: str
     summary: str | None = None
+    generation_attempts: int = 0
+    quality_feedback: tuple[str, ...] = ()
 
 
 class ReviewExtractionError(RuntimeError):
     """DeepSeek 复习内容未能生成或未通过质量门禁。"""
+
+    def __init__(self, message: str, *, diagnostics: list[str] | tuple[str, ...] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = tuple(diagnostics or [message])
 
 
 class KnowledgePointExtractor:
@@ -112,8 +122,10 @@ class KnowledgePointExtractor:
         self,
         material: LearningMaterialContext,
         evidences: list[Evidence],
+        *,
+        user_feedback: str | None = None,
     ) -> ExtractionResult:
-        """只根据传入 evidence 调用 DeepSeek，失败时不发布任何降级内容。"""
+        """只根据 evidence 运行多轮 DeepSeek 生成图，失败时不发布降级内容。"""
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
         # 每次生成前刷新一次密钥，但仍只允许使用 DEEPSEEK_API_KEY，绝不借用其他供应商配置。
         self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
@@ -139,14 +151,40 @@ class KnowledgePointExtractor:
         try:
             source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
             usable = select_review_prompt_evidences(cleaned, source_questions)
-            modeled = self._extract_with_model(
-                material,
-                usable,
-                source_questions=source_questions,
+            outcome = run_review_generation_graph(
+                actor=lambda attempt, feedback: self._generate_model_payload(
+                    material,
+                    usable,
+                    source_questions=source_questions,
+                    attempt=attempt,
+                    quality_feedback=feedback,
+                    user_feedback=user_feedback,
+                ),
+                observer=lambda payload: self._validate_model_result(
+                    material,
+                    usable,
+                    payload,
+                    source_questions=source_questions,
+                ),
+                plan={
+                    "materialId": material.material_id,
+                    "title": material.title,
+                    "structuredQuestionCount": len(source_questions),
+                    "maxCards": review_card_limit(source_questions),
+                    "hasUserFeedback": bool((user_feedback or "").strip()),
+                },
             )
-            return ExtractionResult(
-                True, category, reason, modeled.knowledge_points, modeled.extractor, modeled.summary
+            modeled = outcome.result
+            return replace(
+                modeled,
+                is_learning_content=True,
+                category=category,
+                reason=reason,
+                generation_attempts=outcome.attempts,
+                quality_feedback=outcome.quality_feedback,
             )
+        except ReviewManualReviewRequired:
+            raise
         except ReviewExtractionError:
             raise
         except json.JSONDecodeError as exc:
@@ -163,7 +201,30 @@ class KnowledgePointExtractor:
         *,
         source_questions: list[dict[str, str]] | None = None,
     ) -> ExtractionResult:
-        """调用 DeepSeek 官方 OpenAI 兼容接口并校验摘要、问句与 evidence 引用。"""
+        """兼容单轮测试入口；正式生成由独立 LangGraph 负责循环。"""
+        payload = self._generate_model_payload(
+            material,
+            evidences,
+            source_questions=source_questions,
+        )
+        return self._validate_model_result(
+            material,
+            evidences,
+            payload,
+            source_questions=source_questions,
+        )
+
+    def _generate_model_payload(
+        self,
+        material: LearningMaterialContext,
+        evidences: list[Evidence],
+        *,
+        source_questions: list[dict[str, str]] | None = None,
+        attempt: int = 1,
+        quality_feedback: list[str] | None = None,
+        user_feedback: str | None = None,
+    ) -> dict[str, Any]:
+        """调用 DeepSeek 官方入口并返回待观察节点校验的原始 JSON。"""
         from openai import OpenAI
 
         source_questions = source_questions or extract_source_question_candidates(evidences)
@@ -173,7 +234,7 @@ class KnowledgePointExtractor:
                 "sectionName": item.sectionName,
                 "snippet": item.snippet,
             }
-            for item in evidences[:16]
+            for item in evidences[:STRUCTURED_EVIDENCE_LIMIT]
         ]
         prompt = review_card_user_prompt(
             title=material.title,
@@ -182,6 +243,9 @@ class KnowledgePointExtractor:
             evidences=evidence_payload,
             source_questions=source_questions,
             max_cards=review_card_limit(source_questions),
+            attempt=attempt,
+            quality_feedback=quality_feedback,
+            user_feedback=user_feedback,
         )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
@@ -196,13 +260,7 @@ class KnowledgePointExtractor:
             timeout=self.timeout_seconds,
         )
         content = response.choices[0].message.content or ""
-        payload = parse_json_object(content)
-        return self._validate_model_result(
-            material,
-            evidences,
-            payload,
-            source_questions=source_questions,
-        )
+        return parse_json_object(content)
 
     def _validate_model_result(
         self,
@@ -212,10 +270,13 @@ class KnowledgePointExtractor:
         *,
         source_questions: list[dict[str, str]] | None = None,
     ) -> ExtractionResult:
-        """只发布结构完整、可独立理解且带有效 evidence 的 DeepSeek 结果。"""
+        """逐卡收集可修复诊断，只发布全部通过门禁且结构覆盖完整的结果。"""
         summary = normalize_generated_summary(payload.get("summary"))
         if summary is None:
-            raise ReviewExtractionError("DeepSeek 未生成有效的资料总结")
+            raise ReviewExtractionError(
+                "DeepSeek 未生成有效的资料总结",
+                diagnostics=["资料总结为空、过短、包含检索产物或仍是噪声，请重新生成 2-5 句资料级总结"],
+            )
         evidence_by_id = {item.evidenceId: item for item in evidences}
         question_candidates = (
             extract_source_question_candidates(evidences)
@@ -224,41 +285,64 @@ class KnowledgePointExtractor:
         )
         points: list[KnowledgePoint] = []
         seen_questions: set[str] = set()
+        covered_source_questions: set[str] = set()
+        diagnostics: list[str] = []
         raw_cards = payload.get("cards")
         if not isinstance(raw_cards, list):
-            raise ReviewExtractionError("DeepSeek 未返回有效的复习卡片数组")
-        for raw in raw_cards:
+            raise ReviewExtractionError(
+                "DeepSeek 未返回有效的复习卡片数组",
+                diagnostics=["cards 必须是 JSON 数组，不能缺失、为 null 或使用其他结构"],
+            )
+        for card_index, raw in enumerate(raw_cards, start=1):
+            label = f"卡片 {card_index}"
             if not isinstance(raw, dict):
+                diagnostics.append(f"{label} 不是 JSON 对象")
                 continue
             answer = normalize_answer_text(raw.get("answer"), 600)
             if not answer:
+                diagnostics.append(f"{label} 的 answer 为空或不是有效文本")
                 continue
             raw_evidence_ids = raw.get("evidenceIds")
             evidence_ids = raw_evidence_ids if isinstance(raw_evidence_ids, list) else []
+            if not 1 <= len(evidence_ids) <= 2:
+                diagnostics.append(f"{label} 必须引用 1 到 2 个 evidenceId")
+                continue
+            unknown_ids = [str(evidence_id) for evidence_id in evidence_ids if evidence_id not in evidence_by_id]
+            if unknown_ids:
+                diagnostics.append(f"{label} 引用了不存在的 evidenceId：{'、'.join(unknown_ids[:4])}")
+                continue
             refs = tuple(
                 evidence_by_id[evidence_id]
                 for evidence_id in evidence_ids
                 if evidence_id in evidence_by_id
             )[:2]
             if not refs:
+                diagnostics.append(f"{label} 没有可用 evidence 引用")
                 continue
             if is_noise_fragment(answer) or not answer_is_grounded(answer, refs):
+                diagnostics.append(f"{label} 的 answer 含噪声或未通过逐论断 evidence 忠实度校验")
                 continue
             raw_source_question = compact_text(raw.get("sourceQuestion"), 180)
             source_question = validated_source_question(raw_source_question, refs, question_candidates)
             if raw_source_question and source_question is None:
+                diagnostics.append(f"{label} 的 sourceQuestion 不是所引用 evidence 中的原始问句候选")
                 continue
             question = compact_text(raw.get("question"), 180)
             hint = compact_text(raw.get("hint"), 180)
             if not question or not is_high_quality_review_question(question):
+                diagnostics.append(f"{label} 的 question 不是主题明确、自包含且以问号结尾的完整疑问句")
                 continue
             if not hint or not is_high_quality_review_hint(hint):
+                diagnostics.append(f"{label} 的 hint 为空、过于泛化或直接包含无效占位内容")
                 continue
             section = clean_section_name(refs[0].sectionName, material.title)
             question_key = normalized_sentence(question)
             if not question_key or question_key in seen_questions:
+                diagnostics.append(f"{label} 与其他卡片问题重复或无法形成稳定问题标识")
                 continue
             seen_questions.add(question_key)
+            if source_question:
+                covered_source_questions.add(normalized_sentence(source_question))
             points.append(
                 KnowledgePoint(
                     source_key=stable_source_key(section, refs, answer),
@@ -268,8 +352,25 @@ class KnowledgePointExtractor:
                     evidence_refs=refs,
                 )
             )
-        if not points:
-            raise ReviewExtractionError("DeepSeek 生成的卡片未通过问题完整性与 evidence 质量门禁")
+
+        expected_structured = structured_source_questions(question_candidates)
+        missing_structured = [
+            question for key, question in expected_structured
+            if key not in covered_source_questions
+        ]
+        if missing_structured:
+            diagnostics.append(
+                "结构化原始问题覆盖不足："
+                f"应覆盖 {len(expected_structured)} 个，已覆盖 {len(expected_structured) - len(missing_structured)} 个；"
+                f"缺少：{'；'.join(missing_structured[:12])}"
+            )
+        if not points and not diagnostics:
+            diagnostics.append("cards 为空，没有生成任何可发布的复习卡片")
+        if diagnostics:
+            raise ReviewExtractionError(
+                "DeepSeek 生成的卡片未通过问题完整性与 evidence 质量门禁",
+                diagnostics=diagnostics[:80],
+            )
         return ExtractionResult(
             True,
             None,
@@ -511,6 +612,22 @@ def review_card_limit(source_questions: list[dict[str, str]]) -> int:
     if len(unique_questions) <= STANDARD_REVIEW_CARD_LIMIT:
         return STANDARD_REVIEW_CARD_LIMIT
     return min(MAX_STRUCTURED_REVIEW_CARD_LIMIT, len(unique_questions))
+
+
+def structured_source_questions(source_questions: list[dict[str, str]]) -> list[tuple[str, str]]:
+    """返回必须逐项覆盖的结构化原始问题，普通资料不强制逐题映射。"""
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in source_questions:
+        question = compact_text(item.get("question"), 180)
+        key = normalized_sentence(question)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append((key, question))
+    if len(result) <= STANDARD_REVIEW_CARD_LIMIT:
+        return []
+    return result[:MAX_STRUCTURED_REVIEW_CARD_LIMIT]
 
 
 def is_meaningful_source_question(value: str) -> bool:

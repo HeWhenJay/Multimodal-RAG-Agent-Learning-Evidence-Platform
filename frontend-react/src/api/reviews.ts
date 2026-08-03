@@ -78,8 +78,11 @@ export interface ReviewMaterial {
   reason?: string | null;
   generationStatus?: string | null;
   generationState?: string | null;
-  status: 'PENDING' | 'GENERATED' | 'SKIPPED' | 'FAILED' | string;
+  status: 'PENDING' | 'GENERATED' | 'SKIPPED' | 'FAILED' | 'NEEDS_REVIEW' | string;
   cardCount: number;
+  generationAttempts?: number;
+  qualityFeedback?: string[];
+  needsManualReview?: boolean;
   folderId?: number | null;
   folderName?: string | null;
   indexRequestVersion?: number;
@@ -263,9 +266,11 @@ export function assignReviewMaterialsToFolder(
 }
 
 // 对单条学习资料重新分类并生成关键知识点卡片。
-export function generateReviewMaterial(materialId: number): Promise<ReviewMaterial> {
+export function generateReviewMaterial(materialId: number, userFeedback?: string): Promise<ReviewMaterial> {
+  const feedback = userFeedback?.trim();
   return request<ReviewMaterial>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/generate`, {
-    method: 'POST'
+    method: 'POST',
+    ...(feedback ? { headers: jsonHeaders, body: JSON.stringify({ userFeedback: feedback }) } : {})
   });
 }
 

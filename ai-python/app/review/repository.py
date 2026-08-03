@@ -63,6 +63,8 @@ class ReviewMaterialRecord:
     summary: str | None = None
     folder_id: int | None = None
     folder_name: str | None = None
+    generation_attempts: int = 0
+    quality_feedback: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,8 @@ class ReviewTransaction(Protocol):
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
+        generation_attempts: int = 0,
+        quality_feedback: list[str] | tuple[str, ...] = (),
     ) -> ReviewMaterialRecord | None: ...
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]: ...
@@ -316,8 +320,11 @@ class DatabaseReviewTransaction:
                       OR (
                           rm.extractor NOT IN (%s, %s)
                           AND (
-                              rm.status <> 'FAILED'
-                              OR rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                              rm.status NOT IN ('FAILED', 'NEEDS_REVIEW')
+                              OR (
+                                  rm.status = 'FAILED'
+                                  AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                              )
                           )
                       )
                   )
@@ -400,6 +407,8 @@ class DatabaseReviewTransaction:
         reason: str,
         extractor: str,
         cards: list[ReviewCardDraft],
+        generation_attempts: int = 0,
+        quality_feedback: list[str] | tuple[str, ...] = (),
     ) -> ReviewMaterialRecord | None:
         """更新分类并按稳定来源键刷新正文，已有卡片不重置 FSRS 状态。"""
         self._cursor.execute(
@@ -436,8 +445,9 @@ class DatabaseReviewTransaction:
                 INSERT INTO {schema}.learning_review_material (
                     material_id, user_id, index_request_version, is_learning_content,
                     category, summary, status, reason, extractor, card_count, generated_at
+                    , generation_attempts, quality_feedback
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP, %s, %s::jsonb)
                 ON CONFLICT (material_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     index_request_version = EXCLUDED.index_request_version,
@@ -447,6 +457,8 @@ class DatabaseReviewTransaction:
                     status = EXCLUDED.status,
                     reason = EXCLUDED.reason,
                     extractor = EXCLUDED.extractor,
+                    generation_attempts = EXCLUDED.generation_attempts,
+                    quality_feedback = EXCLUDED.quality_feedback,
                     generated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE {schema}.learning_review_material.index_request_version <= EXCLUDED.index_request_version
@@ -463,6 +475,8 @@ class DatabaseReviewTransaction:
                 status,
                 reason,
                 extractor,
+                max(0, int(generation_attempts)),
+                json.dumps(list(quality_feedback), ensure_ascii=False, separators=(",", ":")),
             ),
         )
         inserted_row = self._cursor.fetchone()
@@ -560,6 +574,12 @@ class DatabaseReviewTransaction:
                       FROM {schema}.learning_review_material_exclusion excluded_material
                       WHERE excluded_material.material_id = lm.id
                         AND excluded_material.user_id = lm.user_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = lm.id
+                        AND folder_material.user_id = lm.user_id
                   )
                 ORDER BY lm.updated_at DESC, lm.id DESC
                 LIMIT %s
@@ -1031,6 +1051,12 @@ class DatabaseReviewTransaction:
                  AND rm.status = 'GENERATED'
                  AND rm.extractor = {current_model_extractor}
                 WHERE c.user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = c.material_id
+                        AND folder_material.user_id = c.user_id
+                  )
                 """
             ),
             (now, now, now, user_id),
@@ -1054,6 +1080,12 @@ class DatabaseReviewTransaction:
                               AND due_card.user_id = log.user_id
                               AND due_card.active = TRUE
                               AND due_card.due_at <= %s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM {schema}.learning_review_folder_material folder_material
+                                  WHERE folder_material.material_id = due_card.material_id
+                                    AND folder_material.user_id = due_card.user_id
+                              )
                         )
                     ) AS started_due_material_count
                 FROM {schema}.learning_review_log log
@@ -1092,6 +1124,12 @@ class DatabaseReviewTransaction:
                   AND lm.user_id = %s
                   AND c.active = TRUE
                   AND c.due_at <= %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = c.material_id
+                        AND folder_material.user_id = c.user_id
+                  )
                 ORDER BY group_due_at ASC, c.material_id ASC, c.due_at ASC, c.id ASC
                 LIMIT %s
                 """
@@ -1139,6 +1177,12 @@ class DatabaseReviewTransaction:
                       AND lm.user_id = %s
                       AND c.active = TRUE
                       AND c.due_at <= %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.learning_review_folder_material folder_material
+                          WHERE folder_material.material_id = c.material_id
+                            AND folder_material.user_id = c.user_id
+                      )
                 ),
                 due_materials AS (
                     SELECT material_id,
@@ -1241,6 +1285,12 @@ class DatabaseReviewTransaction:
                       FROM {schema}.learning_review_material_exclusion excluded_material
                       WHERE excluded_material.material_id = rm.material_id
                         AND excluded_material.user_id = %s
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = rm.material_id
+                        AND folder_material.user_id = rm.user_id
                   )
                 ORDER BY rm.display_order ASC NULLS LAST, rm.material_id ASC
                 FOR UPDATE OF rm
@@ -1423,6 +1473,16 @@ class DatabaseReviewTransaction:
                         THEN rm.summary
                     ELSE NULL
                 END AS material_summary,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN COALESCE(rm.generation_attempts, 0)
+                    ELSE 0
+                END AS generation_attempts,
+                CASE
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN COALESCE(rm.quality_feedback, '[]'::jsonb)
+                    ELSE '[]'::jsonb
+                END AS quality_feedback,
                 COALESCE(rm.updated_at, lm.updated_at) AS review_updated_at
             FROM {{schema}}.learning_material lm
             LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = lm.id
@@ -1527,6 +1587,14 @@ class DatabaseReviewTransaction:
     @staticmethod
     def _to_review_material(row: dict[str, Any]) -> ReviewMaterialRecord:
         """把联合资料行转换为公开状态记录。"""
+        raw_quality_feedback = row.get("quality_feedback") or []
+        if isinstance(raw_quality_feedback, str):
+            try:
+                parsed_quality_feedback = json.loads(raw_quality_feedback)
+            except (TypeError, ValueError):
+                parsed_quality_feedback = []
+        else:
+            parsed_quality_feedback = raw_quality_feedback
         return ReviewMaterialRecord(
             material_id=int(row["material_id"]),
             title=str(row["title"]),
@@ -1548,6 +1616,12 @@ class DatabaseReviewTransaction:
             summary=row.get("material_summary"),
             folder_id=(int(row["folder_id"]) if row.get("folder_id") is not None else None),
             folder_name=row.get("folder_name"),
+            generation_attempts=int(row.get("generation_attempts") or 0),
+            quality_feedback=tuple(
+                str(item)
+                for item in parsed_quality_feedback
+                if str(item).strip()
+            ),
         )
 
     @staticmethod

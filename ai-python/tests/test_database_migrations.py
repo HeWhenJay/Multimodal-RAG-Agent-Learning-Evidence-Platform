@@ -90,3 +90,14 @@ def test_review_folder_migration_is_registered_and_idempotent() -> None:
     assert "CREATE TABLE IF NOT EXISTS learning_evidence.learning_review_folder" in sql
     assert "CREATE TABLE IF NOT EXISTS learning_evidence.learning_review_folder_material" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_learning_review_folder_material_folder" in sql
+
+
+def test_review_generation_repair_state_migration_is_registered() -> None:
+    """多轮生成尝试、质量反馈和人工终态必须可安全迁移。"""
+    filename = "20260803_0200_add_review_generation_repair_state.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "ADD COLUMN IF NOT EXISTS generation_attempts INTEGER" in sql
+    assert "ADD COLUMN IF NOT EXISTS quality_feedback JSONB" in sql
+    assert "NEEDS_REVIEW" in sql

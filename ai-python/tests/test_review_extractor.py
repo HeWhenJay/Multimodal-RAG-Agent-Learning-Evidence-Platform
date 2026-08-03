@@ -142,7 +142,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v8"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v9"
     assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
     assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
     assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
@@ -154,6 +154,42 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert result.summary == payload["summary"]
     assert result.summary != "这只是 RAG 截断摘要，不应直接展示。"
     assert len(result.knowledge_points) == 1
+
+
+def test_extractor_retries_with_quality_feedback_and_user_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """首轮门禁失败时，复习图会把诊断和人工说明送入下一轮 Prompt。"""
+    calls: list[dict] = []
+    first = valid_payload()
+    first["cards"][0]["answer"] = "ISR 采用量子退火算法预测消费者扩缩容。"
+    responses = [first, valid_payload()]
+
+    class FakeCompletions:
+        """按顺序返回一个坏结果和一个修复结果。"""
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            payload = responses.pop(0)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
+            )
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_GENERATION_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    result = KnowledgePointExtractor(provider="deepseek").extract(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。")],
+        user_feedback="只关注视频原文明确讲到的 Kafka 副本机制。",
+    )
+
+    assert len(calls) == 2
+    assert "用户补充说明" in calls[0]["messages"][1]["content"]
+    assert "answer" in calls[1]["messages"][1]["content"]
+    assert result.generation_attempts == 2
+    assert result.quality_feedback
 
 
 def test_extractor_refreshes_key_before_generation(monkeypatch: pytest.MonkeyPatch) -> None:

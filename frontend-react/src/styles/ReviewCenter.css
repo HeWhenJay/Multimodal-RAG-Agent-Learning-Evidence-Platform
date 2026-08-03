@@ -990,7 +990,12 @@
 .material-status.indexed { color: #0f766e; }
 .material-status.warning { color: #b45309; }
 .material-status.failed { color: #dc2626; }
+.material-status.manual-review { color: #b45309; }
 .material-status.running { color: #4f46e5; }
+
+.review-material-row.needs-manual-review {
+  background: #fffbeb;
+}
 
 .panel-empty {
   margin: 0;
@@ -1400,6 +1405,25 @@
   transform: translateY(-1px);
 }
 
+.review-folder-card.is-drop-target {
+  border-color: #4f46e5;
+  background: #eef2ff;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, .16), 0 12px 26px rgba(67, 56, 202, .12);
+  transform: translateY(-2px);
+}
+
+.review-folder-drop-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  padding: 4px 7px;
+  color: #3730a3;
+  background: #e0e7ff;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .review-folder-open {
   width: 100%;
   min-height: 92px;
@@ -1561,6 +1585,41 @@
 .review-folder-dialog-copy input { width: 100%; height: 38px; padding: 0 11px; color: #1f2937; background: #fff; border: 1px solid #cfd6e0; border-radius: 6px; font-size: 13px; }
 .review-folder-dialog-copy input:focus { outline: 2px solid #c7d2fe; border-color: #818cf8; }
 
+.review-generation-dialog {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 14px;
+  width: min(620px, 100%);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow: auto;
+  padding: 22px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(15, 23, 42, .24);
+}
+
+.review-generation-dialog-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  color: #b45309;
+  background: #fff7e6;
+  border-radius: 7px;
+}
+
+.review-generation-dialog-copy { min-width: 0; }
+.review-generation-dialog-copy h3 { margin: 0; color: #1f2937; font-size: 17px; }
+.review-generation-dialog-copy p { margin: 7px 0 0; color: #64748b; font-size: 12px; line-height: 1.55; }
+.review-generation-dialog-copy .review-generation-title { margin-top: 6px; overflow: hidden; color: #334155; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.review-generation-feedback { margin-top: 15px; padding: 11px 12px; color: #78350f; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; font-size: 11px; line-height: 1.55; }
+.review-generation-feedback strong { display: block; margin-bottom: 5px; }
+.review-generation-feedback ul { margin: 0; padding-left: 17px; }
+.review-generation-dialog-copy label { display: block; margin-top: 15px; }
+.review-generation-dialog-copy label span { display: block; margin-bottom: 6px; color: #475569; font-size: 11px; font-weight: 700; }
+.review-generation-dialog-copy textarea { display: block; width: 100%; min-height: 104px; resize: vertical; padding: 9px 10px; color: #1f2937; background: #fff; border: 1px solid #cfd6e0; border-radius: 6px; font: inherit; font-size: 12px; line-height: 1.55; }
+.review-generation-dialog-copy textarea:focus { outline: 2px solid #c7d2fe; border-color: #818cf8; }
+
 .review-folder-detail-header {
   padding-bottom: 18px;
   border-bottom: 1px solid #e6e9ef;
@@ -1600,6 +1659,23 @@
   color: #475569;
   background: #fff;
   border: 0;
+}
+
+.review-folder-document-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 10px;
+  background: #fff;
+}
+
+.review-folder-document-toolbar .review-folder-document-header {
+  flex: 1;
+}
+
+.review-folder-remove {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .review-folder-document-header:hover { background: #fafbfe; }
@@ -1697,9 +1773,13 @@
   .review-folder-heading-actions { width: 100%; justify-content: space-between; }
   .review-folder-grid { grid-template-columns: 1fr; }
   .review-folder-dialog { grid-template-columns: 1fr; width: 100%; border-radius: 8px 8px 0 0; }
+  .review-generation-dialog { grid-template-columns: 1fr; width: 100%; border-radius: 8px 8px 0 0; }
   .review-material-folder-controls { grid-template-columns: 1fr 1fr; }
   .review-material-folder-controls select { grid-column: 1 / -1; }
   .review-folder-document-header { padding: 11px; }
+  .review-folder-document-toolbar { align-items: stretch; flex-direction: column; gap: 0; padding-right: 0; }
+  .review-folder-document-toolbar .review-folder-document-header { flex: none; }
+  .review-folder-remove { justify-content: center; margin: 0 11px 11px; }
   .review-folder-document-index { display: none; }
   .review-folder-document-copy strong { white-space: normal; line-height: 1.35; }
 }

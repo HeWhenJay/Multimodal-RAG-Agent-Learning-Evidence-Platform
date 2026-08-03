@@ -195,6 +195,7 @@ def test_due_group_query_applies_material_order_without_changing_card_rank() -> 
     ) == []
     normalized_sql = " ".join(cursor.statement.split())
     assert "rm.display_order AS material_display_order" in normalized_sql
+    assert "learning_review_folder_material" in normalized_sql
     assert "ORDER BY due_cards.material_display_order ASC NULLS LAST" in normalized_sql
     assert "MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at" in normalized_sql
     assert "material_rank <= 4" not in normalized_sql

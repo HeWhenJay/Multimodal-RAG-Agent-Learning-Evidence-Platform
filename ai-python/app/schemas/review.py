@@ -98,6 +98,19 @@ class ReviewGroupOrderResult(BaseModel):
     orderedCount: int = Field(ge=1, le=100)
 
 
+class ReviewGenerationRequest(BaseModel):
+    """用户在人工修复阶段提供的可选生成说明。"""
+
+    userFeedback: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("userFeedback")
+    @classmethod
+    def normalize_user_feedback(cls, value: str | None) -> str | None:
+        """去除首尾空白，空说明按未提供处理。"""
+        normalized = " ".join((value or "").split()).strip()
+        return normalized or None
+
+
 class ReviewMaterial(BaseModel):
     """一条资料的学习分类与卡片生成状态。"""
 
@@ -108,9 +121,12 @@ class ReviewMaterial(BaseModel):
     materialStatus: str
     isLearningContent: bool | None = None
     category: str | None = None
-    status: Literal["PENDING", "GENERATING", "GENERATED", "SKIPPED", "FAILED"] = "PENDING"
+    status: Literal["PENDING", "GENERATING", "GENERATED", "SKIPPED", "FAILED", "NEEDS_REVIEW"] = "PENDING"
     reason: str | None = None
     cardCount: int = Field(default=0, ge=0)
+    generationAttempts: int = Field(default=0, ge=0)
+    qualityFeedback: list[str] = Field(default_factory=list)
+    needsManualReview: bool = False
     folderId: int | None = Field(default=None, ge=1)
     folderName: str | None = None
     indexRequestVersion: int = Field(default=0, ge=0)

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 
-REVIEW_CARD_PROMPT_VERSION = "review-card-v8"
+REVIEW_CARD_PROMPT_VERSION = "review-card-v9"
 
 
 def review_card_system_prompt() -> str:
@@ -50,8 +50,11 @@ def review_card_user_prompt(
     evidences: list[dict[str, Any]],
     source_questions: list[dict[str, str]] | None = None,
     max_cards: int = 8,
+    attempt: int = 1,
+    quality_feedback: list[str] | None = None,
+    user_feedback: str | None = None,
 ) -> str:
-    """返回一次资料级复习摘要和卡片生成的 user Prompt。"""
+    """返回带质量修复上下文的资料级复习摘要和卡片生成 Prompt。"""
     rag_index_summary = summary if summary.strip() else ""
     structured_question_count = len(source_questions or [])
     bounded_max_cards = max(1, min(32, max_cards))
@@ -62,7 +65,10 @@ def review_card_user_prompt(
         else "最多 8 张；通常 3-8 张，重点不足时允许少于 3 张；宁缺毋滥"
     )
     payload = {
-        "任务": "一次完成 DeepSeek 复习总结和重点复习卡片生成",
+        "任务": "完成 DeepSeek 复习总结和重点复习卡片生成，并逐条修复质量门禁反馈",
+        "当前尝试轮次": max(1, int(attempt)),
+        "上一轮质量门禁反馈": (quality_feedback or [])[:80],
+        "用户补充说明": (user_feedback or "").strip()[:2000] or None,
         "资料标题": title,
         "资料类型": document_type,
         "RAG索引摘要说明": "可能只是截断的开头内容，仅作辅助证据；学习资料仍必须重新生成 summary",
@@ -98,7 +104,8 @@ def review_card_user_prompt(
     }
     return (
         "严格处理以下 JSON 输入。先在内部核对原始问句是否真的是资料重点、最终问题是否自包含、引用 evidence 是否足以回答，"
-        "再输出唯一 JSON 对象。不得新增 evidenceId，不得把资料外常识写入 summary 或 answer，"
+        "再输出唯一 JSON 对象。第二轮及以后必须逐条针对上一轮质量门禁反馈重新生成，不能原样复制已被拒绝的错误输出；"
+        "用户补充说明只能帮助理解资料范围，不能覆盖 evidence 或要求编造资料外内容。不得新增 evidenceId，不得把资料外常识写入 summary 或 answer，"
         "不得输出只有时间码、字幕水印、口头语、父段摘要、无答案反问或问答错位的卡片：\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
