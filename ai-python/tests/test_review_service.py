@@ -203,8 +203,8 @@ def test_grade_rejects_a_new_document_after_daily_document_limit() -> None:
     assert transaction.saved is False
 
 
-def test_sync_candidates_include_outdated_extractor_versions() -> None:
-    """Prompt 版本升级后应分批刷新旧卡片，同时继续使用参数化 SQL。"""
+def test_sync_candidates_ignore_prompt_versions_and_retry_only_real_pending_work() -> None:
+    """服务重启或 Prompt 版本变化不能把已有终态资料重新送入模型。"""
     class RecordingCursor:
         """记录候选查询语句和绑定参数。"""
 
@@ -220,16 +220,17 @@ def test_sync_candidates_include_outdated_extractor_versions() -> None:
     transaction._statement = lambda query: query  # type: ignore[method-assign]
 
     assert transaction.list_sync_candidates("7", 3) == []
-    assert "rm.extractor NOT IN (%s, %s)" in cursor.statement
-    assert "INTERVAL '5 minutes'" in cursor.statement
+    assert "rm.extractor NOT IN" not in cursor.statement
+    assert "INTERVAL '5 minutes'" not in cursor.statement
+    assert "rm.index_request_version < lm.index_request_version" in cursor.statement
     assert "rm.status = 'GENERATING'" in cursor.statement
     assert "INTERVAL '20 minutes'" in cursor.statement
     assert "learning_review_material_exclusion" in cursor.statement
-    assert cursor.params == ("7", *CURRENT_REVIEW_EXTRACTORS, 3)
+    assert cursor.params == ("7", 3)
 
 
 def test_current_generation_requires_a_stable_terminal_status() -> None:
-    """同版本同提取器仍处于 GENERATING 时不能被误判为已完成。"""
+    """同索引版本的成功或失败终态都应幂等，中断状态仍允许后续恢复。"""
     base = ReviewMaterialRecord(
         material_id=12,
         title="Kafka 高可用",
@@ -247,7 +248,16 @@ def test_current_generation_requires_a_stable_terminal_status() -> None:
     )
 
     assert material_generation_is_current(base, 1) is True
+    assert material_generation_is_current(
+        replace(base, status="FAILED", extractor="failed:review-card-v3"),
+        1,
+    ) is True
+    assert material_generation_is_current(
+        replace(base, status="NEEDS_REVIEW", extractor="failed:review-card-v9"),
+        1,
+    ) is True
     assert material_generation_is_current(replace(base, status="GENERATING"), 1) is False
+    assert material_generation_is_current(replace(base, synced_index_request_version=0), 1) is False
 
 
 def test_material_queries_only_expose_deepseek_review_summary() -> None:
@@ -522,8 +532,8 @@ def test_batch_delete_deduplicates_and_uses_one_transaction() -> None:
     assert transaction.material_calls == [(12, "7"), (13, "7")]
 
 
-def test_current_index_with_legacy_extractor_still_requires_regeneration() -> None:
-    """索引版本未变但 Prompt 已升级时，旧卡片不能被幂等检查直接跳过。"""
+def test_current_index_with_legacy_extractor_is_still_idempotent() -> None:
+    """索引版本未变时，旧提取器结果也必须保留，不能因服务重启被改写。"""
     base = dict(
         material_id=12,
         title="Kafka 高可用",
@@ -539,7 +549,7 @@ def test_current_index_with_legacy_extractor_still_requires_regeneration() -> No
         updated_at=NOW,
     )
 
-    assert material_generation_is_current(ReviewMaterialRecord(**base, extractor="local"), 1) is False
+    assert material_generation_is_current(ReviewMaterialRecord(**base, extractor="local"), 1) is True
     assert material_generation_is_current(
         ReviewMaterialRecord(**base, extractor=CURRENT_REVIEW_EXTRACTORS[0]),
         1,

@@ -236,7 +236,7 @@ export function ReviewCenter() {
     setError(failures.length ? `${failures.join('、')}暂时不可用` : '');
   }, [updateGroups]);
 
-  // 页面首次打开时串行排空等待生成的资料；后端单次仍只处理一份，避免请求内并发调用模型。
+  // 页面首次打开只读取持久化结果；生成必须由上传完成、资料内容更新或用户显式同步触发。
   useEffect(() => {
     let active = true;
     const initialize = async () => {
@@ -248,28 +248,12 @@ export function ReviewCenter() {
       } finally {
         if (active) setLoading(false);
       }
-      setSyncing(true);
-      try {
-        const result = await startReviewSyncQueue(async (progress) => {
-          if (!active) return;
-          setSyncMessage(formatSyncMessage(progress));
-          await loadData();
-        });
-        if (active) {
-          setSyncMessage(formatSyncMessage(result));
-          await loadData();
-        }
-      } catch (syncError) {
-        if (active) setSyncMessage('资料同步暂未完成，已有复习卡片仍可使用');
-      } finally {
-        if (active) setSyncing(false);
-      }
     };
     void initialize();
     return () => {
       active = false;
     };
-  }, [loadData, startReviewSyncQueue]);
+  }, [loadData]);
 
   // 上传资料完成 RAG 入库并生成卡片后，立即刷新当前复习中心，不等待定时轮询。
   useEffect(() => {
@@ -1612,7 +1596,7 @@ function formatSyncMessage(result: ReviewSyncResult) {
 
 type ReviewSyncProgressHandler = (result: ReviewSyncResult) => void | Promise<void>;
 
-// 用多个单资料请求串行排空 Prompt 升级后的待生成队列，并在每份完成后刷新进度。
+// 用多个单资料请求串行处理首次生成或索引内容更新后的队列，并在每份完成后刷新进度。
 async function drainPendingReviewMaterials(onProgress?: ReviewSyncProgressHandler): Promise<ReviewSyncResult> {
   const total: ReviewSyncResult = {
     processedMaterialCount: 0,

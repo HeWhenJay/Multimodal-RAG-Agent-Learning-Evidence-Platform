@@ -19,7 +19,6 @@ from app.review.knowledge_extractor import (
 )
 from app.review.missing_knowledge import MissingKnowledgeExtractor
 from app.review.repository import (
-    CURRENT_REVIEW_EXTRACTORS,
     MaterialSourceRecord,
     ReviewCardDraft,
     ReviewCardRecord,
@@ -840,12 +839,11 @@ def card_response(
 
 
 def material_generation_is_current(record: ReviewMaterialRecord, index_request_version: int) -> bool:
-    """同时校验资料索引版本和提炼器版本，确保 Prompt 升级会重建旧卡片。"""
+    """按资料索引版本和持久化终态判定幂等，服务或 Prompt 升级不改写旧卡片。"""
     return (
         record.synced_index_request_version is not None
         and record.synced_index_request_version >= index_request_version
-        and record.extractor in CURRENT_REVIEW_EXTRACTORS
-        and record.status in {"GENERATED", "SKIPPED"}
+        and record.status in {"GENERATED", "SKIPPED", "FAILED", "NEEDS_REVIEW"}
     )
 
 

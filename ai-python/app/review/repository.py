@@ -24,9 +24,8 @@ CURRENT_REVIEW_EXTRACTORS = (
     f"model:{REVIEW_CARD_PROMPT_VERSION}",
     f"filter:{REVIEW_CARD_PROMPT_VERSION}",
 )
+# 保留公开测试和历史扩展使用的模型提取器标识；它不再参与版本失效判定。
 CURRENT_REVIEW_MODEL_EXTRACTOR = CURRENT_REVIEW_EXTRACTORS[0]
-CURRENT_REVIEW_EMPTY_EXTRACTOR = CURRENT_REVIEW_EXTRACTORS[1]
-CURRENT_REVIEW_FAILED_EXTRACTOR = f"failed:{REVIEW_CARD_PROMPT_VERSION}"
 
 
 @dataclass(frozen=True)
@@ -316,7 +315,7 @@ class DatabaseReviewTransaction:
         self._schema = schema
 
     def list_sync_candidates(self, user_id: str, limit: int) -> list[MaterialSourceRecord]:
-        """扫描当前用户已完成索引且当前版本尚未分类的资料。"""
+        """只扫描首次生成、资料新索引版本或中断超时的资料。"""
         self._cursor.execute(
             self._statement(
                 """
@@ -333,33 +332,17 @@ class DatabaseReviewTransaction:
                   )
                   AND (
                       rm.material_id IS NULL
+                      OR rm.index_request_version < lm.index_request_version
                       OR (
                           rm.status = 'GENERATING'
                           AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
-                      )
-                      OR (
-                          COALESCE(rm.status, 'PENDING') <> 'GENERATING'
-                          AND (
-                              rm.index_request_version < lm.index_request_version
-                              OR rm.extractor IS NULL
-                              OR (
-                                  rm.extractor NOT IN (%s, %s)
-                                  AND (
-                                      rm.status NOT IN ('FAILED', 'NEEDS_REVIEW')
-                                      OR (
-                                          rm.status = 'FAILED'
-                                          AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
-                                      )
-                                  )
-                              )
-                          )
                       )
                   )
                 ORDER BY lm.updated_at ASC, lm.id ASC
                 LIMIT %s
                 """
             ),
-            (user_id, *CURRENT_REVIEW_EXTRACTORS, limit),
+            (user_id, limit),
         )
         return [self._to_material(row) for row in self._cursor.fetchall()]
 
@@ -470,7 +453,7 @@ class DatabaseReviewTransaction:
             return []
         if int(current.get("index_request_version") or 0) != material.index_request_version:
             raise RuntimeError("追加复习卡片时资料索引版本已变化，请重新查找遗漏知识点")
-        if current.get("review_status") != "GENERATED" or current.get("extractor") != CURRENT_REVIEW_MODEL_EXTRACTOR:
+        if current.get("review_status") != "GENERATED":
             raise RuntimeError("只有已成功生成的复习资料才能追加遗漏知识点")
         review_material_id = int(current["review_material_id"])
         self._cursor.execute(
@@ -1288,11 +1271,14 @@ class DatabaseReviewTransaction:
                     COUNT(DISTINCT c.material_id) FILTER (WHERE c.active = TRUE AND c.due_at <= %s) AS due_material_count,
                     MIN(c.due_at) FILTER (WHERE c.active = TRUE AND c.due_at > %s) AS next_due_at
                 FROM {schema}.learning_review_card c
+                JOIN {schema}.learning_material lm
+                  ON lm.id = c.material_id
+                 AND lm.user_id = c.user_id
                 JOIN {schema}.learning_review_material rm
                   ON rm.material_id = c.material_id
                  AND rm.user_id = c.user_id
                  AND rm.status = 'GENERATED'
-                 AND rm.extractor = {current_model_extractor}
+                 AND rm.index_request_version = lm.index_request_version
                 WHERE c.user_id = %s
                 """
             ),
@@ -1308,11 +1294,14 @@ class DatabaseReviewTransaction:
                         WHERE EXISTS (
                             SELECT 1
                             FROM {schema}.learning_review_card due_card
+                            JOIN {schema}.learning_material due_source
+                              ON due_source.id = due_card.material_id
+                             AND due_source.user_id = due_card.user_id
                             JOIN {schema}.learning_review_material due_material
                               ON due_material.material_id = due_card.material_id
                              AND due_material.user_id = due_card.user_id
                              AND due_material.status = 'GENERATED'
-                             AND due_material.extractor = {current_model_extractor}
+                             AND due_material.index_request_version = due_source.index_request_version
                             WHERE due_card.material_id = log.material_id
                               AND due_card.user_id = log.user_id
                               AND due_card.active = TRUE
@@ -1352,7 +1341,7 @@ class DatabaseReviewTransaction:
                   ON rm.material_id = c.material_id
                  AND rm.user_id = c.user_id
                  AND rm.status = 'GENERATED'
-                 AND rm.extractor = {current_model_extractor}
+                 AND rm.index_request_version = lm.index_request_version
                 LEFT JOIN {schema}.learning_review_folder_material folder_material
                   ON folder_material.material_id = c.material_id
                  AND folder_material.user_id = c.user_id
@@ -1405,7 +1394,7 @@ class DatabaseReviewTransaction:
                       ON rm.material_id = c.material_id
                      AND rm.user_id = c.user_id
                      AND rm.status = 'GENERATED'
-                     AND rm.extractor = {current_model_extractor}
+                     AND rm.index_request_version = lm.index_request_version
                     LEFT JOIN reviewed_materials
                         ON reviewed_materials.material_id = c.material_id
                     LEFT JOIN {schema}.learning_review_folder_material folder_material
@@ -1668,39 +1657,30 @@ class DatabaseReviewTransaction:
                 lm.status AS material_status, lm.index_request_version,
                 rm.index_request_version AS synced_index_request_version,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN NULL
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN rm.is_learning_content
                     ELSE NULL
                 END AS is_learning_content,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN NULL
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN rm.category
                     ELSE NULL
                 END AS category,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN 'GENERATING'
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN COALESCE(rm.status, 'PENDING')
                     ELSE 'PENDING'
                 END AS review_status,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN rm.reason
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN rm.reason
                     WHEN rm.material_id IS NOT NULL
-                        THEN '复习生成规则已升级，等待 DeepSeek 重新生成'
+                        THEN '资料内容已更新，等待生成当前索引版本的复习卡片'
                     ELSE NULL
                 END AS reason,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN 0
-                    WHEN rm.extractor = {{current_model_extractor}}
+                    WHEN rm.index_request_version = lm.index_request_version
+                         AND rm.status = 'GENERATED'
                         THEN COALESCE(rm.card_count, 0)
                     ELSE 0
                 END AS card_count,
@@ -1708,30 +1688,22 @@ class DatabaseReviewTransaction:
                 review_folder_material.folder_id,
                 review_folder.name AS folder_name,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN NULL
-                    WHEN rm.extractor = {{current_model_extractor}}
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN rm.summary
                     ELSE NULL
                 END AS material_summary,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN COALESCE(rm.generation_attempts, 0)
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN COALESCE(rm.generation_attempts, 0)
                     ELSE 0
                 END AS generation_attempts,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN '[]'::jsonb
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN COALESCE(rm.quality_feedback, '[]'::jsonb)
                     ELSE '[]'::jsonb
                 END AS quality_feedback,
                 CASE
-                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
-                        THEN COALESCE(rm.generation_progress, '{{{{}}}}'::jsonb)
-                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                    WHEN rm.index_request_version = lm.index_request_version
                         THEN COALESCE(rm.generation_progress, '{{{{}}}}'::jsonb)
                     ELSE '{{{{}}}}'::jsonb
                 END AS generation_progress,
@@ -1779,7 +1751,7 @@ class DatabaseReviewTransaction:
               ON review_material.material_id = material.id
              AND review_material.user_id = folder.user_id
              AND review_material.status = 'GENERATED'
-             AND review_material.extractor = {{current_model_extractor}}
+             AND review_material.index_request_version = material.index_request_version
             LEFT JOIN {{schema}}.learning_review_card card
               ON card.material_id = material.id
              AND card.user_id = folder.user_id
@@ -1808,7 +1780,7 @@ class DatabaseReviewTransaction:
               ON rm.material_id = c.material_id
              AND rm.user_id = c.user_id
              AND rm.status = 'GENERATED'
-             AND rm.extractor = {{current_model_extractor}}
+             AND rm.index_request_version = lm.index_request_version
             LEFT JOIN {{schema}}.learning_review_folder_material folder_material
               ON folder_material.material_id = c.material_id
              AND folder_material.user_id = c.user_id
@@ -1823,12 +1795,7 @@ class DatabaseReviewTransaction:
         """使用 psycopg 标识符拼接 schema，拒绝配置值注入。"""
         from psycopg import sql
 
-        return sql.SQL(query).format(
-            schema=sql.Identifier(self._schema),
-            current_model_extractor=sql.Literal(CURRENT_REVIEW_MODEL_EXTRACTOR),
-            current_empty_extractor=sql.Literal(CURRENT_REVIEW_EMPTY_EXTRACTOR),
-            current_failed_extractor=sql.Literal(CURRENT_REVIEW_FAILED_EXTRACTOR),
-        )
+        return sql.SQL(query).format(schema=sql.Identifier(self._schema))
 
     @staticmethod
     def _to_material(row: dict[str, Any]) -> MaterialSourceRecord:
