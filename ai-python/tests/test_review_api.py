@@ -89,6 +89,8 @@ class StubReviewService:
                     materialTitle="Kafka 高可用",
                     materialSummary="资料讲解 Kafka 分区副本与 ISR 故障转移机制。",
                     documentType="mp4",
+                    folderId=7,
+                    folderName="后端面试",
                     dueCardCount=1,
                     cards=[card],
                 )
@@ -290,6 +292,7 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
         assert responses[3].json()["data"]["groups"][0]["materialSummary"] == (
             "资料讲解 Kafka 分区副本与 ISR 故障转移机制。"
         )
+        assert responses[3].json()["data"]["groups"][0]["folderId"] == 7
         assert responses[4].json()["data"] == {"materialIds": [13, 12], "orderedCount": 2}
         assert responses[5].json()["data"][0]["summary"] == "资料讲解 Kafka 分区副本与 ISR 故障转移机制。"
         assert responses[6].json()["data"][0]["name"] == "Python 面试"

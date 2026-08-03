@@ -18,6 +18,7 @@ import {
   FolderPlus,
   FolderX,
   GripVertical,
+  LocateFixed,
   Loader2,
   MessageCirclePlus,
   MoveRight,
@@ -140,6 +141,8 @@ export function ReviewCenter() {
   const [reviewFeedbackText, setReviewFeedbackText] = useState('');
   const [reviewFeedbackBusy, setReviewFeedbackBusy] = useState(false);
   const [missingKnowledgeTarget, setMissingKnowledgeTarget] = useState<MissingKnowledgeTarget | null>(null);
+  const [locatedMaterialId, setLocatedMaterialId] = useState<number | null>(null);
+  const locateTimerRef = useRef<number | null>(null);
   const settingsDirtyRef = useRef(false);
   const syncPromiseRef = useRef<Promise<ReviewSyncResult> | null>(null);
   const reviewStartedAtRef = useRef<Record<number, number>>({});
@@ -301,6 +304,10 @@ export function ReviewCenter() {
       window.clearInterval(timer);
     };
   }, [generationPollingActive]);
+
+  useEffect(() => () => {
+    if (locateTimerRef.current !== null) window.clearTimeout(locateTimerRef.current);
+  }, []);
 
   // 到期时间和评分日志由服务端维护，页面定时或重新聚焦时刷新概览与分组队列。
   useEffect(() => {
@@ -490,6 +497,28 @@ export function ReviewCenter() {
     } finally {
       setFolderBusy(false);
     }
+  }
+
+  // 今日队列可以定位到未归档资料行，也可携带文档 ID 跳进对应文件夹。
+  function locateReviewMaterial(group: ReviewCardGroup) {
+    if (group.folderId) {
+      const params = new URLSearchParams({ materialId: String(group.materialId) });
+      navigate(`/reviews/folders/${group.folderId}?${params.toString()}`);
+      return;
+    }
+    const target = document.getElementById(reviewMaterialArchiveId(group.materialId));
+    if (!target) {
+      setFolderError('暂时没有找到对应资料，请刷新资料归档后重试');
+      return;
+    }
+    setLocatedMaterialId(group.materialId);
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.setTimeout(() => target.focus({ preventScroll: true }), 320);
+    if (locateTimerRef.current !== null) window.clearTimeout(locateTimerRef.current);
+    locateTimerRef.current = window.setTimeout(() => {
+      setLocatedMaterialId((current) => current === group.materialId ? null : current);
+      locateTimerRef.current = null;
+    }, 2600);
   }
 
   // 手柄获得焦点后支持方向键逐项移动，Home/End 可快速置顶或置底。
@@ -916,6 +945,7 @@ export function ReviewCenter() {
               onGrade={(card, rating) => void gradeCard(card, rating)}
               onDeleteCard={requestCardDeletion}
               onDeleteMaterial={() => requestMaterialDeletion(group.materialId, group.materialTitle)}
+              onLocateMaterial={() => locateReviewMaterial(group)}
               onToggleSelected={(cardId) => setSelectedCardIds((previous) => toggleSelected(previous, cardId))}
               onMove={(targetIndex) => moveGroupToIndex(group.materialId, targetIndex)}
               onOrderKeyDown={(event) => handleGroupOrderKeyDown(event, group.materialId, groupIndex)}
@@ -955,7 +985,7 @@ export function ReviewCenter() {
             {materials.length ? materials.map((material) => {
               const materialId = resolveMaterialId(material);
               const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
-              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} located={materialId != null && locatedMaterialId === materialId} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
             }) : <p className="panel-empty">暂无已索引资料</p>}
           </div>
         </section>
@@ -1133,6 +1163,7 @@ function ReviewMaterialGroup({
   onGrade,
   onDeleteCard,
   onDeleteMaterial,
+  onLocateMaterial,
   onToggleSelected,
   onMove,
   onOrderKeyDown,
@@ -1161,6 +1192,7 @@ function ReviewMaterialGroup({
   onGrade: (card: ReviewCard, rating: ReviewRating) => void;
   onDeleteCard: (card: ReviewCard) => void;
   onDeleteMaterial: () => void;
+  onLocateMaterial: () => void;
   onToggleSelected: (cardId: number) => void;
   onMove: (targetIndex: number) => void;
   onOrderKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
@@ -1197,7 +1229,7 @@ function ReviewMaterialGroup({
             <GripVertical size={17} />
           </button>
           <span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span>
-          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · 优先级 {position + 1}</span></div>
+          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · {group.folderName ? `文件夹：${group.folderName}` : '未归档'} · 优先级 {position + 1}</span></div>
         </div>
         <div className="review-group-actions">
           <div className="review-group-step-actions" aria-label="调整资料优先级">
@@ -1205,6 +1237,7 @@ function ReviewMaterialGroup({
             <button className="icon-button tiny" type="button" title="下移资料" aria-label={`下移 ${group.materialTitle}`} onClick={() => onMove(position + 1)} disabled={orderDisabled || ordering || position === groupCount - 1}><ArrowDown size={14} /></button>
           </div>
           <span className="group-count">{group.cards.length}</span>
+          <button className="outline-action small review-locate-action" type="button" title={group.folderId ? `在文件夹“${group.folderName || '复习文件夹'}”中定位资料` : '在资料归档中定位资料'} aria-label={`定位资料：${group.materialTitle}`} onClick={onLocateMaterial} disabled={ordering}><LocateFixed size={14} /><span className="review-locate-label">定位资料</span></button>
           <button className="icon-button tiny danger" type="button" title="将资料移出复习中心" aria-label={`将 ${group.materialTitle} 移出复习中心`} onClick={onDeleteMaterial} disabled={deletingKey !== null || ordering}>{deletingKey === `MATERIAL:${group.materialId}` ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
         </div>
       </header>
@@ -1383,12 +1416,13 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy, deleting, locked, onToggleSelected, onFindMissing, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onFindMissing: () => void; onRegenerate: () => void; onDelete: () => void }) {
+function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, located, busy, deleting, locked, onToggleSelected, onFindMissing, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; located: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onFindMissing: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
   const showProgress = ['PENDING', 'GENERATING', 'FAILED', 'NEEDS_REVIEW'].includes((material.status || '').toUpperCase());
+  const materialId = resolveMaterialId(material);
   return (
-    <article className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}>
+    <article id={materialId == null ? undefined : reviewMaterialArchiveId(materialId)} className={`review-material-row${selected ? ' is-selected' : ''}${located ? ' is-located' : ''}${manualReview ? ' needs-manual-review' : ''}`} tabIndex={-1}>
       <label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}>
         <input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} />
       </label>
@@ -1520,6 +1554,10 @@ function selectedIds(value: Record<number, boolean>): number[] {
 // 提取当前可见 group 的资料顺序，作为排序接口的完整批量载荷。
 function materialOrder(groups: ReviewCardGroup[]): number[] {
   return groups.map((group) => group.materialId);
+}
+
+function reviewMaterialArchiveId(materialId: number): string {
+  return `review-material-archive-${materialId}`;
 }
 
 // 将一个资料组移动到指定索引，卡片内容和对象引用保持不变。

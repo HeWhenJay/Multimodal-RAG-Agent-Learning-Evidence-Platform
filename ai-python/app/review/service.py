@@ -432,6 +432,8 @@ class ReviewService:
                     materialTitle=record.material_title,
                     materialSummary=record.material_summary,
                     documentType=record.document_type,
+                    folderId=record.folder_id,
+                    folderName=record.folder_name,
                     dueCardCount=0,
                     cards=[],
                 ),

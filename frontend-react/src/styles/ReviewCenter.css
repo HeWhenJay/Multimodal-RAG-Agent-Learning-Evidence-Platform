@@ -493,6 +493,20 @@
   gap: 2px;
 }
 
+.review-locate-action {
+  min-height: 28px;
+  padding: 0 8px;
+  color: #4338ca;
+  background: #eef2ff;
+  border-color: #c7d2fe;
+  white-space: nowrap;
+}
+
+.review-locate-action:hover:not(:disabled) {
+  color: #312e81;
+  background: #e0e7ff;
+}
+
 .review-card-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -927,6 +941,26 @@
 
 .review-material-row.is-selected {
   background: #f8faff;
+}
+
+.review-material-row.is-located,
+.review-folder-document.is-located {
+  position: relative;
+  z-index: 1;
+  border-color: #6366f1;
+  background: #f8faff;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, .16), 0 9px 24px rgba(79, 70, 229, .12);
+  animation: review-locate-pulse 1.2s ease-out 1;
+}
+
+.review-material-row.is-located:focus,
+.review-folder-document.is-located:focus {
+  outline: none;
+}
+
+@keyframes review-locate-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, .34), 0 9px 24px rgba(79, 70, 229, .08); }
+  100% { box-shadow: 0 0 0 3px rgba(99, 102, 241, .16), 0 9px 24px rgba(79, 70, 229, .12); }
 }
 
 .material-row-selector-hitbox {
@@ -1451,6 +1485,8 @@
   .review-group-step-actions { display: flex; }
   .material-type-icon { width: 30px; height: 30px; }
   .review-group-title h4 { white-space: normal; line-height: 1.35; }
+  .review-locate-action { width: 28px; min-width: 28px; padding: 0; }
+  .review-locate-label { display: none; }
   .review-side-column { display: block; }
   .review-settings-form input[type="number"],
   .review-settings-form input[type="time"],
@@ -1483,6 +1519,8 @@
   .spin,
   .review-progress i,
   .review-material-group,
+  .review-material-row.is-located,
+  .review-folder-document.is-located,
   .outline-action,
   .danger-action,
   .rating-button { animation: none; transition: none; }

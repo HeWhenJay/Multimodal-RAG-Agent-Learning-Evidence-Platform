@@ -46,6 +46,8 @@ export interface ReviewCardGroup {
   materialTitle: string;
   materialSummary?: string | null;
   documentType: string;
+  folderId?: number | null;
+  folderName?: string | null;
   dueCardCount: number;
   cards: ReviewCard[];
 }

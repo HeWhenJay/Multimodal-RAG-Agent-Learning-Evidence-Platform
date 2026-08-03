@@ -63,6 +63,8 @@ class ReviewCardGroup(BaseModel):
     materialTitle: str
     materialSummary: str | None = None
     documentType: str
+    folderId: int | None = Field(default=None, ge=1)
+    folderName: str | None = None
     dueCardCount: int = Field(default=0, ge=0)
     cards: list[ReviewCard] = Field(default_factory=list)
 

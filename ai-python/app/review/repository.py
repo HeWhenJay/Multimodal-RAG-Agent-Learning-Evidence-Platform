@@ -116,6 +116,8 @@ class ReviewCardRecord:
     created_at: datetime | None
     updated_at: datetime | None
     material_summary: str | None = None
+    folder_id: int | None = None
+    folder_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1292,12 +1294,6 @@ class DatabaseReviewTransaction:
                  AND rm.status = 'GENERATED'
                  AND rm.extractor = {current_model_extractor}
                 WHERE c.user_id = %s
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.learning_review_folder_material folder_material
-                      WHERE folder_material.material_id = c.material_id
-                        AND folder_material.user_id = c.user_id
-                  )
                 """
             ),
             (now, now, now, user_id),
@@ -1321,12 +1317,6 @@ class DatabaseReviewTransaction:
                               AND due_card.user_id = log.user_id
                               AND due_card.active = TRUE
                               AND due_card.due_at <= %s
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM {schema}.learning_review_folder_material folder_material
-                                  WHERE folder_material.material_id = due_card.material_id
-                                    AND folder_material.user_id = due_card.user_id
-                              )
                         )
                     ) AS started_due_material_count
                 FROM {schema}.learning_review_log log
@@ -1353,6 +1343,8 @@ class DatabaseReviewTransaction:
                 """
                 SELECT c.*, lm.title AS material_title, lm.document_type,
                        rm.summary AS material_summary,
+                       folder_material.folder_id,
+                       folder.name AS folder_name,
                        MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                 FROM {schema}.learning_review_card c
                 JOIN {schema}.learning_material lm ON lm.id = c.material_id
@@ -1361,16 +1353,16 @@ class DatabaseReviewTransaction:
                  AND rm.user_id = c.user_id
                  AND rm.status = 'GENERATED'
                  AND rm.extractor = {current_model_extractor}
+                LEFT JOIN {schema}.learning_review_folder_material folder_material
+                  ON folder_material.material_id = c.material_id
+                 AND folder_material.user_id = c.user_id
+                LEFT JOIN {schema}.learning_review_folder folder
+                  ON folder.id = folder_material.folder_id
+                 AND folder.user_id = c.user_id
                 WHERE c.user_id = %s
                   AND lm.user_id = %s
                   AND c.active = TRUE
                   AND c.due_at <= %s
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.learning_review_folder_material folder_material
-                      WHERE folder_material.material_id = c.material_id
-                        AND folder_material.user_id = c.user_id
-                  )
                 ORDER BY group_due_at ASC, c.material_id ASC, c.due_at ASC, c.id ASC
                 LIMIT %s
                 """
@@ -1403,6 +1395,8 @@ class DatabaseReviewTransaction:
                     SELECT c.*, lm.title AS material_title, lm.document_type,
                            rm.summary AS material_summary,
                            rm.display_order AS material_display_order,
+                           folder_material.folder_id,
+                           folder.name AS folder_name,
                            (reviewed_materials.material_id IS NOT NULL) AS started_today,
                            MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                     FROM {schema}.learning_review_card c
@@ -1414,16 +1408,16 @@ class DatabaseReviewTransaction:
                      AND rm.extractor = {current_model_extractor}
                     LEFT JOIN reviewed_materials
                         ON reviewed_materials.material_id = c.material_id
+                    LEFT JOIN {schema}.learning_review_folder_material folder_material
+                      ON folder_material.material_id = c.material_id
+                     AND folder_material.user_id = c.user_id
+                    LEFT JOIN {schema}.learning_review_folder folder
+                      ON folder.id = folder_material.folder_id
+                     AND folder.user_id = c.user_id
                     WHERE c.user_id = %s
                       AND lm.user_id = %s
                       AND c.active = TRUE
                       AND c.due_at <= %s
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.learning_review_folder_material folder_material
-                          WHERE folder_material.material_id = c.material_id
-                            AND folder_material.user_id = c.user_id
-                      )
                 ),
                 due_materials AS (
                     SELECT material_id,
@@ -1526,12 +1520,6 @@ class DatabaseReviewTransaction:
                       FROM {schema}.learning_review_material_exclusion excluded_material
                       WHERE excluded_material.material_id = rm.material_id
                         AND excluded_material.user_id = %s
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.learning_review_folder_material folder_material
-                      WHERE folder_material.material_id = rm.material_id
-                        AND folder_material.user_id = rm.user_id
                   )
                 ORDER BY rm.display_order ASC NULLS LAST, rm.material_id ASC
                 FOR UPDATE OF rm
@@ -1811,7 +1799,9 @@ class DatabaseReviewTransaction:
         return self._statement(
             f"""
             SELECT c.*, lm.title AS material_title, lm.document_type,
-                   rm.summary AS material_summary
+                   rm.summary AS material_summary,
+                   folder_material.folder_id,
+                   folder.name AS folder_name
             FROM {{schema}}.learning_review_card c
             JOIN {{schema}}.learning_material lm ON lm.id = c.material_id
             JOIN {{schema}}.learning_review_material rm
@@ -1819,6 +1809,12 @@ class DatabaseReviewTransaction:
              AND rm.user_id = c.user_id
              AND rm.status = 'GENERATED'
              AND rm.extractor = {{current_model_extractor}}
+            LEFT JOIN {{schema}}.learning_review_folder_material folder_material
+              ON folder_material.material_id = c.material_id
+             AND folder_material.user_id = c.user_id
+            LEFT JOIN {{schema}}.learning_review_folder folder
+              ON folder.id = folder_material.folder_id
+             AND folder.user_id = c.user_id
             {suffix}
             """
         )
@@ -1934,6 +1930,8 @@ class DatabaseReviewTransaction:
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
             material_summary=row.get("material_summary"),
+            folder_id=(int(row["folder_id"]) if row.get("folder_id") is not None else None),
+            folder_name=row.get("folder_name"),
         )
 
     @staticmethod

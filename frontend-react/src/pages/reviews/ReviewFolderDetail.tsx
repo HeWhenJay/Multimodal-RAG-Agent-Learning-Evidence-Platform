@@ -15,7 +15,7 @@ import {
   MessageCirclePlus
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { assignReviewMaterialsToFolder, fetchReviewCard, fetchReviewFolder, gradeReviewCard, type ReviewCard, type ReviewFolderDetail as ReviewFolderDetailData } from '../../api/reviews';
 import { MarkdownText } from '../../components/MarkdownText';
 import { buildEvidenceOpenHref } from '../../utils/evidenceLinks';
@@ -33,7 +33,10 @@ const RATING_OPTIONS: Array<{ rating: ReviewRating; label: string; detail: strin
 // 文件夹详情按文档展示全部活动卡片，答案仍由用户主动揭示。
 export function ReviewFolderDetail() {
   const { folderId } = useParams();
+  const [searchParams] = useSearchParams();
   const resolvedFolderId = Number(folderId);
+  const requestedMaterialId = Number(searchParams.get('materialId'));
+  const locatedMaterialId = Number.isInteger(requestedMaterialId) && requestedMaterialId > 0 ? requestedMaterialId : null;
   const [detail, setDetail] = useState<ReviewFolderDetailData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -58,8 +61,12 @@ export function ReviewFolderDetail() {
     void fetchReviewFolder(resolvedFolderId)
       .then((result) => {
         if (!active) return;
+        setError('');
         setDetail(result);
-        setExpandedMaterials(Object.fromEntries(result.materials.map((material, index) => [material.materialId, index === 0])));
+        setExpandedMaterials(Object.fromEntries(result.materials.map((material, index) => [
+          material.materialId,
+          locatedMaterialId === material.materialId || (locatedMaterialId === null && index === 0)
+        ])));
       })
       .catch((loadError) => {
         if (active) setError(loadError instanceof Error ? loadError.message : '复习文件夹读取失败');
@@ -70,7 +77,21 @@ export function ReviewFolderDetail() {
     return () => {
       active = false;
     };
-  }, [resolvedFolderId]);
+  }, [locatedMaterialId, resolvedFolderId]);
+
+  useEffect(() => {
+    if (!detail || locatedMaterialId === null) return undefined;
+    if (!detail.materials.some((material) => material.materialId === locatedMaterialId)) {
+      setError('文件夹中没有找到要定位的资料');
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      const target = document.getElementById(reviewFolderMaterialId(locatedMaterialId));
+      target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target?.focus({ preventScroll: true });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [detail, locatedMaterialId]);
 
   async function revealCard(card: ReviewCard) {
     if (revealedCards[card.id]?.answer || revealLoadingId === card.id) return;
@@ -143,7 +164,7 @@ export function ReviewFolderDetail() {
       {!loading && detail?.materials.length ? <div className="review-folder-document-list">{detail.materials.map((material, index) => {
         const expanded = Boolean(expandedMaterials[material.materialId]);
         return (
-          <section className="review-folder-document" key={material.materialId}>
+          <section id={reviewFolderMaterialId(material.materialId)} className={`review-folder-document${locatedMaterialId === material.materialId ? ' is-located' : ''}`} key={material.materialId} tabIndex={-1}>
             <div className="review-folder-document-toolbar">
               <button className="review-folder-document-header" type="button" aria-expanded={expanded} onClick={() => setExpandedMaterials((previous) => ({ ...previous, [material.materialId]: !expanded }))}>
                 <span className="review-folder-document-index">{String(index + 1).padStart(2, '0')}</span>
@@ -213,4 +234,8 @@ function formatDocumentType(value?: string | null) {
 
 function isVideoType(value?: string | null) {
   return /^(mp4|mov|m4v|webm|mkv|avi)$/i.test(value || '') || Boolean(value && /video/i.test(value));
+}
+
+function reviewFolderMaterialId(materialId: number): string {
+  return `review-folder-material-${materialId}`;
 }
