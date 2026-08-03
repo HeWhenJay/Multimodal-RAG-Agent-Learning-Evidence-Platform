@@ -106,6 +106,10 @@ def test_review_llm_config_uses_dedicated_environment_variables():
 def test_missing_review_key_is_reported_during_startup(monkeypatch, capsys):
     """缺少 DeepSeek 密钥时启动日志应给出可操作提示，但不阻止其他接口启动。"""
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "app.core.runtime_config.read_process_or_windows_user_environment",
+        lambda _name: "",
+    )
 
     load_runtime_config(parse_args(["--skip-default-config"]))
 

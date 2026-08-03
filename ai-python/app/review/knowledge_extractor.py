@@ -10,6 +10,7 @@ import os
 import re
 from typing import Any
 
+from app.core.environment import read_process_or_windows_user_environment
 from app.schemas.rag import Evidence
 from prompts.review import (
     REVIEW_CARD_PROMPT_VERSION,
@@ -96,7 +97,7 @@ class KnowledgePointExtractor:
     ) -> None:
         # 复习模型固定走 DeepSeek 官方入口，避免误继承通用 RAG 或代理配置。
         self.provider = (provider or os.getenv("REVIEW_EXTRACTION_PROVIDER") or "auto").strip().lower()
-        self.api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
         self.model = REVIEW_LLM_MODEL
         self.reasoning_effort = REVIEW_LLM_REASONING_EFFORT
         self.timeout_seconds = float(os.getenv("REVIEW_EXTRACTION_TIMEOUT_SECONDS", "120"))
@@ -110,7 +111,7 @@ class KnowledgePointExtractor:
         """只根据传入 evidence 调用 DeepSeek，失败时不发布任何降级内容。"""
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
         # 每次生成前刷新一次密钥，但仍只允许使用 DEEPSEEK_API_KEY，绝不借用其他供应商配置。
-        self.api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
         usable = sanitize_evidences(deduplicate_evidences(evidences))
         if not usable:
             return ExtractionResult(

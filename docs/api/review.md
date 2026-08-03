@@ -25,7 +25,7 @@
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
 - 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，一份资料的一次生成尝试只执行一次 LLM 请求，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。`DEEPSEEK_API_KEY` 缺失、DeepSeek 请求失败、响应不是合法 JSON 或结果未通过质量门禁时，整次生成写入 `FAILED` 并停用该资料当前活跃卡片，禁止回退到本地摘要或规则问答。
-- `FAILED` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示“失败原因”。最常见的配置错误是启动 8091 的 PyCharm 进程未继承 `DEEPSEEK_API_KEY`；配置或修改用户环境变量后必须重启 PyCharm/`run.py`，再点击“重新生成”。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。
+- `FAILED` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示“失败原因”。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
 - 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v7`；v7 保留本地学习内容前置过滤与 DeepSeek-only 内容生成边界，并把答案忠实度门禁升级为逐论断核验：句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
@@ -40,13 +40,13 @@
 
 DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务固定请求 `deepseek-v4-flash`。官方说明该模型标识会滚动指向最新正式版本；思考模式请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`。参数依据：[首次 API 调用](https://api-docs.deepseek.com/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON 输出](https://api-docs.deepseek.com/guides/json_mode)。
 
-密钥只从进程环境变量 `DEEPSEEK_API_KEY` 读取。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
+密钥只从用户环境变量 `DEEPSEEK_API_KEY` 读取。默认优先使用当前进程环境；Windows 进程环境缺失时，再只读当前用户的 `HKCU\Environment`，并缓存到当前进程供受监督 worker 继承。Linux、容器和服务器环境仍只使用标准进程环境。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
 
 ```powershell
 [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', '<your-key>', 'User')
 ```
 
-设置后需要重新启动 PyCharm 和 `run.py`，让新进程继承用户环境变量。配置文件、接口响应和日志均不得记录密钥值。
+设置后重新运行 `run.py` 即可；即使 PyCharm 自身仍持有旧环境快照，Windows 用户环境变量回退也能生效。配置文件、接口响应和日志均不得记录密钥值。
 
 ## 公开端点
 

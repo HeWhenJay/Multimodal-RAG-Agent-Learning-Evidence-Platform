@@ -1,6 +1,7 @@
 """本地学习过滤与 DeepSeek-only 复习内容提炼测试。"""
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,10 @@ def valid_payload(*, summary: str = "资料说明 Kafka 通过 ISR 与副本选�
 def test_missing_key_fails_without_local_generated_content(monkeypatch: pytest.MonkeyPatch) -> None:
     """缺少密钥时必须明确失败，不能再用本地规则生成摘要或卡片。"""
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "app.review.knowledge_extractor.read_process_or_windows_user_environment",
+        lambda _name: "",
+    )
     extractor = KnowledgePointExtractor()
 
     with pytest.raises(ReviewExtractionError, match="DEEPSEEK_API_KEY"):
@@ -163,6 +168,10 @@ def test_extractor_refreshes_key_before_generation(monkeypatch: pytest.MonkeyPat
             )
 
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "app.review.knowledge_extractor.read_process_or_windows_user_environment",
+        lambda name: (os.getenv(name) or "").strip(),
+    )
     extractor = KnowledgePointExtractor(provider="deepseek")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "late-test-key")
     monkeypatch.setattr(
@@ -324,6 +333,10 @@ def test_review_model_does_not_inherit_proxy_or_other_provider_keys(monkeypatch:
     monkeypatch.setenv("SU_BAI_API_KEY", "proxy-key")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
     monkeypatch.setenv("RAG_LLM_MODEL", "qwen-plus")
+    monkeypatch.setattr(
+        "app.review.knowledge_extractor.read_process_or_windows_user_environment",
+        lambda _name: "",
+    )
     extractor = KnowledgePointExtractor()
 
     with pytest.raises(ReviewExtractionError, match="DEEPSEEK_API_KEY"):

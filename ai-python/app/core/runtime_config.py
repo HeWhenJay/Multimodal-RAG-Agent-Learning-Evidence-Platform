@@ -10,6 +10,8 @@ from typing import Any
 
 import uvicorn
 
+from app.core.environment import read_process_or_windows_user_environment
+
 
 AI_PYTHON_DIR = Path(__file__).resolve().parents[2]
 if str(AI_PYTHON_DIR) not in sys.path:
@@ -308,9 +310,9 @@ def load_runtime_config(args: argparse.Namespace) -> None:
     for name, value in env_defaults.items():
         os.environ.setdefault(name, value)
 
-    # 复习生成严格依赖 DeepSeek；缺少密钥时仍允许其他 RAG 接口启动，
-    # 但在启动日志中明确告知原因，避免用户只看到资料列表里的笼统“失败”。
-    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+    # Windows 下 PyCharm 可能持有旧环境快照；从当前用户环境变量只读回退后，
+    # 再让受监督 API 与 worker 统一继承，仍不把密钥写入配置文件或日志。
+    if not read_process_or_windows_user_environment("DEEPSEEK_API_KEY"):
         print("复习生成提示：未配置 DEEPSEEK_API_KEY，复习资料生成请求将记录为 FAILED；配置后请重新生成。")
 
     if loaded_paths:
