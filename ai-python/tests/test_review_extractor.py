@@ -149,6 +149,38 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert len(result.knowledge_points) == 1
 
 
+def test_extractor_refreshes_key_before_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """服务初始化时未注入密钥，随后补充环境变量也应能立即重试。"""
+    payload = valid_payload()
+    clients: list[dict] = []
+
+    class FakeCompletions:
+        """返回合法的 DeepSeek 复习结果。"""
+
+        def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
+            )
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    extractor = KnowledgePointExtractor(provider="deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "late-test-key")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **kwargs: clients.append(kwargs) or SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions()),
+        ),
+    )
+
+    result = extractor.extract(
+        LearningMaterialContext(12, "Kafka 的高可用性课程", "mp4"),
+        [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合。")],
+    )
+
+    assert clients == [{"api_key": "late-test-key", "base_url": REVIEW_LLM_BASE_URL}]
+    assert result.knowledge_points
+
+
 def test_source_question_is_audited_but_final_question_uses_deepseek_polished_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

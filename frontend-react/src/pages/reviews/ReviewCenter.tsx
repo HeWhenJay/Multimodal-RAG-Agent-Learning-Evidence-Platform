@@ -967,13 +967,19 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
 }
 
 function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
-  const summary = materialSummary(material.summary);
+  const summary = materialSummary(material.summary, material.reason, material.status);
   return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
 }
 
-// 统一压缩接口摘要中的空白，未生成时保持稳定、简洁的占位状态。
-function materialSummary(summary?: string | null): string {
-  return summary?.replace(/\s+/g, ' ').trim() || '摘要生成中';
+// 优先展示 DeepSeek 摘要；失败或跳过时直接展示后端原因，避免“摘要生成中”掩盖真实状态。
+function materialSummary(summary?: string | null, reason?: string | null, status?: string): string {
+  const normalizedSummary = summary?.replace(/\s+/g, ' ').trim();
+  if (normalizedSummary) return normalizedSummary;
+  const normalizedReason = reason?.replace(/\s+/g, ' ').trim();
+  if (normalizedReason && (status === 'FAILED' || status === 'SKIPPED')) {
+    return `${status === 'FAILED' ? '失败原因' : '跳过原因'}：${normalizedReason}`;
+  }
+  return '摘要生成中';
 }
 
 function EmptyReviewQueue({ onSync, syncing }: { onSync: () => void; syncing: boolean }) {

@@ -108,6 +108,9 @@ class KnowledgePointExtractor:
         evidences: list[Evidence],
     ) -> ExtractionResult:
         """只根据传入 evidence 调用 DeepSeek，失败时不发布任何降级内容。"""
+        # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
+        # 每次生成前刷新一次密钥，但仍只允许使用 DEEPSEEK_API_KEY，绝不借用其他供应商配置。
+        self.api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
         usable = sanitize_evidences(deduplicate_evidences(evidences))
         if not usable:
             return ExtractionResult(

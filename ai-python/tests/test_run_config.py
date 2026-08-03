@@ -6,6 +6,7 @@ from run import (
     build_env_defaults,
     cron_enabled,
     kafka_enabled,
+    load_runtime_config,
     main,
     parse_args,
     rag_task_worker_enabled,
@@ -100,6 +101,15 @@ def test_review_llm_config_uses_dedicated_environment_variables():
     assert "SU_BAI_API_KEY" not in env_defaults
     assert "DASHSCOPE_API_KEY" not in env_defaults
     assert "RAG_LLM_BASE_URL" not in env_defaults
+
+
+def test_missing_review_key_is_reported_during_startup(monkeypatch, capsys):
+    """缺少 DeepSeek 密钥时启动日志应给出可操作提示，但不阻止其他接口启动。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    load_runtime_config(parse_args(["--skip-default-config"]))
+
+    assert "未配置 DEEPSEEK_API_KEY" in capsys.readouterr().out
 
 
 def test_model_dynamic_batch_config_env_mapping_is_effective():

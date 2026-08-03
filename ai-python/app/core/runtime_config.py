@@ -308,6 +308,11 @@ def load_runtime_config(args: argparse.Namespace) -> None:
     for name, value in env_defaults.items():
         os.environ.setdefault(name, value)
 
+    # 复习生成严格依赖 DeepSeek；缺少密钥时仍允许其他 RAG 接口启动，
+    # 但在启动日志中明确告知原因，避免用户只看到资料列表里的笼统“失败”。
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        print("复习生成提示：未配置 DEEPSEEK_API_KEY，复习资料生成请求将记录为 FAILED；配置后请重新生成。")
+
     if loaded_paths:
         joined_paths = ", ".join(str(path) for path in loaded_paths)
         print(f"已加载 Python AI 运行配置: {joined_paths}")
