@@ -151,6 +151,11 @@ export function ReviewCenter() {
   const reviewProgress = Math.min(100, Math.round(((overview?.todayReviewedCount || 0) / Math.max(1, dailyLimit)) * 100));
   const selectedCardIdList = selectedIds(selectedCardIds);
   const selectedMaterialIdList = selectedIds(selectedMaterialIds);
+  const selectableMaterialIdList = materials
+    .map(resolveMaterialId)
+    .filter((materialId): materialId is number => materialId !== null);
+  const allMaterialsSelected = selectableMaterialIdList.length > 0
+    && selectableMaterialIdList.every((materialId) => Boolean(selectedMaterialIds[materialId]));
 
   // 同步维护可立即读取的 group 引用，拖拽事件无需等待 React 批量提交状态。
   const updateGroups = useCallback((update: SetStateAction<ReviewCardGroup[]>) => {
@@ -732,6 +737,14 @@ export function ReviewCenter() {
     }
   }
 
+  // 主页面提供全选入口，仍以整份文档为最小批量归档单位。
+  function toggleAllMaterials() {
+    if (!selectableMaterialIdList.length) return;
+    setSelectedMaterialIds(allMaterialsSelected
+      ? {}
+      : Object.fromEntries(selectableMaterialIdList.map((materialId) => [materialId, true])));
+  }
+
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
     setSettingsSaving(true);
@@ -876,7 +889,10 @@ export function ReviewCenter() {
 
           <section className="review-panel materials-panel">
             <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料归档</h3></div><span>{materials.length}</span></div>
-            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份文档</span><div className="review-material-folder-controls"><select aria-label="目标复习文件夹" value={folderTargetValue} onChange={(event) => setFolderTargetValue(event.target.value)} disabled={folderBusy}><option value="unfiled">未归档</option>{folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}</select><button className="outline-action small" type="button" onClick={() => void moveSelectedMaterialsToFolder()} disabled={folderBusy}><MoveRight size={14} />移动</button><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy || folderBusy}><Trash2 size={14} />移出中心</button></div></div> : <p className="review-material-select-hint">选择文档后可整份移动到文件夹</p>}
+            <div className="review-material-bulkbar">
+              <label className="review-material-select-all"><input type="checkbox" checked={allMaterialsSelected} onChange={toggleAllMaterials} disabled={!selectableMaterialIdList.length || folderBusy || orderBusy} /><span>{allMaterialsSelected ? '已全选' : '全选未归档资料'}</span></label>
+              {selectedMaterialIdList.length ? <><span className="review-material-selected-count">已选 {selectedMaterialIdList.length} 份文档</span><div className="review-material-folder-controls"><select aria-label="目标复习文件夹" value={folderTargetValue} onChange={(event) => setFolderTargetValue(event.target.value)} disabled={folderBusy}><option value="unfiled">未归档</option>{folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}</select><button className="outline-action small" type="button" onClick={() => void moveSelectedMaterialsToFolder()} disabled={folderBusy}><MoveRight size={14} />{folderTargetValue === 'unfiled' ? '批量移出文件夹' : '批量进入文件夹'}</button><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy || folderBusy}><Trash2 size={14} />移出中心</button></div></> : <span className="review-material-select-hint">选择多份文档后可批量进入文件夹</span>}
+            </div>
             <div className="review-material-list">
               {materials.length ? materials.map((material) => {
                 const materialId = resolveMaterialId(material);
