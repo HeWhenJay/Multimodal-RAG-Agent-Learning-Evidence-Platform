@@ -356,7 +356,7 @@ def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert result.summary is None
     assert result.reason == "DeepSeek 生成的卡片未通过质量门禁"
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v7"
+    assert transaction.saved["extractor"] == "failed:review-card-v8"
     assert transaction.saved["cards"] == []
 
 

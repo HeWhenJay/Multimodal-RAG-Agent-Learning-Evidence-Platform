@@ -111,9 +111,88 @@ class ReviewMaterial(BaseModel):
     status: Literal["PENDING", "GENERATING", "GENERATED", "SKIPPED", "FAILED"] = "PENDING"
     reason: str | None = None
     cardCount: int = Field(default=0, ge=0)
+    folderId: int | None = Field(default=None, ge=1)
+    folderName: str | None = None
     indexRequestVersion: int = Field(default=0, ge=0)
     syncedIndexRequestVersion: int | None = Field(default=None, ge=0)
     updatedAt: datetime | None = None
+
+
+class ReviewFolderNameRequest(BaseModel):
+    """创建或重命名复习文件夹时使用的名称。"""
+
+    name: str = Field(..., min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        """去掉首尾空白，并拒绝只包含空白的名称。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("文件夹名称不能为空")
+        return normalized
+
+
+class ReviewFolder(BaseModel):
+    """用户自定义复习文件夹及其实时资料统计。"""
+
+    id: int
+    name: str
+    materialCount: int = Field(default=0, ge=0)
+    cardCount: int = Field(default=0, ge=0)
+    dueCardCount: int = Field(default=0, ge=0)
+    updatedAt: datetime | None = None
+
+
+class ReviewFolderMaterial(BaseModel):
+    """文件夹中以文档为单位聚合的全部活动卡片。"""
+
+    materialId: int
+    title: str
+    summary: str | None = None
+    documentType: str
+    cardCount: int = Field(default=0, ge=0)
+    cards: list[ReviewCard] = Field(default_factory=list)
+
+
+class ReviewFolderDetail(BaseModel):
+    """进入文件夹后按文档展示卡片的响应。"""
+
+    folder: ReviewFolder
+    materials: list[ReviewFolderMaterial] = Field(default_factory=list)
+
+
+class ReviewMaterialFolderRequest(BaseModel):
+    """以文档为最小单位批量更新文件夹归属。"""
+
+    materialIds: list[int] = Field(..., min_length=1, max_length=100)
+    folderId: int | None = Field(default=None, ge=1)
+
+    @field_validator("materialIds")
+    @classmethod
+    def validate_material_ids(cls, value: list[int]) -> list[int]:
+        """拒绝无效或重复 ID，确保批量归档语义明确。"""
+        if any(item <= 0 for item in value):
+            raise ValueError("资料 ID 必须是正整数")
+        if len(set(value)) != len(value):
+            raise ValueError("资料 ID 不能重复")
+        return value
+
+
+class ReviewFolderAssignmentResult(BaseModel):
+    """批量更新文档归属后的稳定结果。"""
+
+    folderId: int | None = Field(default=None, ge=1)
+    materialIds: list[int] = Field(..., min_length=1, max_length=100)
+    movedCount: int = Field(ge=1, le=100)
+
+
+class ReviewFolderDeletionResult(BaseModel):
+    """删除文件夹但保留资料和卡片的结果。"""
+
+    folderId: int
+    deleted: bool = True
+    unfiledMaterialCount: int = Field(default=0, ge=0)
 
 
 class ReviewSyncResult(BaseModel):

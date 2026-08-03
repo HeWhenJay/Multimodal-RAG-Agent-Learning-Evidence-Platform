@@ -48,6 +48,11 @@ ANSWER_CLAIM_CONNECTOR_PATTERN = (
     r"(?:使用|采用|通过|依赖|负责|保证|支持|实现|解决|导致|需要|可以|能够|会|将|必须|应当)|"
     r"并(?:使用|采用|通过|依赖|负责|保证|支持|实现|解决|导致|需要|可以|能够|会|将)"
 )
+STANDARD_REVIEW_CARD_LIMIT = 8
+MAX_STRUCTURED_REVIEW_CARD_LIMIT = 32
+STANDARD_EVIDENCE_LIMIT = 16
+STRUCTURED_EVIDENCE_LIMIT = 48
+SOURCE_QUESTION_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -112,8 +117,8 @@ class KnowledgePointExtractor:
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
         # 每次生成前刷新一次密钥，但仍只允许使用 DEEPSEEK_API_KEY，绝不借用其他供应商配置。
         self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
-        usable = sanitize_evidences(deduplicate_evidences(evidences))
-        if not usable:
+        cleaned = clean_review_evidences(deduplicate_evidences(evidences))
+        if not cleaned:
             return ExtractionResult(
                 False,
                 "非学习资料",
@@ -122,7 +127,7 @@ class KnowledgePointExtractor:
                 f"filter:{REVIEW_CARD_PROMPT_VERSION}",
                 None,
             )
-        is_learning, category, reason = classify_learning_content(material, usable)
+        is_learning, category, reason = classify_learning_content(material, cleaned)
         if not is_learning:
             return ExtractionResult(
                 False, category, reason, (), f"filter:{REVIEW_CARD_PROMPT_VERSION}", None
@@ -132,7 +137,13 @@ class KnowledgePointExtractor:
         if not self.api_key:
             raise ReviewExtractionError("未配置 DEEPSEEK_API_KEY，无法生成复习内容")
         try:
-            modeled = self._extract_with_model(material, usable)
+            source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
+            usable = select_review_prompt_evidences(cleaned, source_questions)
+            modeled = self._extract_with_model(
+                material,
+                usable,
+                source_questions=source_questions,
+            )
             return ExtractionResult(
                 True, category, reason, modeled.knowledge_points, modeled.extractor, modeled.summary
             )
@@ -149,11 +160,13 @@ class KnowledgePointExtractor:
         self,
         material: LearningMaterialContext,
         evidences: list[Evidence],
+        *,
+        source_questions: list[dict[str, str]] | None = None,
     ) -> ExtractionResult:
         """调用 DeepSeek 官方 OpenAI 兼容接口并校验摘要、问句与 evidence 引用。"""
         from openai import OpenAI
 
-        source_questions = extract_source_question_candidates(evidences)
+        source_questions = source_questions or extract_source_question_candidates(evidences)
         evidence_payload = [
             {
                 "evidenceId": item.evidenceId,
@@ -168,6 +181,7 @@ class KnowledgePointExtractor:
             summary=material.summary or "",
             evidences=evidence_payload,
             source_questions=source_questions,
+            max_cards=review_card_limit(source_questions),
         )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
@@ -260,7 +274,7 @@ class KnowledgePointExtractor:
             True,
             None,
             "DeepSeek 已生成复习内容",
-            tuple(points[:8]),
+            tuple(points[: review_card_limit(question_candidates)]),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
             summary,
         )
@@ -330,6 +344,14 @@ def infer_learning_category(corpus: str) -> str:
 
 def sanitize_evidences(evidences: list[Evidence]) -> list[Evidence]:
     """进入模型前移除噪声，并在整份资料中均匀选择代表性 evidence。"""
+    return select_representative_evidences(
+        clean_review_evidences(evidences),
+        limit=STANDARD_EVIDENCE_LIMIT,
+    )
+
+
+def clean_review_evidences(evidences: list[Evidence]) -> list[Evidence]:
+    """清洗整份资料但不提前截断，让结构化问题可以完整参与选题。"""
     result: list[Evidence] = []
     for item in evidences:
         snippet = clean_content_text(item.snippet)
@@ -338,7 +360,32 @@ def sanitize_evidences(evidences: list[Evidence]) -> list[Evidence]:
         cleaned = compact_text(snippet, 600)
         if cleaned:
             result.append(item.model_copy(update={"snippet": cleaned}))
-    return select_representative_evidences(result, limit=16)
+    return result
+
+
+def select_review_prompt_evidences(
+    evidences: list[Evidence],
+    source_questions: list[dict[str, str]],
+) -> list[Evidence]:
+    """结构化资料优先保留问题片段和相邻答案片段，再补充整篇均匀采样。"""
+    if len(source_questions) <= STANDARD_REVIEW_CARD_LIMIT:
+        return select_representative_evidences(evidences, limit=STANDARD_EVIDENCE_LIMIT)
+
+    ordered = sorted(evidences, key=evidence_position)
+    preferred_ids = {str(item.get("evidenceId") or "") for item in source_questions}
+    expanded_ids = set(preferred_ids)
+    for index, evidence in enumerate(ordered[:-1]):
+        if evidence.evidenceId in preferred_ids:
+            expanded_ids.add(ordered[index + 1].evidenceId)
+
+    preferred = [item for item in ordered if item.evidenceId in expanded_ids]
+    selected = preferred[:STRUCTURED_EVIDENCE_LIMIT]
+    selected_ids = {item.evidenceId for item in selected}
+    remaining = STRUCTURED_EVIDENCE_LIMIT - len(selected)
+    if remaining > 0:
+        candidates = [item for item in ordered if item.evidenceId not in selected_ids]
+        selected.extend(select_representative_evidences(candidates, limit=remaining))
+    return sorted(selected[:STRUCTURED_EVIDENCE_LIMIT], key=evidence_position)
 
 
 def select_representative_evidences(evidences: list[Evidence], *, limit: int) -> list[Evidence]:
@@ -395,7 +442,11 @@ def evidence_position(item: Evidence) -> int:
         return 2**31 - 1
 
 
-def extract_source_question_candidates(evidences: list[Evidence]) -> list[dict[str, str]]:
+def extract_source_question_candidates(
+    evidences: list[Evidence],
+    *,
+    limit: int = SOURCE_QUESTION_LIMIT,
+) -> list[dict[str, str]]:
     """提取带 evidence 归属的原始问句，供模型选择和服务端校验。"""
     result: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -411,7 +462,7 @@ def extract_source_question_candidates(evidences: list[Evidence]) -> list[dict[s
                 continue
             seen.add(key)
             result.append({"evidenceId": evidence.evidenceId, "question": question})
-            if len(result) >= 32:
+            if len(result) >= max(1, limit):
                 return result
     return result
 
@@ -447,7 +498,19 @@ def extract_source_questions(evidence: Evidence) -> list[str]:
         key = normalized_sentence(section)
         if key not in seen:
             result.append(section)
-    return result[:6]
+    return result[:32]
+
+
+def review_card_limit(source_questions: list[dict[str, str]]) -> int:
+    """普通资料保持精炼，明确列出问题清单时按原始问题数动态放宽。"""
+    unique_questions = {
+        normalized_sentence(str(item.get("question") or ""))
+        for item in source_questions
+        if normalized_sentence(str(item.get("question") or ""))
+    }
+    if len(unique_questions) <= STANDARD_REVIEW_CARD_LIMIT:
+        return STANDARD_REVIEW_CARD_LIMIT
+    return min(MAX_STRUCTURED_REVIEW_CARD_LIMIT, len(unique_questions))
 
 
 def is_meaningful_source_question(value: str) -> bool:

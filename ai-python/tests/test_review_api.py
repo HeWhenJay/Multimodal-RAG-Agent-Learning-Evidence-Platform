@@ -15,9 +15,15 @@ from app.schemas.review import (
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewFolder,
+    ReviewFolderAssignmentResult,
+    ReviewFolderDeletionResult,
+    ReviewFolderDetail,
+    ReviewFolderMaterial,
     ReviewGroupOrderResult,
     ReviewGradeResult,
     ReviewMaterial,
+    ReviewMaterialFolderRequest,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -102,6 +108,50 @@ class StubReviewService:
         self.remember(user_id)
         return [sample_material()]
 
+    def list_folders(self, user_id: str) -> list[ReviewFolder]:
+        self.remember(user_id)
+        return [sample_folder()]
+
+    def create_folder(self, name: str, user_id: str) -> ReviewFolder:
+        self.remember(user_id)
+        assert name == "Python 面试"
+        return sample_folder().model_copy(update={"name": name})
+
+    def get_folder(self, folder_id: int, user_id: str) -> ReviewFolderDetail:
+        self.remember(user_id)
+        assert folder_id == 7
+        return ReviewFolderDetail(
+            folder=sample_folder(),
+            materials=[
+                ReviewFolderMaterial(
+                    materialId=12,
+                    title="Kafka 高可用",
+                    documentType="mp4",
+                    cardCount=1,
+                    cards=[sample_card().model_copy(update={"answer": None, "evidenceRefs": []})],
+                )
+            ],
+        )
+
+    def rename_folder(self, folder_id: int, name: str, user_id: str) -> ReviewFolder:
+        self.remember(user_id)
+        assert folder_id == 7 and name == "后端面试"
+        return sample_folder().model_copy(update={"name": name})
+
+    def delete_folder(self, folder_id: int, user_id: str) -> ReviewFolderDeletionResult:
+        self.remember(user_id)
+        assert folder_id == 7
+        return ReviewFolderDeletionResult(folderId=folder_id, unfiledMaterialCount=1)
+
+    def assign_materials_to_folder(
+        self,
+        payload: ReviewMaterialFolderRequest,
+        user_id: str,
+    ) -> ReviewFolderAssignmentResult:
+        self.remember(user_id)
+        assert payload.materialIds == [12, 13] and payload.folderId == 7
+        return ReviewFolderAssignmentResult(folderId=7, materialIds=payload.materialIds, movedCount=2)
+
     def generate_material(self, material_id: int, user_id: str) -> ReviewMaterial:
         self.remember(user_id)
         assert material_id == 12
@@ -184,8 +234,13 @@ def sample_material() -> ReviewMaterial:
     )
 
 
+def sample_folder() -> ReviewFolder:
+    """构造一个包含到期卡片统计的复习文件夹。"""
+    return ReviewFolder(id=7, name="Python 面试", materialCount=1, cardCount=3, dueCardCount=1, updatedAt=NOW)
+
+
 def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
-    """14 个公开端点只能使用认证用户并保持 Result 信封。"""
+    """20 个公开端点只能使用认证用户并保持 Result 信封。"""
     service = StubReviewService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_review_service] = lambda: service
@@ -199,6 +254,12 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
             client.get("/api/reviews/due-groups?limit=20", headers=headers),
             client.put("/api/reviews/due-groups/order", headers=headers, json={"materialIds": [13, 12]}),
             client.get("/api/reviews/materials", headers=headers),
+            client.get("/api/reviews/folders", headers=headers),
+            client.post("/api/reviews/folders", headers=headers, json={"name": " Python  面试 "}),
+            client.get("/api/reviews/folders/7", headers=headers),
+            client.patch("/api/reviews/folders/7", headers=headers, json={"name": "后端面试"}),
+            client.delete("/api/reviews/folders/7", headers=headers),
+            client.put("/api/reviews/materials/folder", headers=headers, json={"materialIds": [12, 13], "folderId": 7}),
             client.post("/api/reviews/materials/12/generate", headers=headers),
             client.post("/api/reviews/materials/batch-delete", headers=headers, json={"materialIds": [13, 12]}),
             client.delete("/api/reviews/materials/12", headers=headers),
@@ -216,7 +277,10 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
         )
         assert responses[4].json()["data"] == {"materialIds": [13, 12], "orderedCount": 2}
         assert responses[5].json()["data"][0]["summary"] == "资料讲解 Kafka 分区副本与 ISR 故障转移机制。"
-        assert service.users == ["42"] * 14
+        assert responses[6].json()["data"][0]["name"] == "Python 面试"
+        assert responses[8].json()["data"]["materials"][0]["cards"][0]["answer"] is None
+        assert responses[11].json()["data"] == {"folderId": 7, "materialIds": [12, 13], "movedCount": 2}
+        assert service.users == ["42"] * 20
     finally:
         app.dependency_overrides.clear()
 

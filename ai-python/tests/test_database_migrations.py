@@ -79,3 +79,14 @@ def test_review_material_order_migration_is_registered_and_idempotent() -> None:
     sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
     assert "ADD COLUMN IF NOT EXISTS display_order INTEGER" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_learning_review_material_user_order" in sql
+
+
+def test_review_folder_migration_is_registered_and_idempotent() -> None:
+    """复习文件夹和文档归属表必须随 Python 服务启动安全创建。"""
+    filename = "20260803_0100_add_review_folders.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "CREATE TABLE IF NOT EXISTS learning_evidence.learning_review_folder" in sql
+    assert "CREATE TABLE IF NOT EXISTS learning_evidence.learning_review_folder_material" in sql
+    assert "CREATE INDEX IF NOT EXISTS idx_learning_review_folder_material_folder" in sql

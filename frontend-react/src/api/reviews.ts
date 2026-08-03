@@ -80,10 +80,47 @@ export interface ReviewMaterial {
   generationState?: string | null;
   status: 'PENDING' | 'GENERATED' | 'SKIPPED' | 'FAILED' | string;
   cardCount: number;
+  folderId?: number | null;
+  folderName?: string | null;
   indexRequestVersion?: number;
   syncedIndexRequestVersion?: number | null;
   updatedAt?: string | null;
   errorMessage?: string | null;
+}
+
+export interface ReviewFolder {
+  id: number;
+  name: string;
+  materialCount: number;
+  cardCount: number;
+  dueCardCount: number;
+  updatedAt?: string | null;
+}
+
+export interface ReviewFolderMaterial {
+  materialId: number;
+  title: string;
+  summary?: string | null;
+  documentType: string;
+  cardCount: number;
+  cards: ReviewCard[];
+}
+
+export interface ReviewFolderDetail {
+  folder: ReviewFolder;
+  materials: ReviewFolderMaterial[];
+}
+
+export interface ReviewFolderAssignmentResult {
+  folderId?: number | null;
+  materialIds: number[];
+  movedCount: number;
+}
+
+export interface ReviewFolderDeletionResult {
+  folderId: number;
+  deleted: boolean;
+  unfiledMaterialCount: number;
 }
 
 export interface ReviewGradePayload {
@@ -176,6 +213,53 @@ export function fetchReviewCard(cardId: number): Promise<ReviewCard> {
 // 读取资料分类、卡片生成状态和卡片数量。
 export function fetchReviewMaterials(): Promise<ReviewMaterial[]> {
   return request<ReviewMaterial[]>('/api/reviews/materials');
+}
+
+// 读取当前用户的复习文件夹及文档、卡片和到期统计。
+export function fetchReviewFolders(): Promise<ReviewFolder[]> {
+  return request<ReviewFolder[]>('/api/reviews/folders');
+}
+
+// 进入文件夹后按文档读取全部活动卡片，列表阶段不预加载答案。
+export function fetchReviewFolder(folderId: number): Promise<ReviewFolderDetail> {
+  return request<ReviewFolderDetail>(`/api/reviews/folders/${encodeURIComponent(String(folderId))}`);
+}
+
+// 创建当前用户的复习文件夹。
+export function createReviewFolder(name: string): Promise<ReviewFolder> {
+  return request<ReviewFolder>('/api/reviews/folders', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ name })
+  });
+}
+
+// 重命名文件夹并保留既有文档归属。
+export function renameReviewFolder(folderId: number, name: string): Promise<ReviewFolder> {
+  return request<ReviewFolder>(`/api/reviews/folders/${encodeURIComponent(String(folderId))}`, {
+    method: 'PATCH',
+    headers: jsonHeaders,
+    body: JSON.stringify({ name })
+  });
+}
+
+// 删除文件夹只解除文档归档，不删除资料、卡片或评分记录。
+export function deleteReviewFolder(folderId: number): Promise<ReviewFolderDeletionResult> {
+  return request<ReviewFolderDeletionResult>(`/api/reviews/folders/${encodeURIComponent(String(folderId))}`, {
+    method: 'DELETE'
+  });
+}
+
+// 以整份文档为单位批量移动；folderId 为空时恢复未归档。
+export function assignReviewMaterialsToFolder(
+  materialIds: number[],
+  folderId: number | null
+): Promise<ReviewFolderAssignmentResult> {
+  return request<ReviewFolderAssignmentResult>('/api/reviews/materials/folder', {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify({ materialIds, folderId })
+  });
 }
 
 // 对单条学习资料重新分类并生成关键知识点卡片。

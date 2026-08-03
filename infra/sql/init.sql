@@ -33,6 +33,8 @@ DROP TABLE IF EXISTS learning_evidence.learning_review_card_exclusion;
 DROP TABLE IF EXISTS learning_evidence.learning_review_material_exclusion;
 DROP TABLE IF EXISTS learning_evidence.learning_review_log;
 DROP TABLE IF EXISTS learning_evidence.learning_review_card;
+DROP TABLE IF EXISTS learning_evidence.learning_review_folder_material;
+DROP TABLE IF EXISTS learning_evidence.learning_review_folder;
 DROP TABLE IF EXISTS learning_evidence.learning_review_material;
 DROP TABLE IF EXISTS learning_evidence.learning_review_setting;
 DROP TABLE IF EXISTS learning_evidence.learning_material;
@@ -180,6 +182,33 @@ CREATE TABLE learning_evidence.learning_review_setting (
     CONSTRAINT ck_learning_review_retention CHECK (desired_retention BETWEEN 0.80 AND 0.97),
     CONSTRAINT ck_learning_review_daily_limit CHECK (daily_limit BETWEEN 1 AND 100)
 );
+
+CREATE TABLE learning_evidence.learning_review_folder (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(120) NOT NULL,
+    name VARCHAR(80) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_learning_review_folder_name CHECK (LENGTH(BTRIM(name)) BETWEEN 1 AND 80),
+    CONSTRAINT uk_learning_review_folder_user_name UNIQUE (user_id, name)
+);
+
+CREATE INDEX idx_learning_review_folder_user_updated
+    ON learning_evidence.learning_review_folder(user_id, updated_at DESC, id DESC);
+
+CREATE TABLE learning_evidence.learning_review_folder_material (
+    material_id BIGINT PRIMARY KEY REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,
+    folder_id BIGINT NOT NULL REFERENCES learning_evidence.learning_review_folder(id) ON DELETE CASCADE,
+    user_id VARCHAR(120) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_learning_review_folder_material_folder
+    ON learning_evidence.learning_review_folder_material(folder_id, updated_at DESC, material_id);
+
+CREATE INDEX idx_learning_review_folder_material_user
+    ON learning_evidence.learning_review_folder_material(user_id, folder_id, material_id);
 
 CREATE TABLE learning_evidence.learning_review_material_exclusion (
     material_id BIGINT PRIMARY KEY REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,

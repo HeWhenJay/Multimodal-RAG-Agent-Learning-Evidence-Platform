@@ -21,6 +21,7 @@ from app.review.repository import (
     MaterialSourceRecord,
     ReviewCardDraft,
     ReviewCardRecord,
+    ReviewFolderRecord,
     ReviewMaterialRecord,
     ReviewOverviewStats,
     ReviewRepository,
@@ -34,10 +35,16 @@ from app.schemas.review import (
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewFolder,
+    ReviewFolderAssignmentResult,
+    ReviewFolderDeletionResult,
+    ReviewFolderDetail,
+    ReviewFolderMaterial,
     ReviewGroupOrderResult,
     ReviewGradeRequest,
     ReviewGradeResult,
     ReviewMaterial,
+    ReviewMaterialFolderRequest,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -125,6 +132,103 @@ class ReviewService:
         with self.repository.transaction() as transaction:
             records = transaction.list_review_materials(user_id)
         return [material_response(record) for record in records]
+
+    def list_folders(self, user_id: str) -> list[ReviewFolder]:
+        """读取当前用户的复习文件夹和实时文档、卡片统计。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            records = transaction.list_review_folders(user_id, now=now)
+        return [folder_response(record) for record in records]
+
+    def get_folder(self, folder_id: int, user_id: str) -> ReviewFolderDetail:
+        """进入一个文件夹，并按文档返回全部活动卡片且隐藏答案。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            folder = transaction.find_review_folder(folder_id, user_id, now=now)
+            if folder is None:
+                raise BusinessError("复习文件夹不存在")
+            materials = transaction.list_review_materials_in_folder(folder_id, user_id)
+            cards = transaction.list_review_cards_in_folder(folder_id, user_id)
+            settings = transaction.get_or_create_settings(user_id)
+        scheduler = FsrsReviewScheduler(settings.desired_retention)
+        cards_by_material: dict[int, list[ReviewCard]] = {}
+        for card in cards:
+            cards_by_material.setdefault(card.material_id, []).append(
+                card_response(card, scheduler, now, include_answer=False)
+            )
+        return ReviewFolderDetail(
+            folder=folder_response(folder),
+            materials=[
+                ReviewFolderMaterial(
+                    materialId=material.material_id,
+                    title=material.title,
+                    summary=material.summary,
+                    documentType=material.document_type,
+                    cardCount=material.card_count,
+                    cards=cards_by_material.get(material.material_id, []),
+                )
+                for material in materials
+            ],
+        )
+
+    def create_folder(self, name: str, user_id: str) -> ReviewFolder:
+        """创建当前用户的空复习文件夹，并拒绝同名目录。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            if transaction.review_folder_name_exists(user_id, name):
+                raise BusinessError("复习文件夹名称已存在")
+            record = transaction.create_review_folder(user_id, name, now=now)
+        return folder_response(record)
+
+    def rename_folder(self, folder_id: int, name: str, user_id: str) -> ReviewFolder:
+        """重命名当前用户文件夹并保留全部文档归属。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            if transaction.review_folder_name_exists(user_id, name, exclude_folder_id=folder_id):
+                raise BusinessError("复习文件夹名称已存在")
+            record = transaction.rename_review_folder(folder_id, user_id, name, now=now)
+        if record is None:
+            raise BusinessError("复习文件夹不存在")
+        return folder_response(record)
+
+    def delete_folder(self, folder_id: int, user_id: str) -> ReviewFolderDeletionResult:
+        """删除文件夹并把其中资料恢复为未归档，不删除任何卡片。"""
+        with self.repository.transaction() as transaction:
+            material_count = transaction.delete_review_folder(folder_id, user_id)
+        if material_count is None:
+            raise BusinessError("复习文件夹不存在")
+        return ReviewFolderDeletionResult(
+            folderId=folder_id,
+            deleted=True,
+            unfiledMaterialCount=material_count,
+        )
+
+    def assign_materials_to_folder(
+        self,
+        payload: ReviewMaterialFolderRequest,
+        user_id: str,
+    ) -> ReviewFolderAssignmentResult:
+        """在一个事务中移动整份文档，禁止部分成功或越权归档。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            if payload.folderId is not None and transaction.find_review_folder(
+                payload.folderId,
+                user_id,
+                now=now,
+            ) is None:
+                raise BusinessError("复习文件夹不存在")
+            moved_ids = transaction.assign_review_materials_to_folder(
+                user_id,
+                payload.materialIds,
+                payload.folderId,
+            )
+        if moved_ids is None:
+            raise BusinessError("复习资料不存在")
+        return ReviewFolderAssignmentResult(
+            folderId=payload.folderId,
+            materialIds=moved_ids,
+            movedCount=len(moved_ids),
+        )
 
     def delete_material(self, material_id: int, user_id: str) -> ReviewDeletionResult:
         """删除资料的全部复习内容并持久保存资料级排除意图。"""
@@ -555,8 +659,22 @@ def material_response(record: ReviewMaterialRecord) -> ReviewMaterial:
         status=record.status,  # type: ignore[arg-type]
         reason=record.reason,
         cardCount=record.card_count,
+        folderId=record.folder_id,
+        folderName=record.folder_name,
         indexRequestVersion=record.index_request_version,
         syncedIndexRequestVersion=record.synced_index_request_version,
+        updatedAt=record.updated_at,
+    )
+
+
+def folder_response(record: ReviewFolderRecord) -> ReviewFolder:
+    """把文件夹聚合记录转换为公开响应。"""
+    return ReviewFolder(
+        id=record.id,
+        name=record.name,
+        materialCount=record.material_count,
+        cardCount=record.card_count,
+        dueCardCount=record.due_card_count,
         updatedAt=record.updated_at,
     )
 

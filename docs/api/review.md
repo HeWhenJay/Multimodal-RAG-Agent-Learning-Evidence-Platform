@@ -1,10 +1,14 @@
 # 学习复习与提醒接口文档
 
-更新日期：2026-08-02
+更新日期：2026-08-03
 
 ## 变更摘要
 
 新增 `/api/reviews/*` 公开控制面。系统在资料完成 RAG 入库后识别八股背诵、面经、课程讲解、技术原理、学习笔记等学习型内容，从已有 RAG evidence 提炼短小的关键知识点卡片，并使用 FSRS 间隔重复算法计算下次复习时间。每日队列以用户上传资料为 group；每日上限按资料份数计算，被选中的资料会返回该资料全部当前到期的小卡片，不再按 group 截断卡片数量。
+
+新增用户自定义复习文件夹。用户以整份文档为最小归档单位，把一份资料及其全部复习卡片移动到一个文件夹；点击文件夹进入独立详情页，按文档查看该文件夹中的全部活动卡片。文件夹归属不改变 FSRS 到期时间、今日队列优先级、RAG 索引或资料排除状态。删除文件夹只解除文档归档，不能删除资料或卡片。
+
+结构化视频不再受普通资料“最多 8 张”的固定截断影响。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，再把命中问题的 evidence 与相邻答案片段优先送给 DeepSeek。当资料明确列出超过 8 个可回答问题时，模型应逐项保留，单份资料最多 32 张；没有明确问题清单的普通资料仍以 3-8 张高价值卡片为目标。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
 
@@ -26,7 +30,7 @@
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
 - 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，一份资料的一次生成尝试只执行一次 LLM 请求，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。`DEEPSEEK_API_KEY` 缺失、DeepSeek 请求失败、响应不是合法 JSON 或结果未通过质量门禁时，整次生成写入 `FAILED` 并停用该资料当前活跃卡片，禁止回退到本地摘要或规则问答。
 - `FAILED` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示“失败原因”。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v7`；v7 保留本地学习内容前置过滤与 DeepSeek-only 内容生成边界，并把答案忠实度门禁升级为逐论断核验：句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v8`；v8 保留本地学习内容前置过滤、DeepSeek-only 内容生成边界和逐论断答案忠实度门禁，并新增结构化原始问题完整保留策略。句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
@@ -58,9 +62,15 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 | GET | `/api/reviews/due-groups?limit=20` | 按上传资料 group 获取今日到期卡片，列表不返回答案正文 |
 | PUT | `/api/reviews/due-groups/order` | 批量保存当前用户今日资料 group 的拖拽顺序 |
 | GET | `/api/reviews/materials` | 获取资料分类、生成状态和卡片数 |
+| PUT | `/api/reviews/materials/folder` | 以文档为单位批量移入指定文件夹，`folderId=null` 时移出文件夹 |
 | POST | `/api/reviews/materials/{materialId}/generate` | 对一条当前用户资料重新分类并生成卡片 |
 | POST | `/api/reviews/materials/batch-delete` | 批量将多份资料移出复习中心 |
 | DELETE | `/api/reviews/materials/{materialId}` | 将整份资料永久移出复习中心，保留原始 RAG 文件 |
+| GET | `/api/reviews/folders` | 获取当前用户的文件夹及文档、卡片和到期统计 |
+| POST | `/api/reviews/folders` | 新建复习文件夹 |
+| GET | `/api/reviews/folders/{folderId}` | 进入文件夹并按文档读取全部活动卡片，答案保持隐藏 |
+| PATCH | `/api/reviews/folders/{folderId}` | 重命名复习文件夹 |
+| DELETE | `/api/reviews/folders/{folderId}` | 删除文件夹并把其中资料改为未归档 |
 | GET | `/api/reviews/cards/{cardId}` | 用户主动揭示答案时获取答案、提示和原文 evidence |
 | POST | `/api/reviews/cards/{cardId}/grade` | 提交四档回忆结果并更新 FSRS 状态 |
 | POST | `/api/reviews/cards/batch-delete` | 批量删除多张复习卡片 |
@@ -152,7 +162,7 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 }
 ```
 
-`materialSummary` 只取当前 `review-card-v7` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+`materialSummary` 只取当前 `review-card-v8` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
 
 ### 保存资料 group 顺序
 
@@ -194,9 +204,82 @@ Authorization: Bearer <token>
   "category": "面试复习",
   "status": "GENERATED",
   "cardCount": 4,
+  "folderId": 7,
+  "folderName": "Python 面试",
   "indexRequestVersion": 1,
   "syncedIndexRequestVersion": 1
 }
+```
+
+### `ReviewFolder`
+
+```json
+{
+  "id": 7,
+  "name": "Python 面试",
+  "materialCount": 3,
+  "cardCount": 42,
+  "dueCardCount": 8,
+  "updatedAt": "2026-08-03T09:30:00+08:00"
+}
+```
+
+文件夹名称去除首尾空白后必须为 1-80 个字符；同一用户不能创建同名文件夹。所有统计只包含当前用户且未从复习中心排除的资料，`cardCount` 只统计当前提炼器版本的活动卡片。
+
+### `ReviewFolderDetail`
+
+```json
+{
+  "folder": {
+    "id": 7,
+    "name": "Python 面试",
+    "materialCount": 1,
+    "cardCount": 20,
+    "dueCardCount": 6,
+    "updatedAt": "2026-08-03T09:30:00+08:00"
+  },
+  "materials": [
+    {
+      "materialId": 12,
+      "title": "python基础面经—秋招实习小白必看常见考点和问题",
+      "summary": "资料按原视频问题顺序覆盖 Python 基础面试考点。",
+      "documentType": "mp4",
+      "cardCount": 20,
+      "cards": [
+        {
+          "id": 81,
+          "materialId": 12,
+          "materialTitle": "python基础面经—秋招实习小白必看常见考点和问题",
+          "documentType": "mp4",
+          "question": "Python 的深拷贝与浅拷贝有什么区别？",
+          "answer": null,
+          "evidenceRefs": [],
+          "dueAt": "2026-08-03T09:00:00+08:00",
+          "reviewCount": 0,
+          "lapseCount": 0
+        }
+      ]
+    }
+  ]
+}
+```
+
+文件夹详情返回每份文档的全部活动卡片，不受“今日到期”条件和每日文档上限影响；列表中的答案与 evidence 仍保持隐藏，用户点击“查看答案”后复用 `GET /api/reviews/cards/{cardId}`。文件夹详情用于浏览和主动回忆，不允许绕过 `POST /cards/{cardId}/grade` 的到期校验。
+
+### 文档归档
+
+```http
+PUT /api/reviews/materials/folder
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{"materialIds": [12, 13], "folderId": 7}
+```
+
+`materialIds` 必须包含 1-100 个互不重复的正整数资料 ID。服务端在单个事务中校验文件夹和所有资料都属于当前用户且资料未被排除，任一 ID 无效则整次不做部分移动。`folderId=null` 表示把资料移回未归档状态。成功返回：
+
+```json
+{"folderId": 7, "materialIds": [12, 13], "movedCount": 2}
 ```
 
 ### `ReviewOverview`
@@ -372,6 +455,10 @@ Authorization: Bearer <token>
 | 批量 ID 包含不存在或不属于当前用户的记录 | 其余命中项仍返回成功，`deletedCount` 小于 `requestedCount` |
 | 排序列表为空、超过 100 个、包含非正整数或重复 ID | 返回请求校验错误，不修改既有顺序 |
 | 排序列表包含不存在、已移除或不属于当前用户的资料 | `复习资料不存在`，整次排序不做部分更新 |
+| 文件夹名称为空、超过 80 字或同名 | 返回中文校验错误，不创建或覆盖文件夹 |
+| 文件夹不存在或不属于当前用户 | `复习文件夹不存在` |
+| 文档归档包含不存在、越权或已排除资料 | `复习资料不存在`，整次移动不做部分更新 |
+| 删除文件夹 | 文件夹消失，原文档和卡片保留并回到未归档状态 |
 | 手动生成已移出复习中心的资料 | `该资料已从复习中心移除` |
 | 同一资料正在由其他请求生成 | `该资料的复习卡片正在生成，请稍后刷新` |
 | 资料尚未完成索引 | `学习资料尚未完成索引` |
@@ -385,6 +472,8 @@ Authorization: Bearer <token>
 ## 前端影响
 
 - 新增 `/reviews` 复习中心，按上传资料展示每日 group；资料总结以卡片网格首位的全宽独立 box 展示，不参与回忆评分，标题区只保留资料元信息。group 内展示该资料全部到期卡片、答案揭示、四档评分、来源 evidence 和下一次复习时间。今日资料支持拖拽手柄、键盘方向键/Home/End，以及移动端上移/下移按钮调整优先级。
+- 复习中心新增文件夹区。文件夹卡片展示文档数、卡片数和到期数；点击后跳转到 `/reviews/folders/{folderId}`，详情页按文档分组显示全部卡片，并保留返回复习中心的面包屑。
+- 资料列表支持批量选择后移入文件夹或移回未归档；新建、重命名和删除文件夹都提供明确的页面内交互，删除提示必须说明不会删除文档与卡片。
 - 侧栏新增“复习中心”；顶部通知按钮展示到期数量并跳转到复习中心。
 - 页面打开时调用一次 `POST /api/reviews/sync`，之后定时刷新 `overview`；文件上传后会在 RAG 状态进入 `READY/PARTIAL` 时按 `materialId` 调用生成接口，避免上传响应早于 evidence 入库而漏生成卡片，也避免历史候选抢占本次上传。资料同步失败不阻断其他页面。
 - 卡片右上角提供图标删除操作；资料 group 标题和右侧资料列表提供“移出复习中心”操作。两种操作都先显示明确确认对话框，资料确认文案必须说明原始 RAG 文件不会删除且移除后不会重新生成。
@@ -393,3 +482,7 @@ Authorization: Bearer <token>
 - 删除成功后前端立即移除对应卡片或 group，并分别刷新 `overview`、`due-groups` 和 `materials`；刷新失败不能把已经成功的删除误报为删除失败。
 - 浏览器通知只在用户主动授权后启用；后端持久化到期时间是唯一事实来源，前端不能自行计算 FSRS 间隔。
 - 浏览器通知会等待用户设置时区中的 `reminderTime`，同一自然日最多发送一次；浏览器关闭后的系统级通知仍需后续接入 Web Push 或邮件基础设施。
+
+## Java/Python 集成说明
+
+当前公开复习控制面由 Python FastAPI 直接承载，文件夹归属、卡片读取和结构化问题提炼均在 Python 服务与 PostgreSQL 中完成；本次不新增 Java 侧 AI 或目录业务逻辑。若后续恢复 Java 业务壳，Java 只透传上述 `Result<T>` 契约并注入认证用户，不能在 Java 中重新生成、截断或合并卡片。

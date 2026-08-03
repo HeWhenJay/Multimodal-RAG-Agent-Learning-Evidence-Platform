@@ -61,6 +61,21 @@ class ReviewMaterialRecord:
     synced_index_request_version: int | None
     updated_at: datetime | None
     summary: str | None = None
+    folder_id: int | None = None
+    folder_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewFolderRecord:
+    """用户复习文件夹及其实时聚合统计。"""
+
+    id: int
+    user_id: str
+    name: str
+    material_count: int
+    card_count: int
+    due_card_count: int
+    updated_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -150,6 +165,41 @@ class ReviewTransaction(Protocol):
     ) -> ReviewMaterialRecord | None: ...
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]: ...
+
+    def list_review_folders(self, user_id: str, *, now: datetime) -> list[ReviewFolderRecord]: ...
+
+    def find_review_folder(self, folder_id: int, user_id: str, *, now: datetime) -> ReviewFolderRecord | None: ...
+
+    def review_folder_name_exists(self, user_id: str, name: str, *, exclude_folder_id: int | None = None) -> bool: ...
+
+    def create_review_folder(self, user_id: str, name: str, *, now: datetime) -> ReviewFolderRecord: ...
+
+    def rename_review_folder(
+        self,
+        folder_id: int,
+        user_id: str,
+        name: str,
+        *,
+        now: datetime,
+    ) -> ReviewFolderRecord | None: ...
+
+    def delete_review_folder(self, folder_id: int, user_id: str) -> int | None: ...
+
+    def assign_review_materials_to_folder(
+        self,
+        user_id: str,
+        material_ids: list[int],
+        folder_id: int | None,
+    ) -> list[int] | None: ...
+
+    def list_review_materials_in_folder(
+        self,
+        folder_id: int,
+        user_id: str,
+        limit: int = 100,
+    ) -> list[ReviewMaterialRecord]: ...
+
+    def list_review_cards_in_folder(self, folder_id: int, user_id: str) -> list[ReviewCardRecord]: ...
 
     def find_review_material(self, material_id: int, user_id: str) -> ReviewMaterialRecord | None: ...
 
@@ -519,6 +569,243 @@ class DatabaseReviewTransaction:
         )
         return [self._to_review_material(row) for row in self._cursor.fetchall()]
 
+    def list_review_folders(self, user_id: str, *, now: datetime) -> list[ReviewFolderRecord]:
+        """按最近更新顺序读取当前用户文件夹及实时卡片统计。"""
+        self._cursor.execute(
+            self._folder_select(
+                "WHERE folder.user_id = %s",
+                "ORDER BY folder.updated_at DESC, folder.id DESC",
+            ),
+            (now, user_id),
+        )
+        return [self._to_folder(row) for row in self._cursor.fetchall()]
+
+    def find_review_folder(self, folder_id: int, user_id: str, *, now: datetime) -> ReviewFolderRecord | None:
+        """按文件夹和认证用户读取统计，隐藏其他用户同 ID 文件夹。"""
+        self._cursor.execute(
+            self._folder_select("WHERE folder.id = %s AND folder.user_id = %s"),
+            (now, folder_id, user_id),
+        )
+        row = self._cursor.fetchone()
+        return self._to_folder(row) if row else None
+
+    def review_folder_name_exists(
+        self,
+        user_id: str,
+        name: str,
+        *,
+        exclude_folder_id: int | None = None,
+    ) -> bool:
+        """以不区分大小写的方式拒绝同一用户的同名文件夹。"""
+        query = """
+            SELECT 1
+            FROM {schema}.learning_review_folder
+            WHERE user_id = %s AND LOWER(name) = LOWER(%s)
+        """
+        params: list[Any] = [user_id, name]
+        if exclude_folder_id is not None:
+            query += " AND id <> %s"
+            params.append(exclude_folder_id)
+        self._cursor.execute(self._statement(query), tuple(params))
+        return self._cursor.fetchone() is not None
+
+    def create_review_folder(self, user_id: str, name: str, *, now: datetime) -> ReviewFolderRecord:
+        """创建一个空文件夹并返回零统计快照。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                INSERT INTO {schema}.learning_review_folder (user_id, name)
+                VALUES (%s, %s)
+                RETURNING id
+                """
+            ),
+            (user_id, name),
+        )
+        folder_id = int(self._cursor.fetchone()["id"])
+        record = self.find_review_folder(folder_id, user_id, now=now)
+        if record is None:
+            raise RuntimeError("创建复习文件夹后无法读取结果")
+        return record
+
+    def rename_review_folder(
+        self,
+        folder_id: int,
+        user_id: str,
+        name: str,
+        *,
+        now: datetime,
+    ) -> ReviewFolderRecord | None:
+        """只允许当前用户重命名文件夹。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_folder
+                SET name = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (name, folder_id, user_id),
+        )
+        if self._cursor.rowcount != 1:
+            return None
+        return self.find_review_folder(folder_id, user_id, now=now)
+
+    def delete_review_folder(self, folder_id: int, user_id: str) -> int | None:
+        """删除文件夹并依靠级联解除归档，返回受影响文档数。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT id
+                FROM {schema}.learning_review_folder
+                WHERE id = %s AND user_id = %s
+                FOR UPDATE
+                """
+            ),
+            (folder_id, user_id),
+        )
+        if self._cursor.fetchone() is None:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT COUNT(material_id) AS material_count
+                FROM {schema}.learning_review_folder_material
+                WHERE folder_id = %s AND user_id = %s
+                """
+            ),
+            (folder_id, user_id),
+        )
+        material_count = int((self._cursor.fetchone() or {}).get("material_count") or 0)
+        self._cursor.execute(
+            self._statement("DELETE FROM {schema}.learning_review_folder WHERE id = %s AND user_id = %s"),
+            (folder_id, user_id),
+        )
+        return material_count
+
+    def assign_review_materials_to_folder(
+        self,
+        user_id: str,
+        material_ids: list[int],
+        folder_id: int | None,
+    ) -> list[int] | None:
+        """锁定全部资料后原子更新文件夹归属，任一越权或排除资料都会失败。"""
+        if folder_id is not None:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    SELECT id
+                    FROM {schema}.learning_review_folder
+                    WHERE id = %s AND user_id = %s
+                    FOR UPDATE
+                    """
+                ),
+                (folder_id, user_id),
+            )
+            if self._cursor.fetchone() is None:
+                return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT material.id
+                FROM {schema}.learning_material material
+                WHERE material.user_id = %s
+                  AND material.id = ANY(%s::BIGINT[])
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = material.id
+                        AND excluded_material.user_id = material.user_id
+                  )
+                ORDER BY material.id
+                FOR UPDATE OF material
+                """
+            ),
+            (user_id, material_ids),
+        )
+        owned_ids = [int(row["id"]) for row in self._cursor.fetchall()]
+        if set(owned_ids) != set(material_ids):
+            return None
+
+        self._cursor.execute(
+            self._statement(
+                """
+                DELETE FROM {schema}.learning_review_folder_material
+                WHERE user_id = %s AND material_id = ANY(%s::BIGINT[])
+                """
+            ),
+            (user_id, material_ids),
+        )
+        if folder_id is not None:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_folder_material (
+                        material_id, folder_id, user_id
+                    )
+                    SELECT material_id, %s, %s
+                    FROM UNNEST(%s::BIGINT[]) AS selected(material_id)
+                    """
+                ),
+                (folder_id, user_id, material_ids),
+            )
+            self._cursor.execute(
+                self._statement(
+                    """
+                    UPDATE {schema}.learning_review_folder
+                    SET updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s AND user_id = %s
+                    """
+                ),
+                (folder_id, user_id),
+            )
+        return list(material_ids)
+
+    def list_review_materials_in_folder(
+        self,
+        folder_id: int,
+        user_id: str,
+        limit: int = 100,
+    ) -> list[ReviewMaterialRecord]:
+        """按归档更新时间读取文件夹中的文档。"""
+        self._cursor.execute(
+            self._review_material_select(
+                """
+                WHERE review_folder_material.folder_id = %s
+                  AND review_folder_material.user_id = %s
+                  AND lm.user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = lm.id
+                        AND excluded_material.user_id = lm.user_id
+                  )
+                ORDER BY review_folder_material.updated_at DESC, lm.id DESC
+                LIMIT %s
+                """
+            ),
+            (folder_id, user_id, user_id, limit),
+        )
+        return [self._to_review_material(row) for row in self._cursor.fetchall()]
+
+    def list_review_cards_in_folder(self, folder_id: int, user_id: str) -> list[ReviewCardRecord]:
+        """读取文件夹内全部活动卡片，不应用今日到期或每日额度过滤。"""
+        self._cursor.execute(
+            self._card_select(
+                """
+                JOIN {schema}.learning_review_folder_material review_folder_material
+                  ON review_folder_material.material_id = c.material_id
+                 AND review_folder_material.user_id = c.user_id
+                WHERE review_folder_material.folder_id = %s
+                  AND c.user_id = %s
+                  AND lm.user_id = %s
+                  AND c.active = TRUE
+                ORDER BY review_folder_material.updated_at DESC, c.material_id DESC, c.id ASC
+                """
+            ),
+            (folder_id, user_id, user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
     def find_review_material(self, material_id: int, user_id: str) -> ReviewMaterialRecord | None:
         """按资料和用户读取当前复习生成状态，用于生成前幂等复核。"""
         return self._find_review_material(material_id, user_id)
@@ -558,6 +845,15 @@ class DatabaseReviewTransaction:
                 INSERT INTO {schema}.learning_review_material_exclusion (material_id, user_id)
                 VALUES (%s, %s)
                 ON CONFLICT (material_id) DO NOTHING
+                """
+            ),
+            (material_id, user_id),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                DELETE FROM {schema}.learning_review_folder_material
+                WHERE material_id = %s AND user_id = %s
                 """
             ),
             (material_id, user_id),
@@ -1120,6 +1416,8 @@ class DatabaseReviewTransaction:
                     ELSE 0
                 END AS card_count,
                 rm.extractor,
+                review_folder_material.folder_id,
+                review_folder.name AS folder_name,
                 CASE
                     WHEN rm.extractor = {{current_model_extractor}}
                         THEN rm.summary
@@ -1128,7 +1426,59 @@ class DatabaseReviewTransaction:
                 COALESCE(rm.updated_at, lm.updated_at) AS review_updated_at
             FROM {{schema}}.learning_material lm
             LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = lm.id
+            LEFT JOIN {{schema}}.learning_review_folder_material review_folder_material
+              ON review_folder_material.material_id = lm.id
+             AND review_folder_material.user_id = lm.user_id
+            LEFT JOIN {{schema}}.learning_review_folder review_folder
+              ON review_folder.id = review_folder_material.folder_id
+             AND review_folder.user_id = lm.user_id
             {suffix}
+            """
+        )
+
+    def _folder_select(self, where_clause: str, tail_clause: str = "") -> Any:
+        """构造文件夹与活动卡片统计的统一 SELECT。"""
+        return self._statement(
+            f"""
+            SELECT
+                folder.id,
+                folder.user_id,
+                folder.name,
+                folder.updated_at,
+                COUNT(DISTINCT folder_material.material_id) FILTER (
+                    WHERE material.id IS NOT NULL AND excluded_material.material_id IS NULL
+                ) AS material_count,
+                COUNT(DISTINCT card.id) FILTER (
+                    WHERE excluded_material.material_id IS NULL AND card.active = TRUE
+                ) AS card_count,
+                COUNT(DISTINCT card.id) FILTER (
+                    WHERE excluded_material.material_id IS NULL
+                      AND card.active = TRUE
+                      AND card.due_at <= %s
+                ) AS due_card_count
+            FROM {{schema}}.learning_review_folder folder
+            LEFT JOIN {{schema}}.learning_review_folder_material folder_material
+              ON folder_material.folder_id = folder.id
+             AND folder_material.user_id = folder.user_id
+            LEFT JOIN {{schema}}.learning_material material
+              ON material.id = folder_material.material_id
+             AND material.user_id = folder.user_id
+            LEFT JOIN {{schema}}.learning_review_material review_material
+              ON review_material.material_id = material.id
+             AND review_material.user_id = folder.user_id
+             AND review_material.status = 'GENERATED'
+             AND review_material.extractor = {{current_model_extractor}}
+            LEFT JOIN {{schema}}.learning_review_card card
+              ON card.material_id = material.id
+             AND card.user_id = folder.user_id
+             AND card.active = TRUE
+             AND review_material.material_id IS NOT NULL
+            LEFT JOIN {{schema}}.learning_review_material_exclusion excluded_material
+              ON excluded_material.material_id = material.id
+             AND excluded_material.user_id = folder.user_id
+            {where_clause}
+            GROUP BY folder.id, folder.user_id, folder.name, folder.updated_at
+            {tail_clause}
             """
         )
 
@@ -1196,6 +1546,21 @@ class DatabaseReviewTransaction:
             ),
             updated_at=row.get("review_updated_at"),
             summary=row.get("material_summary"),
+            folder_id=(int(row["folder_id"]) if row.get("folder_id") is not None else None),
+            folder_name=row.get("folder_name"),
+        )
+
+    @staticmethod
+    def _to_folder(row: dict[str, Any]) -> ReviewFolderRecord:
+        """把文件夹统计行转换为业务记录。"""
+        return ReviewFolderRecord(
+            id=int(row["id"]),
+            user_id=str(row["user_id"]),
+            name=str(row["name"]),
+            material_count=int(row.get("material_count") or 0),
+            card_count=int(row.get("card_count") or 0),
+            due_card_count=int(row.get("due_card_count") or 0),
+            updated_at=row.get("updated_at"),
         )
 
     @staticmethod

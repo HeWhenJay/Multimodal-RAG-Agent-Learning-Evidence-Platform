@@ -23,7 +23,9 @@ from app.review.knowledge_extractor import (
     is_high_quality_review_question,
     is_noise_fragment,
     is_repetitive_noise,
+    review_card_limit,
     sanitize_evidences,
+    select_review_prompt_evidences,
     split_knowledge_sentences,
     stable_source_key,
 )
@@ -140,7 +142,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v7"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v8"
     assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
     assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
     assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
@@ -380,6 +382,54 @@ def test_representative_evidence_sampling_covers_whole_video_and_prefers_raw() -
     assert "raw-0" in selected_ids
     assert "raw-29" in selected_ids
     assert sum(item.evidenceId.startswith("raw-") for item in selected) >= 12
+
+
+def test_structured_video_preserves_twenty_explicit_questions_and_answer_neighbors() -> None:
+    """视频已经列出的 20 个问题不能再被 8 张上限或 16 段采样截断。"""
+    topics = [
+        "列表", "元组", "字典", "集合", "浅拷贝", "深拷贝", "生成器", "迭代器", "装饰器", "上下文管理器",
+        "断言", "过滤器", "匿名函数", "可变参数", "类继承", "抽象类", "垃圾回收", "全局解释器锁", "堆维护", "Top K",
+    ]
+    evidences: list[Evidence] = []
+    cards: list[dict] = []
+    for index, topic in enumerate(topics):
+        question = f"Python 的{topic}在面试资料中有什么核心特性？"
+        answer = f"Python 的{topic}核心特性是按原视频给出的规则完成对应操作。"
+        evidence_id = f"question-{index}"
+        evidences.extend(
+            [
+                evidence(evidence_id, topic, f"{question}{answer}", position=index * 2),
+                evidence(f"answer-{index}", topic, f"补充说明：{answer}", position=index * 2 + 1),
+            ]
+        )
+        cards.append(
+            {
+                "question": question,
+                "sourceQuestion": question,
+                "answer": answer,
+                "hint": f"关注{topic}在原视频中的定义与操作规则",
+                "evidenceIds": [evidence_id],
+            }
+        )
+
+    source_questions = extract_source_question_candidates(evidences)
+    selected = select_review_prompt_evidences(evidences, source_questions)
+    result = KnowledgePointExtractor(provider="deepseek")._validate_model_result(
+        LearningMaterialContext(12, "Python 基础面经", "mp4"),
+        selected,
+        {
+            "summary": "视频按二十个明确问题讲解 Python 基础面试考点，并逐项给出定义、行为和使用方式。",
+            "cards": cards,
+        },
+        source_questions=source_questions,
+    )
+
+    selected_ids = {item.evidenceId for item in selected}
+    assert len(source_questions) == 20
+    assert review_card_limit(source_questions) == 20
+    assert all(f"question-{index}" in selected_ids for index in range(20))
+    assert all(f"answer-{index}" in selected_ids for index in range(20))
+    assert len(result.knowledge_points) == 20
 
 
 def test_answer_grounding_requires_overlap_with_referenced_evidence() -> None:

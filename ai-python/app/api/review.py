@@ -18,12 +18,18 @@ from app.schemas.review import (
     ReviewCardBatchDeleteRequest,
     ReviewDeletionResult,
     ReviewDueGroups,
+    ReviewFolder,
+    ReviewFolderAssignmentResult,
+    ReviewFolderDeletionResult,
+    ReviewFolderDetail,
+    ReviewFolderNameRequest,
     ReviewGroupOrderRequest,
     ReviewGroupOrderResult,
     ReviewGradeRequest,
     ReviewGradeResult,
     ReviewMaterial,
     ReviewMaterialBatchDeleteRequest,
+    ReviewMaterialFolderRequest,
     ReviewOverview,
     ReviewSettings,
     ReviewSyncResult,
@@ -103,6 +109,82 @@ def review_materials(
 ) -> Result[list[ReviewMaterial]]:
     """读取资料分类和卡片生成状态。"""
     return Result.success(execute("获取复习资料列表", lambda: service.list_materials(str(current_user.id))))
+
+
+@router.put("/materials/folder", response_model=Result[ReviewFolderAssignmentResult])
+def assign_review_materials_to_folder(
+    payload: ReviewMaterialFolderRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewFolderAssignmentResult]:
+    """以整份文档为单位批量移入文件夹或恢复未归档。"""
+    return Result.success(
+        execute(
+            "更新复习资料文件夹",
+            lambda: service.assign_materials_to_folder(payload, str(current_user.id)),
+        )
+    )
+
+
+@router.get("/folders", response_model=Result[list[ReviewFolder]])
+def review_folders(
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[list[ReviewFolder]]:
+    """读取当前用户的复习文件夹与实时卡片统计。"""
+    return Result.success(execute("获取复习文件夹", lambda: service.list_folders(str(current_user.id))))
+
+
+@router.post("/folders", response_model=Result[ReviewFolder])
+def create_review_folder(
+    payload: ReviewFolderNameRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewFolder]:
+    """创建一个当前用户可见的空复习文件夹。"""
+    return Result.success(
+        execute("创建复习文件夹", lambda: service.create_folder(payload.name, str(current_user.id)))
+    )
+
+
+@router.get("/folders/{folder_id}", response_model=Result[ReviewFolderDetail])
+def review_folder_detail(
+    folder_id: int,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewFolderDetail]:
+    """进入文件夹并按文档读取全部活动卡片，答案由揭示接口返回。"""
+    return Result.success(
+        execute("获取复习文件夹详情", lambda: service.get_folder(folder_id, str(current_user.id)))
+    )
+
+
+@router.patch("/folders/{folder_id}", response_model=Result[ReviewFolder])
+def rename_review_folder(
+    folder_id: int,
+    payload: ReviewFolderNameRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewFolder]:
+    """重命名文件夹且保留已有文档归属。"""
+    return Result.success(
+        execute(
+            "重命名复习文件夹",
+            lambda: service.rename_folder(folder_id, payload.name, str(current_user.id)),
+        )
+    )
+
+
+@router.delete("/folders/{folder_id}", response_model=Result[ReviewFolderDeletionResult])
+def delete_review_folder(
+    folder_id: int,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewFolderDeletionResult]:
+    """删除文件夹并解除文档归档，不删除资料和卡片。"""
+    return Result.success(
+        execute("删除复习文件夹", lambda: service.delete_folder(folder_id, str(current_user.id)))
+    )
 
 
 @router.post("/materials/{material_id}/generate", response_model=Result[ReviewMaterial])

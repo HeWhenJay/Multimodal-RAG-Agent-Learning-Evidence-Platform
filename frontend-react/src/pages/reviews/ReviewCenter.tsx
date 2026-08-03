@@ -13,8 +13,14 @@ import {
   EyeOff,
   FileText,
   FileVideo2,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  FolderX,
   GripVertical,
   Loader2,
+  MoveRight,
+  Pencil,
   RefreshCw,
   Save,
   Settings2,
@@ -23,25 +29,32 @@ import {
   X
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type Dispatch, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MutableRefObject, type SetStateAction } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MarkdownText } from '../../components/MarkdownText';
 import {
   REVIEW_OVERVIEW_UPDATED_EVENT,
   REVIEW_CONTENT_UPDATED_EVENT,
+  assignReviewMaterialsToFolder,
+  createReviewFolder,
   deleteReviewCard,
   deleteReviewCards,
   deleteReviewMaterial,
   deleteReviewMaterials,
+  deleteReviewFolder,
   fetchDueReviewGroups,
   fetchReviewCard,
+  fetchReviewFolders,
   fetchReviewMaterials,
   fetchReviewOverview,
   generateReviewMaterial,
   gradeReviewCard,
+  renameReviewFolder,
   syncReviewMaterials,
   updateDueReviewGroupOrder,
   updateReviewSettings,
   type ReviewCard,
   type ReviewCardGroup,
+  type ReviewFolder,
   type ReviewGradeResult,
   type ReviewMaterial,
   type ReviewOverview,
@@ -59,6 +72,7 @@ type ReviewDeleteTarget =
   | { scope: 'MATERIAL'; materialId: number; title: string }
   | { scope: 'CARD_BATCH'; cardIds: number[] }
   | { scope: 'MATERIAL_BATCH'; materialIds: number[]; titles: string[] };
+type ReviewFolderEditorTarget = { mode: 'CREATE' } | { mode: 'RENAME'; folder: ReviewFolder };
 
 const DEFAULT_SETTINGS: ReviewSettings = {
   enabled: true,
@@ -79,9 +93,11 @@ const TIMEZONE_OPTIONS = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Taipei', 'Asi
 
 // 复习中心按上传资料展示每日到期 group，每张小卡片独立揭示、定位和评分。
 export function ReviewCenter() {
+  const navigate = useNavigate();
   const [overview, setOverview] = useState<ReviewOverview | null>(null);
   const [groups, setGroups] = useState<ReviewCardGroup[]>([]);
   const [materials, setMaterials] = useState<ReviewMaterial[]>([]);
+  const [folders, setFolders] = useState<ReviewFolder[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
@@ -108,6 +124,13 @@ export function ReviewCenter() {
   const [orderSaving, setOrderSaving] = useState(false);
   const [orderMessage, setOrderMessage] = useState('');
   const [orderError, setOrderError] = useState('');
+  const [folderEditorTarget, setFolderEditorTarget] = useState<ReviewFolderEditorTarget | null>(null);
+  const [folderEditorName, setFolderEditorName] = useState('');
+  const [folderDeleteTarget, setFolderDeleteTarget] = useState<ReviewFolder | null>(null);
+  const [folderTargetValue, setFolderTargetValue] = useState('unfiled');
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [folderMessage, setFolderMessage] = useState('');
+  const [folderError, setFolderError] = useState('');
   const settingsDirtyRef = useRef(false);
   const syncPromiseRef = useRef<Promise<ReviewSyncResult> | null>(null);
   const reviewStartedAtRef = useRef<Record<number, number>>({});
@@ -141,12 +164,14 @@ export function ReviewCenter() {
     const results = await Promise.allSettled([
       fetchReviewOverview(),
       fetchDueReviewGroups(100),
-      fetchReviewMaterials()
+      fetchReviewMaterials(),
+      fetchReviewFolders()
     ]);
     const failures: string[] = [];
     const overviewResult = results[0];
     const groupsResult = results[1];
     const materialsResult = results[2];
+    const foldersResult = results[3];
     if (overviewResult.status === 'fulfilled') {
       setOverview(overviewResult.value);
       if (!settingsDirtyRef.current) setSettingsDraft(normalizeSettings(overviewResult.value.settings));
@@ -164,7 +189,12 @@ export function ReviewCenter() {
     } else {
       failures.push('资料状态');
     }
-    if (failures.length === 3) throw new Error('复习数据加载失败，请稍后重试');
+    if (foldersResult.status === 'fulfilled') {
+      setFolders(foldersResult.value);
+    } else {
+      failures.push('复习文件夹');
+    }
+    if (failures.length === 4) throw new Error('复习数据加载失败，请稍后重试');
     setError(failures.length ? `${failures.join('、')}暂时不可用` : '');
   }, [updateGroups]);
 
@@ -423,7 +453,8 @@ export function ReviewCenter() {
     const results = await Promise.allSettled([
       fetchReviewOverview(),
       fetchDueReviewGroups(100),
-      fetchReviewMaterials()
+      fetchReviewMaterials(),
+      fetchReviewFolders()
     ]);
     if (results[0].status === 'fulfilled') {
       setOverview(results[0].value);
@@ -434,6 +465,7 @@ export function ReviewCenter() {
       updateGroups(results[1].value.groups);
     }
     if (results[2].status === 'fulfilled') setMaterials(results[2].value);
+    if (results[3].status === 'fulfilled') setFolders(results[3].value);
   }
 
   function removeCards(cardIds: number[]) {
@@ -555,6 +587,81 @@ export function ReviewCenter() {
     }
   }
 
+  function openCreateFolder() {
+    setFolderError('');
+    setFolderMessage('');
+    setFolderEditorName('');
+    setFolderEditorTarget({ mode: 'CREATE' });
+  }
+
+  function openRenameFolder(folder: ReviewFolder) {
+    setFolderError('');
+    setFolderMessage('');
+    setFolderEditorName(folder.name);
+    setFolderEditorTarget({ mode: 'RENAME', folder });
+  }
+
+  // 新建和重命名共用同一受控表单，成功后以服务端统计刷新文件夹区。
+  async function saveFolder(event: FormEvent) {
+    event.preventDefault();
+    const target = folderEditorTarget;
+    const name = folderEditorName.replace(/\s+/g, ' ').trim();
+    if (!target || !name || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError('');
+    try {
+      const saved = target.mode === 'CREATE'
+        ? await createReviewFolder(name)
+        : await renameReviewFolder(target.folder.id, name);
+      setFolderMessage(target.mode === 'CREATE' ? `已创建文件夹“${saved.name}”` : `已重命名为“${saved.name}”`);
+      setFolderEditorTarget(null);
+      await loadData();
+    } catch (folderFailure) {
+      setFolderError(folderFailure instanceof Error ? folderFailure.message : '复习文件夹保存失败');
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  // 删除目录只解除归档，资料和卡片继续保留在复习中心。
+  async function confirmFolderDeletion() {
+    const folder = folderDeleteTarget;
+    if (!folder || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError('');
+    try {
+      const result = await deleteReviewFolder(folder.id);
+      setFolderDeleteTarget(null);
+      setFolderMessage(`已删除“${folder.name}”，${result.unfiledMaterialCount} 份资料已回到未归档`);
+      await loadData();
+    } catch (folderFailure) {
+      setFolderError(folderFailure instanceof Error ? folderFailure.message : '复习文件夹删除失败');
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  // 资料归档按完整文档批量提交，卡片不会被拆分到不同文件夹。
+  async function moveSelectedMaterialsToFolder() {
+    if (!selectedMaterialIdList.length || folderBusy) return;
+    const folderId = folderTargetValue === 'unfiled' ? null : Number(folderTargetValue);
+    setFolderBusy(true);
+    setFolderError('');
+    try {
+      const result = await assignReviewMaterialsToFolder(selectedMaterialIdList, folderId);
+      const folderName = folders.find((folder) => folder.id === result.folderId)?.name;
+      setFolderMessage(folderName
+        ? `已将 ${result.movedCount} 份资料移入“${folderName}”`
+        : `已将 ${result.movedCount} 份资料移回未归档`);
+      setSelectedMaterialIds({});
+      await loadData();
+    } catch (folderFailure) {
+      setFolderError(folderFailure instanceof Error ? folderFailure.message : '复习资料归档失败');
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
   async function saveSettings(event: FormEvent) {
     event.preventDefault();
     setSettingsSaving(true);
@@ -584,6 +691,7 @@ export function ReviewCenter() {
   }
 
   const totalCards = groups.reduce((count, group) => count + group.cards.length, 0);
+  const unfiledMaterialCount = materials.filter((material) => material.cardCount > 0 && !material.folderId).length;
   const orderBusy = draggingMaterialId !== null || orderSaving;
   const orderControlsDisabled = loading || orderSaving || deletingKey !== null || deleteTarget !== null || groups.length < 2;
 
@@ -614,6 +722,8 @@ export function ReviewCenter() {
       {deleteError ? <div className="review-alert danger"><CircleAlert size={17} />{deleteError}</div> : null}
       {orderMessage ? <div className="review-alert success" role="status"><Check size={17} />{orderMessage}</div> : null}
       {orderError ? <div className="review-alert danger" role="alert"><CircleAlert size={17} />{orderError}</div> : null}
+      {folderMessage ? <div className="review-alert success" role="status"><Check size={17} />{folderMessage}</div> : null}
+      {folderError ? <div className="review-alert danger" role="alert"><CircleAlert size={17} />{folderError}</div> : null}
 
       <section className="review-stat-strip" aria-label="复习统计">
         <div className="review-stat primary"><span>今日待复习资料</span><strong>{dueMaterialCount}</strong><small>{overview && overview.dueCount > totalCards ? `到期积压 ${overview.dueCount} 张卡片` : totalCards ? `当前展示 ${groups.length} 份资料 · ${totalCards} 张卡片` : '队列已清空'}</small></div>
@@ -621,6 +731,16 @@ export function ReviewCenter() {
         <div className="review-stat"><span>学习资料</span><strong>{overview?.activeMaterialCount ?? '--'}</strong><small>已生成复习卡片的资料</small></div>
         <div className="review-stat progress-stat"><div><span>今日进度</span><strong>{reviewProgress}%</strong></div><div className="review-progress"><i style={{ width: `${reviewProgress}%` }} /></div><small>{overview?.nextDueAt ? `下一张卡片 ${formatTime(overview.nextDueAt)}` : '暂无下一张'}</small></div>
       </section>
+
+      <ReviewFolderLibrary
+        folders={folders}
+        unfiledMaterialCount={unfiledMaterialCount}
+        busy={folderBusy}
+        onCreate={openCreateFolder}
+        onOpen={(folder) => navigate(`/reviews/folders/${folder.id}`)}
+        onRename={openRenameFolder}
+        onDelete={setFolderDeleteTarget}
+      />
 
       <div className="review-content-grid">
         <section className="review-queue-column" aria-labelledby="review-queue-title">
@@ -678,8 +798,8 @@ export function ReviewCenter() {
           </section>
 
           <section className="review-panel materials-panel">
-            <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料分组</h3></div><span>{materials.length}</span></div>
-            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份</span><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy}><Trash2 size={14} />批量移出</button></div> : null}
+            <div className="review-panel-heading"><div><BookOpen size={17} /><h3>资料归档</h3></div><span>{materials.length}</span></div>
+            {selectedMaterialIdList.length ? <div className="review-material-bulkbar"><span>已选 {selectedMaterialIdList.length} 份文档</span><div className="review-material-folder-controls"><select aria-label="目标复习文件夹" value={folderTargetValue} onChange={(event) => setFolderTargetValue(event.target.value)} disabled={folderBusy}><option value="unfiled">未归档</option>{folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}</select><button className="outline-action small" type="button" onClick={() => void moveSelectedMaterialsToFolder()} disabled={folderBusy}><MoveRight size={14} />移动</button><button className="outline-action small danger-outline" type="button" onClick={requestMaterialBatchDeletion} disabled={deletingKey !== null || orderBusy || folderBusy}><Trash2 size={14} />移出中心</button></div></div> : <p className="review-material-select-hint">选择文档后可整份移动到文件夹</p>}
             <div className="review-material-list">
               {materials.length ? materials.map((material) => {
                 const materialId = resolveMaterialId(material);
@@ -692,6 +812,93 @@ export function ReviewCenter() {
 
       <OriginalEvidenceDialog card={originalCard} onClose={() => setOriginalCard(null)} />
       <ReviewDeletionDialog target={deleteTarget} deleting={deletingKey !== null} onConfirm={() => void confirmDeletion()} onClose={() => { if (deletingKey === null) setDeleteTarget(null); }} />
+      <ReviewFolderEditorDialog target={folderEditorTarget} name={folderEditorName} busy={folderBusy} onNameChange={setFolderEditorName} onSubmit={saveFolder} onClose={() => { if (!folderBusy) setFolderEditorTarget(null); }} />
+      <ReviewFolderDeleteDialog folder={folderDeleteTarget} busy={folderBusy} onConfirm={() => void confirmFolderDeletion()} onClose={() => { if (!folderBusy) setFolderDeleteTarget(null); }} />
+    </div>
+  );
+}
+
+function ReviewFolderLibrary({
+  folders,
+  unfiledMaterialCount,
+  busy,
+  onCreate,
+  onOpen,
+  onRename,
+  onDelete
+}: {
+  folders: ReviewFolder[];
+  unfiledMaterialCount: number;
+  busy: boolean;
+  onCreate: () => void;
+  onOpen: (folder: ReviewFolder) => void;
+  onRename: (folder: ReviewFolder) => void;
+  onDelete: (folder: ReviewFolder) => void;
+}) {
+  return (
+    <section className="review-folder-library" aria-labelledby="review-folder-title">
+      <div className="review-folder-library-heading">
+        <div><span className="review-folder-heading-icon"><FolderOpen size={18} /></span><div><h3 id="review-folder-title">复习文件夹</h3><p>按文档归档，进入文件夹后逐份查看全部卡片</p></div></div>
+        <div className="review-folder-heading-actions"><span>{unfiledMaterialCount} 份未归档</span><button className="primary-action" type="button" onClick={onCreate} disabled={busy}><FolderPlus size={16} />新建文件夹</button></div>
+      </div>
+      {folders.length ? (
+        <div className="review-folder-grid">
+          {folders.map((folder) => (
+            <article className="review-folder-card" key={folder.id}>
+              <button className="review-folder-open" type="button" onClick={() => onOpen(folder)} disabled={busy} aria-label={`进入文件夹 ${folder.name}`}>
+                <span className="review-folder-icon"><Folder size={24} /></span>
+                <span className="review-folder-copy"><strong>{folder.name}</strong><small>{folder.materialCount} 份文档 · {folder.cardCount} 张卡片</small></span>
+                <span className={`review-folder-due${folder.dueCardCount ? ' has-due' : ''}`}>{folder.dueCardCount ? `${folder.dueCardCount} 张到期` : '暂无到期'}</span>
+              </button>
+              <div className="review-folder-actions">
+                <button className="icon-button tiny" type="button" title="重命名文件夹" aria-label={`重命名 ${folder.name}`} onClick={() => onRename(folder)} disabled={busy}><Pencil size={14} /></button>
+                <button className="icon-button tiny danger" type="button" title="删除文件夹" aria-label={`删除 ${folder.name}`} onClick={() => onDelete(folder)} disabled={busy}><FolderX size={14} /></button>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <button className="review-folder-empty" type="button" onClick={onCreate} disabled={busy}><FolderPlus size={22} /><span><strong>还没有复习文件夹</strong><small>创建后可在右侧选择整份文档归档</small></span></button>
+      )}
+    </section>
+  );
+}
+
+function ReviewFolderEditorDialog({ target, name, busy, onNameChange, onSubmit, onClose }: { target: ReviewFolderEditorTarget | null; name: string; busy: boolean; onNameChange: (value: string) => void; onSubmit: (event: FormEvent) => void; onClose: () => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (target) inputRef.current?.focus();
+  }, [target]);
+  useEffect(() => {
+    if (!target) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [target, busy, onClose]);
+  if (!target) return null;
+  const title = target.mode === 'CREATE' ? '新建复习文件夹' : '重命名复习文件夹';
+  return (
+    <div className="review-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+      <form className="review-folder-dialog" role="dialog" aria-modal="true" aria-labelledby="review-folder-editor-title" onSubmit={onSubmit}>
+        <div className="review-folder-dialog-icon"><FolderPlus size={20} /></div>
+        <div className="review-folder-dialog-copy"><h3 id="review-folder-editor-title">{title}</h3><p>文件夹以整份文档为单位收纳复习卡片。</p><label><span>文件夹名称</span><input ref={inputRef} value={name} maxLength={80} onChange={(event) => onNameChange(event.target.value)} placeholder="例如：Python 面试" disabled={busy} /></label></div>
+        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={busy}>取消</button><button className="primary-action" type="submit" disabled={busy || !name.trim()}>{busy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}{busy ? '保存中' : '保存'}</button></div>
+      </form>
+    </div>
+  );
+}
+
+function ReviewFolderDeleteDialog({ folder, busy, onConfirm, onClose }: { folder: ReviewFolder | null; busy: boolean; onConfirm: () => void; onClose: () => void }) {
+  if (!folder) return null;
+  return (
+    <div className="review-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+      <section className="review-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="review-folder-delete-title" aria-describedby="review-folder-delete-description">
+        <div className="review-delete-icon"><FolderX size={20} /></div>
+        <div className="review-delete-copy"><h3 id="review-folder-delete-title">删除文件夹？</h3><strong>{folder.name}</strong><p id="review-folder-delete-description">文件夹中的 {folder.materialCount} 份文档会回到未归档，原始资料、复习卡片和学习记录都不会删除。</p></div>
+        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-action" type="button" onClick={onConfirm} disabled={busy}>{busy ? <Loader2 className="spin" size={16} /> : <FolderX size={16} />}{busy ? '处理中' : '删除文件夹'}</button></div>
+      </section>
     </div>
   );
 }
@@ -968,7 +1175,7 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
 
 function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title="重新生成卡片" aria-label={`重新生成 ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
 }
 
 // 优先展示 DeepSeek 摘要；失败或跳过时直接展示后端原因，避免“摘要生成中”掩盖真实状态。
