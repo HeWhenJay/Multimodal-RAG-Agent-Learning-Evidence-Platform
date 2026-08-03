@@ -448,7 +448,7 @@ export function ReviewCenter() {
     finishOrderInteraction();
   }
 
-  // 文件夹是文档拖拽目标；投放时恢复队列的临时排序，不写入优先级接口。
+  // 文件夹是文档拖拽目标；投放成功后立即从主页面收起整份资料。
   function handleFolderDragEnter(folderId: number) {
     if (dragSourceIdRef.current != null) setFolderDropTargetId(folderId);
   }
@@ -474,7 +474,7 @@ export function ReviewCenter() {
     try {
       const result = await assignReviewMaterialsToFolder([materialId], folder.id);
       setFolderMessage(`已将 1 份资料移入“${folder.name}”`);
-      setSelectedMaterialIds((previous) => omitKey(previous, materialId));
+      if (result.movedCount) removeMaterialsFromView([materialId]);
       if (result.movedCount) await loadData();
     } catch (folderFailure) {
       setFolderError(folderFailure instanceof Error ? folderFailure.message : '拖拽归档失败');
@@ -483,13 +483,8 @@ export function ReviewCenter() {
     }
   }
 
-  // 今日队列可以定位到未归档资料行，也可携带文档 ID 跳进对应文件夹。
+  // 主页面只包含未归档资料，定位操作直接滚动到资料归档中的对应行。
   function locateReviewMaterial(group: ReviewCardGroup) {
-    if (group.folderId) {
-      const params = new URLSearchParams({ materialId: String(group.materialId) });
-      navigate(`/reviews/folders/${group.folderId}?${params.toString()}`);
-      return;
-    }
     const target = document.getElementById(reviewMaterialArchiveId(group.materialId));
     if (!target) {
       setFolderError('暂时没有找到对应资料，请刷新资料归档后重试');
@@ -797,7 +792,8 @@ export function ReviewCenter() {
       setFolderMessage(folderName
         ? `已将 ${result.movedCount} 份资料移入“${folderName}”`
         : `已将 ${result.movedCount} 份资料移回未归档`);
-      setSelectedMaterialIds({});
+      if (folderId !== null && result.movedCount) removeMaterialsFromView(result.materialIds);
+      else setSelectedMaterialIds({});
       await loadData();
     } catch (folderFailure) {
       setFolderError(folderFailure instanceof Error ? folderFailure.message : '复习资料归档失败');
@@ -843,7 +839,7 @@ export function ReviewCenter() {
   }
 
   const totalCards = groups.reduce((count, group) => count + group.cards.length, 0);
-  const unfiledMaterialCount = materials.filter((material) => material.cardCount > 0 && !material.folderId).length;
+  const unfiledMaterialCount = materials.filter((material) => material.cardCount > 0).length;
   const orderBusy = draggingMaterialId !== null || orderSaving;
   const orderControlsDisabled = loading || orderSaving || deletingKey !== null || deleteTarget !== null || groups.length < 1;
 
@@ -878,9 +874,9 @@ export function ReviewCenter() {
       {folderError ? <div className="review-alert danger" role="alert"><CircleAlert size={17} />{folderError}</div> : null}
 
       <section className="review-stat-strip" aria-label="复习统计">
-        <div className="review-stat primary"><span>今日待复习资料</span><strong>{dueMaterialCount}</strong><small>{overview && overview.dueCount > totalCards ? `到期积压 ${overview.dueCount} 张卡片` : totalCards ? `当前展示 ${groups.length} 份资料 · ${totalCards} 张卡片` : '队列已清空'}</small></div>
+        <div className="review-stat primary"><span>未归档待复习</span><strong>{dueMaterialCount}</strong><small>{overview && overview.dueCount > totalCards ? `到期积压 ${overview.dueCount} 张卡片` : totalCards ? `当前展示 ${groups.length} 份资料 · ${totalCards} 张卡片` : '未归档队列已清空'}</small></div>
         <div className="review-stat"><span>今日已复习资料</span><strong>{overview?.todayReviewedCount ?? '--'}</strong><small>每日上限 {dailyLimit} 份资料</small></div>
-        <div className="review-stat"><span>学习资料</span><strong>{overview?.activeMaterialCount ?? '--'}</strong><small>已生成复习卡片的资料</small></div>
+        <div className="review-stat"><span>未归档资料</span><strong>{overview?.activeMaterialCount ?? '--'}</strong><small>文件夹内容已收起</small></div>
         <div className="review-stat progress-stat"><div><span>今日进度</span><strong>{reviewProgress}%</strong></div><div className="review-progress"><i style={{ width: `${reviewProgress}%` }} /></div><small>{overview?.nextDueAt ? `下一张卡片 ${formatTime(overview.nextDueAt)}` : '暂无下一张'}</small></div>
       </section>
 
@@ -903,7 +899,7 @@ export function ReviewCenter() {
 
       <div className="review-content-grid">
         <section className="review-queue-column" aria-labelledby="review-queue-title">
-          <div className="review-section-heading"><div><h3 id="review-queue-title">今日复习资料</h3><span>{groups.length ? `${groups.length} 份资料 · ${totalCards} 张卡片` : '暂无到期资料'}</span></div><div className="review-section-actions">{orderSaving ? <span className="review-order-saving" role="status"><Loader2 className="spin" size={14} />保存排序</span> : selectedCardIdList.length ? <button className="outline-action small danger-outline" type="button" onClick={requestCardBatchDeletion} disabled={deletingKey !== null || orderBusy}><Trash2 size={14} />删除选中 {selectedCardIdList.length}</button> : <Clock3 size={18} />}</div></div>
+          <div className="review-section-heading"><div><h3 id="review-queue-title">今日复习资料</h3><span>{groups.length ? `${groups.length} 份未归档资料 · ${totalCards} 张卡片` : '暂无未归档到期资料'}</span></div><div className="review-section-actions">{orderSaving ? <span className="review-order-saving" role="status"><Loader2 className="spin" size={14} />保存排序</span> : selectedCardIdList.length ? <button className="outline-action small danger-outline" type="button" onClick={requestCardBatchDeletion} disabled={deletingKey !== null || orderBusy}><Trash2 size={14} />删除选中 {selectedCardIdList.length}</button> : <Clock3 size={18} />}</div></div>
           <p className="review-visually-hidden" id="review-order-instructions">拖动手柄调整资料优先级；键盘可使用上下方向键移动，Home 置顶，End 置底。</p>
           {loading ? <div className="review-loading"><Loader2 className="spin" size={22} /><span>正在读取复习队列</span></div> : null}
           {!loading && groups.length === 0 ? <EmptyReviewQueue onSync={() => void runSync()} syncing={syncing} /> : null}
@@ -970,7 +966,7 @@ export function ReviewCenter() {
               const materialId = resolveMaterialId(material);
               const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
               return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} located={materialId != null && locatedMaterialId === materialId} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
-            }) : <p className="panel-empty">暂无已索引资料</p>}
+            }) : <p className="panel-empty">暂无未归档资料；文件夹中的内容请进入对应文件夹查看</p>}
           </div>
         </section>
       </div>
@@ -1213,7 +1209,7 @@ function ReviewMaterialGroup({
             <GripVertical size={17} />
           </button>
           <span className="material-type-icon">{isVideoType(group.documentType) ? <FileVideo2 size={17} /> : <FileText size={17} />}</span>
-          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · {group.folderName ? `文件夹：${group.folderName}` : '未归档'} · 优先级 {position + 1}</span></div>
+          <div><h4>{group.materialTitle}</h4><span>{formatDocumentType(group.documentType)} · {group.dueCardCount} 张到期 · 未归档 · 优先级 {position + 1}</span></div>
         </div>
         <div className="review-group-actions">
           <div className="review-group-step-actions" aria-label="调整资料优先级">
@@ -1221,7 +1217,7 @@ function ReviewMaterialGroup({
             <button className="icon-button tiny" type="button" title="下移资料" aria-label={`下移 ${group.materialTitle}`} onClick={() => onMove(position + 1)} disabled={orderDisabled || ordering || position === groupCount - 1}><ArrowDown size={14} /></button>
           </div>
           <span className="group-count">{group.cards.length}</span>
-          <button className="outline-action small review-locate-action" type="button" title={group.folderId ? `在文件夹“${group.folderName || '复习文件夹'}”中定位资料` : '在资料归档中定位资料'} aria-label={`定位资料：${group.materialTitle}`} onClick={onLocateMaterial} disabled={ordering}><LocateFixed size={14} /><span className="review-locate-label">定位资料</span></button>
+          <button className="outline-action small review-locate-action" type="button" title="在资料归档中定位资料" aria-label={`定位资料：${group.materialTitle}`} onClick={onLocateMaterial} disabled={ordering}><LocateFixed size={14} /><span className="review-locate-label">定位资料</span></button>
           <button className="icon-button tiny danger" type="button" title="将资料移出复习中心" aria-label={`将 ${group.materialTitle} 移出复习中心`} onClick={onDeleteMaterial} disabled={deletingKey !== null || ordering}>{deletingKey === `MATERIAL:${group.materialId}` ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
         </div>
       </header>

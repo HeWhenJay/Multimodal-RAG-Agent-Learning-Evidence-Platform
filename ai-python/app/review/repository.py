@@ -1260,7 +1260,7 @@ class DatabaseReviewTransaction:
         today_start: datetime,
         tomorrow_start: datetime,
     ) -> ReviewOverviewStats:
-        """用持久化 due_at 和评分日志实时计算复习统计。"""
+        """只统计主页面未归档资料，文件夹内容由文件夹详情独立展示。"""
         self._cursor.execute(
             self._statement(
                 """
@@ -1280,6 +1280,12 @@ class DatabaseReviewTransaction:
                  AND rm.status = 'GENERATED'
                  AND rm.index_request_version = lm.index_request_version
                 WHERE c.user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = c.material_id
+                        AND folder_material.user_id = c.user_id
+                  )
                 """
             ),
             (now, now, now, user_id),
@@ -1306,6 +1312,12 @@ class DatabaseReviewTransaction:
                               AND due_card.user_id = log.user_id
                               AND due_card.active = TRUE
                               AND due_card.due_at <= %s
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM {schema}.learning_review_folder_material folder_material
+                                  WHERE folder_material.material_id = due_card.material_id
+                                    AND folder_material.user_id = due_card.user_id
+                              )
                         )
                     ) AS started_due_material_count
                 FROM {schema}.learning_review_log log
@@ -1326,7 +1338,7 @@ class DatabaseReviewTransaction:
         )
 
     def list_due_cards(self, user_id: str, *, now: datetime, limit: int) -> list[ReviewCardRecord]:
-        """保留兼容的卡片级查询；公开队列使用文档级分组查询。"""
+        """保留未归档资料的卡片级查询；公开队列使用文档级分组查询。"""
         self._cursor.execute(
             self._statement(
                 """
@@ -1352,6 +1364,7 @@ class DatabaseReviewTransaction:
                   AND lm.user_id = %s
                   AND c.active = TRUE
                   AND c.due_at <= %s
+                  AND folder_material.material_id IS NULL
                 ORDER BY group_due_at ASC, c.material_id ASC, c.due_at ASC, c.id ASC
                 LIMIT %s
                 """
@@ -1369,7 +1382,7 @@ class DatabaseReviewTransaction:
         tomorrow_start: datetime,
         limit: int,
     ) -> list[ReviewCardRecord]:
-        """先按文档额度选择资料组，再返回每组全部到期卡片。"""
+        """先从未归档资料中选择文档组，再返回每组全部到期卡片。"""
         self._cursor.execute(
             self._statement(
                 """
@@ -1407,6 +1420,7 @@ class DatabaseReviewTransaction:
                       AND lm.user_id = %s
                       AND c.active = TRUE
                       AND c.due_at <= %s
+                      AND folder_material.material_id IS NULL
                 ),
                 due_materials AS (
                     SELECT material_id,
@@ -1484,7 +1498,7 @@ class DatabaseReviewTransaction:
         return bool(row.get("reviewed_today"))
 
     def reorder_review_materials(self, user_id: str, material_ids: list[int]) -> list[int] | None:
-        """锁定用户复习资料并以单次集合更新保存稳定的拖拽顺序。"""
+        """锁定主页面未归档资料并以单次集合更新保存稳定的拖拽顺序。"""
         # 用户设置行作为轻量级用户锁，使同一用户的并发排序按请求完成顺序串行化。
         self.get_or_create_settings(user_id, for_update=True)
         self._cursor.execute(
@@ -1509,6 +1523,12 @@ class DatabaseReviewTransaction:
                       FROM {schema}.learning_review_material_exclusion excluded_material
                       WHERE excluded_material.material_id = rm.material_id
                         AND excluded_material.user_id = %s
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = rm.material_id
+                        AND folder_material.user_id = rm.user_id
                   )
                 ORDER BY rm.display_order ASC NULLS LAST, rm.material_id ASC
                 FOR UPDATE OF rm

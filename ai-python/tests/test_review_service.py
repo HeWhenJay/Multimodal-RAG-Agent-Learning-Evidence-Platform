@@ -280,6 +280,7 @@ def test_material_queries_only_expose_deepseek_review_summary() -> None:
     assert "ELSE NULL" in cursor.statement
     assert "lm.document_summary" not in cursor.statement
     assert "learning_review_folder_material" in cursor.statement
+    assert "folder_material.material_id = lm.id" in cursor.statement
     assert "generation_progress" in cursor.statement
 
 

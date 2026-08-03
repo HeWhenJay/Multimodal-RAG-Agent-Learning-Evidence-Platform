@@ -65,7 +65,8 @@ def test_reorder_places_requested_materials_first_and_keeps_remaining_order() ->
     assert "rm.user_id = %s" in update_sql
     assert "rm.display_order IS DISTINCT FROM ordered.position" in update_sql
     select_sql = next(sql for sql, _params in cursor.executions if "SELECT rm.material_id" in sql)
-    assert "learning_review_folder_material" not in select_sql
+    assert "learning_review_folder_material" in select_sql
+    assert "folder_material.material_id = rm.material_id" in select_sql
 
 
 def test_reorder_rejects_cross_user_or_missing_material_without_any_update() -> None:
