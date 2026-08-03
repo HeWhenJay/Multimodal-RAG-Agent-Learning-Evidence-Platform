@@ -111,6 +111,28 @@ class ReviewGenerationRequest(BaseModel):
         return normalized or None
 
 
+class ReviewGenerationProgressEvent(BaseModel):
+    """复习生成图的一条阶段事件，供前端展示真实处理进度。"""
+
+    stageCode: str
+    stageLabel: str
+    message: str
+    status: str = "RUNNING"
+    currentStep: int | None = Field(default=None, ge=0)
+    totalSteps: int | None = Field(default=None, ge=1)
+    percent: int = Field(default=0, ge=0, le=100)
+    attempt: int | None = Field(default=None, ge=0)
+    maxAttempts: int | None = Field(default=None, ge=1)
+    detail: str | None = None
+    createdAt: datetime | None = None
+
+
+class ReviewGenerationProgress(ReviewGenerationProgressEvent):
+    """当前复习生成阶段与最近事件时间线。"""
+
+    events: list[ReviewGenerationProgressEvent] = Field(default_factory=list, max_length=12)
+
+
 class ReviewMaterial(BaseModel):
     """一条资料的学习分类与卡片生成状态。"""
 
@@ -126,6 +148,7 @@ class ReviewMaterial(BaseModel):
     cardCount: int = Field(default=0, ge=0)
     generationAttempts: int = Field(default=0, ge=0)
     qualityFeedback: list[str] = Field(default_factory=list)
+    generationProgress: ReviewGenerationProgress | None = None
     needsManualReview: bool = False
     folderId: int | None = Field(default=None, ge=1)
     folderName: str | None = None

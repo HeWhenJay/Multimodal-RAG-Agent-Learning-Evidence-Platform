@@ -44,6 +44,7 @@ from app.schemas.review import (
     ReviewGroupOrderResult,
     ReviewGradeRequest,
     ReviewGradeResult,
+    ReviewGenerationProgress,
     ReviewMaterial,
     ReviewMaterialFolderRequest,
     ReviewOverview,
@@ -496,6 +497,19 @@ class ReviewService:
                     current = transaction.find_review_material(material.id, user_id)
                 if current and material_generation_is_current(current, material.index_request_version):
                     return material_response(current)
+            self._record_generation_progress(
+                material,
+                {
+                    "stageCode": "review.evidence.load",
+                    "stageLabel": "读取证据",
+                    "message": "正在读取当前索引版本的 RAG evidence",
+                    "status": "RUNNING",
+                    "currentStep": 1,
+                    "totalSteps": 4,
+                    "percent": 6,
+                    "attempt": 0,
+                },
+            )
             with self.repository.transaction() as transaction:
                 evidences = transaction.list_evidences(material)
             now = as_utc(self.now_provider())
@@ -519,12 +533,20 @@ class ReviewService:
                     document_type=material.document_type,
                     summary=material.document_summary,
                 )
-                # 无人工说明时保留旧测试替身和扩展提取器的双参数兼容性。
-                extraction = (
-                    self.extractor.extract(context, evidences, user_feedback=user_feedback)
-                    if (user_feedback or "").strip()
-                    else self.extractor.extract(context, evidences)
-                )
+                if isinstance(self.extractor, KnowledgePointExtractor):
+                    extraction = self.extractor.extract(
+                        context,
+                        evidences,
+                        user_feedback=user_feedback,
+                        progress_callback=lambda event: self._record_generation_progress(material, event),
+                    )
+                else:
+                    # 测试替身和外部扩展提取器继续兼容原有双参数调用方式。
+                    extraction = (
+                        self.extractor.extract(context, evidences, user_feedback=user_feedback)
+                        if (user_feedback or "").strip()
+                        else self.extractor.extract(context, evidences)
+                    )
             except ReviewManualReviewRequired as exc:
                 return self._save_generation(
                     material,
@@ -631,6 +653,22 @@ class ReviewService:
         finally:
             lock.release()
 
+    def _record_generation_progress(
+        self,
+        material: MaterialSourceRecord,
+        event: dict[str, object],
+    ) -> None:
+        """持久化一条真实阶段事件；进度写入失败不能破坏卡片主流程。"""
+        payload = dict(event)
+        payload.setdefault("createdAt", as_utc(self.now_provider()).isoformat())
+        try:
+            with self.repository.transaction() as transaction:
+                save_progress = getattr(transaction, "save_generation_progress", None)
+                if callable(save_progress):
+                    save_progress(material, payload)
+        except Exception:  # noqa: BLE001 - 可观测性失败只记录日志，最终生成仍需收敛。
+            logger.exception("复习生成进度保存失败，materialId=%s", material.id)
+
     def _save_generation(
         self,
         material: MaterialSourceRecord,
@@ -658,6 +696,12 @@ class ReviewService:
                 cards=cards,
                 generation_attempts=generation_attempts,
                 quality_feedback=quality_feedback or [],
+                generation_progress_event=terminal_generation_progress_event(
+                    status,
+                    reason,
+                    generation_attempts,
+                    at=as_utc(self.now_provider()),
+                ),
             )
         return material_response(record) if record is not None else None
 
@@ -703,6 +747,7 @@ def material_generation_is_current(record: ReviewMaterialRecord, index_request_v
         record.synced_index_request_version is not None
         and record.synced_index_request_version >= index_request_version
         and record.extractor in CURRENT_REVIEW_EXTRACTORS
+        and record.status in {"GENERATED", "SKIPPED"}
     )
 
 
@@ -726,8 +771,51 @@ def material_response(record: ReviewMaterialRecord) -> ReviewMaterial:
         updatedAt=record.updated_at,
         generationAttempts=record.generation_attempts,
         qualityFeedback=list(record.quality_feedback),
+        generationProgress=generation_progress_response(record.generation_progress),
         needsManualReview=record.status == "NEEDS_REVIEW",
     )
+
+
+def generation_progress_response(value: dict[str, object] | None) -> ReviewGenerationProgress | None:
+    """把数据库 JSONB 快照转换为公开模型，损坏旧值按无进度处理。"""
+    if not value:
+        return None
+    try:
+        return ReviewGenerationProgress.model_validate(value)
+    except Exception:  # noqa: BLE001 - 历史异常 JSON 不应阻断资料列表。
+        logger.warning("检测到无法解析的复习生成进度快照，已忽略")
+        return None
+
+
+def terminal_generation_progress_event(
+    status: str,
+    reason: str,
+    attempts: int,
+    *,
+    at: datetime,
+) -> dict[str, object]:
+    """为生成、跳过、失败和人工处理构造稳定终态事件。"""
+    mapping = {
+        "GENERATED": ("review.completed", "生成完成", "复习卡片已保存，FSRS 排程已初始化", "COMPLETED"),
+        "SKIPPED": ("review.skipped", "已跳过", reason or "资料不属于复习内容", "SKIPPED"),
+        "NEEDS_REVIEW": ("review.human_review", "等待人工处理", reason, "NEEDS_REVIEW"),
+        "FAILED": ("review.failed", "生成失败", reason, "FAILED"),
+    }
+    stage_code, stage_label, message, progress_status = mapping.get(
+        status,
+        ("review.completed", "处理完成", reason or "复习资料处理完成", status),
+    )
+    return {
+        "stageCode": stage_code,
+        "stageLabel": stage_label,
+        "message": message,
+        "status": progress_status,
+        "currentStep": 4,
+        "totalSteps": 4,
+        "percent": 100,
+        "attempt": max(0, int(attempts)),
+        "createdAt": at.isoformat(),
+    }
 
 
 def folder_response(record: ReviewFolderRecord) -> ReviewFolder:

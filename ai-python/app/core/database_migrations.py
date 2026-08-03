@@ -18,6 +18,7 @@ PYTHON_MIGRATIONS = (
     "20260802_0500_guard_review_extractor_downgrade.sql",
     "20260803_0100_add_review_folders.sql",
     "20260803_0200_add_review_generation_repair_state.sql",
+    "20260803_0300_add_review_generation_progress.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

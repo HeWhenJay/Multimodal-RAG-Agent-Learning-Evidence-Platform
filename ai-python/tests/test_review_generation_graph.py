@@ -60,3 +60,38 @@ def test_exhausted_quality_repair_enters_manual_review() -> None:
 def test_review_graph_keeps_large_recursion_limit_separate_from_model_budget() -> None:
     """999 只用于 LangGraph 递归保护，模型预算仍由独立参数控制。"""
     assert REVIEW_GRAPH_RECURSION_LIMIT == 999
+
+
+def test_review_graph_reports_real_nodes_attempts_and_terminal_progress() -> None:
+    """复习图必须上报真实节点、模型轮次、修复反馈和最终保存阶段。"""
+    events: list[dict] = []
+
+    def actor(attempt: int, _feedback: list[str]) -> dict:
+        return {"attempt": attempt}
+
+    def observer(candidate: dict) -> dict:
+        if candidate["attempt"] == 1:
+            raise GateError("第一次质量门禁失败")
+        return {"ok": True}
+
+    outcome = run_review_generation_graph(
+        actor=actor,
+        observer=observer,
+        plan={"structuredQuestionCount": 20, "maxCards": 20},
+        max_attempts=3,
+        on_progress=events.append,
+    )
+
+    assert outcome.attempts == 2
+    assert [event["stageCode"] for event in events] == [
+        "review.planner",
+        "review.actor",
+        "review.observer",
+        "review.repair",
+        "review.actor",
+        "review.observer",
+        "review.persist",
+    ]
+    assert [event["attempt"] for event in events if event["stageCode"] == "review.actor"] == [1, 2]
+    assert [event["percent"] for event in events] == sorted(event["percent"] for event in events)
+    assert events[-1]["percent"] == 94

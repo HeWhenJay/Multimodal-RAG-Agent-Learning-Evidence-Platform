@@ -63,6 +63,24 @@ export interface ReviewSyncResult {
   failedMaterialCount: number;
 }
 
+export interface ReviewGenerationProgressEvent {
+  stageCode: string;
+  stageLabel: string;
+  message: string;
+  status: string;
+  currentStep?: number | null;
+  totalSteps?: number | null;
+  percent: number;
+  attempt?: number | null;
+  maxAttempts?: number | null;
+  detail?: string | null;
+  createdAt?: string | null;
+}
+
+export interface ReviewGenerationProgress extends ReviewGenerationProgressEvent {
+  events: ReviewGenerationProgressEvent[];
+}
+
 export interface ReviewMaterial {
   materialId: number;
   id?: number;
@@ -82,6 +100,7 @@ export interface ReviewMaterial {
   cardCount: number;
   generationAttempts?: number;
   qualityFeedback?: string[];
+  generationProgress?: ReviewGenerationProgress | null;
   needsManualReview?: boolean;
   folderId?: number | null;
   folderName?: string | null;

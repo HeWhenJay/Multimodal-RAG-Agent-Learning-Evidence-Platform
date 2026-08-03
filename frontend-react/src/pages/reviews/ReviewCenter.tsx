@@ -56,6 +56,7 @@ import {
   type ReviewCardGroup,
   type ReviewFolder,
   type ReviewGradeResult,
+  type ReviewGenerationProgressEvent,
   type ReviewMaterial,
   type ReviewOverview,
   type ReviewSettings,
@@ -157,6 +158,11 @@ export function ReviewCenter() {
     .filter((materialId): materialId is number => materialId !== null);
   const allMaterialsSelected = selectableMaterialIdList.length > 0
     && selectableMaterialIdList.every((materialId) => Boolean(selectedMaterialIds[materialId]));
+  const pendingMaterialIdList = materials
+    .filter((material) => (material.status || '').toUpperCase() === 'PENDING')
+    .map(resolveMaterialId)
+    .filter((materialId): materialId is number => materialId !== null);
+  const generationPollingActive = syncing || busyMaterialId !== null || reviewFeedbackBusy;
 
   // 同步维护可立即读取的 group 引用，拖拽事件无需等待 React 批量提交状态。
   const updateGroups = useCallback((update: SetStateAction<ReviewCardGroup[]>) => {
@@ -267,6 +273,31 @@ export function ReviewCenter() {
     window.addEventListener(REVIEW_CONTENT_UPDATED_EVENT, refreshGeneratedMaterial);
     return () => window.removeEventListener(REVIEW_CONTENT_UPDATED_EVENT, refreshGeneratedMaterial);
   }, [loadData]);
+
+  // 生成请求仍在执行时单独轮询资料阶段，及时展示 LangGraph 节点、轮次和质量修复反馈。
+  useEffect(() => {
+    if (!generationPollingActive) return undefined;
+    let active = true;
+    let reading = false;
+    const refreshGenerationProgress = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        const result = await fetchReviewMaterials();
+        if (active) setMaterials(result);
+      } catch {
+        // 主同步请求负责最终错误提示，短轮询失败时保留最后一份阶段快照。
+      } finally {
+        reading = false;
+      }
+    };
+    void refreshGenerationProgress();
+    const timer = window.setInterval(refreshGenerationProgress, 1200);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [generationPollingActive]);
 
   // 到期时间和评分日志由服务端维护，页面定时或重新聚焦时刷新概览与分组队列。
   useEffect(() => {
@@ -918,7 +949,8 @@ export function ReviewCenter() {
             <div className="review-material-list">
               {materials.length ? materials.map((material) => {
                 const materialId = resolveMaterialId(material);
-                return <ReviewMaterialRow key={materialId ?? material.title} material={material} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+                const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
+                return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} busy={busyMaterialId === materialId} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
               }) : <p className="panel-empty">暂无已索引资料</p>}
             </div>
           </section>
@@ -1346,10 +1378,68 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
+function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /></label><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
+  const showProgress = ['PENDING', 'GENERATING', 'FAILED', 'NEEDS_REVIEW'].includes((material.status || '').toUpperCase());
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /></label><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p>{showProgress ? <ReviewGenerationProgressPanel material={material} queuePosition={queuePosition} queueTotal={queueTotal} /> : null}</div>;
+}
+
+function ReviewGenerationProgressPanel({ material, queuePosition, queueTotal }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number }) {
+  const normalizedStatus = (material.status || '').toUpperCase();
+  const progress = material.generationProgress;
+  const pending = normalizedStatus === 'PENDING';
+  const terminalWithoutProgress = !progress && ['FAILED', 'NEEDS_REVIEW'].includes(normalizedStatus);
+  const percent = terminalWithoutProgress ? 100 : pending && !progress ? 0 : clampNumber(progress?.percent ?? 0, 0, 100);
+  const stageLabel = progress?.stageLabel || (pending ? '等待队列' : formatGenerationStatus(material.status));
+  const queueLabel = queuePosition && queueTotal ? `当前位于队列第 ${queuePosition}/${queueTotal} 位` : '已进入串行生成队列';
+  const message = progress?.message || (pending ? `${queueLabel}，前一份资料完成后会自动开始` : material.reason || '等待后端更新生成阶段');
+  const events = (progress?.events || []).slice(-6).reverse();
+  const progressState = normalizedStatus === 'FAILED'
+    ? 'failed'
+    : normalizedStatus === 'NEEDS_REVIEW'
+      ? 'manual'
+      : normalizedStatus === 'GENERATING'
+        ? 'running'
+        : 'pending';
+  return (
+    <section className={`review-generation-progress is-${progressState}`} aria-label={`${material.title} 复习生成进度`}>
+      <div className="review-generation-progress-head">
+        <span>{progressState === 'running' ? <Loader2 className="spin" size={12} /> : <Clock3 size={12} />}{stageLabel}</span>
+        <strong>{Math.round(percent)}%</strong>
+      </div>
+      <div className="review-generation-progress-bar" role="progressbar" aria-label="复习卡片生成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(percent)}>
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <p>{message}</p>
+      <div className="review-generation-progress-meta">
+        {progress?.currentStep && progress.totalSteps ? <span>阶段 {progress.currentStep}/{progress.totalSteps}</span> : <span>{pending && queuePosition ? `队列 ${queuePosition}/${queueTotal}` : pending ? '等待自动开始' : terminalWithoutProgress ? '自动流程已结束' : '处理中'}</span>}
+        {typeof progress?.attempt === 'number' && progress.maxAttempts ? <span>模型轮次 {progress.attempt}/{progress.maxAttempts}</span> : null}
+        {progress?.createdAt ? <span>更新于 {formatTime(progress.createdAt)}</span> : null}
+      </div>
+      {progress?.detail ? <small className="review-generation-progress-detail">{progress.detail}</small> : pending && material.reason ? <small className="review-generation-progress-detail">{material.reason}</small> : null}
+      {events.length > 1 ? (
+        <details className="review-generation-progress-events">
+          <summary>查看最近流程（{events.length}）</summary>
+          <ol>
+            {events.map((event, index) => <ReviewGenerationProgressEventRow key={`${event.stageCode}-${event.createdAt || index}-${index}`} event={event} />)}
+          </ol>
+        </details>
+      ) : null}
+    </section>
+  );
+}
+
+function ReviewGenerationProgressEventRow({ event }: { event: ReviewGenerationProgressEvent }) {
+  return <li><span className={`event-dot ${progressEventClass(event.status)}`} /><div><strong>{event.stageLabel}</strong><small>{event.message}{event.attempt && event.maxAttempts ? ` · 第 ${event.attempt}/${event.maxAttempts} 轮` : ''}{event.createdAt ? ` · ${formatTime(event.createdAt)}` : ''}</small></div></li>;
+}
+
+function progressEventClass(status?: string | null) {
+  const normalized = (status || '').toUpperCase();
+  if (normalized === 'FAILED') return 'failed';
+  if (normalized === 'NEEDS_REVIEW') return 'manual';
+  if (normalized === 'COMPLETED' || normalized === 'SKIPPED') return 'completed';
+  return 'running';
 }
 
 // 优先展示 DeepSeek 摘要；失败或跳过时直接展示后端原因，避免“摘要生成中”掩盖真实状态。

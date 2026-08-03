@@ -49,6 +49,7 @@ class ReviewManualReviewRequired(RuntimeError):
 
 Actor = Callable[[int, list[str]], dict[str, Any]]
 Observer = Callable[[dict[str, Any]], Any]
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def configured_review_graph_max_attempts() -> int:
@@ -67,6 +68,7 @@ def run_review_generation_graph(
     observer: Observer,
     plan: dict[str, Any],
     max_attempts: int | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> ReviewGenerationOutcome:
     """执行复习生成图，把质量门禁诊断反馈给下一次模型生成。"""
     bounded_attempts = max_attempts or configured_review_graph_max_attempts()
@@ -89,11 +91,23 @@ def run_review_generation_graph(
         return actor(attempt, feedback)
 
     try:
-        state = build_review_generation_graph(tracked_actor, observer).invoke(
+        state = build_review_generation_graph(tracked_actor, observer, on_progress=on_progress).invoke(
             initial,
             {"recursion_limit": REVIEW_GRAPH_RECURSION_LIMIT},
         )
     except GraphRecursionError as exc:
+        emit_progress(
+            on_progress,
+            stageCode="review.human_review",
+            stageLabel="等待人工处理",
+            message="生成图达到递归上限，已停止自动循环",
+            status="NEEDS_REVIEW",
+            currentStep=4,
+            totalSteps=4,
+            percent=100,
+            attempt=attempts_seen,
+            maxAttempts=bounded_attempts,
+        )
         raise ReviewManualReviewRequired(
             "复习生成图达到最大递归深度，需要人工处理",
             attempts=attempts_seen,
@@ -115,14 +129,19 @@ def run_review_generation_graph(
     )
 
 
-def build_review_generation_graph(actor: Actor, observer: Observer):
+def build_review_generation_graph(
+    actor: Actor,
+    observer: Observer,
+    *,
+    on_progress: ProgressCallback | None = None,
+):
     """构建规划、生成、观察、修复与人工终态组成的复习图。"""
     workflow = StateGraph(ReviewGenerationState)
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("actor", lambda state: actor_node(state, actor))
-    workflow.add_node("observer", lambda state: observer_node(state, observer))
-    workflow.add_node("repair", repair_node)
-    workflow.add_node("human_review", human_review_node)
+    workflow.add_node("planner", lambda state: planner_progress_node(state, on_progress))
+    workflow.add_node("actor", lambda state: actor_progress_node(state, actor, on_progress))
+    workflow.add_node("observer", lambda state: observer_progress_node(state, observer, on_progress))
+    workflow.add_node("repair", lambda state: repair_progress_node(state, on_progress))
+    workflow.add_node("human_review", lambda state: human_review_progress_node(state, on_progress))
 
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "actor")
@@ -139,6 +158,166 @@ def build_review_generation_graph(actor: Actor, observer: Observer):
     )
     workflow.add_edge("human_review", END)
     return workflow.compile()
+
+
+def planner_progress_node(
+    state: ReviewGenerationState,
+    on_progress: ProgressCallback | None,
+) -> ReviewGenerationState:
+    """规划目标并上报图已开始执行。"""
+    result = planner_node(state)
+    plan = dict(state.get("plan") or {})
+    emit_progress(
+        on_progress,
+        stageCode="review.planner",
+        stageLabel="规划生成",
+        message="正在确认资料结构、卡片目标和质量标准",
+        status="RUNNING",
+        currentStep=1,
+        totalSteps=4,
+        percent=18,
+        attempt=0,
+        maxAttempts=int(state.get("max_attempts") or 1),
+        detail=(
+            f"识别到 {int(plan.get('structuredQuestionCount') or 0)} 个原始问题，"
+            f"本轮最多生成 {int(plan.get('maxCards') or 0)} 张卡片"
+        ),
+    )
+    return result
+
+
+def actor_progress_node(
+    state: ReviewGenerationState,
+    actor: Actor,
+    on_progress: ProgressCallback | None,
+) -> ReviewGenerationState:
+    """在模型调用前上报尝试轮次，避免长请求期间界面静默。"""
+    attempt = int(state.get("attempt") or 0) + 1
+    max_attempts = int(state.get("max_attempts") or 1)
+    feedback = unique_feedback(state.get("repair_feedback") or [])
+    emit_progress(
+        on_progress,
+        stageCode="review.actor",
+        stageLabel="DeepSeek 生成",
+        message=f"正在请求 DeepSeek 生成第 {attempt}/{max_attempts} 版复习卡片",
+        status="RUNNING",
+        currentStep=2,
+        totalSteps=4,
+        percent=attempt_percent(attempt, max_attempts, phase=0),
+        attempt=attempt,
+        maxAttempts=max_attempts,
+        detail=(f"本轮将修复：{'；'.join(feedback[:2])}" if feedback else "正在基于清洗后的 evidence 生成摘要、问题、答案和提示"),
+    )
+    return actor_node(state, actor)
+
+
+def observer_progress_node(
+    state: ReviewGenerationState,
+    observer: Observer,
+    on_progress: ProgressCallback | None,
+) -> ReviewGenerationState:
+    """在质量门禁前后上报校验与保存阶段。"""
+    attempt = int(state.get("attempt") or 0)
+    max_attempts = int(state.get("max_attempts") or 1)
+    emit_progress(
+        on_progress,
+        stageCode="review.observer",
+        stageLabel="质量校验",
+        message=f"正在校验第 {attempt}/{max_attempts} 版卡片的完整性与 evidence 忠实度",
+        status="RUNNING",
+        currentStep=3,
+        totalSteps=4,
+        percent=attempt_percent(attempt, max_attempts, phase=1),
+        attempt=attempt,
+        maxAttempts=max_attempts,
+        detail="检查摘要、完整问句、提示、sourceQuestion、evidenceId、逐论断忠实度和问题覆盖率",
+    )
+    result = observer_node(state, observer)
+    if result.get("status") == "COMPLETED":
+        emit_progress(
+            on_progress,
+            stageCode="review.persist",
+            stageLabel="保存卡片",
+            message="质量门禁已通过，正在保存卡片并初始化 FSRS",
+            status="RUNNING",
+            currentStep=4,
+            totalSteps=4,
+            percent=94,
+            attempt=attempt,
+            maxAttempts=max_attempts,
+        )
+    return result
+
+
+def repair_progress_node(
+    state: ReviewGenerationState,
+    on_progress: ProgressCallback | None,
+) -> ReviewGenerationState:
+    """整理质量反馈并说明是否继续自动修复。"""
+    result = repair_node(state)
+    attempt = int(state.get("attempt") or 0)
+    max_attempts = int(state.get("max_attempts") or 1)
+    feedback = unique_feedback(state.get("attempt_feedback") or [])
+    exhausted = result.get("status") == "NEEDS_REVIEW"
+    emit_progress(
+        on_progress,
+        stageCode="review.repair",
+        stageLabel="自动修复" if not exhausted else "自动修复已耗尽",
+        message=(
+            f"第 {attempt}/{max_attempts} 版未通过，正在把质量反馈送入下一轮"
+            if not exhausted
+            else f"第 {attempt}/{max_attempts} 版仍未通过，准备转入人工处理"
+        ),
+        status="RUNNING" if not exhausted else "NEEDS_REVIEW",
+        currentStep=3,
+        totalSteps=4,
+        percent=attempt_percent(attempt, max_attempts, phase=2),
+        attempt=attempt,
+        maxAttempts=max_attempts,
+        detail="；".join(feedback[:3]) or "模型结果未达到发布条件",
+    )
+    return result
+
+
+def human_review_progress_node(
+    state: ReviewGenerationState,
+    on_progress: ProgressCallback | None,
+) -> ReviewGenerationState:
+    """自动预算耗尽时上报稳定人工终态。"""
+    result = human_review_node(state)
+    attempt = int(state.get("attempt") or 0)
+    max_attempts = int(state.get("max_attempts") or 1)
+    emit_progress(
+        on_progress,
+        stageCode="review.human_review",
+        stageLabel="等待人工处理",
+        message=f"自动修复 {attempt} 次后仍未通过，请补充说明后重新生成",
+        status="NEEDS_REVIEW",
+        currentStep=4,
+        totalSteps=4,
+        percent=100,
+        attempt=attempt,
+        maxAttempts=max_attempts,
+    )
+    return result
+
+
+def attempt_percent(attempt: int, max_attempts: int, *, phase: int) -> int:
+    """按轮次和节点位置提供不会在下一轮回退的进度。"""
+    bounded_max = max(1, max_attempts)
+    bounded_attempt = max(1, min(attempt, bounded_max))
+    bounded_phase = max(0, min(2, phase))
+    completed_units = ((bounded_attempt - 1) * 3) + bounded_phase
+    return min(90, 25 + round((completed_units / (bounded_max * 3)) * 65))
+
+
+def emit_progress(
+    callback: ProgressCallback | None,
+    **event: Any,
+) -> None:
+    """在配置回调时同步发送一条结构化阶段事件。"""
+    if callback is not None:
+        callback(dict(event))
 
 
 def planner_node(state: ReviewGenerationState) -> ReviewGenerationState:

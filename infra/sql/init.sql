@@ -234,6 +234,7 @@ CREATE TABLE learning_evidence.learning_review_material (
     card_count INTEGER NOT NULL DEFAULT 0,
     generation_attempts INTEGER NOT NULL DEFAULT 0,
     quality_feedback JSONB NOT NULL DEFAULT '[]'::jsonb,
+    generation_progress JSONB NOT NULL DEFAULT '{}'::jsonb,
     generated_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,

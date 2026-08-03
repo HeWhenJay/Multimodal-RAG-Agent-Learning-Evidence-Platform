@@ -222,8 +222,32 @@ def test_sync_candidates_include_outdated_extractor_versions() -> None:
     assert transaction.list_sync_candidates("7", 3) == []
     assert "rm.extractor NOT IN (%s, %s)" in cursor.statement
     assert "INTERVAL '5 minutes'" in cursor.statement
+    assert "rm.status = 'GENERATING'" in cursor.statement
+    assert "INTERVAL '20 minutes'" in cursor.statement
     assert "learning_review_material_exclusion" in cursor.statement
     assert cursor.params == ("7", *CURRENT_REVIEW_EXTRACTORS, 3)
+
+
+def test_current_generation_requires_a_stable_terminal_status() -> None:
+    """同版本同提取器仍处于 GENERATING 时不能被误判为已完成。"""
+    base = ReviewMaterialRecord(
+        material_id=12,
+        title="Kafka 高可用",
+        document_type="mp4",
+        material_status="READY",
+        is_learning_content=True,
+        category="技术原理",
+        status="GENERATED",
+        reason=None,
+        extractor=CURRENT_REVIEW_EXTRACTORS[0],
+        card_count=3,
+        index_request_version=1,
+        synced_index_request_version=1,
+        updated_at=NOW,
+    )
+
+    assert material_generation_is_current(base, 1) is True
+    assert material_generation_is_current(replace(base, status="GENERATING"), 1) is False
 
 
 def test_material_queries_only_expose_deepseek_review_summary() -> None:
@@ -246,6 +270,7 @@ def test_material_queries_only_expose_deepseek_review_summary() -> None:
     assert "ELSE NULL" in cursor.statement
     assert "lm.document_summary" not in cursor.statement
     assert "learning_review_folder_material" in cursor.statement
+    assert "generation_progress" in cursor.statement
 
 
 class SummaryGenerationTransaction:
@@ -332,6 +357,7 @@ def test_generation_always_persists_deepseek_review_summary(
     assert result.summary == "提炼生成的摘要"
     assert transaction.saved is not None
     assert transaction.saved["summary"] == "提炼生成的摘要"
+    assert transaction.saved["generation_progress_event"]["stageCode"] == "review.skipped"
 
 
 def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
@@ -360,6 +386,7 @@ def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert transaction.saved is not None
     assert transaction.saved["extractor"] == "failed:review-card-v9"
     assert transaction.saved["cards"] == []
+    assert transaction.saved["generation_progress_event"]["stageCode"] == "review.failed"
 
 
 def test_unexpected_extractor_failure_is_persisted_instead_of_remaining_pending() -> None:

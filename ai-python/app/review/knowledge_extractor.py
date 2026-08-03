@@ -12,7 +12,9 @@ from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
 from app.review.generation_graph import (
+    ProgressCallback,
     ReviewManualReviewRequired,
+    emit_progress,
     run_review_generation_graph,
 )
 from app.schemas.rag import Evidence
@@ -124,6 +126,7 @@ class KnowledgePointExtractor:
         evidences: list[Evidence],
         *,
         user_feedback: str | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> ExtractionResult:
         """只根据 evidence 运行多轮 DeepSeek 生成图，失败时不发布降级内容。"""
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
@@ -151,6 +154,19 @@ class KnowledgePointExtractor:
         try:
             source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
             usable = select_review_prompt_evidences(cleaned, source_questions)
+            emit_progress(
+                progress_callback,
+                stageCode="review.evidence",
+                stageLabel="整理证据",
+                message="已完成 evidence 清洗，正在提取原始问题并准备模型上下文",
+                status="RUNNING",
+                currentStep=1,
+                totalSteps=4,
+                percent=12,
+                attempt=0,
+                maxAttempts=None,
+                detail=f"清洗后保留 {len(cleaned)} 条 evidence，选取 {len(usable)} 条，识别 {len(source_questions)} 个原始问题",
+            )
             outcome = run_review_generation_graph(
                 actor=lambda attempt, feedback: self._generate_model_payload(
                     material,
@@ -173,6 +189,7 @@ class KnowledgePointExtractor:
                     "maxCards": review_card_limit(source_questions),
                     "hasUserFeedback": bool((user_feedback or "").strip()),
                 },
+                on_progress=progress_callback,
             )
             modeled = outcome.result
             return replace(

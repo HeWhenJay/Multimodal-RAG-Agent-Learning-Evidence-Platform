@@ -65,6 +65,7 @@ class ReviewMaterialRecord:
     folder_name: str | None = None
     generation_attempts: int = 0
     quality_feedback: tuple[str, ...] = ()
+    generation_progress: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,13 @@ class ReviewTransaction(Protocol):
         cards: list[ReviewCardDraft],
         generation_attempts: int = 0,
         quality_feedback: list[str] | tuple[str, ...] = (),
+        generation_progress_event: dict[str, Any] | None = None,
+    ) -> ReviewMaterialRecord | None: ...
+
+    def save_generation_progress(
+        self,
+        material: MaterialSourceRecord,
+        event: dict[str, Any],
     ) -> ReviewMaterialRecord | None: ...
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]: ...
@@ -315,15 +323,24 @@ class DatabaseReviewTransaction:
                   )
                   AND (
                       rm.material_id IS NULL
-                      OR rm.index_request_version < lm.index_request_version
-                      OR rm.extractor IS NULL
                       OR (
-                          rm.extractor NOT IN (%s, %s)
+                          rm.status = 'GENERATING'
+                          AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
+                      )
+                      OR (
+                          COALESCE(rm.status, 'PENDING') <> 'GENERATING'
                           AND (
-                              rm.status NOT IN ('FAILED', 'NEEDS_REVIEW')
+                              rm.index_request_version < lm.index_request_version
+                              OR rm.extractor IS NULL
                               OR (
-                                  rm.status = 'FAILED'
-                                  AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                                  rm.extractor NOT IN (%s, %s)
+                                  AND (
+                                      rm.status NOT IN ('FAILED', 'NEEDS_REVIEW')
+                                      OR (
+                                          rm.status = 'FAILED'
+                                          AND rm.updated_at <= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                                      )
+                                  )
                               )
                           )
                       )
@@ -396,6 +413,72 @@ class DatabaseReviewTransaction:
         )
         return [self._to_evidence(row, material.id) for row in self._cursor.fetchall()]
 
+    def save_generation_progress(
+        self,
+        material: MaterialSourceRecord,
+        event: dict[str, Any],
+    ) -> ReviewMaterialRecord | None:
+        """按资料行锁追加一条生成事件，并把当前状态标记为真实运行中。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.index_request_version,
+                       rm.generation_progress,
+                       EXISTS (
+                           SELECT 1
+                           FROM {schema}.learning_review_material_exclusion excluded_material
+                           WHERE excluded_material.material_id = lm.id
+                             AND excluded_material.user_id = lm.user_id
+                       ) AS review_excluded
+                FROM {schema}.learning_material lm
+                LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = lm.id
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        current_material = self._cursor.fetchone()
+        if current_material is None or bool(current_material.get("review_excluded")):
+            return None
+        if int(current_material.get("index_request_version") or 0) != material.index_request_version:
+            return self._find_review_material(material.id, material.user_id)
+        progress = merge_generation_progress(current_material.get("generation_progress"), event)
+        attempt = max(0, int(event.get("attempt") or 0))
+        message = " ".join(str(event.get("message") or "复习内容生成中").split()).strip()[:500]
+        self._cursor.execute(
+            self._statement(
+                """
+                INSERT INTO {schema}.learning_review_material (
+                    material_id, user_id, index_request_version, status, reason,
+                    card_count, generation_attempts, quality_feedback, generation_progress
+                )
+                VALUES (%s, %s, %s, 'GENERATING', %s, 0, %s, '[]'::jsonb, %s::jsonb)
+                ON CONFLICT (material_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    index_request_version = EXCLUDED.index_request_version,
+                    status = 'GENERATING',
+                    reason = EXCLUDED.reason,
+                    generation_attempts = EXCLUDED.generation_attempts,
+                    generation_progress = EXCLUDED.generation_progress,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE {schema}.learning_review_material.index_request_version <= EXCLUDED.index_request_version
+                RETURNING id
+                """
+            ),
+            (
+                material.id,
+                material.user_id,
+                material.index_request_version,
+                message,
+                attempt,
+                json.dumps(progress, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+        if self._cursor.fetchone() is None:
+            return self._find_review_material(material.id, material.user_id)
+        return self._find_review_material(material.id, material.user_id)
+
     def save_generation(
         self,
         material: MaterialSourceRecord,
@@ -409,12 +492,14 @@ class DatabaseReviewTransaction:
         cards: list[ReviewCardDraft],
         generation_attempts: int = 0,
         quality_feedback: list[str] | tuple[str, ...] = (),
+        generation_progress_event: dict[str, Any] | None = None,
     ) -> ReviewMaterialRecord | None:
         """更新分类并按稳定来源键刷新正文，已有卡片不重置 FSRS 状态。"""
         self._cursor.execute(
             self._statement(
                 """
                 SELECT lm.index_request_version,
+                       rm.generation_progress,
                        EXISTS (
                            SELECT 1
                            FROM {schema}.learning_review_material_exclusion excluded_material
@@ -422,6 +507,7 @@ class DatabaseReviewTransaction:
                              AND excluded_material.user_id = lm.user_id
                        ) AS review_excluded
                 FROM {schema}.learning_material lm
+                LEFT JOIN {schema}.learning_review_material rm ON rm.material_id = lm.id
                 WHERE lm.id = %s AND lm.user_id = %s
                 FOR UPDATE OF lm
                 """
@@ -439,15 +525,19 @@ class DatabaseReviewTransaction:
             if current is not None:
                 return current
             raise RuntimeError("保存复习卡片时资料索引版本已变化")
+        generation_progress = merge_generation_progress(
+            current_material.get("generation_progress"),
+            generation_progress_event,
+        )
         self._cursor.execute(
             self._statement(
                 """
                 INSERT INTO {schema}.learning_review_material (
                     material_id, user_id, index_request_version, is_learning_content,
                     category, summary, status, reason, extractor, card_count, generated_at
-                    , generation_attempts, quality_feedback
+                    , generation_attempts, quality_feedback, generation_progress
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP, %s, %s::jsonb)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP, %s, %s::jsonb, %s::jsonb)
                 ON CONFLICT (material_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     index_request_version = EXCLUDED.index_request_version,
@@ -459,6 +549,7 @@ class DatabaseReviewTransaction:
                     extractor = EXCLUDED.extractor,
                     generation_attempts = EXCLUDED.generation_attempts,
                     quality_feedback = EXCLUDED.quality_feedback,
+                    generation_progress = EXCLUDED.generation_progress,
                     generated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE {schema}.learning_review_material.index_request_version <= EXCLUDED.index_request_version
@@ -477,6 +568,7 @@ class DatabaseReviewTransaction:
                 extractor,
                 max(0, int(generation_attempts)),
                 json.dumps(list(quality_feedback), ensure_ascii=False, separators=(",", ":")),
+                json.dumps(generation_progress, ensure_ascii=False, separators=(",", ":")),
             ),
         )
         inserted_row = self._cursor.fetchone()
@@ -1439,21 +1531,29 @@ class DatabaseReviewTransaction:
                 lm.status AS material_status, lm.index_request_version,
                 rm.index_request_version AS synced_index_request_version,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN NULL
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN rm.is_learning_content
                     ELSE NULL
                 END AS is_learning_content,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN NULL
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN rm.category
                     ELSE NULL
                 END AS category,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN 'GENERATING'
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN COALESCE(rm.status, 'PENDING')
                     ELSE 'PENDING'
                 END AS review_status,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN rm.reason
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN rm.reason
                     WHEN rm.material_id IS NOT NULL
@@ -1461,6 +1561,8 @@ class DatabaseReviewTransaction:
                     ELSE NULL
                 END AS reason,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN 0
                     WHEN rm.extractor = {{current_model_extractor}}
                         THEN COALESCE(rm.card_count, 0)
                     ELSE 0
@@ -1469,20 +1571,33 @@ class DatabaseReviewTransaction:
                 review_folder_material.folder_id,
                 review_folder.name AS folder_name,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN NULL
                     WHEN rm.extractor = {{current_model_extractor}}
                         THEN rm.summary
                     ELSE NULL
                 END AS material_summary,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN COALESCE(rm.generation_attempts, 0)
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN COALESCE(rm.generation_attempts, 0)
                     ELSE 0
                 END AS generation_attempts,
                 CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN '[]'::jsonb
                     WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
                         THEN COALESCE(rm.quality_feedback, '[]'::jsonb)
                     ELSE '[]'::jsonb
                 END AS quality_feedback,
+                CASE
+                    WHEN rm.status = 'GENERATING' AND rm.index_request_version = lm.index_request_version
+                        THEN COALESCE(rm.generation_progress, '{{{{}}}}'::jsonb)
+                    WHEN rm.extractor IN ({{current_model_extractor}}, {{current_empty_extractor}}, {{current_failed_extractor}})
+                        THEN COALESCE(rm.generation_progress, '{{{{}}}}'::jsonb)
+                    ELSE '{{{{}}}}'::jsonb
+                END AS generation_progress,
                 COALESCE(rm.updated_at, lm.updated_at) AS review_updated_at
             FROM {{schema}}.learning_material lm
             LEFT JOIN {{schema}}.learning_review_material rm ON rm.material_id = lm.id
@@ -1595,6 +1710,16 @@ class DatabaseReviewTransaction:
                 parsed_quality_feedback = []
         else:
             parsed_quality_feedback = raw_quality_feedback
+        raw_generation_progress = row.get("generation_progress") or {}
+        if isinstance(raw_generation_progress, str):
+            try:
+                parsed_generation_progress = json.loads(raw_generation_progress)
+            except (TypeError, ValueError):
+                parsed_generation_progress = {}
+        else:
+            parsed_generation_progress = raw_generation_progress
+        if not isinstance(parsed_generation_progress, dict):
+            parsed_generation_progress = {}
         return ReviewMaterialRecord(
             material_id=int(row["material_id"]),
             title=str(row["title"]),
@@ -1622,6 +1747,7 @@ class DatabaseReviewTransaction:
                 for item in parsed_quality_feedback
                 if str(item).strip()
             ),
+            generation_progress=(dict(parsed_generation_progress) if parsed_generation_progress else None),
         )
 
     @staticmethod
@@ -1771,3 +1897,28 @@ def json_text(value: object, default: str) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def merge_generation_progress(
+    current: object,
+    event: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """把当前阶段与最近十二条事件合并为有界 JSONB 快照。"""
+    if isinstance(current, str):
+        try:
+            parsed = json.loads(current)
+        except (TypeError, ValueError):
+            parsed = {}
+    else:
+        parsed = current
+    snapshot = dict(parsed) if isinstance(parsed, dict) else {}
+    if not event:
+        return snapshot
+    normalized = {key: value for key, value in event.items() if value is not None and key != "events"}
+    for key in ("stageCode", "stageLabel", "message", "status", "detail"):
+        if key in normalized:
+            normalized[key] = " ".join(str(normalized[key]).split()).strip()[:500]
+    previous_events = snapshot.get("events")
+    events = [dict(item) for item in previous_events if isinstance(item, dict)] if isinstance(previous_events, list) else []
+    events.append(dict(normalized))
+    return {**normalized, "events": events[-12:]}

@@ -101,3 +101,13 @@ def test_review_generation_repair_state_migration_is_registered() -> None:
     assert "ADD COLUMN IF NOT EXISTS generation_attempts INTEGER" in sql
     assert "ADD COLUMN IF NOT EXISTS quality_feedback JSONB" in sql
     assert "NEEDS_REVIEW" in sql
+
+
+def test_review_generation_progress_migration_is_registered() -> None:
+    """复习生成阶段快照必须进入启动迁移并提供 JSONB 默认值。"""
+    filename = "20260803_0300_add_review_generation_progress.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "ADD COLUMN IF NOT EXISTS generation_progress JSONB" in sql
+    assert "DEFAULT '{}'::jsonb" in sql

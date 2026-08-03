@@ -33,6 +33,7 @@
 - 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—生成—质量观察—修复”循环，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。图的 `recursion_limit` 固定为 `999`，真实模型调用默认最多 `6` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
 - `DEEPSEEK_API_KEY` 缺失等不可执行错误写入 `FAILED`。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
 - `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
+- 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、DeepSeek 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
 - 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v9`；v9 保留本地学习内容前置过滤、DeepSeek-only 内容生成边界、结构化原始问题完整保留和逐论断答案忠实度门禁，并新增当前尝试轮次、上一轮质量反馈与用户补充说明。句号分隔的内容以及逗号后由“此外”“并且”“同时”“它使用/采用/通过”等连接词引出的新增事实都必须由所引用 evidence 支撑。业务模块只负责送模决策、清洗输入、校验结构、验证 evidence 引用和拒绝低质量结果，不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
@@ -209,6 +210,20 @@ Authorization: Bearer <token>
   "cardCount": 4,
   "generationAttempts": 2,
   "qualityFeedback": ["第 1 次：卡片 2 的答案未通过 evidence 忠实度校验"],
+  "generationProgress": {
+    "stageCode": "review.observer",
+    "stageLabel": "质量校验",
+    "message": "正在校验第 2/6 版卡片的完整性与 evidence 忠实度",
+    "status": "RUNNING",
+    "currentStep": 3,
+    "totalSteps": 4,
+    "percent": 46,
+    "attempt": 2,
+    "maxAttempts": 6,
+    "detail": "检查摘要、完整问句、提示、sourceQuestion、evidenceId、逐论断忠实度和问题覆盖率",
+    "createdAt": "2026-08-03T21:30:00+08:00",
+    "events": []
+  },
   "needsManualReview": false,
   "folderId": 7,
   "folderName": "Python 面试",
@@ -217,7 +232,7 @@ Authorization: Bearer <token>
 }
 ```
 
-`status` 可能为 `PENDING`、`GENERATING`、`GENERATED`、`SKIPPED`、`FAILED` 或 `NEEDS_REVIEW`。`NEEDS_REVIEW` 表示自动修复已经耗尽，前端应展示质量反馈并提供人工说明输入框。用户再次生成时可以发送：
+`status` 可能为 `PENDING`、`GENERATING`、`GENERATED`、`SKIPPED`、`FAILED` 或 `NEEDS_REVIEW`。`PENDING` 表示位于串行队列，`GENERATING` 表示后端已真正开始执行；前端可轮询 `GET /api/reviews/materials` 展示 `generationProgress`。`NEEDS_REVIEW` 表示自动修复已经耗尽，前端应展示质量反馈并提供人工说明输入框。用户再次生成时可以发送：
 
 ```http
 POST /api/reviews/materials/12/generate
