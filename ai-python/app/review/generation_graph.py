@@ -234,7 +234,7 @@ def observer_progress_node(
         percent=attempt_percent(attempt, max_attempts, phase=1),
         attempt=attempt,
         maxAttempts=max_attempts,
-        detail="检查摘要、完整问句、提示、sourceQuestion、evidenceId、逐论断忠实度和问题覆盖率",
+        detail="检查摘要、卡面回忆提示、evidenceId、逐论断忠实度和结构化知识覆盖率",
     )
     result = observer_node(state, observer)
     if result.get("status") == "COMPLETED":
@@ -329,7 +329,7 @@ def planner_node(state: ReviewGenerationState) -> ReviewGenerationState:
     plan = dict(state.get("plan") or {})
     plan["completionCriteria"] = [
         "资料摘要通过质量校验",
-        "至少一张卡片通过问题、提示和 evidence 门禁",
+        "至少一张卡片通过卡面回忆提示、hint 和 evidence 门禁",
         "结构化原始问题达到完整覆盖要求",
     ]
     return {"plan": plan, "status": "GENERATING"}

@@ -374,16 +374,24 @@ class KnowledgePointExtractor:
             if is_noise_fragment(answer) or not answer_is_grounded(answer, refs):
                 diagnostics.append(f"{label} 的 answer 含噪声或未通过逐论断 evidence 忠实度校验")
                 continue
-            raw_source_question = compact_text(raw.get("sourceQuestion"), 180)
-            source_question = validated_source_question(raw_source_question, refs, question_candidates)
-            if raw_source_question and source_question is None:
-                diagnostics.append(f"{label} 的 sourceQuestion 不是所引用 evidence 中的原始问句候选")
-                continue
             question = compact_text(raw.get("question"), 180)
             hint = compact_text(raw.get("hint"), 180)
             if not question or not is_high_quality_review_question(question):
-                diagnostics.append(f"{label} 的 question 不是主题明确、自包含且以问号结尾的完整疑问句")
+                diagnostics.append(f"{label} 的 question 不是主题明确、自包含的疑问句或主动回忆指令")
                 continue
+            raw_source_question = compact_text(raw.get("sourceQuestion"), 180)
+            source_question = resolve_source_question(
+                raw_source_question,
+                refs,
+                question_candidates,
+                review_question=question,
+            )
+            if raw_source_question and source_question != raw_source_question:
+                logger.info(
+                    "复习卡片忽略了无法按资料问题候选核对的 sourceQuestion：material_id=%s card=%s",
+                    material.material_id,
+                    card_index,
+                )
             if not hint or not is_high_quality_review_hint(hint):
                 diagnostics.append(f"{label} 的 hint 为空、过于泛化或直接包含无效占位内容")
                 continue
@@ -794,6 +802,92 @@ def validated_source_question(
     return None
 
 
+def resolve_source_question(
+    value: object,
+    evidence_refs: tuple[Evidence, ...],
+    candidates: list[dict[str, str]],
+    *,
+    review_question: str,
+) -> str | None:
+    """把 sourceQuestion 作为资料级可选审计信息，问题与答案允许位于相邻 evidence。"""
+    validated = validated_source_question(value, evidence_refs, candidates)
+    if validated:
+        return validated
+    requested = compact_text(value, 180)
+    requested_key = normalized_sentence(requested or "")
+    for candidate in candidates:
+        candidate_question = compact_text(candidate.get("question"), 180)
+        if (
+            candidate_question
+            and requested_key
+            and normalized_sentence(candidate_question) == requested_key
+            and is_meaningful_source_question(candidate_question)
+            and source_question_similarity(review_question, candidate_question) >= 0.18
+        ):
+            return candidate_question
+    global_match = best_matching_source_question(review_question, candidates)
+    if global_match:
+        return global_match
+    evidence_ids = {reference.evidenceId for reference in evidence_refs}
+    referenced = [
+        question
+        for candidate in candidates
+        if candidate.get("evidenceId") in evidence_ids
+        and (question := compact_text(candidate.get("question"), 180))
+        and is_meaningful_source_question(question)
+    ]
+    if len(referenced) == 1:
+        return referenced[0]
+    if not referenced:
+        return None
+    # 一个切块含多个原问句时，只在卡面与其中一项有明确字符重合且最优项唯一时自动关联。
+    scored = sorted(
+        (
+            source_question_similarity(review_question, candidate),
+            index,
+            candidate,
+        )
+        for index, candidate in enumerate(referenced)
+    )
+    best_score, _best_index, best = scored[-1]
+    second_score = scored[-2][0] if len(scored) > 1 else 0.0
+    return best if best_score >= 0.18 and best_score > second_score else None
+
+
+def best_matching_source_question(
+    review_question: str,
+    candidates: list[dict[str, str]],
+) -> str | None:
+    """从整份资料问题清单推断唯一主题匹配项，解除问题与答案必须同切块的限制。"""
+    questions = [
+        question
+        for candidate in candidates
+        if (question := compact_text(candidate.get("question"), 180))
+        and is_meaningful_source_question(question)
+    ]
+    if not questions:
+        return None
+    scored = sorted(
+        (source_question_similarity(review_question, candidate), index, candidate)
+        for index, candidate in enumerate(questions)
+    )
+    best_score, _best_index, best = scored[-1]
+    second_score = scored[-2][0] if len(scored) > 1 else 0.0
+    return best if best_score >= 0.18 and best_score > second_score else None
+
+
+def source_question_similarity(left: str, right: str) -> float:
+    """用中文字符二元组比较卡面与同一 evidence 内的多个原始问题。"""
+    left_key = normalized_sentence(left)
+    right_key = normalized_sentence(right)
+    if not left_key or not right_key:
+        return 0.0
+    left_grams = {left_key[index : index + 2] for index in range(max(1, len(left_key) - 1))}
+    right_grams = {right_key[index : index + 2] for index in range(max(1, len(right_key) - 1))}
+    union = left_grams | right_grams
+    return len(left_grams & right_grams) / len(union) if union else 0.0
+
+
 def normalize_generated_summary(value: object) -> str | None:
     """只清洗并校验 DeepSeek 摘要，不从 evidence 或本地规则补写内容。"""
     summary = compact_text(value, 500)
@@ -808,12 +902,14 @@ def normalize_generated_summary(value: object) -> str | None:
 
 
 def is_high_quality_review_question(value: str) -> bool:
-    """拒绝无上下文指代、陈述句、转场句和泛化占位题。"""
+    """接受完整疑问或主动回忆指令，问号仅作展示标点而非发布门禁。"""
     question = " ".join(str(value or "").split()).strip()
     normalized = normalized_sentence(question)
-    if not question.endswith(("?", "？")) or not 8 <= len(normalized) <= 180:
+    if not 8 <= len(normalized) <= 180:
         return False
     if contains_review_artifact(question) or is_noise_fragment(question):
+        return False
+    if re.match(r"^(?:就|还|接下来|下面|首先)?(?:必须|需要|要)?(?:先)?(?:搞定|来看|看看|讲解|学习)", question):
         return False
     if re.match(
         r"^(?:那|那么|然后|所以|这时|这时候|这个|这些|那这些|它|其|这里|那里|上述|前面|刚才|"
@@ -827,13 +923,16 @@ def is_high_quality_review_question(value: str) -> bool:
         question,
     ):
         return False
-    return bool(
-        re.search(
-            r"什么|为什么|为何|如何|怎么|怎样|哪些|哪一种|哪种|哪个|是否|能否|有何|有什么|"
-            r"区别|作用|含义|机制|流程|条件|场景|原因|由谁|由什么|通过什么|分别",
-            question,
-        )
+    question_form = re.search(
+        r"什么|为什么|为何|如何|怎么|怎样|哪些|哪一种|哪种|哪个|是否|能否|有何|有什么|"
+        r"区别|作用|含义|机制|流程|条件|场景|原因|由谁|由什么|通过什么|分别",
+        question,
     )
+    recall_instruction = re.match(
+        r"^(?:请)?(?:说明|解释|概述|列出|比较|分析|描述|总结|梳理|阐述|指出|回忆)\s*",
+        question,
+    )
+    return bool(question_form or recall_instruction)
 
 
 def is_high_quality_review_hint(value: str) -> bool:

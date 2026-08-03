@@ -17,6 +17,7 @@ from app.review.knowledge_extractor import (
     clean_content_text,
     clean_section_name,
     classify_learning_content,
+    best_matching_source_question,
     extract_source_question_candidates,
     extract_source_questions,
     is_generic_speech_cue,
@@ -271,8 +272,8 @@ def test_source_question_is_audited_but_final_question_uses_deepseek_polished_te
     assert result.knowledge_points[0].question == "Kafka 为什么能在 Leader 故障后继续提供分区服务？"
 
 
-def test_unreferenced_source_question_causes_quality_failure() -> None:
-    """模型声称沿用的原问句不属于引用 evidence 时，整张坏卡不得发布。"""
+def test_unreferenced_source_question_is_recovered_from_referenced_evidence() -> None:
+    """sourceQuestion 填错时按引用 evidence 恢复，不能拖死内容合格的卡片。"""
     extractor = KnowledgePointExtractor(provider="deepseek")
     first = evidence(
         "material-12-first",
@@ -285,26 +286,71 @@ def test_unreferenced_source_question_causes_quality_failure() -> None:
         "ISR 为什么影响 Leader 选举？ISR 保存与 Leader 保持同步的副本集合。",
     )
 
-    with pytest.raises(ReviewExtractionError, match="质量门禁"):
-        extractor._validate_model_result(
-            LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
-            [first, second],
-            {
-                "isLearningContent": True,
-                "category": "课程复习",
-                "reason": "包含核心机制",
-                "summary": "资料讲解 Kafka 的副本机制与 ISR 选举范围，并说明二者在故障恢复中的作用。",
-                "cards": [
-                    {
-                        "question": "Kafka 的副本机制在节点故障时有什么作用？",
-                        "sourceQuestion": "ISR 为什么影响 Leader 选举？",
-                        "answer": "多个副本用于在节点故障时保留分区数据。",
-                        "hint": "关注节点故障后的分区数据保留方式",
-                        "evidenceIds": ["material-12-first"],
-                    }
-                ],
-            },
-        )
+    result = extractor._validate_model_result(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [first, second],
+        {
+            "isLearningContent": True,
+            "category": "课程复习",
+            "reason": "包含核心机制",
+            "summary": "资料讲解 Kafka 的副本机制与 ISR 选举范围，并说明二者在故障恢复中的作用。",
+            "cards": [
+                {
+                    "question": "Kafka 的副本机制在节点故障时有什么作用？",
+                    "sourceQuestion": "ISR 为什么影响 Leader 选举？",
+                    "answer": "多个副本用于在节点故障时保留分区数据。",
+                    "hint": "关注节点故障后的分区数据保留方式",
+                    "evidenceIds": ["material-12-first"],
+                }
+            ],
+        },
+    )
+
+    assert [point.question for point in result.knowledge_points] == ["Kafka 的副本机制在节点故障时有什么作用？"]
+
+
+def test_source_question_and_answer_may_use_neighboring_evidences() -> None:
+    """视频问题与答案落在相邻切块时仍应保留资料级 sourceQuestion 映射。"""
+    question_evidence = evidence(
+        "material-12-question",
+        "副本",
+        "Kafka 为什么需要多个副本？",
+    )
+    answer_evidence = evidence(
+        "material-12-answer",
+        "副本",
+        "多个副本用于在节点故障时保留分区数据。",
+    )
+    source_questions = extract_source_question_candidates([question_evidence, answer_evidence])
+    result = KnowledgePointExtractor(provider="deepseek")._validate_model_result(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [question_evidence, answer_evidence],
+        {
+            "summary": "资料讲解 Kafka 副本在节点故障时保留分区数据的作用，并给出了对应面试问题。",
+            "cards": [
+                {
+                    "question": "Kafka 为什么需要多个副本",
+                    "sourceQuestion": "Kafka 为什么需要多个副本？",
+                    "answer": "多个副本用于在节点故障时保留分区数据。",
+                    "hint": "关注节点故障后的数据保留方式",
+                    "evidenceIds": ["material-12-answer"],
+                }
+            ],
+        },
+        source_questions=source_questions,
+    )
+
+    assert result.knowledge_points[0].question == "Kafka 为什么需要多个副本"
+
+
+def test_source_question_can_be_inferred_when_model_returns_null() -> None:
+    """模型不填写审计字段时，可按最终卡面从资料级问题清单确定性恢复。"""
+    candidates = [
+        {"evidenceId": "question-1", "question": "Kafka 为什么需要多个副本？"},
+        {"evidenceId": "question-2", "question": "ISR 为什么影响 Leader 选举？"},
+    ]
+
+    assert best_matching_source_question("Kafka 为什么需要多个副本", candidates) == "Kafka 为什么需要多个副本？"
 
 
 @pytest.mark.parametrize(
@@ -319,16 +365,33 @@ def test_unreferenced_source_question_causes_quality_failure() -> None:
         "这段主要讲了什么？",
     ],
 )
-def test_quality_gate_rejects_contextless_or_non_question_cards(question: str) -> None:
-    """用户反馈的无上下文代词、父段摘要和陈述句必须全部被拒绝。"""
+def test_quality_gate_rejects_contextless_or_non_recall_cards(question: str) -> None:
+    """无上下文代词、父段摘要和转场陈述仍不能成为卡面。"""
     assert is_high_quality_review_question(question) is False
 
 
 def test_quality_gate_accepts_self_contained_core_questions() -> None:
-    """围绕视频明确重点形成的完整问题应通过门禁。"""
+    """完整疑问句不再依赖结尾问号，主动回忆指令也可发布。"""
     assert is_high_quality_review_question("事务的隔离性如何由锁和 MVCC 共同保证？") is True
+    assert is_high_quality_review_question("事务的隔离性如何由锁和 MVCC 共同保证") is True
     assert is_high_quality_review_question("MVCC 的隐藏字段、undo log 与 Read View 如何协作？") is True
     assert is_high_quality_review_question("RC 与 RR 隔离级别生成 Read View 的时机有什么区别？") is True
+    assert is_high_quality_review_question("说明 Kafka 页缓存提升读写性能的机制") is True
+    assert is_high_quality_review_question("Kafka 使用页缓存把磁盘访问变为内存访问。") is False
+
+
+def test_model_card_without_question_mark_passes_complete_validation() -> None:
+    """卡片不应只因 DeepSeek 漏写问号而被丢弃或触发下一轮。"""
+    payload = valid_payload()
+    payload["cards"][0]["question"] = "Kafka 的 ISR 在 Leader 故障转移中起什么作用"
+
+    result = KnowledgePointExtractor(provider="deepseek")._validate_model_result(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。")],
+        payload,
+    )
+
+    assert result.knowledge_points[0].question == "Kafka 的 ISR 在 Leader 故障转移中起什么作用"
 
 
 def test_source_question_candidates_ignore_parent_summary_and_ocr() -> None:
