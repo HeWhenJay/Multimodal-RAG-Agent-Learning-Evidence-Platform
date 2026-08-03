@@ -915,7 +915,7 @@
 
 .review-material-row {
   display: grid;
-  grid-template-columns: 16px 28px minmax(0, 1fr) auto 60px;
+  grid-template-columns: 24px 28px minmax(0, 1fr) auto 60px;
   align-items: center;
   gap: 8px;
   min-height: 84px;
@@ -927,8 +927,29 @@
   background: #f7f7ff;
 }
 
+.material-row-selector-hitbox {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.material-row-selector-hitbox:hover {
+  background: #eef2ff;
+}
+
+.material-row-selector-hitbox:focus-within {
+  outline: 2px solid #a5b4fc;
+  outline-offset: 1px;
+}
+
 .material-row-selector {
-  align-self: center;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #4f46e5;
 }
 
 .material-row-actions {
@@ -992,6 +1013,7 @@
 .material-status.failed { color: #dc2626; }
 .material-status.manual-review { color: #b45309; }
 .material-status.running { color: #4f46e5; }
+.material-status.pending { color: #64748b; }
 
 .review-material-row.needs-manual-review {
   background: #fffbeb;

@@ -552,6 +552,21 @@ class ReviewService:
                     generation_attempts=0,
                     quality_feedback=list(exc.diagnostics),
                 )
+            except Exception as exc:  # noqa: BLE001 - 未预期错误也必须收敛为可重试终态。
+                logger.exception("复习内容生成发生未预期错误，materialId=%s", material.id)
+                safe_reason = f"复习生成遇到未预期错误（{type(exc).__name__}），请稍后重新生成"
+                return self._save_generation(
+                    material,
+                    is_learning_content=None,
+                    category=None,
+                    summary=None,
+                    status="FAILED",
+                    reason=safe_reason,
+                    extractor=f"failed:{REVIEW_CARD_PROMPT_VERSION}",
+                    cards=[],
+                    generation_attempts=0,
+                    quality_feedback=[safe_reason],
+                )
             generation_attempts = max(0, int(getattr(extraction, "generation_attempts", 0) or 0))
             quality_feedback = list(getattr(extraction, "quality_feedback", ()) or ())
             summary = extraction.summary

@@ -90,6 +90,7 @@ const RATING_OPTIONS: Array<{ rating: ReviewRating; label: string; detail: strin
 ];
 
 const TIMEZONE_OPTIONS = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Taipei', 'Asia/Singapore', 'UTC'];
+const MAX_AUTOMATIC_REVIEW_SYNC_COUNT = 100;
 
 // 复习中心按上传资料展示每日到期 group，每张小卡片独立揭示、定位和评分。
 export function ReviewCenter() {
@@ -166,6 +167,22 @@ export function ReviewCenter() {
     setGroups(next);
   }, []);
 
+  // 同一页面始终只启动一条串行同步链，避免 StrictMode、上传事件和手动检查重复调用模型。
+  const startReviewSyncQueue = useCallback((onProgress?: ReviewSyncProgressHandler) => {
+    if (syncPromiseRef.current) return syncPromiseRef.current;
+    const promise = drainPendingReviewMaterials(onProgress);
+    syncPromiseRef.current = promise;
+    void promise.then(
+      () => {
+        if (syncPromiseRef.current === promise) syncPromiseRef.current = null;
+      },
+      () => {
+        if (syncPromiseRef.current === promise) syncPromiseRef.current = null;
+      }
+    );
+    return promise;
+  }, []);
+
   // 同时读取概览、分组队列和资料状态，单个区域失败时保留其余数据。
   const loadData = useCallback(async () => {
     const groupReadVersion = ++groupReadVersionRef.current;
@@ -207,7 +224,7 @@ export function ReviewCenter() {
     setError(failures.length ? `${failures.join('、')}暂时不可用` : '');
   }, [updateGroups]);
 
-  // 页面首次打开时增量同步已完成 RAG 入库的资料，再读取最新队列。
+  // 页面首次打开时串行排空等待生成的资料；后端单次仍只处理一份，避免请求内并发调用模型。
   useEffect(() => {
     let active = true;
     const initialize = async () => {
@@ -219,10 +236,13 @@ export function ReviewCenter() {
       } finally {
         if (active) setLoading(false);
       }
-      if (!syncPromiseRef.current) syncPromiseRef.current = syncReviewMaterials(1);
       setSyncing(true);
       try {
-        const result = await syncPromiseRef.current;
+        const result = await startReviewSyncQueue(async (progress) => {
+          if (!active) return;
+          setSyncMessage(formatSyncMessage(progress));
+          await loadData();
+        });
         if (active) {
           setSyncMessage(formatSyncMessage(result));
           await loadData();
@@ -237,7 +257,7 @@ export function ReviewCenter() {
     return () => {
       active = false;
     };
-  }, [loadData]);
+  }, [loadData, startReviewSyncQueue]);
 
   // 上传资料完成 RAG 入库并生成卡片后，立即刷新当前复习中心，不等待定时轮询。
   useEffect(() => {
@@ -279,11 +299,13 @@ export function ReviewCenter() {
   }, [syncing]);
 
   async function runSync() {
-    if (syncing) return;
     setSyncing(true);
     setError('');
     try {
-      const result = await syncReviewMaterials(1);
+      const result = await startReviewSyncQueue(async (progress) => {
+        setSyncMessage(formatSyncMessage(progress));
+        await loadData();
+      });
       setSyncMessage(formatSyncMessage(result));
       await loadData();
     } catch (syncError) {
@@ -1327,7 +1349,7 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
 function ReviewMaterialRow({ material, selected, busy, deleting, locked, onToggleSelected, onRegenerate, onDelete }: { material: ReviewMaterial; selected: boolean; busy: boolean; deleting: boolean; locked: boolean; onToggleSelected: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
-  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
+  return <div className={`review-material-row${selected ? ' is-selected' : ''}${manualReview ? ' needs-manual-review' : ''}`}><label className="material-row-selector-hitbox" title={`选择资料：${material.title}`}><input className="material-row-selector" type="checkbox" checked={selected} onChange={onToggleSelected} aria-label={`选择资料：${material.title}`} /></label><div className="material-row-icon">{isVideoType(material.documentType) ? <FileVideo2 size={15} /> : <FileText size={15} />}</div><div className="material-row-copy"><strong title={material.title}>{material.title}</strong><span>{formatReviewClassification(material.category, material.isLearningContent)} · {material.cardCount} 张卡片 · {material.folderName || '未归档'}</span></div><div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div><div className="material-row-actions"><button className="icon-button tiny" type="button" title={manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button><button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button></div><p className="material-row-summary" title={summary}>{summary}</p></div>;
 }
 
 // 优先展示 DeepSeek 摘要；失败或跳过时直接展示后端原因，避免“摘要生成中”掩盖真实状态。
@@ -1335,10 +1357,13 @@ function materialSummary(summary?: string | null, reason?: string | null, status
   const normalizedSummary = summary?.replace(/\s+/g, ' ').trim();
   if (normalizedSummary) return normalizedSummary;
   const normalizedReason = reason?.replace(/\s+/g, ' ').trim();
-  if (normalizedReason && (status === 'FAILED' || status === 'NEEDS_REVIEW' || status === 'SKIPPED')) {
-    return `${status === 'SKIPPED' ? '跳过原因' : status === 'NEEDS_REVIEW' ? '人工处理原因' : '失败原因'}：${normalizedReason}`;
+  const normalizedStatus = (status || '').toUpperCase();
+  if (normalizedReason && ['FAILED', 'NEEDS_REVIEW', 'SKIPPED', 'PENDING'].includes(normalizedStatus)) {
+    return `${normalizedStatus === 'SKIPPED' ? '跳过原因' : normalizedStatus === 'NEEDS_REVIEW' ? '人工处理原因' : normalizedStatus === 'PENDING' ? '等待原因' : '失败原因'}：${normalizedReason}`;
   }
-  return '摘要生成中';
+  if (normalizedStatus === 'PENDING') return '等待 DeepSeek 生成摘要';
+  if (['GENERATING', 'RUNNING', 'PROCESSING'].includes(normalizedStatus)) return '摘要生成中';
+  return '暂无复习摘要';
 }
 
 function EmptyReviewQueue({ onSync, syncing }: { onSync: () => void; syncing: boolean }) {
@@ -1428,8 +1453,35 @@ function resolveMaterialId(material: ReviewMaterial) {
 }
 
 function formatSyncMessage(result: ReviewSyncResult) {
+  if (!result.processedMaterialCount) return '当前没有等待生成的资料';
   const details = [result.skippedMaterialCount ? `跳过 ${result.skippedMaterialCount} 份非学习资料` : '', result.failedMaterialCount ? `${result.failedMaterialCount} 份处理失败` : ''].filter(Boolean);
-  return `已同步 ${result.processedMaterialCount} 份资料，生成 ${result.generatedCardCount} 张卡片${details.length ? `，${details.join('，')}` : ''}`;
+  return `已处理 ${result.processedMaterialCount} 份资料，生成 ${result.generatedCardCount} 张卡片${details.length ? `，${details.join('，')}` : ''}`;
+}
+
+type ReviewSyncProgressHandler = (result: ReviewSyncResult) => void | Promise<void>;
+
+// 用多个单资料请求串行排空 Prompt 升级后的待生成队列，并在每份完成后刷新进度。
+async function drainPendingReviewMaterials(onProgress?: ReviewSyncProgressHandler): Promise<ReviewSyncResult> {
+  const total: ReviewSyncResult = {
+    processedMaterialCount: 0,
+    generatedCardCount: 0,
+    skippedMaterialCount: 0,
+    failedMaterialCount: 0
+  };
+  for (let index = 0; index < MAX_AUTOMATIC_REVIEW_SYNC_COUNT; index += 1) {
+    const current = await syncReviewMaterials(1);
+    if (!current.processedMaterialCount) break;
+    total.processedMaterialCount += current.processedMaterialCount;
+    total.generatedCardCount += current.generatedCardCount;
+    total.skippedMaterialCount += current.skippedMaterialCount;
+    total.failedMaterialCount += current.failedMaterialCount;
+    if (onProgress) await onProgress({ ...total });
+    const reachedTerminalState = current.generatedCardCount > 0
+      || current.skippedMaterialCount > 0
+      || current.failedMaterialCount > 0;
+    if (!reachedTerminalState) break;
+  }
+  return total;
 }
 
 function formatGradeMessage(result: ReviewGradeResult, rating: ReviewRating) {
@@ -1491,7 +1543,8 @@ function formatReviewClassification(value?: string | null, isLearningContent?: b
 function formatGenerationStatus(value?: string | null) {
   const normalized = (value || '').toUpperCase();
   if (normalized === 'GENERATED' || normalized === 'READY' || normalized === 'SUCCESS') return '已生成';
-  if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING' || normalized === 'PENDING') return '生成中';
+  if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING') return '生成中';
+  if (normalized === 'PENDING') return '等待生成';
   if (normalized === 'SKIPPED') return '已跳过';
   if (normalized === 'FAILED') return '失败';
   if (normalized === 'NEEDS_REVIEW') return '待人工处理';
@@ -1503,7 +1556,8 @@ function statusClass(value?: string | null) {
   if (normalized === 'FAILED') return 'failed';
   if (normalized === 'NEEDS_REVIEW') return 'manual-review';
   if (normalized === 'SKIPPED') return 'warning';
-  if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING' || normalized === 'PENDING') return 'running';
+  if (normalized === 'GENERATING' || normalized === 'RUNNING' || normalized === 'PROCESSING') return 'running';
+  if (normalized === 'PENDING') return 'pending';
   return 'indexed';
 }
 

@@ -362,6 +362,33 @@ def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert transaction.saved["cards"] == []
 
 
+def test_unexpected_extractor_failure_is_persisted_instead_of_remaining_pending() -> None:
+    """提取器未预期异常也必须保存 FAILED，避免前端永久显示等待生成。"""
+    class BrokenExtractor:
+        """模拟模型客户端之外的未预期运行错误。"""
+
+        def extract(self, _material, _evidences):
+            raise RuntimeError("不应直接暴露的内部错误")
+
+    transaction = SummaryGenerationTransaction()
+    service = ReviewService(
+        repository=FakeReviewRepository(transaction),
+        extractor=BrokenExtractor(),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+    material = MaterialSourceRecord(12, "RabbitMQ 消息可靠性", "7", "mp4", "READY", None, 1, NOW)
+
+    result = service._generate(material, "7", force=True)
+
+    assert result is not None
+    assert result.status == "FAILED"
+    assert result.reason == "复习生成遇到未预期错误（RuntimeError），请稍后重新生成"
+    assert "不应直接暴露" not in result.reason
+    assert transaction.saved is not None
+    assert transaction.saved["extractor"] == "failed:review-card-v9"
+    assert transaction.saved["quality_feedback"] == [result.reason]
+
+
 def test_quality_retry_exhaustion_is_persisted_as_manual_review() -> None:
     """复习图耗尽自动修复后，服务必须保存 NEEDS_REVIEW 和质量反馈。"""
     class ManualReviewExtractor:
