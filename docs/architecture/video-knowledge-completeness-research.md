@@ -11,16 +11,20 @@
 - [Microsoft GraphRAG](https://github.com/microsoft/graphrag)：从非结构化文本抽取实体、关系和社区摘要，适合全局主题理解，但索引成本较高，也不是面向复习卡片覆盖率设计。
 - [RAPTOR](https://github.com/parthsarthi03/raptor)：递归聚类并摘要成树，适合长文的层级检索；摘要树能改善跨尺度理解，但不能单独证明所有知识点均被枚举。
 
-## 项目采用方式
+## LangExtract 真实 A/B 与采用决策
 
-当前不直接引入重量级新依赖。自动 Knowledge Curator 后续借鉴 LangExtract 的核心思路：
+项目已直接引入官方 `langextract==1.6.x` 作为实验依赖，不再只停留在“借鉴思路”。适配器使用 LangExtract 官方 OpenAI provider 接入同一 DeepSeek 模型，并启用中文 `UnicodeTokenizer`、长文分块、多轮 extraction passes 和原文字符定位；任何不能逐字回指原文或不能映射到真实 `evidenceId` 的候选都会被丢弃。
+
+2026-08-04 在 Kafka 高性能陈述式课程和带 20 项目录的 Python 基础面经上完成真实 A/B。LangExtract 将两类平均金标召回率从 47.5% 提升到 95.0%，绝对提升 47.5 个百分点；但总 Token 成本达到当前方案的 3.05 倍，Python 长视频的原始 evidence 映射成功率只有 62.8%，过滤后近重复候选约 12.4%。完整设计、冻结金标、逐例指标和复现命令见 [复习 Knowledge Curator × LangExtract A/B 方案与结果](../testing/review-curator-langextract-ab-plan.md)。
+
+因此本轮决策是：保留官方依赖、适配器和 A/B runner，但暂不把 LangExtract 接入生产卡片生成。它尚未通过预注册的 evidence 映射、近重复和 1.5 倍成本门槛。后续调优仍采用以下已验证有效的方向：
 
 1. 按视频时间或文档结构分块，先在每个局部块内执行高召回知识单元抽取。
 2. 对长资料运行多轮抽取，使用不同关注维度发现定义、机制、流程、因果、对比和实践结论。
 3. 每个候选必须绑定原始 evidence 和位置，不能只保留无来源摘要。
 4. 最后执行跨块语义去重、覆盖审计和卡片质量门禁。
 
-这比“先用正则找问号，再要求模型覆盖问题清单”更适合普通课程讲解。陈述式知识点不需要伪装成原始问题；正则只负责噪声过滤和确定性校验，知识候选由 LLM 从局部 evidence 中提取。
+真实 A/B 已证明这比“先用正则找问号，再要求模型覆盖问题清单”更适合普通课程讲解。陈述式知识点不需要伪装成原始问题；正则只负责噪声过滤和确定性校验，知识候选由 LLM 从局部 evidence 中提取。但在成本、定位和去重达标前，不能仅凭召回提升直接进入生产。
 
 ## 本轮落地：用户可控补漏
 
