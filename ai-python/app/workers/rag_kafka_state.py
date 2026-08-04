@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import logging
 from typing import Any, Protocol
 
 from app.repositories.rag_job import RagJobRepository
 from app.schemas.kafka import KafkaEnvelope
+
+
+logger = logging.getLogger(__name__)
 
 
 class RagKafkaStateRepository(Protocol):
@@ -23,8 +28,14 @@ class RagKafkaStateRepository(Protocol):
 class RagKafkaStateWriter:
     """把 progress、result、promote result 与 DLQ 写回 PostgreSQL。"""
 
-    def __init__(self, repository: RagKafkaStateRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: RagKafkaStateRepository | None = None,
+        *,
+        review_sync: Callable[[int], Any] | None = None,
+    ) -> None:
         self.repository = repository or RagJobRepository()
+        self.review_sync = review_sync
 
     def handle_progress(self, envelope: KafkaEnvelope) -> bool:
         """消费并去重用户可见的索引进度。"""
@@ -35,8 +46,19 @@ class RagKafkaStateWriter:
         return self.repository.consume_index_result(envelope)
 
     def handle_promote_result(self, envelope: KafkaEnvelope) -> bool:
-        """消费 promote 终态并更新资料可检索状态。"""
-        return self.repository.consume_promote_result(envelope)
+        """消费 promote 终态，并在成功后幂等衔接资料复习生成。"""
+        persisted = self.repository.consume_promote_result(envelope)
+        payload = envelope.payload or {}
+        if self.review_sync is not None and str(payload.get("status") or "") == "SUCCEEDED":
+            try:
+                material_id = int(payload.get("materialId"))
+                self.review_sync(material_id)
+            except (TypeError, ValueError):
+                logger.warning("RAG 提升成功事件缺少合法 materialId，已跳过复习生成")
+            except Exception:
+                # 复习是索引后的派生能力，失败不能回滚或阻断已经可检索的资料。
+                logger.exception("RAG 入库后自动生成复习卡片失败，materialId=%s", payload.get("materialId"))
+        return persisted
 
     def handle_dlq(self, envelope: KafkaEnvelope) -> bool:
         """消费死信摘要并将 active job 收敛为终态失败。"""

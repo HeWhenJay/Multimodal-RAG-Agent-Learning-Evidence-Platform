@@ -1,6 +1,8 @@
-# Agent 记忆方案
+# Agent 记忆方案（历史设计存档）
 
 更新日期：2026-07-18
+
+> 本文主体记录 Java Gateway 迁移前的记忆设计，仅用于追溯设计演进，不代表当前运行契约。当前项目已没有 Java 源码；现行实现以 Python FastAPI、`AgentRuntimeService`、进程内 `LocalAgentGateway`、PostgreSQL 事实表和可选 Redis L2 快照为准，公开契约见 [`docs/api/agent.md`](../api/agent.md)，系统总览见 [`README.md`](../../README.md)。
 
 ## 1. 设计目标
 
@@ -119,7 +121,7 @@ flowchart TD
 - Python Agent state 保存 `goal/plan/toolResults/draft/reviewDecision/memoryContext`。
 - 最近 3-5 个关键 Observation 保留摘要，不注入完整工具响应。
 - 更早的任务过程压缩为 `workingSummary`，摘要前先抽取关键事实，避免摘要压缩丢失用户硬约束。
-- 长会话恢复时，Java `/api/internal/agent/tasks/{taskId}/context` 会同时返回最近原文窗口和 `compressionCandidateMessages`。候选窗口只包含“尚未被摘要覆盖、且不属于最近原文窗口”的早期消息；Python 只把它交给 `conversation_compression` 节点，不直接注入业务 LLM prompt。
+- 长会话恢复时，Python `LocalAgentGateway.restore_context()` 会同时返回 token 阈值内的最近原文窗口和 `compressionCandidateMessages`。候选窗口只包含“尚未被摘要覆盖、且超过当前 token 触发窗口”的早期消息；Python 只把它交给 `conversation_compression` 节点，不直接注入业务 LLM prompt。
 - `agent_chat_message` 使用任务内递增的 `sequence_no` 作为上下文顺序依据。新增消息时 Java 在同一事务内锁定 `agent_task` 行后再分配序号，并用 `(task_id, sequence_no)` 唯一索引兜底。最近窗口、压缩候选、覆盖范围回捞和摘要覆盖端点选择都按 `sequence_no` 比较，避免同一事务内多条消息 `created_at` 相同且随机 UUID 打乱顺序。
 - `agent_task` 仍保存输入、计划、草稿和最终输出，作为任务审计记录。
 
@@ -513,7 +515,7 @@ Java 调 Python 仍使用 `X-Agent-Internal-Token`，Python 只接受 Java 传�
 3. Java 根据 `taskId` 查询 `agent_task.user_id`，强制当前用户范围。
 4. Python 将返回的 Top 记忆写入 `memoryContext`，供 planner 和 finalizer 使用。
 
-统一图入口还会先执行 `context_restore`：Python 只能调用 Java `GET /api/internal/agent/tasks/{taskId}/context` 恢复最近原文窗口、ACTIVE 摘要、摘要段检索结果和压缩候选窗口。Java 用 SQL 小窗口查询选出尚未被历史摘要覆盖且不属于最近窗口的早期消息；没有摘要时从最早消息开始取候选，并保留最近 `recentLimit` 条原文。超过 best window 时，`context_budget_guard` 触发 `conversation_compression`，只压缩 `compressionCandidateMessages` 并写入 `agent_conversation_summary`，保存成功后清空候选，后续业务 prompt 只带摘要段和最近原文。单次图执行默认最多压缩 2 段，避免异常状态反复压缩；后续跨天恢复再通过摘要段和必要原文回捞补齐上下文。摘要段检索当前是 Java 侧小规模关键词评分 fallback，不是数据库 BM25；后续摘要段规模变大后再升级为数据库全文检索或专用索引。
+统一图入口还会先执行 `context_restore`：Python 通过进程内 `LocalAgentGateway.restore_context()` 恢复 token 阈值内最近原文窗口、ACTIVE 摘要、摘要段检索结果和压缩候选窗口。恢复层先排除已被历史摘要覆盖的消息；未摘要原文估算未超过 `bestWindowTokens` 时全部保留，不再按“最近 12 条”或固定条数提前裁剪。超过 best window 时，较早的未摘要消息进入 `compressionCandidateMessages`，阈值内最近原文继续留在 `messageWindow`；`context_budget_guard` 触发 `conversation_compression` 后只压缩候选窗口并写入 `agent_conversation_summary`，保存成功后清空候选，后续业务 prompt 只带摘要段和最近原文。线上默认按 1M 上下文的约 25%（256K）触发，单段摘要目标约 25K token、硬上限约 30K。单次图执行默认最多压缩 2 段，避免异常状态反复压缩；后续跨天恢复再通过摘要段和必要原文回捞补齐上下文。摘要段检索当前是小规模关键词评分 fallback，不是数据库 BM25；后续摘要段规模变大后再升级为数据库全文检索或专用索引。
 
 ### 13.2 工具执行中
 

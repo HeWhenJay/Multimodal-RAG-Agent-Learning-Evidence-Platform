@@ -17,6 +17,7 @@ class AgentQwenResult:
     data: dict[str, Any]
     provider: str
     model: str
+    usage: dict[str, int]
 
     def diagnostics(self) -> dict[str, str]:
         """返回可记录到状态机的非敏感诊断信息。"""
@@ -73,7 +74,7 @@ class AgentQwenClient:
         content = extract_message_content(data).strip()
         parsed = parse_json_object(content)
         parsed.setdefault("node", node)
-        return AgentQwenResult(data=parsed, provider="dashscope", model=model)
+        return AgentQwenResult(data=parsed, provider="dashscope", model=model, usage=extract_usage(data))
 
 
 def get_agent_qwen_client() -> AgentQwenClient:
@@ -125,6 +126,17 @@ def extract_message_content(data: dict[str, Any]) -> str:
                     parts.append(item["content"])
         return "\n".join(parts)
     return str(content)
+
+
+def extract_usage(data: dict[str, Any]) -> dict[str, int]:
+    """提取兼容 OpenAI 响应中的模型计费 token，缺失时返回空字典。"""
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    result: dict[str, int] = {}
+    for source, target in (("prompt_tokens", "promptTokens"), ("completion_tokens", "completionTokens"), ("total_tokens", "totalTokens")):
+        value = usage.get(source)
+        if isinstance(value, int) and value >= 0:
+            result[target] = value
+    return result
 
 
 def parse_json_object(content: str) -> dict[str, Any]:

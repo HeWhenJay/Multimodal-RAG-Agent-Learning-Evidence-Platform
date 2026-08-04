@@ -15,6 +15,7 @@ from app.schemas.resume_template import (
     ResumeTemplateBinding,
 )
 from rag.resume_template.docx_patch import validate_resume_patches
+from prompts.resume import resume_patch_system_prompt, resume_patch_user_prompt
 
 
 SCHEMA_NAME = "resume_content_patch_response"
@@ -148,10 +149,7 @@ def generate_with_openai_structured_outputs(request: ResumePatchGenerationReques
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "你是简历字段级内容补丁生成器。只输出字段内容补丁，不输出 DOCX、XML、样式、"
-                    "字体、布局、路径或 locationRefs。所有修改必须基于用户简历摘要，并尽量由 evidence 支撑。"
-                ),
+                "content": resume_patch_system_prompt(strict=True),
             },
             {"role": "user", "content": build_generation_prompt(request)},
         ],
@@ -178,7 +176,7 @@ def generate_with_dashscope_json_mode(request: ResumePatchGenerationRequest) -> 
         model=os.getenv("DASHSCOPE_RESUME_PATCH_MODEL", os.getenv("RAG_LLM_MODEL", "qwen-plus")),
         temperature=0.2,
         messages=[
-            {"role": "system", "content": "你是简历字段级内容补丁生成器，只返回合法 JSON，不返回解释。"},
+            {"role": "system", "content": resume_patch_system_prompt()},
             {"role": "user", "content": build_generation_prompt(request)},
         ],
         response_format={"type": "json_object"},
@@ -252,13 +250,9 @@ def build_generation_prompt(request: ResumePatchGenerationRequest) -> str:
         for field in request.fields
     ]
     evidences = [item.model_dump() for item in request.evidenceCandidates]
-    return json.dumps(
-        {
-            "任务": "根据用户简历摘要、JD 和 evidence 生成字段级内容补丁。禁止输出 style/font/layout/xml/path/locationRefs。",
-            "岗位JD": request.jobDescription[:4000],
-            "用户已上传简历摘要": request.resumeText[:4000],
-            "字段": fields,
-            "可用证据": evidences,
-        },
-        ensure_ascii=False,
+    return resume_patch_user_prompt(
+        job_description=request.jobDescription,
+        resume_text=request.resumeText,
+        fields=fields,
+        evidences=evidences,
     )

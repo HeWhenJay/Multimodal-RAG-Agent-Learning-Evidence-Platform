@@ -9,6 +9,7 @@ from typing import Any
 from rag.generation.bailian_llm import DEFAULT_CHAT_BASE_URL, DEFAULT_CHAT_MODEL, extract_message_content
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import logged_rag_method, process_event
+from prompts.rag import query_expansion_system_prompt, query_expansion_user_prompt
 
 
 DEFAULT_QUERY_EXPANSION_MODEL = DEFAULT_CHAT_MODEL
@@ -127,11 +128,7 @@ class BailianQueryExpansionClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "你是学迹智配的 RAG 查询改写器。你的任务是根据用户原问题生成多路检索查询，"
-                        "帮助 BM25 和向量检索覆盖不同表达、子问题和学习意图。只输出 JSON 字符串数组，"
-                        "不要输出解释、Markdown 或对象。"
-                    ),
+                    "content": query_expansion_system_prompt(),
                 },
                 {
                     "role": "user",
@@ -176,18 +173,7 @@ def expand_queries(question: str) -> list[str]:
 
 def build_query_expansion_prompt(question: str, count: int) -> str:
     """构造查询扩展提示词，避免固定拼接 evidence 后缀。"""
-    base = normalize_query_text(question)
-    return (
-        f"用户原问题：{base}\n\n"
-        f"请生成 {count} 条用于 RAG 召回的中文查询，必须满足：\n"
-        "1. 第一条必须保留用户原问题，不要改写用户的问题边界。\n"
-        "2. 其余查询从不同角度补充同义表达、关键概念、步骤方法、例子、对比点或子问题。\n"
-        "3. 如果用户是想复习忘记的知识点，优先生成“概念原理、关键步骤/公式、例子应用、易混点对比”类查询。\n"
-        "4. 如果用户在问 JD、岗位、招聘或能力缺口，补充岗位要求、技能栈、能力差距和项目匹配类查询。\n"
-        "5. 如果用户在问简历、resume 或项目经历，补充简历证据、项目亮点、技术细节和量化成果类查询。\n"
-        "6. 不要机械追加“关键证据”或“学习资料 笔记”；每条查询应能独立用于检索。\n"
-        f"7. 每条不超过 {MAX_QUERY_LENGTH} 个字符，只输出 JSON 字符串数组。"
-    )
+    return query_expansion_user_prompt(normalize_query_text(question), count, MAX_QUERY_LENGTH)
 
 
 def parse_query_expansion_content(content: str, original_question: str, count: int) -> list[str]:

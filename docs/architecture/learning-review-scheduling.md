@@ -56,6 +56,7 @@ READY/PARTIAL 学习资料
 - 评分日志不可覆盖，后续可用于 FSRS 参数优化和学习效果分析。
 - 所有数据库查询同时约束 `user_id`，不能依赖前端传入的所有者字段。
 - 每个资料索引版本只允许一次模型请求；Redis 不可用时退化为进程内短锁，原子解锁失败时等待 TTL，PostgreSQL 版本幂等仍负责最终一致性。
+- RAG promote 成功后由 local/Kafka 共用状态写回器按 `materialId` 触发复习生成；重复终态消息继续进入版本幂等检查，复习失败不回滚资料索引终态。
 - Python 多实例启动时先获取 PostgreSQL advisory transaction lock，再检查并执行增量迁移，避免并发 DDL 和重复写入迁移版本。
 - Prompt 版本与模板集中在 `ai-python/prompts/`，evidence 被视为不可信输入，模型必须忽略其中的指令文本。
 - 每日接口先按用户保存的资料优先级和文档额度选择 group，再返回入选资料的全部到期卡片；同一资料当天只占用一次额度，列表不返回答案，揭示接口再次校验卡片归属。

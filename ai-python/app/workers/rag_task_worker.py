@@ -16,6 +16,7 @@ from uuid import uuid4
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.repositories.rag_job import RagIndexJobRecord, RagJobRepository
 from app.repositories.rag_task import DurableQueryTask, RagQueryTaskRepositoryProtocol, build_query_task_repository
+from app.review.service import ReviewService
 from app.schemas.kafka import IndexRequestPayload, KafkaEnvelope, PromoteRequestPayload
 from app.schemas.rag import ProgressEvent, QueryRequest
 from app.workers.rag_kafka_state import RagKafkaStateWriter
@@ -94,7 +95,10 @@ class RagDurableTaskWorker:
     ) -> None:
         self.query_repository = query_repository or build_query_task_repository()
         self.index_repository = index_repository or RagJobRepository()
-        self.state_writer = state_writer or RagKafkaStateWriter(repository=self.index_repository)
+        self.state_writer = state_writer or RagKafkaStateWriter(
+            repository=self.index_repository,
+            review_sync=ReviewService().generate_indexed_material,
+        )
         self.store = store or create_rag_store()
         self.parser_router = parser_router
         self.worker_id = worker_id or f"{socket.gethostname() or 'python'}-{uuid4().hex[:12]}"

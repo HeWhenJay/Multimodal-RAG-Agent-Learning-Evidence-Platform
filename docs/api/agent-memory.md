@@ -74,7 +74,7 @@ Agent 记忆的查看、创建、确认、拒绝、编辑、归档和删除均�
 
 2026-07-03 更新：PostgreSQL 后端的记忆索引写入改为复用 RAG 主链路 `embed_text` 生成真实 1024 维语义向量；记忆查询改为 BM25 与 PostgreSQL/pgvector `<=>` 向量召回共同参与 RRF 融合，并对只由向量召回命中的记忆回填元数据后再返回。
 
-核心边界：
+以下内容属于历史迁移记录，当前实现不采用其中的 Java 边界：
 
 - React 只调用 Java `/api/agent/memories*` 和 `/api/agent/tasks*`。
 - Java 是当前用户、权限、状态、版本、审计、幂等和统一响应边界。

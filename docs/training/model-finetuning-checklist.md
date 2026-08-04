@@ -4,7 +4,7 @@
 
 ## 文档目的
 
-本文只记录后续需要人工准备数据、算力或模型选择后再实施的训练任务，不表示这些能力已经完成。当前在线服务继续使用 FastAPI，Java 继续负责业务状态、权限和统一响应；训练逻辑只能位于 Python 离线训练边界，不能迁移到 Java。
+本文只记录后续需要人工准备数据、算力或模型选择后再实施的训练任务，不表示这些能力已经完成。当前在线服务由 React 与 Python FastAPI 组成，FastAPI 负责业务状态、权限和统一响应；训练逻辑只能位于 Python 离线训练边界，不能混入 Web 请求进程。
 
 建议项目主线命名为：**面向学习证据与岗位适配的自适应多模态检索融合**。
 
@@ -230,8 +230,8 @@ ai-python/
 
 - [ ] `training/` 只包含离线数据、训练、评测和导出。
 - [ ] `rag/` 只加载已发布 artifact 并负责在线 fallback。
-- [ ] Java 只管理反馈、权限、任务状态和模型发布业务状态。
-- [ ] React 只提供标注、实验结果和发布状态界面，不直接调用 Python。
+- [ ] FastAPI 只管理反馈、权限、任务状态和模型发布业务状态，不在 HTTP 请求内执行训练。
+- [ ] React 只通过公开 FastAPI 契约提供标注、实验结果和发布状态界面，不直连训练进程。
 
 ## Flask 备选边界
 
@@ -242,7 +242,7 @@ ai-python/
 - `POST /rerank`
 - `POST /match`
 
-训练仍由离线 CLI 执行，不提供 `/train`。当前 FastAPI 通过版本化客户端调用 Flask companion service，Java 和前端不绕过 FastAPI。
+训练仍由离线 CLI 执行，不提供 `/train`。若未来拆出 Flask companion service，只允许 FastAPI 通过版本化客户端调用，前端不得绕过 FastAPI。
 
 ## 最终完成定义
 

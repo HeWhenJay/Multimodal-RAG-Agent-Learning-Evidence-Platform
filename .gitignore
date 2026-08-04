@@ -12,7 +12,11 @@ AGENTS.local.md
 CLAUDE.md
 GEMINI.md
 .codex/
+.codex_tmp/
 .cursor/
+
+# Local QA / benchmark workspaces may contain generated reports or personal files
+_qa_*/
 
 # Logs
 *.log

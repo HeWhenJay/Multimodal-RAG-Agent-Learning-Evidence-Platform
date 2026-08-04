@@ -213,6 +213,33 @@ export interface AgentTaskCreatePayload {
   input: AgentTaskInput;
 }
 
+export interface AgentConversationCreatePayload {
+  folderId?: string | null;
+  title?: string;
+  taskType?: 'pure_read_query' | 'planning_task' | 'mutation_task';
+  input?: Partial<AgentTaskInput>;
+}
+
+export interface AgentTaskContinuePayload {
+  content: string;
+  clientTurnId: string;
+  taskType?: 'pure_read_query' | 'planning_task' | 'mutation_task';
+  title?: string;
+  input?: Partial<AgentTaskInput>;
+}
+
+export interface AgentOnlineBenchmarkRun {
+  runId: string;
+  scenarioSetId: string;
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | string;
+  stage?: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+  resultDir?: string;
+  summary?: Record<string, unknown>;
+}
+
 export interface AgentReviewDecisionPayload {
   decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED';
   comment?: string;
@@ -306,7 +333,7 @@ export interface AgentTask {
   id: string;
   folderId?: string | null;
   taskType: string;
-  status: 'CREATED' | 'RUNNING' | 'WAITING_TOOL_RESULT' | 'COMPLETED' | 'CANCELED' | 'FAILED' | string;
+  status: 'DRAFT' | 'CREATED' | 'RUNNING' | 'WAITING_TOOL_RESULT' | 'COMPLETED' | 'CANCELED' | 'FAILED' | string;
   title: string;
   input: Record<string, unknown>;
   plan?: Record<string, unknown>;

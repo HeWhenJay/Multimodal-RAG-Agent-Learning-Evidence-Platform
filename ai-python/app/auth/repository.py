@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 import re
+import time
 from typing import Any, ContextManager, Protocol
 
 
@@ -233,11 +234,10 @@ class AuthRepository:
         if not self._database_url:
             raise RuntimeError("未配置 AUTH_DATABASE_URL、RAG_DATABASE_URL 或 DATABASE_URL")
         try:
-            import psycopg
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("认证数据库仓储需要安装 psycopg[binary]") from exc
-        return psycopg.connect(self._database_url, row_factory=dict_row)
+        return connect_postgres(self._database_url, row_factory=dict_row, purpose="认证数据库仓储")
 
 
 def resolve_database_url() -> str:
@@ -247,6 +247,54 @@ def resolve_database_url() -> str:
         or os.getenv("RAG_DATABASE_URL", "").strip()
         or os.getenv("DATABASE_URL", "").strip()
     )
+
+
+def connect_postgres(database_url: str, *, row_factory: Any | None = None, purpose: str = "PostgreSQL 仓储") -> Any:
+    """连接 PostgreSQL；对 Windows 短进程压测中的瞬态端口错误做有限重试。"""
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError(f"{purpose}需要安装 psycopg[binary]") from exc
+    kwargs = {"row_factory": row_factory} if row_factory is not None else {}
+    attempts = positive_int_env("POSTGRES_CONNECT_RETRY_ATTEMPTS", 5, upper=20)
+    delay_seconds = positive_float_env("POSTGRES_CONNECT_RETRY_DELAY_SECONDS", 0.15, upper=5.0)
+    for attempt in range(attempts):
+        try:
+            return psycopg.connect(database_url, **kwargs)
+        except psycopg.OperationalError as exc:
+            if attempt + 1 >= attempts or not transient_connect_error(exc):
+                raise
+            time.sleep(delay_seconds * (attempt + 1))
+    raise RuntimeError("PostgreSQL 连接重试状态异常")
+
+
+def transient_connect_error(exc: Exception) -> bool:
+    """识别可重试的连接层错误，不重试 SQL 语义或权限问题。"""
+    message = str(exc).lower()
+    markers = (
+        "address already in use",
+        "connection timeout expired",
+        "connection refused",
+        "server closed the connection unexpectedly",
+        "could not receive data from server",
+    )
+    return any(marker in message for marker in markers)
+
+
+def positive_int_env(name: str, default: int, *, upper: int) -> int:
+    """读取正整数环境变量，异常值回退默认。"""
+    try:
+        return max(1, min(int(os.getenv(name, str(default))), upper))
+    except ValueError:
+        return default
+
+
+def positive_float_env(name: str, default: float, *, upper: float) -> float:
+    """读取正浮点环境变量，异常值回退默认。"""
+    try:
+        return max(0.01, min(float(os.getenv(name, str(default))), upper))
+    except ValueError:
+        return default
 
 
 def validate_schema(value: str) -> str:

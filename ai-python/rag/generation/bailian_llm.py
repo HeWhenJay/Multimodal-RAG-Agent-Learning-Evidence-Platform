@@ -9,6 +9,7 @@ from app.schemas.rag import Evidence
 from rag.core.source_references import evidence_source_label
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import logged_rag_method, process_event
+from prompts.rag import rag_answer_system_prompt, rag_answer_user_prompt
 
 
 DEFAULT_CHAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -114,11 +115,7 @@ class BailianChatClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "你是学迹智配的 RAG 回答生成器。只能根据用户提供的 evidence 回答，"
-                        "不得编造 evidence 中不存在的事实。回答必须使用中文，并保留引用标记，"
-                        "引用格式为 [evidenceId]。如果 evidence 不足，明确说明缺口和需要补充的资料。"
-                    ),
+                    "content": rag_answer_system_prompt(),
                 },
                 {
                     "role": "user",
@@ -157,17 +154,9 @@ def generate_grounded_answer(question: str, evidences: list[Evidence]) -> Genera
 
 
 def build_prompt(question: str, evidences: list[Evidence]) -> str:
+    """构造 RAG user Prompt，模板正文统一由 prompts 目录维护。"""
     evidence_text = "\n".join(render_evidence(item, index) for index, item in enumerate(evidences, start=1))
-    return (
-        f"用户问题：{question}\n\n"
-        "可用 evidence：\n"
-        f"{evidence_text}\n\n"
-        "请输出：\n"
-        "1. 直接回答用户问题。\n"
-        "2. 对每个关键判断追加 [evidenceId] 引用。\n"
-        "3. 如果包含视频 evidence，写出时间范围并提醒可从证据卡片播放定位。\n"
-        "4. 如果证据不足，不要猜测，列出还需要上传的资料。"
-    )
+    return rag_answer_user_prompt(question, evidence_text)
 
 
 def render_evidence(item: Evidence, index: int) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from typing import Any, Literal, TypedDict
 
@@ -11,6 +12,7 @@ from langgraph.graph import END, StateGraph
 
 from agents.gateway.local_gateway import AgentGateway
 from agents.llm.qwen_client import agent_qwen_model, get_agent_qwen_client
+from agents.tokenization import count_tokens, tokenizer_metadata
 from agents.orchestration.planning_helpers import (
     build_alignment,
     build_evidence_question,
@@ -33,6 +35,30 @@ from agents.orchestration.read_only_helpers import (
     utc_time_provider,
 )
 from app.schemas.agent import AgentTaskEvent, AgentTaskResumeRequest, AgentTaskStartRequest, AgentTaskStartResponse, AgentToolCallEvent
+from prompts.agent import (
+    acceptance_system_prompt as _acceptance_system_prompt,
+    acceptance_user_prompt as _acceptance_user_prompt,
+    answer_writer_system_prompt as _answer_writer_system_prompt,
+    answer_writer_user_prompt as _answer_writer_user_prompt,
+    conversation_compression_system_prompt,
+    conversation_compression_user_prompt,
+    conversation_title_system_prompt as _conversation_title_system_prompt,
+    conversation_title_user_prompt as _conversation_title_user_prompt,
+    executor_system_prompt as _executor_system_prompt,
+    executor_user_prompt as _executor_user_prompt,
+    planner_system_prompt as _planner_system_prompt,
+    planner_user_prompt as _planner_user_prompt,
+    repair_system_prompt as _repair_system_prompt,
+    repair_user_prompt as _repair_user_prompt,
+    resume_evidence_summarizer_system_prompt as _resume_evidence_summarizer_system_prompt,
+    resume_evidence_summarizer_user_prompt as _resume_evidence_summarizer_user_prompt,
+    resume_jd_analyzer_system_prompt as _resume_jd_analyzer_system_prompt,
+    resume_jd_analyzer_user_prompt as _resume_jd_analyzer_user_prompt,
+    resume_revision_advisor_system_prompt as _resume_revision_advisor_system_prompt,
+    resume_revision_advisor_user_prompt as _resume_revision_advisor_user_prompt,
+    resume_rewrite_acceptance_system_prompt as _resume_rewrite_acceptance_system_prompt,
+    resume_rewrite_acceptance_user_prompt as _resume_rewrite_acceptance_user_prompt,
+)
 
 
 READ_EXECUTION_TOOLS = {
@@ -59,8 +85,11 @@ MUTATION_TOOLS = {
 ALLOWED_INTERNAL_SUBGRAPHS = {"resume_rewrite_subgraph"}
 AGENT_GRAPH_RECURSION_LIMIT = 24
 AGENT_GRAPH_RECURSION_LIMIT_CODE = "AGENT_GRAPH_RECURSION_LIMIT"
-DEFAULT_BEST_WINDOW_TOKENS = 18_000
-DEFAULT_COMPRESSION_THRESHOLD_RATIO = 0.82
+DEFAULT_MODEL_CONTEXT_TOKENS = 1_000_000
+DEFAULT_BEST_WINDOW_TOKENS = 256_000
+DEFAULT_CONTEXT_SUMMARY_TARGET_TOKENS = 25_000
+DEFAULT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS = 30_000
+DEFAULT_COMPRESSION_THRESHOLD_RATIO = 1.0
 DEFAULT_MAX_CONTEXT_COMPRESSIONS = 2
 RESUME_REWRITE_CONTENT_FIELDS = {"summary", "skills", "project_experience", "learning_plan", "gap_summary"}
 RESUME_PROJECT_EVIDENCE_KEYWORDS = ("项目", "系统", "平台", "开发", "实现", "构建", "作品", "工程", "服务")
@@ -330,7 +359,7 @@ def initial_state(
         "approved_operation_ids": [],
         "idempotency_keys": [],
         "restored_context": {},
-        "context_budget": {"bestWindowTokens": best_window_tokens(), "restoreSource": "postgresql"},
+        "context_budget": {"bestWindowTokens": best_window_tokens_for_input(task_input), "restoreSource": "postgresql"},
         "context_summaries": [],
         "context_messages": [],
         "recalled_context_messages": [],
@@ -493,9 +522,9 @@ def context_restore_node(state: UnifiedAgentState, client: AgentGateway) -> Unif
         context = client.restore_context(
             state["task_id"],
             query=query,
-            recent_limit=int(os.getenv("AGENT_CONTEXT_RECENT_MESSAGE_LIMIT", "12")),
-            summary_limit=int(os.getenv("AGENT_CONTEXT_SUMMARY_LIMIT", "6")),
-            best_window_tokens=best_window_tokens(),
+            summary_limit=context_summary_limit(state),
+            best_window_tokens=best_window_tokens(state),
+            summary_target_tokens=context_summary_target_tokens(state),
         )
     except Exception as exc:
         record_llm_diagnostic(state, "context_restore", "python-postgresql-context", f"fallback: {exc}")
@@ -522,6 +551,7 @@ def context_restore_node(state: UnifiedAgentState, client: AgentGateway) -> Unif
         message=f"已从 PostgreSQL 恢复上下文：最近 {len(messages)} 条原文、{len(summary_segments)} 个摘要段。",
         extra={"restoreSource": budget.get("restoreSource") or "postgresql", "activeSummaryId": active_summary_id},
     )
+    maybe_pause_after_benchmark_restore(state, client)
     return {
         **state,
         "restored_context": context,
@@ -532,7 +562,8 @@ def context_restore_node(state: UnifiedAgentState, client: AgentGateway) -> Unif
         "context_budget": {
             **dict(state.get("context_budget") or {}),
             **budget,
-            "bestWindowTokens": int_value(budget.get("promptTargetTokens"), best_window_tokens()),
+            "bestWindowTokens": int_value(budget.get("promptTargetTokens"), best_window_tokens(state)),
+            "summaryTargetTokens": int_value(budget.get("summaryTargetTokens"), context_summary_target_tokens(state)),
         },
     }
 
@@ -1539,8 +1570,12 @@ def context_budget_guard(
 ) -> UnifiedAgentState:
     """检查上下文估算 token，超过 best window 时压缩早期窗口并保存摘要段。"""
     budget = dict(state.get("context_budget") or {})
-    best = int_value(budget.get("bestWindowTokens"), best_window_tokens())
+    best = int_value(budget.get("bestWindowTokens"), best_window_tokens(state))
     threshold = int(best * compression_threshold_ratio())
+    compression_enabled = context_compression_enabled(state)
+    if compression_enabled:
+        state = rebalance_context_window_for_budget(state, threshold, context_summary_target_tokens(state))
+    budget = dict(state.get("context_budget") or {})
     current = estimate_state_tokens(state)
     candidates = [item for item in list(state.get("compression_candidate_messages") or []) if isinstance(item, dict)]
     max_compressions = max_context_compressions()
@@ -1551,10 +1586,14 @@ def context_budget_guard(
             "compressionThresholdTokens": threshold,
             "compressionCandidateCount": len(candidates),
             "maxCompressionsPerInvocation": max_compressions,
+            "compressionEnabled": compression_enabled,
+            "summaryTargetTokens": context_summary_target_tokens(state),
+            "summaryHardLimitTokens": context_summary_hard_limit_tokens(state),
+            **tokenizer_metadata(),
         }
     )
     state["context_budget"] = budget
-    if current <= threshold or not candidates or int_value(state.get("compression_count"), 0) >= max_compressions:
+    if not compression_enabled or current <= threshold or not candidates or int_value(state.get("compression_count"), 0) >= max_compressions:
         return state
     summary = build_conversation_compression(state, node)
     state["compression_count"] = int_value(state.get("compression_count"), 0) + 1
@@ -1613,7 +1652,12 @@ def build_conversation_compression(state: UnifiedAgentState, node: str) -> dict[
                 {
                     "goal": state.get("user_goal"),
                     "node": node,
-                    "compressionCandidateMessages": compact_compression_candidate_messages(messages),
+                    "summaryTokenTarget": context_summary_target_tokens(state),
+                    "summaryTokenHardLimit": context_summary_hard_limit_tokens(state),
+                    "compressionCandidateMessages": compact_compression_candidate_messages(
+                        messages,
+                        token_budget=max(4_000, best_window_tokens(state)),
+                    ),
                     "recentMessages": compact_recent_messages(state.get("context_messages") or []),
                     "existingSummaries": compact_summary_segments(summaries),
                     "toolFindings": summarize_observations(state.get("observations") or []),
@@ -1630,6 +1674,7 @@ def build_conversation_compression(state: UnifiedAgentState, node: str) -> dict[
     summary_body = constrain_context_summary_to_messages(summary_body, messages)
     covered = summary_body.get("coveredMessageRange") if isinstance(summary_body.get("coveredMessageRange"), dict) else {}
     summary_text = text_value(summary_body.get("rollingSummary")) or fallback["summaryText"]
+    summary_text = truncate_text_to_token_budget(summary_text, context_summary_hard_limit_tokens(state))
     key_facts = summary_body.get("keyFacts") if isinstance(summary_body.get("keyFacts"), list) else []
     evidence_refs = summary_body.get("evidenceRefs") if isinstance(summary_body.get("evidenceRefs"), list) else []
     loss_risk = text_value(summary_body.get("lossRisk")) or "LOW"
@@ -1653,7 +1698,9 @@ def build_conversation_compression(state: UnifiedAgentState, node: str) -> dict[
         "diagnostics": {
             "triggerNode": node,
             "lossRisk": loss_risk,
-            "bestWindowTokens": best_window_tokens(),
+            "bestWindowTokens": best_window_tokens(state),
+            "summaryTargetTokens": context_summary_target_tokens(state),
+            "summaryHardLimitTokens": context_summary_hard_limit_tokens(state),
             "candidateSource": "compression_candidate_messages",
             "redisPolicy": "Redis TTL 不影响恢复；摘要和消息原文已落 PostgreSQL。",
         },
@@ -1684,20 +1731,114 @@ def deterministic_context_summary(
         "coveredMessageRange": {"startId": first_message_id(messages), "endId": last_message_id(messages)},
         "compressionVersion": 1,
         "confidence": 0.62 if summaries else 0.58,
-        "lossRisk": "MEDIUM" if estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str)) > best_window_tokens() else "LOW",
+        "lossRisk": "MEDIUM" if estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str)) > best_window_tokens(state) else "LOW",
     }
     return {"summary": summary, "summaryText": rolling}
 
 
-def best_window_tokens() -> int:
-    """读取 prompt 最佳使用窗口，不吃满模型上下文。"""
-    return max(4_000, int(os.getenv("AGENT_CONTEXT_BEST_WINDOW_TOKENS", str(DEFAULT_BEST_WINDOW_TOKENS))))
+def best_window_tokens(state: UnifiedAgentState | None = None) -> int:
+    """读取触发压缩的 prompt 预算；默认按 1M 上下文的约 25% 触发。"""
+    benchmark = benchmark_config(state)
+    configured = benchmark.get("bestWindowTokens") if benchmark else os.getenv("AGENT_CONTEXT_BEST_WINDOW_TOKENS", str(DEFAULT_BEST_WINDOW_TOKENS))
+    try:
+        return max(4_000, min(int(configured), 2_000_000))
+    except (TypeError, ValueError):
+        return DEFAULT_BEST_WINDOW_TOKENS
+
+
+def best_window_tokens_for_input(task_input: dict[str, Any]) -> int:
+    """初始化状态时也应用仅基准可用的窗口配置。"""
+    state: UnifiedAgentState = {"task_input": task_input}
+    return best_window_tokens(state)
+
+
+def context_recent_message_limit(state: UnifiedAgentState | None = None) -> int:
+    """兼容旧配置名；新策略不再用固定条数裁剪最近原文。"""
+    benchmark = benchmark_config(state)
+    configured = benchmark.get("rawMessageFetchLimit") if benchmark else os.getenv("AGENT_CONTEXT_RAW_MESSAGE_FETCH_LIMIT", "2000")
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        value = 2000
+    return max(1, min(value, 10_000))
+
+
+def context_summary_target_tokens(state: UnifiedAgentState | None = None) -> int:
+    """读取单段滚动摘要目标 token，默认约为 1M 上下文的 2.5%。"""
+    benchmark = benchmark_config(state)
+    configured = benchmark.get("summaryTargetTokens") if benchmark else os.getenv("AGENT_CONTEXT_SUMMARY_TARGET_TOKENS", str(DEFAULT_CONTEXT_SUMMARY_TARGET_TOKENS))
+    minimum = 200 if benchmark else 1_000
+    try:
+        return max(minimum, min(int(configured), 200_000))
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_SUMMARY_TARGET_TOKENS
+
+
+def context_summary_hard_limit_tokens(state: UnifiedAgentState | None = None) -> int:
+    """读取摘要硬上限，防止摘要自身继续膨胀。"""
+    benchmark = benchmark_config(state)
+    configured = benchmark.get("summaryHardLimitTokens") if benchmark else os.getenv("AGENT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS", str(DEFAULT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS))
+    try:
+        return max(context_summary_target_tokens(state), min(int(configured), 250_000))
+    except (TypeError, ValueError):
+        return max(context_summary_target_tokens(state), DEFAULT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS)
+
+
+def context_summary_limit(state: UnifiedAgentState | None = None) -> int:
+    """读取可注入 Prompt 的持久摘要段上限，避免历史摘要重复膨胀。"""
+    benchmark = benchmark_config(state)
+    configured = benchmark.get("summaryLimit") if benchmark else os.getenv("AGENT_CONTEXT_SUMMARY_LIMIT", "6")
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        value = 6
+    return max(1, min(value, 20))
+
+
+def benchmark_config(state: UnifiedAgentState | None) -> dict[str, Any]:
+    """读取仅在显式本地基准开关下生效的服务端固定场景配置。"""
+    if os.getenv("AGENT_BENCHMARK_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    task_input = state.get("task_input") if isinstance(state.get("task_input"), dict) else {}
+    config = task_input.get("agentBenchmark") if isinstance(task_input.get("agentBenchmark"), dict) else {}
+    return dict(config) if config.get("scenarioSetId") == "agent-control-long-context-v1" else {}
+
+
+def context_compression_enabled(state: UnifiedAgentState) -> bool:
+    """正常任务读取全局开关，固定基准可在单个任务内选择 A/B 策略。"""
+    benchmark = benchmark_config(state)
+    if isinstance(benchmark.get("compressionEnabled"), bool):
+        return bool(benchmark["compressionEnabled"])
+    return os.getenv("AGENT_CONTEXT_COMPRESSION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def maybe_pause_after_benchmark_restore(state: UnifiedAgentState, client: AgentGateway) -> None:
+    """在线基准在恢复持久化屏障后暂停第一个 Worker，以验证新进程恢复。"""
+    benchmark = benchmark_config(state)
+    if not benchmark or state.get("task_input", {}).get("agentBenchmarkPhase") == "token_probe":
+        return
+    try:
+        delay_ms = int(benchmark.get("pauseAfterRestoreMs") or 0)
+    except (TypeError, ValueError):
+        return
+    if delay_ms <= 0:
+        return
+    turn_id = text_value((state.get("task_input") or {}).get("clientTurnId")) or "initial"
+    required_prefix = text_value(benchmark.get("pauseTurnPrefix"))
+    if required_prefix and not turn_id.startswith(required_prefix):
+        return
+    claim = getattr(client, "claim_benchmark_pause", None)
+    if not callable(claim) or not claim(turn_id, max(10, delay_ms // 1000 + 10)):
+        return
+    time.sleep(min(delay_ms, 30_000) / 1000)
 
 
 def compression_threshold_ratio() -> float:
-    """读取压缩触发比例，默认在 best window 约 82% 触发。"""
+    """读取压缩触发比例，默认在 256K 左右触发。"""
     try:
-        return min(0.95, max(0.5, float(os.getenv("AGENT_CONTEXT_COMPRESSION_THRESHOLD_RATIO", str(DEFAULT_COMPRESSION_THRESHOLD_RATIO)))))
+        return min(1.0, max(0.25, float(os.getenv("AGENT_CONTEXT_COMPRESSION_THRESHOLD_RATIO", str(DEFAULT_COMPRESSION_THRESHOLD_RATIO)))))
     except ValueError:
         return DEFAULT_COMPRESSION_THRESHOLD_RATIO
 
@@ -1708,6 +1849,57 @@ def max_context_compressions() -> int:
         return max(1, min(4, int(os.getenv("AGENT_CONTEXT_MAX_COMPRESSIONS", str(DEFAULT_MAX_CONTEXT_COMPRESSIONS)))))
     except ValueError:
         return DEFAULT_MAX_CONTEXT_COMPRESSIONS
+
+
+def rebalance_context_window_for_budget(
+    state: UnifiedAgentState,
+    threshold_tokens: int,
+    summary_target_tokens: int,
+) -> UnifiedAgentState:
+    """当恢复层未预先切分时，按 token 阈值动态拆出早期压缩候选。"""
+    messages = [item for item in list(state.get("context_messages") or []) if isinstance(item, dict)]
+    candidates = [item for item in list(state.get("compression_candidate_messages") or []) if isinstance(item, dict)]
+    if candidates or len(messages) <= 1:
+        return state
+    estimates = [estimate_tokens(compact_recent_messages([item])[0]) for item in messages]
+    raw_tokens = sum(estimates)
+    if raw_tokens <= threshold_tokens:
+        state["context_budget"] = {
+            **dict(state.get("context_budget") or {}),
+            "windowPolicy": "token_threshold_v2",
+            "rawTokenEstimate": raw_tokens,
+            "messageWindowTokenEstimate": raw_tokens,
+            "compressionCandidateTokenEstimate": 0,
+        }
+        return state
+    reserved_tokens = max(summary_target_tokens * 2, threshold_tokens // 10)
+    minimum_tail_budget = min(4_000, max(1, threshold_tokens // 2))
+    tail_budget = max(minimum_tail_budget, threshold_tokens - reserved_tokens)
+    tail_start = len(messages)
+    tail_tokens = 0
+    for index in range(len(messages) - 1, -1, -1):
+        token_count = max(1, estimates[index])
+        if tail_start < len(messages) and tail_tokens + token_count > tail_budget:
+            break
+        tail_start = index
+        tail_tokens += token_count
+    if tail_start <= 0:
+        tail_start = max(0, len(messages) - 1)
+        tail_tokens = sum(estimates[tail_start:])
+    candidate_tokens = sum(estimates[:tail_start])
+    state["context_messages"] = messages[tail_start:]
+    state["compression_candidate_messages"] = messages[:tail_start]
+    state["context_budget"] = {
+        **dict(state.get("context_budget") or {}),
+        "windowPolicy": "token_threshold_v2",
+        "rebalanceSource": "graph_guard",
+        "rawTokenEstimate": raw_tokens,
+        "messageWindowTokenEstimate": tail_tokens,
+        "compressionCandidateTokenEstimate": candidate_tokens,
+        "messageWindowCount": len(state["context_messages"]),
+        "compressionCandidateCount": len(state["compression_candidate_messages"]),
+    }
+    return state
 
 
 def estimate_state_tokens(state: UnifiedAgentState) -> int:
@@ -1727,44 +1919,69 @@ def estimate_state_tokens(state: UnifiedAgentState) -> int:
 
 
 def estimate_tokens(value: Any) -> int:
-    """中文场景用字符数近似 token，作为预算保护的保守估计。"""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    return 0 if not text else max(1, len(text) // 2)
+    """以显式 tokenizer 计算上下文预算，依赖异常时由适配层回退。"""
+    return count_tokens(value)
 
 
-def compact_recent_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """压缩最近原文窗口，避免把完整 payload 注入 LLM。"""
+def truncate_text_to_token_budget(value: str, token_budget: int) -> str:
+    """按 token 硬上限裁剪摘要文本，避免摘要段自身继续膨胀。"""
+    text = text_value(value)
+    if not text or estimate_tokens(text) <= token_budget:
+        return text
+    ratio = max(0.05, min(0.95, token_budget / max(1, estimate_tokens(text))))
+    candidate = text[: max(200, int(len(text) * ratio * 0.92))]
+    while candidate and estimate_tokens(candidate) > token_budget:
+        candidate = candidate[: max(1, int(len(candidate) * 0.9))]
+    return candidate.rstrip()
+
+
+def compact_recent_messages(messages: list[dict[str, Any]], limit: int | None = None, token_budget: int | None = None) -> list[dict[str, Any]]:
+    """保留已选中的最近原文消息；选择窗口由 token 预算决定，而不是固定条数。"""
     compacted = []
-    for item in messages[-12:]:
+    selected = [item for item in messages if isinstance(item, dict)]
+    if limit is not None:
+        safe_limit = max(1, min(int_value(limit, len(selected) or 1), 10_000))
+        selected = selected[-safe_limit:]
+    spent = 0
+    for item in selected:
         if not isinstance(item, dict):
             continue
-        compacted.append(
-            {
-                "id": item.get("id"),
-                "role": item.get("role"),
-                "messageType": item.get("messageType"),
-                "content": truncate_text(text_value(item.get("content")), 800),
-                "createdAt": item.get("createdAt"),
-            }
-        )
+        entry = {
+            "id": item.get("id"),
+            "role": item.get("role"),
+            "messageType": item.get("messageType"),
+            "content": text_value(item.get("content")),
+            "createdAt": item.get("createdAt"),
+        }
+        token_estimate = estimate_tokens(entry)
+        if token_budget is not None and compacted and spent + token_estimate > token_budget:
+            break
+        entry["tokenEstimate"] = token_estimate
+        compacted.append(entry)
+        spent += token_estimate
     return compacted
 
 
-def compact_compression_candidate_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """压缩候选窗口不进入业务 prompt，只供 conversation_compression 使用。"""
+def compact_compression_candidate_messages(messages: list[dict[str, Any]], token_budget: int | None = None) -> list[dict[str, Any]]:
+    """保留待压缩候选原文，供 conversation_compression 生成滚动摘要。"""
     compacted = []
-    for item in messages[:40]:
+    spent = 0
+    for item in messages:
         if not isinstance(item, dict):
             continue
-        compacted.append(
-            {
-                "id": item.get("id"),
-                "role": item.get("role"),
-                "messageType": item.get("messageType"),
-                "content": truncate_text(text_value(item.get("content")), 1000),
-                "createdAt": item.get("createdAt"),
-            }
-        )
+        entry = {
+            "id": item.get("id"),
+            "role": item.get("role"),
+            "messageType": item.get("messageType"),
+            "content": text_value(item.get("content")),
+            "createdAt": item.get("createdAt"),
+        }
+        token_estimate = estimate_tokens(entry)
+        if token_budget is not None and compacted and spent + token_estimate > token_budget:
+            break
+        entry["tokenEstimate"] = token_estimate
+        compacted.append(entry)
+        spent += token_estimate
     return compacted
 
 
@@ -1884,20 +2101,6 @@ def collect_evidence_refs_from_state(state: UnifiedAgentState) -> list[dict[str,
             if isinstance(evidence, dict) and evidence.get("evidenceId"):
                 refs.append({"type": "rag_evidence", "id": str(evidence.get("evidenceId")), "title": text_value(evidence.get("title"))})
     return refs
-
-
-def conversation_compression_system_prompt() -> str:
-    """上下文压缩系统提示。"""
-    return (
-        "你是 Agent 上下文压缩器。先保留关键事实，再压缩摘要，输出唯一 JSON。"
-        "不要丢失用户硬约束、审批决策、工具发现、evidence 引用和当前任务状态。"
-        "不得编造资料正文或新的 evidence。"
-    )
-
-
-def conversation_compression_user_prompt(payload: dict[str, Any]) -> str:
-    """上下文压缩用户提示。"""
-    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def build_planning_plan(task_input: dict[str, Any]) -> dict[str, Any]:
@@ -2211,6 +2414,7 @@ def synthesize_read_final(state: UnifiedAgentState) -> dict[str, Any]:
     evidences = data.get("evidences") if isinstance(data.get("evidences"), list) else []
     return {
         "answer": text_value(data.get("answer")) or "只读 Agent 已完成检索覆盖诊断",
+        "evidences": evidences,
         "evidenceIds": [str(item.get("evidenceId")) for item in evidences if isinstance(item, dict) and item.get("evidenceId")],
         "evidenceCount": len(evidences) if evidences else int_value(data.get("evidenceCount"), 0),
         "expandedQueries": data.get("expandedQueries") if isinstance(data.get("expandedQueries"), list) else [],
@@ -2243,6 +2447,7 @@ def synthesize_planning_draft(state: UnifiedAgentState, client: AgentGateway) ->
         "matchSummary": build_match_summary(alignment, evidence_ids),
         "alignment": alignment,
         "gaps": gaps,
+        "evidences": evidences,
         "evidenceIds": evidence_ids,
         "memoryContext": merge_memory_contexts(state),
         "webReferences": web_references_from_state(state),
@@ -2362,7 +2567,7 @@ def build_resume_evidence_question(profile: dict[str, Any], goal: str) -> str:
 
 
 def safe_resume_evidence_item(item: dict[str, Any]) -> dict[str, Any] | None:
-    """提取供后续子 Agent 使用的最小 evidence 字段，保留来源和分数。"""
+    """提取供后续子 Agent 使用的 evidence 字段，并保留前端跳转所需元数据。"""
     evidence_id = text_value(item.get("evidenceId"))
     if not evidence_id:
         return None
@@ -2370,14 +2575,35 @@ def safe_resume_evidence_item(item: dict[str, Any]) -> dict[str, Any] | None:
         score = float(item.get("score") or 0.0)
     except (TypeError, ValueError):
         score = 0.0
-    return {
+    safe_item: dict[str, Any] = {
         "evidenceId": evidence_id,
+        "documentId": text_value(item.get("documentId")) or evidence_id,
         "documentTitle": truncate_text(text_value(item.get("documentTitle")) or text_value(item.get("title")) or "未命名资料", 160),
+        "title": truncate_text(text_value(item.get("title")) or text_value(item.get("documentTitle")) or "未命名资料", 160),
+        "sectionTitle": truncate_text(text_value(item.get("sectionTitle")), 200),
         "sectionName": truncate_text(text_value(item.get("sectionName")) or "全文", 120),
         "snippet": truncate_text(text_value(item.get("snippet")), 500),
-        "source": truncate_text(text_value(item.get("source")) or "learning_material", 120),
+        "source": text_value(item.get("source")) or "learning_material",
+        "sourcePath": text_value(item.get("sourcePath")),
+        "assetPath": text_value(item.get("assetPath")),
+        "playbackUrl": text_value(item.get("playbackUrl")),
+        "documentType": text_value(item.get("documentType")),
+        "blockId": text_value(item.get("blockId")),
+        "blockType": text_value(item.get("blockType")),
+        "startTime": text_value(item.get("startTime")),
+        "endTime": text_value(item.get("endTime")),
+        "sheetName": text_value(item.get("sheetName")),
+        "cellRange": text_value(item.get("cellRange")),
+        "retrievalSource": text_value(item.get("retrievalSource")),
+        "parseEngine": text_value(item.get("parseEngine")),
         "score": max(0.0, min(score, 1.0)),
     }
+    for key in ("pageIndex", "slideIndex"):
+        if item.get(key) is not None:
+            safe_item[key] = item.get(key)
+    if isinstance(item.get("metadata"), dict):
+        safe_item["metadata"] = dict(item.get("metadata") or {})
+    return safe_item
 
 
 def build_resume_evidence_bundle(profile: dict[str, Any], question: str, rag_data: dict[str, Any]) -> dict[str, Any]:
@@ -3352,11 +3578,6 @@ def truncate_text(value: str, limit: int) -> str:
     return value[:limit] if len(value) > limit else value
 
 
-def json_prompt(payload: dict[str, Any]) -> str:
-    """把提示词输入序列化为中文 JSON。"""
-    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-
-
 def fallback_conversation_title(goal: str) -> str:
     """在 LLM 不可用时用首句生成可读标题。"""
     first_line = " ".join((goal or "Agent 会话").strip().split())
@@ -3385,140 +3606,100 @@ def record_llm_diagnostic(state: UnifiedAgentState, node: str, model: str, statu
 
 
 def conversation_title_system_prompt() -> str:
-    """Conversation Title 节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的会话主题命名节点。你的唯一任务是根据用户第一句话生成一个中文短标题。"
-        "标题必须概括用户目标，8 到 20 个中文字符为宜，不要使用标点、引号、换行或表情。"
-        "不得编造用户没有提到的公司、岗位、技术或结论。只输出合法 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的 Conversation Title Prompt。"""
+    return _conversation_title_system_prompt()
 
 
 def conversation_title_user_prompt(payload: dict[str, Any]) -> str:
-    """Conversation Title 节点用户提示词。"""
-    expected = {"conversationTitle": "8到20字中文主题标题"}
-    return "请根据以下用户目标生成会话标题 JSON，不要输出解释文字：\n" + json_prompt({**payload, "expectedJson": expected})
+    """兼容旧导入路径，返回集中管理的 Conversation Title user Prompt。"""
+    return _conversation_title_user_prompt(payload)
 
 
 def planner_system_prompt() -> str:
-    """Planner 节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的 LangGraph 规划节点。你只生成可审批计划，不执行工具、不保存数据、不生成最终答案。"
-        "所有工具必须通过 Python 本地 Gateway。PLAN 审批只确认路线，不授权写操作。任何保存、修改、删除、写入记忆或导出文件"
-        "都必须在 OUTPUT 审批后再进入 CRUD 审批。只允许从 allowedTools 和 allowedSubgraphs 选择。"
-        "若 taskInputSummary.workspaceMode=free_explore，必须把 web_search_probe 作为第一步，把 rag_query_probe_non_persistent 作为第二步补充或降级路径。"
-        "若目标涉及优化简历、修改简历、生成投递简历、简历改写，必须设置 resumeRewriteIntent=true 并加入 internalSubgraphs=[\"resume_rewrite_subgraph\"]。"
-        "只输出合法 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的 Planner Prompt。"""
+    return _planner_system_prompt()
 
 
 def planner_user_prompt(payload: dict[str, Any]) -> str:
-    """Planner 节点用户提示词。"""
-    return "请根据以下任务上下文生成可审批计划 JSON，不要输出解释文字：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的 Planner user Prompt。"""
+    return _planner_user_prompt(payload)
 
 
 def executor_system_prompt() -> str:
-    """Executor 节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的 ReAct 执行节点。你只能根据已批准计划选择下一步只读工具或判断无需工具。"
-        "不能发明工具名，不能选择 mutation 工具，不能绕过 Python 本地 Gateway。只输出 JSON action。"
-    )
+    """兼容旧导入路径，返回集中管理的 Executor Prompt。"""
+    return _executor_system_prompt()
 
 
 def executor_user_prompt(payload: dict[str, Any]) -> str:
-    """Executor 节点用户提示词。"""
-    return "请根据当前计划步骤和工具观察选择下一步只读 action JSON；如无需工具，toolName 置空：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的 Executor user Prompt。"""
+    return _executor_user_prompt(payload)
 
 
 def repair_system_prompt() -> str:
-    """Repair 节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的修补节点。你根据工具错误码、retryable、重试次数和任务目标决定 RETRY、SKIP_TOOL、REPLAN 或 REPORT_UNABLE。"
-        "权限、内部令牌、跨用户资源错误必须硬停止。web_search_probe 不可用时优先降级到本地 RAG。只输出 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的 Repair Prompt。"""
+    return _repair_system_prompt()
 
 
 def repair_user_prompt(payload: dict[str, Any]) -> str:
-    """Repair 节点用户提示词。"""
-    return "请根据失败摘要输出修补决策 JSON，只能使用 allowedDecisions 中的值：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的 Repair user Prompt。"""
+    return _repair_user_prompt(payload)
 
 
 def acceptance_system_prompt() -> str:
-    """Acceptance 节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的验收节点。你检查计划步骤、工具观察、completion criteria、evidenceIds、riskLevel 和审批要求，"
-        "判断继续执行、修补、输出审批或完成。不能虚构 evidence。只输出 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的 Acceptance Prompt。"""
+    return _acceptance_system_prompt()
 
 
 def acceptance_user_prompt(payload: dict[str, Any]) -> str:
-    """Acceptance 节点用户提示词。"""
-    return "请检查任务是否满足完成标准并输出验收 JSON，不得新增 evidence：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的 Acceptance user Prompt。"""
+    return _acceptance_user_prompt(payload)
 
 
 def resume_jd_analyzer_system_prompt() -> str:
-    """JD 分析子 Agent 的提示词。"""
-    return (
-        "你是简历证据改写工作流中的 JD 分析子 Agent。你只从给定岗位 JD 提取硬性要求、加分项和关键词。"
-        "不能编造 JD 未出现的资格、公司信息或项目要求；不能输出 evidence、DOCX、文件路径、样式、XML 或保存动作。"
-        "保留输入中已有 requirement id，不要新建不可追溯 id。只输出合法 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的 JD 分析 Prompt。"""
+    return _resume_jd_analyzer_system_prompt()
 
 
 def resume_jd_analyzer_user_prompt(payload: dict[str, Any]) -> str:
-    """JD 分析子 Agent 的用户提示词。"""
-    return "请将以下岗位 JD 归纳为可检索、可审计的岗位画像 JSON，不要输出解释文字：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的 JD 分析 user Prompt。"""
+    return _resume_jd_analyzer_user_prompt(payload)
 
 
 def resume_evidence_summarizer_system_prompt() -> str:
-    """学习证据归纳子 Agent 的提示词。"""
-    return (
-        "你是学习证据归纳子 Agent。你只能根据输入 evidence 的标题、章节、片段、来源和分数概括支持范围。"
-        "requirementId 和 evidenceId 必须从输入集合中选择；证据不足时必须列为缺口，不能推断学生具备未被片段支持的能力。"
-        "不能输出 DOCX、排版、路径、保存操作或新的 evidence。只输出合法 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的证据归纳 Prompt。"""
+    return _resume_evidence_summarizer_system_prompt()
 
 
 def resume_evidence_summarizer_user_prompt(payload: dict[str, Any]) -> str:
-    """学习证据归纳子 Agent 的用户提示词。"""
-    return "请在保留 evidence 引用的条件下生成证据覆盖摘要 JSON，不要输出解释文字：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的证据归纳 user Prompt。"""
+    return _resume_evidence_summarizer_user_prompt(payload)
 
 
 def resume_revision_advisor_system_prompt() -> str:
-    """可微调的简历修改建议子 Agent 提示词。"""
-    return (
-        "你是简历修改建议子 Agent。你的任务是依据 JD、原简历和输入 evidence 生成字段级改写候选。"
-        "你只能修改 summary、skills、project_experience、learning_plan、gap_summary 五类文本候选；每个事实性改写必须引用输入 evidenceId，并提供该 evidence 片段中的精确短语 evidenceQuotes。"
-        "如果证据不足，只输出缺口和补强建议，不能补造项目、技能、指标、证书、实习或工作经历。"
-        "不得输出 fieldId、sourceTextHash、locationRefs、DOCX、XML、样式、路径、确认状态或保存动作。只输出合法 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的简历修改建议 Prompt。"""
+    return _resume_revision_advisor_system_prompt()
 
 
 def resume_revision_advisor_user_prompt(payload: dict[str, Any]) -> str:
-    """可微调的简历修改建议子 Agent 用户提示词。"""
-    return "请生成可由用户逐条确认的简历字段修改建议 JSON，不要输出解释文字：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的简历修改建议 user Prompt。"""
+    return _resume_revision_advisor_user_prompt(payload)
 
 
 def resume_rewrite_acceptance_system_prompt() -> str:
-    """简历修改验收节点专用提示词。"""
-    return (
-        "你是简历修改子图的验收节点。你检查每个字段候选的风险标记、evidenceId、精确引文和独立 gapSuggestions 是否可进入人工 OUTPUT 审批。"
-        "存在 MISSING_EVIDENCE 时只能作为缺口建议，不得认可为已具备能力。你不能批准保存、不能写 DOCX、不能新增 evidence。只输出 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的简历验收 Prompt。"""
+    return _resume_rewrite_acceptance_system_prompt()
 
 
 def resume_rewrite_acceptance_user_prompt(payload: dict[str, Any]) -> str:
-    """简历修改验收节点用户提示词。"""
-    return "请检查简历候选是否可进入 OUTPUT 审批，并输出验收 JSON：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的简历验收 user Prompt。"""
+    return _resume_rewrite_acceptance_user_prompt(payload)
 
 
 def answer_writer_system_prompt() -> str:
-    """回答节点专用提示词。"""
-    return (
-        "你是学迹智配 Agent 的输出节点。你根据已验证 draft/final 和审批状态生成中文输出摘要。"
-        "必须保留 evidence 引用，不得新增事实。等待审批时只生成审批说明，不伪装任务完成。只输出 JSON。"
-    )
+    """兼容旧导入路径，返回集中管理的回答节点 Prompt。"""
+    return _answer_writer_system_prompt()
 
 
 def answer_writer_user_prompt(payload: dict[str, Any]) -> str:
-    """回答节点用户提示词。"""
-    return "请基于已验证结果生成中文输出 JSON；等待审批时只写审批说明：\n" + json_prompt(payload)
+    """兼容旧导入路径，返回集中管理的回答节点 user Prompt。"""
+    return _answer_writer_user_prompt(payload)

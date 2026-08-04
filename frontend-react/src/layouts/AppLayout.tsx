@@ -12,6 +12,7 @@ import {
   Loader2,
   LogOut,
   Menu,
+  Plus,
   Search,
   Settings,
   Trash2,
@@ -22,6 +23,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
+  createAgentConversation,
   createAgentConversationFolder,
   deleteAgentConversationFolder,
   fetchAgentConversationTree,
@@ -117,7 +119,7 @@ export function AppLayout() {
           </div>
         </div>
 
-        <nav className="side-nav" aria-label="\u4e3b\u5bfc\u822a">
+        <nav className="side-nav" aria-label="主导航">
           {navItems.map((item) => (
             item.to === '/agent' ? (
               <AgentConversationNav key={item.to} />
@@ -136,7 +138,7 @@ export function AppLayout() {
             <strong>{displayName}</strong>
             <span>{accountLabel}</span>
           </div>
-          <button className="icon-button tiny" onClick={() => void logout()} aria-label="\u9000\u51fa\u767b\u5f55">
+          <button className="icon-button tiny" onClick={() => void logout()} aria-label="退出登录">
             <LogOut size={16} />
           </button>
         </div>
@@ -149,7 +151,7 @@ export function AppLayout() {
           </button>
           <div className="search-box">
             <Search size={18} />
-            <input placeholder="\u641c\u7d22\u8d44\u6599\u3001\u8bc1\u636e\u6216\u4efb\u52a1..." />
+            <input placeholder="搜索资料、证据或任务..." />
           </div>
           <button className="primary-action" onClick={openUploadPicker} disabled={uploading}>
             {uploading ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
@@ -309,6 +311,27 @@ function AgentConversationNav() {
     }
   }
 
+  async function createConversation(folderId: string | null) {
+    const targetKey = folderId || 'unfiled';
+    try {
+      setBusy(`create-conversation-${targetKey}`);
+      const task = await createAgentConversation({
+        folderId,
+        title: '新对话',
+        taskType: 'pure_read_query',
+        input: { workspaceMode: 'read' }
+      });
+      await loadTree();
+      window.dispatchEvent(new Event('agent-conversations-updated'));
+      navigate(`/agent?taskId=${encodeURIComponent(task.id)}`);
+      setOpen(true);
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : '新建对话失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function removeFolder(folder: AgentConversationFolder) {
     if (!folder.id) return;
     if (!window.confirm(`删除“${folder.name}”？其中会话会回到未分类。`)) return;
@@ -380,6 +403,7 @@ function AgentConversationNav() {
                 folder={tree.unfiled}
                 folders={tree.folders}
                 busy={busy}
+                onCreateConversation={(folderId) => void createConversation(folderId)}
                 onOpenTask={openTask}
                 onMoveTask={(task, folderId) => void moveTask(task, folderId)}
               />
@@ -389,6 +413,7 @@ function AgentConversationNav() {
                   folder={folder}
                   folders={tree.folders}
                   busy={busy}
+                  onCreateConversation={(folderId) => void createConversation(folderId)}
                   onDeleteFolder={() => void removeFolder(folder)}
                   onOpenTask={openTask}
                   onMoveTask={(task, folderId) => void moveTask(task, folderId)}
@@ -408,6 +433,7 @@ function ConversationFolderBlock({
   folder,
   folders,
   busy,
+  onCreateConversation,
   onDeleteFolder,
   onMoveTask,
   onOpenTask
@@ -415,11 +441,13 @@ function ConversationFolderBlock({
   folder: AgentConversationFolder;
   folders: AgentConversationFolder[];
   busy: string;
+  onCreateConversation: (folderId: string | null) => void;
   onDeleteFolder?: () => void;
   onMoveTask: (task: AgentTask, folderId: string) => void;
   onOpenTask: (task: AgentTask) => void;
 }) {
   const [open, setOpen] = useState(true);
+  const folderKey = folder.id || 'unfiled';
   return (
     <section className="agent-folder-block">
       <div className="agent-folder-head">
@@ -428,6 +456,15 @@ function ConversationFolderBlock({
           <Folder size={14} />
           <span>{folder.name}</span>
           <em>{folder.conversationCount}</em>
+        </button>
+        <button
+          className="agent-folder-new"
+          type="button"
+          onClick={() => onCreateConversation(folder.id)}
+          disabled={busy === `create-conversation-${folderKey}`}
+          aria-label={`在${folder.name}中新建对话`}
+        >
+          {busy === `create-conversation-${folderKey}` ? <Loader2 className="spin" size={13} /> : <Plus size={13} />}
         </button>
         {folder.id ? (
           <button className="agent-folder-delete" type="button" onClick={onDeleteFolder} disabled={busy === `delete-${folder.id}`} aria-label={`删除 ${folder.name}`}>

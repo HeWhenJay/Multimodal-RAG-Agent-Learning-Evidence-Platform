@@ -309,6 +309,27 @@ def test_visual_dedup_disabled_falls_back_to_basic_v2(tmp_path, monkeypatch):
     assert all(frame.visual_decision is None for frame in selected)
 
 
+def test_visual_hash_and_diff_reuse_one_decoded_frame(tmp_path, monkeypatch):
+    """同一候选帧同时参与 hash 和差异计算时只应解码一次。"""
+    from PIL import Image
+
+    frame_path = make_frame(tmp_path / "cached-frame.jpg", "缓存视觉特征")
+    vp._cached_visual_image_features.cache_clear()
+    original_open = Image.open
+    open_count = 0
+
+    def counting_open(*args, **kwargs):
+        nonlocal open_count
+        open_count += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", counting_open)
+
+    assert vp.visual_hash_for_image(frame_path)
+    assert vp.image_difference_score(frame_path, frame_path) == 0.0
+    assert open_count == 1
+
+
 class TimedOcrClient:
     """记录并发起点的 OCR 替身，避免单测访问远程百炼服务。"""
 

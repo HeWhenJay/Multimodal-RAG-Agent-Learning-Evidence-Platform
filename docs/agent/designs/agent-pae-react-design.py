@@ -1,11 +1,11 @@
 """
 ================================================================================
-PAE + ReAct LangGraph 节点与边设计方案（面向当前项目落地）
+PAE + ReAct LangGraph 节点与边设计方案（历史迁移草案）
 ================================================================================
 
-基于当前项目统一图改造目标设计。历史 `read_only_graph.py` / `planning_graph.py`
-仅作为旧阶段背景，不再作为运行主图或 helper 容器；统一入口为
-`agents.orchestration.pae_react_graph`。
+本文保存 Java Gateway 迁移前的伪代码和设计推演，仅供追溯，不是当前可运行入口。
+当前项目已没有 Java 源码；真实统一图、进程内工具边界和测试以
+`agents.orchestration.pae_react_graph`、`agents.gateway.local_gateway` 为准。
 
 核心思路：
   - PAE 层（Supervisor）：Planner 生成步骤计划 → Executor 逐步执行 → Reviewer 把关 → Finalize 收尾
@@ -396,7 +396,7 @@ def _planner(state: PaeAgentState, client: JavaAgentGatewayClient) -> PaeAgentSt
                 f"可用只读工具：\n{tools_desc}\n\n"
                 "输出严格的 JSON 格式，不要 Markdown code block：\n"
                 '{"title": "计划标题", "steps": [{"description": "步骤描述", "allowedTools": ["工具名"], '
-                '"expectedOutput": "期望产出"}], "riskLevel": "LOW|MEDIUM|HIGH"}\n\n"
+                '"expectedOutput": "期望产出"}], "riskLevel": "LOW|MEDIUM|HIGH"}\n\n'
                 "规则：\n"
                 "1. 步骤数不超过 5 步\n"
                 "2. 每个步骤只能使用 allowedTools 列表中的工具\n"
@@ -886,9 +886,9 @@ def _parse_json_response(text: str) -> dict[str, Any]:
 
 
 def _format_message_history(messages: list[dict[str, Any]]) -> str:
-    """将 ReAct 消息历史格式化为 LLM 可读文本。"""
+    """将已按 token 预算选择好的 ReAct 消息窗口格式化为 LLM 可读文本。"""
     return "\n\n".join(
-        f"[{msg['role']}]\n{msg['content']}" for msg in messages[-6:]  # 只保留最近 6 条
+        f"[{msg['role']}]\n{msg['content']}" for msg in messages
     )
 
 

@@ -1,7 +1,9 @@
 import type {
+  AgentConversationCreatePayload,
   AgentConversationFolder,
   AgentConversationFolderPayload,
   AgentConversationMovePayload,
+  AgentOnlineBenchmarkRun,
   AgentConversationTree,
   AgentMemory,
   AgentMemoryCreatePayload,
@@ -12,6 +14,7 @@ import type {
   AgentOperationUndoPayload,
   AgentReviewDecisionPayload,
   AgentTask,
+  AgentTaskContinuePayload,
   AgentTaskCreatePayload,
   AgentToolDefinition,
   Result
@@ -47,6 +50,38 @@ export function createAgentTask(payload: AgentTaskCreatePayload): Promise<AgentT
     headers: jsonHeaders,
     body: JSON.stringify(payload)
   });
+}
+
+// 创建空白 Agent 会话草稿，首次发送消息后才入队执行。
+export function createAgentConversation(payload: AgentConversationCreatePayload): Promise<AgentTask> {
+  return request<AgentTask>('/api/agent/conversations', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 为已结束任务追加一轮消息，保持同一后端线程标识。
+export function continueAgentTask(taskId: string, payload: AgentTaskContinuePayload): Promise<AgentTask> {
+  return request<AgentTask>(`/api/agent/tasks/${taskId}/messages`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 仅开发态 Agent 工作台使用：服务端展开固定的线上 A/B 场景。
+export function startAgentOnlineBenchmark(): Promise<AgentOnlineBenchmarkRun> {
+  return request<AgentOnlineBenchmarkRun>('/api/agent/benchmarks/runs', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: '{}'
+  });
+}
+
+// 轮询后台基准的阶段与最终统计，不下载原始长上下文。
+export function fetchAgentOnlineBenchmark(runId: string): Promise<AgentOnlineBenchmarkRun> {
+  return request<AgentOnlineBenchmarkRun>(`/api/agent/benchmarks/runs/${runId}`);
 }
 
 // 查询当前用户最近的 Agent 会话任务。

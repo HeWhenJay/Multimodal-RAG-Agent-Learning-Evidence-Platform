@@ -148,7 +148,8 @@ def test_resume_rewrite_nodes_retrieve_evidence_before_generating_patch(monkeypa
 
     state = graph.resume_evidence_retriever_node(state, gateway)
     assert gateway.tool_names == ["rag_query_probe_non_persistent"]
-    assert state["resume_evidence_bundle"]["items"][0] == rag_evidences[0]
+    assert state["resume_evidence_bundle"]["items"][0]["evidenceId"] == rag_evidences[0]["evidenceId"]
+    assert state["resume_evidence_bundle"]["items"][0]["snippet"] == rag_evidences[0]["snippet"]
 
     state = graph.resume_evidence_summarizer_node(state, gateway)
     assert state["resume_evidence_bundle"]["evidenceIds"] == ["evidence-rag-1"]

@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import process_event
+from prompts.vision import DEFAULT_OCR_PROMPT
 
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -18,10 +19,8 @@ MAX_BASE64_IMAGE_BYTES = 10_000_000
 DATA_URL_OVERHEAD_BYTES = 64
 # 百炼对 Base64 图片字符串限制为 10MB，保守预留 data URL 头后换算为原始图片字节数。
 DEFAULT_MAX_IMAGE_BYTES = ((MAX_BASE64_IMAGE_BYTES - DATA_URL_OVERHEAD_BYTES) // 4) * 3
-DEFAULT_PROMPT = (
-    "请只返回图片中的 OCR 文本，保留自然段、标题和表格结构。"
-    "如果是表格，请优先使用 Markdown 表格；不要输出解释、免责声明或额外说明。"
-)
+# 保留旧导出名，实际模板统一维护在 prompts/vision.py。
+DEFAULT_PROMPT = DEFAULT_OCR_PROMPT
 
 
 @dataclass(frozen=True)

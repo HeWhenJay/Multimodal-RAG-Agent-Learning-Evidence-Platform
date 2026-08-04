@@ -45,5 +45,6 @@ dependencies:
       - "confluent-kafka>=2.5,<3.0"
       - "oss2>=2.18,<3.0"
       - "redis>=5.0,<7.0"
+      - "tiktoken>=0.7,<1.0"
       - "fsrs>=6.3.1,<7.0"
       - "yt-dlp>=2026.7.4,<2027.0"

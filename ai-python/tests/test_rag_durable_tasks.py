@@ -308,6 +308,30 @@ def test_index_result_builds_terminal_progress_without_cross_topic_ordering() ->
     assert progress["message"] == "索引完成：状态 READY，共 14 个切块"
 
 
+def test_successful_promote_triggers_idempotent_review_generation() -> None:
+    """资料真正可检索后应按 materialId 触发复习生成，重复消息仍交给业务幂等检查。"""
+    material_ids: list[int] = []
+    writer = RagKafkaStateWriter(repository=StateRepository(), review_sync=material_ids.append)
+    promote = event("RAG_PROMOTE_RESULT").model_copy(
+        update={"payload": {"jobId": "job-1", "materialId": 7, "requestVersion": 1, "status": "SUCCEEDED"}}
+    )
+
+    assert writer.handle_promote_result(promote) is True
+    assert material_ids == [7]
+
+
+def test_failed_promote_does_not_trigger_review_generation() -> None:
+    """RAG 提升失败时没有可用 canonical evidence，不能提前生成复习卡片。"""
+    material_ids: list[int] = []
+    writer = RagKafkaStateWriter(repository=StateRepository(), review_sync=material_ids.append)
+    promote = event("RAG_PROMOTE_RESULT").model_copy(
+        update={"payload": {"jobId": "job-1", "materialId": 7, "requestVersion": 1, "status": "FAILED"}}
+    )
+
+    assert writer.handle_promote_result(promote) is True
+    assert material_ids == []
+
+
 def test_local_index_worker_consumes_durable_job_without_kafka(monkeypatch) -> None:
     """Kafka 关闭时 LOCAL job 仍由 Python worker 执行 staging/promote 链路。"""
     monkeypatch.setenv("RAG_EMBEDDING_PROVIDER", "hash")

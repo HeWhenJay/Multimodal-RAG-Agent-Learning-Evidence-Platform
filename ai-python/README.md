@@ -1,4 +1,4 @@
-# 纯 Python FastAPI 后端
+# 学迹智配 Agent：纯 Python FastAPI 后端
 
 ## 环境变量配置
 
@@ -30,12 +30,12 @@ dashscope:
 - `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
 - `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
 - `RAG_LLM_MODEL`：默认 `qwen-plus`
-- `REVIEW_EXTRACTION_PROVIDER`：默认 `auto`；配置 `DASHSCOPE_API_KEY` 时每份资料索引版本执行一次模型生成，否则使用本地确定性降级
-- `REVIEW_EXTRACTION_MODEL`：默认 `qwen-plus`，复习卡片专用模型可独立于 RAG 答案模型配置
-- `REDIS_URL`：可选；用于跨实例复习生成短锁，不能替代 PostgreSQL 的 dueAt 和评分日志
+- `DEEPSEEK_API_KEY`：复习摘要、知识单元发现和卡片生成使用的 DeepSeek 官方 API Key；缺失时返回可诊断失败，不生成本地伪内容
+- `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料同一 pass 的 LangExtract I/O 并发，默认 `8`、硬上限 `10`
+- `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 
-复习 Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
+Agent、RAG、复习、简历、视觉 OCR 和音频 ASR Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
 
 本机覆盖时复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 后修改。`application.local.yml` 已加入 `.gitignore`，可用于填写本机路径或临时离线模式。
 
@@ -49,10 +49,10 @@ dashscope:
 ai-python/run.py
 ```
 
-PyCharm 配置：
+PyCharm 配置（`<PROJECT_ROOT>` 指仓库根目录，目录名不参与程序运行）：
 
-- Script path：`C:\Users\WhenJayHe\IdeaProjects\Multimodal-RAG-Agent-Learning-Evidence-Platform-React-Java-Python\ai-python\run.py`
-- Working directory：`C:\Users\WhenJayHe\IdeaProjects\Multimodal-RAG-Agent-Learning-Evidence-Platform-React-Java-Python\ai-python`
+- Script path：`<PROJECT_ROOT>\ai-python\run.py`
+- Working directory：`<PROJECT_ROOT>\ai-python`
 - Python interpreter：`C:\Users\WhenJayHe\miniforge3\envs\learning-evidence-rag\python.exe`
 
 如需直接运行 `ai-python/app/main.py`，当前也已支持，效果等同于调用 `run.py`。启动后访问 `http://127.0.0.1:8090/health` 检查服务状态。
@@ -128,7 +128,7 @@ conda run -n learning-evidence-rag python -B ai-python/run.py
 - `agents/gateway/`：受控本地工具、RAG 和记忆调用网关。
 - `agents/llm/`：Agent 规划、执行和回答使用的模型客户端。
 - `agents/orchestration/`：统一 PAE/ReAct 状态图及只读、规划辅助函数。
-- `prompts/`：复习功能模型 Prompt 及版本号的集中目录；其他模块可按同一方式逐步迁移。
+- `prompts/`：Agent、RAG、复习、简历、视觉 OCR 和音频 ASR Prompt 及版本号的集中目录。
 - `agents/memory/`：长期记忆候选、冲突判断、索引和检索服务。
 - `agents/resume_adapter/`：简历模板填充适配；`agents/note_writer/` 当前仅为预留目录。
 - `rag/core/`：RAG 通用模型、元数据过滤和文本清洗。
@@ -141,7 +141,7 @@ conda run -n learning-evidence-rag python -B ai-python/run.py
 
 ### Agent 状态恢复
 
-Agent 任务、消息、审批、会话文件夹和记忆状态均以 PostgreSQL 为权威来源。Agent worker 从待执行任务中领取工作，任务事件和终态写回数据库；SSE 通过数据库增量事件恢复，断线或进程重启后可继续轮询同一任务。
+Agent 任务、消息、上下文摘要、审批、会话文件夹和记忆状态均以 PostgreSQL 为权威来源。Redis 只保存带身份校验和 TTL 的可重建上下文快照；miss 或不可用时由 `LocalAgentGateway` 回源 PostgreSQL。Agent worker 从待执行任务中领取工作，任务事件和终态写回数据库；SSE 通过数据库增量事件恢复，断线或进程重启后可继续轮询同一任务。
 
 ## 开发验证
 

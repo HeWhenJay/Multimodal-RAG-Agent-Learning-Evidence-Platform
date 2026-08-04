@@ -11,7 +11,7 @@ import os
 from threading import RLock
 from typing import Any, ContextManager, Protocol
 
-from app.auth.repository import DEFAULT_SCHEMA, resolve_database_url, validate_schema
+from app.auth.repository import DEFAULT_SCHEMA, connect_postgres, resolve_database_url, validate_schema
 
 
 JSON_FIELDS = {
@@ -47,6 +47,8 @@ class AgentRepositoryProtocol(Protocol):
     def update_task(self, task_id: str, **changes: Any) -> dict[str, Any] | None: ...
 
     def append_message(self, record: dict[str, Any]) -> dict[str, Any]: ...
+
+    def append_turn_and_requeue(self, task_id: str, user_id: str, record: dict[str, Any], input_json: dict[str, Any], updated_at: datetime) -> dict[str, Any] | None: ...
 
     def list_messages(
         self,
@@ -191,6 +193,30 @@ class InMemoryAgentRepository:
             item["sequence_no"] = len(task_messages) + 1
             task_messages.append(item)
             return deepcopy(item)
+
+    def append_turn_and_requeue(self, task_id: str, user_id: str, record: dict[str, Any], input_json: dict[str, Any], updated_at: datetime) -> dict[str, Any] | None:
+        """原子追加新轮用户消息并重新排入同一任务。"""
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None or task.get("user_id") != user_id:
+                return None
+            task_messages = self.messages.setdefault(task_id, [])
+            duplicate = next((item for item in task_messages if item.get("dedupe_key") == record.get("dedupe_key")), None)
+            if duplicate is None:
+                item = deepcopy(record)
+                item["sequence_no"] = len(task_messages) + 1
+                task_messages.append(item)
+            task.update(
+                {
+                    "input_json": deepcopy(input_json),
+                    "status": "CREATED",
+                    "final_json": {},
+                    "error_code": None,
+                    "error_message": None,
+                    "updated_at": updated_at,
+                }
+            )
+            return deepcopy(task)
 
     def list_messages(
         self,
@@ -515,6 +541,51 @@ class PostgresAgentRepository:
             )
             return normalize_row(cursor.fetchone())
 
+    def append_turn_and_requeue(self, task_id: str, user_id: str, record: dict[str, Any], input_json: dict[str, Any], updated_at: datetime) -> dict[str, Any] | None:
+        """在同一 PostgreSQL 事务中追加消息、更新目标并重置任务状态。"""
+        with self._transaction() as cursor:
+            cursor.execute(
+                self._statement("SELECT * FROM {schema}.agent_task WHERE id = %s AND user_id = %s FOR UPDATE"),
+                (task_id, user_id),
+            )
+            task = cursor.fetchone()
+            if task is None:
+                return None
+            cursor.execute(
+                self._statement("SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_no FROM {schema}.agent_chat_message WHERE task_id = %s"),
+                (task_id,),
+            )
+            next_no = int((cursor.fetchone() or {}).get("next_no") or 1)
+            cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.agent_chat_message
+                        (id, task_id, user_id, sequence_no, role, message_type, content, payload_json,
+                         source_event_type, source_id, dedupe_key, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (task_id, dedupe_key) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                (
+                    record["id"], task_id, user_id, next_no, record["role"], record["message_type"], record["content"],
+                    json_text(record.get("payload_json")), record.get("source_event_type"), record.get("source_id"),
+                    record["dedupe_key"], record["created_at"], record["updated_at"],
+                ),
+            )
+            cursor.execute(
+                self._statement(
+                    """
+                    UPDATE {schema}.agent_task
+                    SET input_json = %s, status = 'CREATED', final_json = %s, error_code = NULL,
+                        error_message = NULL, updated_at = %s
+                    WHERE id = %s AND user_id = %s
+                    RETURNING *
+                    """
+                ),
+                (json_text(input_json), json_text({}), updated_at, task_id, user_id),
+            )
+            return normalize_row(cursor.fetchone())
+
     def list_messages(self, task_id: str, limit: int, before_sequence_no: int | None = None, after_sequence_no: int | None = None) -> list[dict[str, Any]]:
         if before_sequence_no is not None:
             rows = self._rows(
@@ -820,7 +891,7 @@ class PostgresAgentRepository:
         if not changes:
             return self._row(f"SELECT * FROM {{schema}}.{table} WHERE id = %s", (item_id,))
         allowed = {
-            "agent_task": {"status", "title", "folder_id", "input_json", "plan_json", "draft_json", "final_json", "python_thread_id", "error_code", "error_message", "updated_at"},
+            "agent_task": {"status", "title", "folder_id", "task_type", "input_json", "plan_json", "draft_json", "final_json", "python_thread_id", "error_code", "error_message", "updated_at"},
             "agent_human_review": {"status", "decision_json", "reviewed_by", "reviewed_at", "updated_at"},
             "agent_operation": {"status", "before_snapshot_ref", "after_snapshot_ref", "undo_deadline", "audit_event_id", "error_code", "error_message", "updated_at"},
             "agent_conversation_folder": {"name", "sort_order", "updated_at"},
@@ -869,11 +940,10 @@ class PostgresAgentRepository:
         if not self._database_url:
             raise RuntimeError("未配置 AUTH_DATABASE_URL、RAG_DATABASE_URL 或 DATABASE_URL")
         try:
-            import psycopg
             from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("Agent PostgreSQL 仓储需要安装 psycopg[binary]") from exc
-        return psycopg.connect(self._database_url, row_factory=dict_row)
+        return connect_postgres(self._database_url, row_factory=dict_row, purpose="Agent PostgreSQL 仓储")
 
 
 def json_text(value: Any) -> str:

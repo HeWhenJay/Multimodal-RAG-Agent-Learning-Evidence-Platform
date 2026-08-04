@@ -9,18 +9,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from rag.observability.model_logging import log_model_call
+from prompts.media import DEFAULT_ASR_PROMPT
 
 
 DEFAULT_ASR_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ASR_TASK_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_ASR_MODEL = "qwen3-asr-flash"
 DEFAULT_ASR_FILETRANS_MODEL = "qwen3-asr-flash-filetrans"
-DEFAULT_ASR_PROMPT = (
-    "请将音频转写为 SRT 字幕格式，只输出字幕内容。"
-    "每段必须包含序号、HH:MM:SS,mmm --> HH:MM:SS,mmm 时间范围和中文转写文本。"
-)
-
-
 class RollingWindowRateLimiter:
     """用进程内滚动窗口限制百炼 ASR 请求启动速率。"""
 

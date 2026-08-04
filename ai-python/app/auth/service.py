@@ -96,7 +96,7 @@ class AuthService:
             return to_user_response(user, user.last_login_at)
 
     def logout(self, token: str | None) -> None:
-        """幂等撤销当前令牌；缺少令牌时保持 Java 接口的成功语义。"""
+        """幂等撤销当前令牌；缺少令牌时保持既有接口的成功语义。"""
         if not token or not token.strip():
             return
         with self._repository.transaction() as transaction:

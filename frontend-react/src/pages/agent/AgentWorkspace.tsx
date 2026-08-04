@@ -25,19 +25,23 @@ import { useSearchParams } from 'react-router-dom';
 import {
   archiveAgentMemory,
   confirmAgentMemory,
+  continueAgentTask,
   createAgentTask,
   decideAgentReview,
   deleteAgentMemory,
   fetchAgentMemories,
+  fetchAgentOnlineBenchmark,
   fetchAgentTask,
   fetchAgentTaskMessages,
   fetchAgentTasks,
   rejectAgentMemory,
   subscribeAgentTask,
+  startAgentOnlineBenchmark,
   undoAgentOperation
 } from '../../api/agent';
-import type { AgentChatMessage, AgentHumanReview, AgentMemory, AgentOperation, AgentStreamEvent, AgentTask, AgentToolCall } from '../../api/types';
+import type { AgentChatMessage, AgentHumanReview, AgentMemory, AgentOnlineBenchmarkRun, AgentOperation, AgentStreamEvent, AgentTask, AgentToolCall, RagEvidence } from '../../api/types';
 import { MarkdownText } from '../../components/MarkdownText';
+import { buildEvidenceHrefRewriter, buildEvidenceOpenHref } from '../../utils/evidenceLinks';
 
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELED']);
 
@@ -52,6 +56,8 @@ interface FeatureOption {
   tags: string[];
   defaultGoal: string;
 }
+
+type EvidenceHrefRewriter = (href: string, contextText?: string) => string;
 
 const COPY = {
   readTitle: '\u53ea\u8bfb\u95ee\u7b54',
@@ -108,6 +114,31 @@ const DETAIL_TABS: Array<{ value: DetailTab; label: string; icon: ReactNode }> =
   { value: 'history', label: COPY.history, icon: <History size={15} /> }
 ];
 
+const AGENT_BENCHMARK_DEVELOPER_KEY = 'learning-evidence.agentBenchmarkDeveloper';
+
+// 控制线上 A/B 入口默认隐藏，仅允许开发者通过显式开关临时打开。
+function isAgentBenchmarkUiEnabled(searchParams: URLSearchParams) {
+  if (import.meta.env.VITE_AGENT_ONLINE_BENCHMARK_UI === 'true') {
+    return true;
+  }
+
+  if (!import.meta.env.DEV || typeof window === 'undefined') {
+    return false;
+  }
+
+  const developerFlag = searchParams.get('agentBenchmark');
+  if (developerFlag === '1') {
+    window.localStorage.setItem(AGENT_BENCHMARK_DEVELOPER_KEY, 'true');
+    return true;
+  }
+  if (developerFlag === '0') {
+    window.localStorage.removeItem(AGENT_BENCHMARK_DEVELOPER_KEY);
+    return false;
+  }
+
+  return window.localStorage.getItem(AGENT_BENCHMARK_DEVELOPER_KEY) === 'true';
+}
+
 export function AgentWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [goal, setGoal] = useState('');
@@ -129,12 +160,15 @@ export function AgentWorkspace() {
   const [undoing, setUndoing] = useState('');
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState('');
+  const [benchmarkRun, setBenchmarkRun] = useState<AgentOnlineBenchmarkRun | null>(null);
+  const [benchmarkStarting, setBenchmarkStarting] = useState(false);
   const featureMenuRef = useRef<HTMLDivElement | null>(null);
   const detailPanelRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<EventSource | null>(null);
 
   const activeFeature = findFeature(workspaceMode);
   const hasConversation = Boolean(task);
+  const isDraftConversation = task?.status === 'DRAFT';
   const visibleMessages = conversationMessages.length ? conversationMessages : (task?.messages || []);
   const hasServerMessages = Boolean(visibleMessages.length);
   const pendingReviews = (task?.reviews || []).filter((review) => review.status === 'PENDING');
@@ -142,10 +176,20 @@ export function AgentWorkspace() {
   const finalAnswer = stringValue(task?.final?.answer);
   const draftSummary = stringValue(task?.draft?.matchSummary) || stringValue(task?.draft?.answer);
   const backendNotice = task ? buildBackendNotice(task) : '';
-  const evidenceIds = useMemo(() => uniqueList([...normalizeStringList(task?.final?.evidenceIds), ...normalizeStringList(task?.draft?.evidenceIds)]), [task?.final, task?.draft]);
+  const taskEvidences = useMemo(() => collectTaskEvidences(task), [task]);
+  const evidenceHrefRewriter = useMemo(() => buildEvidenceHrefRewriter(taskEvidences), [taskEvidences]);
+  const evidenceIds = useMemo(
+    () => uniqueList([
+      ...normalizeStringList(task?.final?.evidenceIds),
+      ...normalizeStringList(task?.draft?.evidenceIds),
+      ...taskEvidences.map((item) => item.evidenceId)
+    ]),
+    [task?.final, task?.draft, taskEvidences]
+  );
   const expandedQueries = useMemo(() => normalizeStringList(task?.final?.expandedQueries || task?.draft?.expandedQueries), [task?.final, task?.draft]);
   const progressSteps = useMemo(() => buildProgressSteps(task), [task]);
   const routeTaskId = searchParams.get('taskId') || '';
+  const benchmarkUiEnabled = isAgentBenchmarkUiEnabled(searchParams);
 
   useEffect(() => {
     void loadMemories();
@@ -175,7 +219,7 @@ export function AgentWorkspace() {
   }, []);
 
   useEffect(() => {
-    if (!task?.id || task.status === 'CREATING' || TERMINAL_STATUSES.has(task.status)) {
+    if (!task?.id || task.status === 'DRAFT' || task.status === 'CREATING' || TERMINAL_STATUSES.has(task.status)) {
       setPolling(false);
       return undefined;
     }
@@ -185,6 +229,14 @@ export function AgentWorkspace() {
     }, 1600);
     return () => window.clearInterval(timer);
   }, [task?.id, task?.status]);
+
+  useEffect(() => {
+    if (!benchmarkRun || benchmarkRun.status !== 'RUNNING') return undefined;
+    const timer = window.setInterval(() => {
+      void fetchAgentOnlineBenchmark(benchmarkRun.runId).then(setBenchmarkRun).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [benchmarkRun]);
 
   function chooseFeature(feature: FeatureOption) {
     setWorkspaceMode(feature.value);
@@ -212,11 +264,14 @@ export function AgentWorkspace() {
       webSearchQuery: enableWebSearch ? trimmedGoal : undefined,
       toolHints: buildToolHints(workspaceMode)
     };
+    const draftTask = task?.status === 'DRAFT' && !task.id.startsWith('local-pending-') ? task : null;
+    const continuingTask = task && !draftTask && TERMINAL_STATUSES.has(task.status) && !task.id.startsWith('local-pending-') ? task : null;
     const optimisticTask: AgentTask = {
-      id: `local-pending-${Date.now()}`,
+      id: draftTask?.id || continuingTask?.id || `local-pending-${Date.now()}`,
       taskType,
       status: 'CREATING',
-      title: trimmedGoal.slice(0, 48),
+      title: draftTask || !continuingTask ? trimmedGoal.slice(0, 48) : continuingTask.title,
+      folderId: draftTask?.folderId || continuingTask?.folderId || null,
       input,
       plan: {},
       draft: {
@@ -234,11 +289,11 @@ export function AgentWorkspace() {
       setDetailTab('progress');
       setSubmitting(true);
       setError('');
-      const created = await createAgentTask({
-        taskType,
-        title: trimmedGoal.slice(0, 48),
-        input
-      });
+      const created = draftTask
+        ? await continueAgentTask(draftTask.id, { content: input.goal, clientTurnId: `web-${Date.now()}`, taskType, title: trimmedGoal.slice(0, 48), input })
+        : continuingTask
+          ? await continueAgentTask(continuingTask.id, { content: input.goal, clientTurnId: `web-${Date.now()}` })
+        : await createAgentTask({ taskType, title: trimmedGoal.slice(0, 48), input });
       setTask(created);
       applyTaskMessages(created);
       setSearchParams({ taskId: created.id });
@@ -282,11 +337,17 @@ export function AgentWorkspace() {
       setTask(latest);
       applyTaskMessages(latest);
       setSearchParams({ taskId: latest.id });
-      setGoal(displayUserGoal(latest.input?.goal || latest.title || ''));
+      setGoal(latest.status === 'DRAFT' ? '' : displayUserGoal(latest.input?.goal || latest.title || ''));
       setWorkspaceMode(normalizeMode(latest.input?.workspaceMode));
       setDetailTab('progress');
       setDetailPanelOpen(false);
-      connectTaskStream(latest.id);
+      if (latest.status === 'DRAFT') {
+        streamRef.current?.close();
+        streamRef.current = null;
+        setPolling(false);
+      } else {
+        connectTaskStream(latest.id);
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '\u5386\u53f2\u4f1a\u8bdd\u8bfb\u53d6\u5931\u8d25');
     }
@@ -369,7 +430,15 @@ export function AgentWorkspace() {
   }
 
   function applyTaskMessages(latest: AgentTask) {
-    setConversationMessages((current) => mergeMessages(current, latest.messages || []));
+    if (latest.status === 'DRAFT') {
+      setConversationMessages([]);
+      setHasMoreBefore(false);
+      return;
+    }
+    setConversationMessages((current) => {
+      const sameTask = current.every((message) => !message.taskId || message.taskId === latest.id);
+      return mergeMessages(sameTask ? current : [], latest.messages || []);
+    });
     setHasMoreBefore(Boolean(latest.hasMoreMessagesBefore));
   }
 
@@ -458,6 +527,18 @@ export function AgentWorkspace() {
     }
   }
 
+  async function startBenchmark() {
+    try {
+      setBenchmarkStarting(true);
+      setError('');
+      setBenchmarkRun(await startAgentOnlineBenchmark());
+    } catch (benchmarkError) {
+      setError(benchmarkError instanceof Error ? benchmarkError.message : '线上 A/B 基准启动失败');
+    } finally {
+      setBenchmarkStarting(false);
+    }
+  }
+
   return (
     <div className={`agent-page-v2 ${hasConversation ? 'has-conversation' : 'is-empty'}`}>
       <div className="agent-context-anchor" ref={detailPanelRef}>
@@ -471,6 +552,7 @@ export function AgentWorkspace() {
             activeFeature={activeFeature}
             detailTab={detailTab}
             evidenceIds={evidenceIds}
+            evidences={taskEvidences}
             expandedQueries={expandedQueries}
             historyLoading={historyLoading}
             historyTasks={historyTasks}
@@ -493,6 +575,15 @@ export function AgentWorkspace() {
           />
         ) : null}
       </div>
+      {benchmarkUiEnabled ? (
+        <div className="agent-context-anchor" data-testid="agent-online-benchmark">
+          <button className="chip-button" type="button" disabled={benchmarkStarting || benchmarkRun?.status === 'RUNNING'} onClick={() => void startBenchmark()}>
+            {benchmarkStarting || benchmarkRun?.status === 'RUNNING' ? <Loader2 className="spin" size={15} /> : <ListChecks size={15} />}
+            <span>运行线上 A/B</span>
+          </button>
+          {benchmarkRun ? <small>{benchmarkRun.status === 'FAILED' ? benchmarkRun.error || '运行失败' : benchmarkRun.stage || benchmarkRun.status}</small> : null}
+        </div>
+      ) : null}
 
       {!hasConversation ? (
         <section className="agent-empty-center">
@@ -517,9 +608,12 @@ export function AgentWorkspace() {
       ) : (
         <main className="agent-conversation-main">
           <div className="agent-chat-stream">
-            {hasServerMessages && task ? (
+            {isDraftConversation && task ? (
+              <DraftConversationPrompt task={task} />
+            ) : hasServerMessages && task ? (
               <ServerMessageStream
                 activeFeature={activeFeature}
+                evidenceHrefRewriter={evidenceHrefRewriter}
                 error={error}
                 hasMoreBefore={hasMoreBefore}
                 loadingOlder={loadingOlder}
@@ -535,6 +629,8 @@ export function AgentWorkspace() {
                 draftSummary={draftSummary}
                 error={error}
                 evidenceIds={evidenceIds}
+                evidences={taskEvidences}
+                evidenceHrefRewriter={evidenceHrefRewriter}
                 expandedQueries={expandedQueries}
                 finalAnswer={finalAnswer}
                 goal={goal}
@@ -553,7 +649,7 @@ export function AgentWorkspace() {
                 <MemoryItem memory={memory} busyAction={memoryAction} onAction={(action) => void actOnMemory(memory, action)} />
               </ChatMessage>
             ))}
-            {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} /> : null}
+            {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} rewriteHref={evidenceHrefRewriter} /> : null}
           </div>
           <div className="agent-bottom-composer">
             <Composer
@@ -573,6 +669,18 @@ export function AgentWorkspace() {
         </main>
       )}
     </div>
+  );
+}
+
+function DraftConversationPrompt({ task }: { task: AgentTask }) {
+  const location = task.folderId ? '当前文件夹/项目' : '未分类';
+  return (
+    <ChatMessage role="assistant" title="新对话已创建">
+      <div className="agent-draft-card">
+        <strong>{task.title || '新对话'}</strong>
+        <p>{`这个会话已保存在${location}下。输入第一条目标后，Agent 会复用当前会话并开始执行。`}</p>
+      </div>
+    </ChatMessage>
   );
 }
 
@@ -655,6 +763,7 @@ function DetailPanel(props: {
   activeFeature: FeatureOption;
   detailTab: DetailTab;
   evidenceIds: string[];
+  evidences: RagEvidence[];
   expandedQueries: string[];
   historyLoading: boolean;
   historyTasks: AgentTask[];
@@ -698,7 +807,7 @@ function DetailPanel(props: {
         {props.detailTab === 'environment' ? <EnvironmentTab activeFeature={props.activeFeature} memories={props.memories} task={props.task} /> : null}
         {props.detailTab === 'progress' ? <ProgressTab steps={props.progressSteps} task={props.task} /> : null}
         {props.detailTab === 'plan' ? <PlanTab activeFeature={props.activeFeature} task={props.task} /> : null}
-        {props.detailTab === 'evidence' ? <EvidenceTab evidenceIds={props.evidenceIds} expandedQueries={props.expandedQueries} task={props.task} /> : null}
+        {props.detailTab === 'evidence' ? <EvidenceTab evidenceIds={props.evidenceIds} evidences={props.evidences} expandedQueries={props.expandedQueries} task={props.task} /> : null}
         {props.detailTab === 'approval' ? (
           <ApprovalTab
             memoryAction={props.memoryAction}
@@ -766,10 +875,10 @@ function PlanTab({ activeFeature, task }: { activeFeature: FeatureOption; task: 
   );
 }
 
-function EvidenceTab({ evidenceIds, expandedQueries, task }: { evidenceIds: string[]; expandedQueries: string[]; task: AgentTask | null }) {
+function EvidenceTab({ evidenceIds, evidences, expandedQueries, task }: { evidenceIds: string[]; evidences: RagEvidence[]; expandedQueries: string[]; task: AgentTask | null }) {
   return (
     <div className="agent-detail-section">
-      <EvidenceSummary evidenceIds={evidenceIds} expandedQueries={expandedQueries} task={task} />
+      <EvidenceSummary evidenceIds={evidenceIds} evidences={evidences} expandedQueries={expandedQueries} task={task} />
     </div>
   );
 }
@@ -842,6 +951,7 @@ function ChatMessage({ role, title, children }: { role: 'user' | 'assistant' | '
 
 function ServerMessageStream({
   activeFeature,
+  evidenceHrefRewriter,
   error,
   hasMoreBefore,
   loadingOlder,
@@ -851,6 +961,7 @@ function ServerMessageStream({
   onLoadOlder
 }: {
   activeFeature: FeatureOption;
+  evidenceHrefRewriter: EvidenceHrefRewriter;
   error: string;
   hasMoreBefore: boolean;
   loadingOlder: boolean;
@@ -869,7 +980,16 @@ function ServerMessageStream({
           </button>
         </div>
       ) : null}
-      {messages.map((message) => <ServerMessage key={message.id || `${message.messageType}-${message.dedupeKey}`} activeFeature={activeFeature} message={message} polling={polling} status={status} />)}
+      {messages.map((message) => (
+        <ServerMessage
+          key={message.id || `${message.messageType}-${message.dedupeKey}`}
+          activeFeature={activeFeature}
+          evidenceHrefRewriter={evidenceHrefRewriter}
+          message={message}
+          polling={polling}
+          status={status}
+        />
+      ))}
       {error ? (
         <ChatMessage role="assistant" title={COPY.executionNote}>
           <p className="form-message danger">{error}</p>
@@ -879,7 +999,7 @@ function ServerMessageStream({
   );
 }
 
-function ServerMessage({ activeFeature, message, polling, status }: { activeFeature: FeatureOption; message: AgentChatMessage; polling: boolean; status?: string }) {
+function ServerMessage({ activeFeature, evidenceHrefRewriter, message, polling, status }: { activeFeature: FeatureOption; evidenceHrefRewriter: EvidenceHrefRewriter; message: AgentChatMessage; polling: boolean; status?: string }) {
   const role = normalizeMessageRole(message.role);
   const title = messageTitle(message);
   if (message.messageType === 'USER_GOAL') {
@@ -911,7 +1031,7 @@ function ServerMessage({ activeFeature, message, polling, status }: { activeFeat
   if (message.messageType === 'FINAL_ANSWER') {
     return (
       <ChatMessage role="assistant" title={title}>
-        <MarkdownText className="answer-copy" content={message.content} />
+        <MarkdownText className="answer-copy" content={message.content} rewriteHref={evidenceHrefRewriter} />
       </ChatMessage>
     );
   }
@@ -949,6 +1069,8 @@ function LegacyTaskStream({
   draftSummary,
   error,
   evidenceIds,
+  evidences,
+  evidenceHrefRewriter,
   expandedQueries,
   finalAnswer,
   goal,
@@ -960,6 +1082,8 @@ function LegacyTaskStream({
   draftSummary: string;
   error: string;
   evidenceIds: string[];
+  evidences: RagEvidence[];
+  evidenceHrefRewriter: EvidenceHrefRewriter;
   expandedQueries: string[];
   finalAnswer: string;
   goal: string;
@@ -987,11 +1111,11 @@ function LegacyTaskStream({
       {(task?.toolCalls || []).map((call) => <ToolCallMessage key={call.id} call={call} />)}
       {evidenceIds.length || expandedQueries.length ? (
         <ChatMessage role="assistant" title={COPY.evidence}>
-          <EvidenceSummary evidenceIds={evidenceIds} expandedQueries={expandedQueries} task={task} />
+          <EvidenceSummary evidenceIds={evidenceIds} evidences={evidences} expandedQueries={expandedQueries} task={task} />
         </ChatMessage>
       ) : null}
-      {task ? <PlanningResult task={task} /> : null}
-      {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} /> : null}
+      {task ? <PlanningResult task={task} evidences={evidences} /> : null}
+      {task ? <FinalAnswer task={task} finalAnswer={finalAnswer} draftSummary={draftSummary} rewriteHref={evidenceHrefRewriter} /> : null}
     </>
   );
 }
@@ -1011,12 +1135,13 @@ function ToolCallMessage({ call }: { call: AgentToolCall }) {
   );
 }
 
-function EvidenceSummary({ evidenceIds, expandedQueries, task }: { evidenceIds: string[]; expandedQueries: string[]; task: AgentTask | null }) {
+function EvidenceSummary({ evidenceIds, evidences, expandedQueries, task }: { evidenceIds: string[]; evidences: RagEvidence[]; expandedQueries: string[]; task: AgentTask | null }) {
   const diagnostics = normalizeRecord(task?.final?.diagnostics || task?.draft?.diagnostics);
+  const evidenceById = buildEvidenceLookup(evidences);
   return (
     <div className="agent-evidence-panel">
       <div className="query-tags agent-tags">
-        {evidenceIds.map((id) => <span key={id}>Evidence {id}</span>)}
+        {evidenceIds.map((id) => <EvidenceReferenceTag key={id} id={id} evidence={evidenceById.get(id)} />)}
         {!evidenceIds.length ? <span>{'\u6682\u65e0 evidence \u56de\u5199'}</span> : null}
       </div>
       {expandedQueries.length ? (
@@ -1027,6 +1152,26 @@ function EvidenceSummary({ evidenceIds, expandedQueries, task }: { evidenceIds: 
       {Object.keys(diagnostics).length ? <p>{formatToolResponse(diagnostics)}</p> : null}
     </div>
   );
+}
+
+function EvidenceReferenceTag({ id, evidence }: { id: string; evidence?: RagEvidence }) {
+  const href = evidence ? buildEvidenceOpenHref(evidence) : '';
+  const label = evidence ? formatEvidenceReferenceLabel(evidence) : `Evidence ${id}`;
+  return href ? (
+    <a className="agent-evidence-link" href={href} target="_blank" rel="noreferrer">
+      {label}
+    </a>
+  ) : <span>{label}</span>;
+}
+
+function buildEvidenceLookup(evidences: RagEvidence[]) {
+  return new Map(evidences.map((item) => [item.evidenceId, item]));
+}
+
+function formatEvidenceReferenceLabel(evidence: RagEvidence) {
+  const title = evidence.documentTitle || evidence.title || evidence.evidenceId;
+  const section = evidence.sectionTitle || evidence.sectionName || evidence.startTime || '';
+  return section ? `[${title} / ${section}]` : `[${title}]`;
 }
 
 function ReviewMessage({ review, reviewing, onDecide }: { review: AgentHumanReview; reviewing: string; onDecide: (decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') => void }) {
@@ -1056,12 +1201,12 @@ function ReviewControls({ review, reviewing, onDecide }: { review: AgentHumanRev
   );
 }
 
-function FinalAnswer({ task, finalAnswer, draftSummary }: { task: AgentTask; finalAnswer: string; draftSummary: string }) {
+function FinalAnswer({ task, finalAnswer, draftSummary, rewriteHref }: { task: AgentTask; finalAnswer: string; draftSummary: string; rewriteHref: EvidenceHrefRewriter }) {
   const content = finalAnswer || draftSummary;
   if (!content && !task.errorMessage) return null;
   return (
     <ChatMessage role="assistant" title={COPY.finalAnswer}>
-      {content ? <MarkdownText className="answer-copy" content={content} /> : <p className="form-message danger">{formatTaskError(task)}</p>}
+      {content ? <MarkdownText className="answer-copy" content={content} rewriteHref={rewriteHref} /> : <p className="form-message danger">{formatTaskError(task)}</p>}
     </ChatMessage>
   );
 }
@@ -1177,11 +1322,12 @@ function MemoryItem({ memory, busyAction, onAction }: { memory: AgentMemory; bus
   );
 }
 
-function PlanningResult({ task }: { task: AgentTask }) {
+function PlanningResult({ task, evidences }: { task: AgentTask; evidences: RagEvidence[] }) {
   const source = task.final?.alignment ? task.final : task.draft;
   const alignment = Array.isArray(source?.alignment) ? source.alignment : [];
   const gaps = Array.isArray(source?.gaps) ? source.gaps : [];
   const webReferences = Array.isArray(source?.webReferences) ? source.webReferences : [];
+  const evidenceById = buildEvidenceLookup(evidences);
   if (!alignment.length && !gaps.length && !webReferences.length) return null;
   return (
     <ChatMessage role="assistant" title={COPY.reasoningSummary}>
@@ -1198,7 +1344,9 @@ function PlanningResult({ task }: { task: AgentTask }) {
                     <span className={`evidence-status ${alignmentStatusClass(status)}`}>{alignmentStatusLabel(status)}</span>
                     <strong>{String(entry.requirement || '\u672a\u547d\u540d\u8981\u6c42')}</strong>
                     <small>{String(entry.reason || '')}</small>
-                    <div className="query-tags agent-tags">{normalizeStringList(entry.evidenceIds).map((id) => <span key={id}>{id}</span>)}</div>
+                    <div className="query-tags agent-tags">
+                      {normalizeStringList(entry.evidenceIds).map((id) => <EvidenceReferenceTag key={id} id={id} evidence={evidenceById.get(id)} />)}
+                    </div>
                   </div>
                 );
               })}
@@ -1299,6 +1447,7 @@ function buildBackendNotice(task: AgentTask) {
   if (task.errorMessage) return formatTaskError(task);
   if (task.status === 'COMPLETED') return '';
   if (task.status === 'CANCELED') return '\u4efb\u52a1\u5df2\u53d6\u6d88\u3002';
+  if (task.status === 'DRAFT') return '新对话已创建，输入第一条消息后开始执行。';
   const draft = normalizeRecord(task.draft);
   const draftMessage = stringValue(draft.message);
   if (draftMessage) return draftMessage;
@@ -1330,6 +1479,7 @@ function formatTaskError(task: AgentTask) {
 function statusLabel(status?: string) {
   const labels: Record<string, string> = {
     IDLE: '\u672a\u521b\u5efa',
+    DRAFT: '草稿',
     CREATING: '\u521b\u5efa\u4e2d',
     CREATED: '\u5df2\u521b\u5efa',
     RUNNING: '\u8fd0\u884c\u4e2d',
@@ -1461,6 +1611,111 @@ function normalizeStringList(value: unknown): string[] {
 
 function uniqueList(items: string[]) {
   return Array.from(new Set(items.filter(Boolean)));
+}
+
+// 从 Agent 任务的多个回写位置提取完整 RAG evidence，供链接改写和证据标签使用。
+function collectTaskEvidences(task: AgentTask | null): RagEvidence[] {
+  if (!task) return [];
+  const sources: unknown[] = [
+    task.final?.evidences,
+    task.draft?.evidences,
+    normalizeRecord(task.final?.evidenceBundle).items,
+    normalizeRecord(task.draft?.evidenceBundle).items
+  ];
+  (task.toolCalls || []).forEach((call) => {
+    const response = normalizeRecord(call.response);
+    const data = normalizeRecord(response.data);
+    sources.push(
+      response.evidences,
+      data.evidences,
+      normalizeRecord(response.evidenceBundle).items,
+      normalizeRecord(data.evidenceBundle).items
+    );
+  });
+  (task.messages || []).forEach((message) => {
+    const payload = normalizeRecord(message.payload);
+    const data = normalizeRecord(payload.data);
+    sources.push(
+      payload.evidences,
+      data.evidences,
+      normalizeRecord(payload.final).evidences,
+      normalizeRecord(payload.draft).evidences,
+      normalizeRecord(payload.evidenceBundle).items
+    );
+  });
+
+  const byId = new Map<string, RagEvidence>();
+  sources.flatMap(normalizeRagEvidenceList).forEach((item) => {
+    const current = byId.get(item.evidenceId);
+    if (!current || evidenceLinkRichness(item) > evidenceLinkRichness(current)) {
+      byId.set(item.evidenceId, item);
+    }
+  });
+  return Array.from(byId.values());
+}
+
+function normalizeRagEvidenceList(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map(normalizeRagEvidence).filter((item): item is RagEvidence => Boolean(item));
+}
+
+function normalizeRagEvidence(value: unknown): RagEvidence | null {
+  const item = normalizeRecord(value);
+  const evidenceId = stringValue(item.evidenceId);
+  if (!evidenceId) return null;
+  const metadata = normalizeRecord(item.metadata);
+  return {
+    evidenceId,
+    documentId: stringValue(item.documentId) || deriveDocumentIdFromEvidenceId(evidenceId),
+    documentTitle: stringValue(item.documentTitle) || stringValue(item.title) || null,
+    blockId: stringValue(item.blockId) || null,
+    blockType: stringValue(item.blockType) || null,
+    pageIndex: optionalNumber(item.pageIndex),
+    slideIndex: optionalNumber(item.slideIndex),
+    startTime: stringValue(item.startTime) || null,
+    endTime: stringValue(item.endTime) || null,
+    sheetName: stringValue(item.sheetName) || null,
+    cellRange: stringValue(item.cellRange) || null,
+    sectionTitle: stringValue(item.sectionTitle) || null,
+    title: stringValue(item.title) || stringValue(item.documentTitle) || '未命名资料',
+    snippet: stringValue(item.snippet),
+    source: stringValue(item.source) || stringValue(item.sourcePath) || 'learning_material',
+    sourcePath: stringValue(item.sourcePath) || null,
+    assetPath: stringValue(item.assetPath) || null,
+    playbackUrl: stringValue(item.playbackUrl) || metadataString(metadata.playbackUrl) || null,
+    sectionName: stringValue(item.sectionName) || stringValue(item.sectionTitle) || '全文',
+    documentType: stringValue(item.documentType) || metadataString(metadata.documentType) || '',
+    score: optionalNumber(item.score) ?? 0,
+    retrievalSource: stringValue(item.retrievalSource) || null,
+    parseEngine: stringValue(item.parseEngine) || null,
+    metadata
+  };
+}
+
+function metadataString(value: unknown) {
+  return typeof value === 'string' ? value : '';
+}
+
+function optionalNumber(value: unknown) {
+  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function deriveDocumentIdFromEvidenceId(evidenceId: string) {
+  const match = /^(material-\d+)/i.exec(evidenceId);
+  return match?.[1] || evidenceId;
+}
+
+function evidenceLinkRichness(evidence: RagEvidence) {
+  return [
+    evidence.sourcePath,
+    evidence.playbackUrl,
+    evidence.startTime,
+    evidence.documentType,
+    evidence.sectionTitle,
+    evidence.metadata?.videoUrl,
+    evidence.metadata?.mediaUrl
+  ].filter(Boolean).length;
 }
 
 function mergeMessages(first: AgentChatMessage[], second: AgentChatMessage[]) {

@@ -66,7 +66,7 @@ rag:
     bootstrap-servers: ${RAG_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
     worker:
       auto-offset-reset: ${RAG_KAFKA_AUTO_OFFSET_RESET:earliest}
-      max-poll-interval-ms: ${RAG_KAFKA_MAX_POLL_INTERVAL_MS:3600000}
+      max-poll-interval-ms: ${RAG_KAFKA_MAX_POLL_INTERVAL_MS:21600000}
       reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
       reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
     producer:

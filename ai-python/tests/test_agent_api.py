@@ -8,6 +8,7 @@ from app.schemas.agent import AgentTaskEvent
 from agents.gateway.local_gateway import LocalAgentGateway
 from agents.orchestration.pae_react_graph import (
     build_planning_plan,
+    synthesize_read_final,
     task_router_node,
     tool_adapter_node,
     web_search_enabled,
@@ -50,6 +51,45 @@ def test_local_gateway_persists_events_and_never_needs_external_callback() -> No
     assert detail["status"] == "COMPLETED"
     assert detail["final"]["answer"] == "当前资料暂无 evidence。"
     assert [item["sourceEventType"] for item in detail["messages"]][-2:] == ["TASK_STARTED", "TASK_COMPLETED"]
+
+
+def test_read_final_preserves_full_evidences_for_frontend_jump() -> None:
+    """只读 Agent 最终结果必须保留前端证据跳转所需的完整字段。"""
+    final = synthesize_read_final(
+        {
+            "tool_results": [
+                {
+                    "status": "SUCCEEDED",
+                    "toolName": "rag_query_probe_non_persistent",
+                    "data": {
+                        "answer": "视频证据命中。",
+                        "expandedQueries": ["RAG 视频证据"],
+                        "evidences": [
+                            {
+                                "evidenceId": "material-8-subtitle-1",
+                                "documentId": "material-8",
+                                "title": "RAG 课程视频",
+                                "documentTitle": "RAG 课程视频",
+                                "documentType": "mp4",
+                                "sectionName": "字幕片段",
+                                "snippet": "这里讲到了 RAG-Fusion。",
+                                "source": "upload",
+                                "sourcePath": "https://example.com/rag-course.mp4",
+                                "playbackUrl": "https://example.com/rag-course.mp4#t=10",
+                                "startTime": "00:00:10",
+                                "endTime": "00:00:20",
+                                "score": 0.93,
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+
+    assert final["evidenceIds"] == ["material-8-subtitle-1"]
+    assert final["evidences"][0]["sourcePath"] == "https://example.com/rag-course.mp4"
+    assert final["evidences"][0]["playbackUrl"] == "https://example.com/rag-course.mp4#t=10"
 
 
 def test_local_gateway_requires_approved_review_before_mutation_and_supports_undo() -> None:

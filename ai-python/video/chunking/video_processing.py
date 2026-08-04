@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -209,6 +210,15 @@ class VisualFrameGroup:
     slide_index: int | None = None
     verification_count: int = 0
     visual_only_times: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VisualImageFeatures:
+    """保存候选帧复用的灰度缩略图和两种轻量视觉指纹。"""
+
+    grayscale: Any
+    difference_hash: str
+    average_hash: str
 
 
 @dataclass(frozen=True)
@@ -1664,16 +1674,45 @@ def visual_decision_for(hash_distance: int | None, diff_score: float | None) -> 
 def visual_hash_for_image(path: Path) -> str:
     """用 Pillow 实现轻量视觉指纹，不引入 OpenCV、SSIM 或 pHash 依赖。"""
     algorithm = os.getenv("RAG_VIDEO_FRAME_VISUAL_HASH_ALGORITHM", "dhash").strip().lower()
-    if algorithm == "ahash":
-        return average_hash_for_image(path)
-    return difference_hash_for_image(path)
+    features = visual_image_features(path)
+    return features.average_hash if algorithm == "ahash" else features.difference_hash
 
 
-def difference_hash_for_image(path: Path) -> str:
-    from PIL import Image
+def visual_image_features(path: Path) -> VisualImageFeatures:
+    """读取一次候选帧并缓存灰度缩略图，避免 hash 和差异计算重复解码 JPEG。"""
+    try:
+        stat = path.stat()
+        return _cached_visual_image_features(str(path), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        # 让底层 Pillow 抛出原始读取异常，调用方可以沿用既有降级告警。
+        return _cached_visual_image_features(str(path), -1, -1)
+
+
+@lru_cache(maxsize=1024)
+def _cached_visual_image_features(path: str, size: int, modified_ns: int) -> VisualImageFeatures:
+    """按文件元数据缓存视觉特征，限制缓存上限避免长视频占用过多内存。"""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow 不可用，无法计算视觉特征") from exc
 
     with Image.open(path) as image:
-        pixels = list(image.convert("L").resize((9, 8)).getdata())
+        grayscale_source = image.convert("L")
+        grayscale = grayscale_source.resize((96, 54)).copy()
+        difference_pixels = list(grayscale_source.resize((9, 8)).getdata())
+        average_pixels = list(grayscale_source.resize((8, 8)).getdata())
+
+    difference_hash = hash_from_difference_pixels(difference_pixels)
+    average_hash = hash_from_average_pixels(average_pixels)
+    return VisualImageFeatures(
+        grayscale=grayscale,
+        difference_hash=difference_hash,
+        average_hash=average_hash,
+    )
+
+
+def hash_from_difference_pixels(pixels: list[int]) -> str:
+    """根据 9×8 灰度像素生成 dHash，保持旧实现的位序和阈值。"""
     bits: list[str] = []
     for row in range(8):
         offset = row * 9
@@ -1682,14 +1721,21 @@ def difference_hash_for_image(path: Path) -> str:
     return f"{int(''.join(bits), 2):016x}"
 
 
-def average_hash_for_image(path: Path) -> str:
-    from PIL import Image
-
-    with Image.open(path) as image:
-        pixels = list(image.convert("L").resize((8, 8)).getdata())
+def hash_from_average_pixels(pixels: list[int]) -> str:
+    """根据 8×8 灰度像素生成 aHash，保持旧实现的平均值规则。"""
     average = sum(pixels) / max(len(pixels), 1)
     bits = ["1" if pixel >= average else "0" for pixel in pixels]
     return f"{int(''.join(bits), 2):016x}"
+
+
+def difference_hash_for_image(path: Path) -> str:
+    """返回候选帧的差分 hash，复用统一视觉特征缓存。"""
+    return visual_image_features(path).difference_hash
+
+
+def average_hash_for_image(path: Path) -> str:
+    """返回候选帧的平均 hash，复用统一视觉特征缓存。"""
+    return visual_image_features(path).average_hash
 
 
 def hamming_distance(left_hash: str, right_hash: str) -> int:
@@ -1764,15 +1810,14 @@ def format_ocr_frame_limit(max_frames: int | None) -> str:
 def image_difference_score(left_path: Path, right_path: Path) -> float:
     """计算两张候选帧缩略图的平均像素差异，用于检测 PPT 翻页。"""
     try:
-        from PIL import Image, ImageChops, ImageStat
+        from PIL import ImageChops, ImageStat
     except ImportError as exc:
         raise RuntimeError("Pillow 不可用，无法检测 PPT 翻页") from exc
 
-    with Image.open(left_path) as left_image, Image.open(right_path) as right_image:
-        left = left_image.convert("L").resize((96, 54))
-        right = right_image.convert("L").resize((96, 54))
-        diff = ImageChops.difference(left, right)
-        return round(ImageStat.Stat(diff).mean[0] / 255.0, 6)
+    left = visual_image_features(left_path).grayscale
+    right = visual_image_features(right_path).grayscale
+    diff = ImageChops.difference(left, right)
+    return round(ImageStat.Stat(diff).mean[0] / 255.0, 6)
 
 
 def probe_media_duration(video_input: str | Path) -> float:

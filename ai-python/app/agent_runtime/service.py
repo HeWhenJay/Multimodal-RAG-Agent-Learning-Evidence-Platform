@@ -8,8 +8,9 @@ import json
 import re
 from typing import Any
 
-from app.agent_runtime.models import DEFAULT_TOOLS, MEMORY_SCOPE_RANK, TASK_TYPES, new_id, utc_now
+from app.agent_runtime.models import DEFAULT_TOOLS, MEMORY_SCOPE_RANK, TASK_TYPES, TERMINAL_TASK_STATUSES, new_id, utc_now
 from app.agent_runtime.repository import AgentRepositoryProtocol, PostgresAgentRepository
+from app.agent_runtime.runtime_state_cache import AgentRuntimeStateCache
 from app.core.result import BusinessError
 
 
@@ -66,6 +67,39 @@ class AgentRuntimeService:
             source_event_type="TASK_CREATED",
             source_id=task_id,
             dedupe_key=f"task-created:{task_id}",
+        )
+        return self.task_summary(created)
+
+    def create_conversation(self, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """创建空白会话草稿；不写用户消息，不触发后台 Worker。"""
+        task_type = text(payload.get("taskType")) or "pure_read_query"
+        if task_type not in TASK_TYPES:
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 任务类型不合法")
+        folder_id = nullable_text(payload.get("folderId"))
+        if folder_id and self._repository.get_folder(folder_id, user_id) is None:
+            raise AgentBusinessError("AGENT_FOLDER_NOT_FOUND: 会话文件夹不存在")
+        task_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+        now = utc_now()
+        task_id = new_id("agent-task")
+        title = truncate(text(payload.get("title")) or "新对话", 80)
+        created = self._repository.create_task(
+            {
+                "id": task_id,
+                "user_id": user_id,
+                "task_type": task_type,
+                "status": "DRAFT",
+                "title": title,
+                "folder_id": folder_id,
+                "input_json": task_input,
+                "plan_json": {},
+                "draft_json": {},
+                "final_json": {},
+                "python_thread_id": task_id,
+                "error_code": None,
+                "error_message": None,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
         return self.task_summary(created)
 
@@ -145,6 +179,125 @@ class AgentRuntimeService:
             "hasMoreAfter": bool(newest and self._repository.has_message_after(task_id, newest)),
             "limit": safe_limit,
         }
+
+    def continue_task(self, task_id: str, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """为草稿或已结束任务追加用户轮次，并重新交给 durable Worker。"""
+        task = self._require_task(task_id, user_id)
+        current_status = str(task.get("status") or "")
+        is_draft = current_status == "DRAFT"
+        if not is_draft and current_status not in TERMINAL_TASK_STATUSES:
+            raise AgentBusinessError("AGENT_TASK_NOT_TERMINAL: 当前 Agent 任务尚未结束，不能追加新轮次")
+        content = text(payload.get("content"))
+        client_turn_id = text(payload.get("clientTurnId"))
+        if not content:
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 追加消息内容不能为空")
+        if len(content) > 8000:
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 追加消息不能超过 8000 字符")
+        if not client_turn_id or len(client_turn_id) > 120 or not re.fullmatch(r"[A-Za-z0-9._:-]+", client_turn_id):
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: clientTurnId 格式不合法")
+        task_input = json_value(task.get("input_json"), {})
+        task_input = dict(task_input) if isinstance(task_input, dict) else {}
+        payload_input = payload.get("input")
+        if isinstance(payload_input, dict):
+            task_input.update(payload_input)
+        task_input["goal"] = content
+        task_input.pop("question", None)
+        task_input["clientTurnId"] = client_turn_id
+        now = utc_now()
+        if is_draft:
+            next_task_type = text(payload.get("taskType")) or text(task.get("task_type")) or "pure_read_query"
+            if next_task_type not in TASK_TYPES:
+                raise AgentBusinessError("AGENT_VALIDATION_FAILED: 任务类型不合法")
+            updated_title = truncate(text(payload.get("title")) or fallback_title(content), 80)
+            if self._repository.update_task(task_id, task_type=next_task_type, title=updated_title, updated_at=now) is None:
+                raise AgentBusinessError("AGENT_TASK_NOT_FOUND: Agent 任务不存在")
+        updated = self._repository.append_turn_and_requeue(
+            task_id,
+            user_id,
+            {
+                "id": new_id("agent-message"),
+                "task_id": task_id,
+                "user_id": user_id,
+                "role": "USER",
+                "message_type": "USER_GOAL" if is_draft else "USER_TURN",
+                "content": content,
+                "payload_json": {"clientTurnId": client_turn_id, "input": task_input},
+                "source_event_type": "TASK_CREATED" if is_draft else "TASK_CONTINUED",
+                "source_id": task_id,
+                "dedupe_key": f"task-created:{task_id}" if is_draft else f"user-turn:{client_turn_id}",
+                "created_at": now,
+                "updated_at": now,
+            },
+            task_input,
+            now,
+        )
+        if updated is None:
+            raise AgentBusinessError("AGENT_TASK_NOT_FOUND: Agent 任务不存在")
+        AgentRuntimeStateCache().invalidate_context(user_id, task_id)
+        return self.task_summary(updated)
+
+    def append_benchmark_context_message(self, task_id: str, user_id: str, *, content: str, case_id: str) -> dict[str, Any]:
+        """向隔离基准任务写入冻结长上下文；不暴露为公开 HTTP 接口。"""
+        if not content or len(content) > 12000:
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 基准上下文内容不合法")
+        self._require_task(task_id, user_id)
+        now = utc_now()
+        self._repository.append_message(
+            {
+                "id": new_id("agent-message"),
+                "task_id": task_id,
+                "user_id": user_id,
+                "role": "USER",
+                "message_type": "BENCHMARK_CONTEXT",
+                "content": content,
+                "payload_json": {"benchmarkCaseId": case_id},
+                "source_event_type": "BENCHMARK_CONTEXT_SEEDED",
+                "source_id": case_id,
+                "dedupe_key": f"benchmark-context:{case_id}",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        AgentRuntimeStateCache().invalidate_context(user_id, task_id)
+        return self.get_task(task_id, user_id)
+
+    def append_benchmark_turn(self, task_id: str, user_id: str, *, content: str, client_turn_id: str) -> dict[str, Any]:
+        """为 Token 基准原子追加冻结用户轮次，不启动 Worker 或开放给浏览器。"""
+        if not content or len(content) > 8000:
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 基准轮次内容不合法")
+        if not client_turn_id or len(client_turn_id) > 120 or not re.fullmatch(r"[A-Za-z0-9._:-]+", client_turn_id):
+            raise AgentBusinessError("AGENT_VALIDATION_FAILED: 基准 clientTurnId 不合法")
+        task = self._require_task(task_id, user_id)
+        task_input = json_value(task.get("input_json"), {})
+        task_input = dict(task_input) if isinstance(task_input, dict) else {}
+        task_input["goal"] = content
+        task_input.pop("question", None)
+        task_input["clientTurnId"] = client_turn_id
+        now = utc_now()
+        updated = self._repository.append_turn_and_requeue(
+            task_id,
+            user_id,
+            {
+                "id": new_id("agent-message"),
+                "task_id": task_id,
+                "user_id": user_id,
+                "role": "USER",
+                "message_type": "BENCHMARK_TURN",
+                "content": content,
+                "payload_json": {"clientTurnId": client_turn_id},
+                "source_event_type": "BENCHMARK_TURN_SEEDED",
+                "source_id": task_id,
+                "dedupe_key": f"benchmark-turn:{client_turn_id}",
+                "created_at": now,
+                "updated_at": now,
+            },
+            task_input,
+            now,
+        )
+        if updated is None:
+            raise AgentBusinessError("AGENT_TASK_NOT_FOUND: Agent 基准任务不存在")
+        AgentRuntimeStateCache().invalidate_context(user_id, task_id)
+        return self.task_summary(updated)
 
     def save_context_summary(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """保存统一图生成的可恢复压缩摘要，并从任务事实记录推导所有者。"""

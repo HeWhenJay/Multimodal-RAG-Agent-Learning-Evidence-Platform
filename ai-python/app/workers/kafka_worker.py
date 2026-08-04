@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.repositories.rag_job import RagJobRepository
+from app.review.service import ReviewService
 from app.schemas.kafka import KafkaEnvelope
 from app.workers.rag_kafka_state import RagKafkaStateWriter
 from rag.kafka.producer import KafkaJsonProducer, build_envelope
@@ -175,7 +176,10 @@ def main() -> None:
     if os.getenv("RAG_KAFKA_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
         raise RuntimeError("RAG_KAFKA_ENABLED 未开启，已拒绝启动 Kafka worker")
     job_repository = RagJobRepository()
-    state_writer = RagKafkaStateWriter(repository=job_repository)
+    state_writer = RagKafkaStateWriter(
+        repository=job_repository,
+        review_sync=ReviewService().generate_indexed_material,
+    )
     index_worker = RagKafkaIndexWorker(job_repository=job_repository)
     promote_worker = RagKafkaPromoteWorker(producer=index_worker.producer)
     retry_scheduler = RagKafkaRetryScheduler(producer=index_worker.producer)

@@ -21,7 +21,7 @@ Python FastAPI 接管原 Spring `PageDataController`。工作台和设置页面�
 - PostgreSQL 连接串按 `PAGE_DATA_DATABASE_URL`、`RAG_DATABASE_URL`、`DATABASE_URL` 的顺序读取。
 - schema 使用 `RAG_DATABASE_SCHEMA`，默认 `learning_evidence`。
 - 工作台读取 `learning_material`、`log_event`、`log_error`；设置读取 `system_setting`。
-- `dashboard` 的资料统计按当前认证用户隔离，系统错误统计保持全局口径，和 Java 实现一致。
+- `dashboard` 的资料统计按当前认证用户隔离，系统错误统计保持全局口径，延续既有业务语义。
 
 ## 接口列表
 

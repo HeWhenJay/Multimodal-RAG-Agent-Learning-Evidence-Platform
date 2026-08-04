@@ -50,6 +50,51 @@ def test_public_task_is_owned_by_session_and_worker_completes_without_external_h
         app.dependency_overrides.clear()
 
 
+def test_public_conversation_draft_can_start_in_unfiled_or_folder() -> None:
+    """空白会话可建在未分类或文件夹下，首条消息才入队执行。"""
+    service = AgentRuntimeService(InMemoryAgentRepository())
+    client = configured_client(service)
+    try:
+        folder = client.post("/api/agent/conversation-folders", json={"name": "RAG 项目"}).json()["data"]
+        unfiled = client.post("/api/agent/conversations", json={"title": "未分类新对话"}).json()
+        filed = client.post(
+            "/api/agent/conversations",
+            json={"folderId": folder["id"], "title": "项目新对话", "input": {"workspaceMode": "read"}},
+        ).json()
+
+        assert unfiled["code"] == 1
+        assert unfiled["data"]["status"] == "DRAFT"
+        assert unfiled["data"]["folderId"] is None
+        assert filed["data"]["status"] == "DRAFT"
+        assert filed["data"]["folderId"] == folder["id"]
+        assert service.list_runnable_task_records() == []
+
+        tree = client.get("/api/agent/conversations/tree").json()["data"]
+        assert tree["unfiled"]["conversationCount"] == 1
+        assert tree["folders"][0]["conversationCount"] == 1
+
+        started = client.post(
+            f"/api/agent/tasks/{filed['data']['id']}/messages",
+            json={
+                "content": "分析这个项目的 RAG 证据覆盖",
+                "clientTurnId": "web-draft-1",
+                "taskType": "planning_task",
+                "title": "RAG 证据覆盖",
+                "input": {"workspaceMode": "free_explore", "topK": 5},
+            },
+        ).json()["data"]
+        detail = client.get(f"/api/agent/tasks/{started['id']}").json()["data"]
+
+        assert started["status"] == "CREATED"
+        assert started["taskType"] == "planning_task"
+        assert started["title"] == "RAG 证据覆盖"
+        assert started["input"]["workspaceMode"] == "free_explore"
+        assert detail["messages"][0]["messageType"] == "USER_GOAL"
+        assert len(service.list_runnable_task_records()) == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_planning_review_is_persisted_then_worker_resumes_from_python_records(monkeypatch) -> None:
     """审批接口仅落库，下一轮 worker 才按同一任务恢复统一图。"""
     service = AgentRuntimeService(InMemoryAgentRepository())

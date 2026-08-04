@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -84,13 +85,27 @@ class AgentTaskWorker:
                 self._service.mark_worker_failure(task_id, "AGENT_PYTHON_UNEXPECTED_ERROR", f"Python Agent worker 执行失败：{exc.__class__.__name__}")
                 return True
 
+    def process_task_id(self, task_id: str) -> bool:
+        """只处理指定任务，供线上恢复基准启动全新一次性 Worker。"""
+        return self.process_task(self._service.task_record(task_id))
+
 
 def main() -> None:
     """启动独立的 durable worker，必须由统一启动入口监督。"""
-    load_runtime_config(parse_args(None))
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--once", action="store_true", help="仅处理一批或指定任务后退出")
+    parser.add_argument("--task-id", default="", help="与 --once 一起使用，只处理指定 Agent 任务")
+    worker_args, runtime_args = parser.parse_known_args()
+    load_runtime_config(parse_args(runtime_args))
     if not agent_worker_enabled():
         raise RuntimeError("AI_AGENT_WORKER_ENABLED 未开启，已拒绝启动 Agent worker")
     worker = AgentTaskWorker()
+    if worker_args.once:
+        if worker_args.task_id:
+            worker.process_task_id(worker_args.task_id)
+        else:
+            worker.process_available_tasks(worker_batch_size())
+        return
     run_forever(worker)
 
 

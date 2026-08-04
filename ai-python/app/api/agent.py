@@ -19,6 +19,7 @@ from app.api.auth import get_auth_service
 from app.auth.service import AuthService
 from app.core.current_user import CurrentUser
 from app.core.result import BusinessError, Result
+from app.services.agent_online_benchmark import get_agent_online_benchmark_registry
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,39 @@ def create_task(
 ) -> Result[dict[str, Any]]:
     """创建任务与首条用户消息，耐久 worker 会异步领取执行。"""
     return Result.success(execute("创建 Agent 任务", lambda: service.create_task(user_id, object_payload(payload))))
+
+
+@router.post("/conversations", response_model=Result[dict[str, Any]])
+def create_conversation(
+    payload: Any = Body(default_factory=dict),
+    user_id: str = Depends(current_agent_user_id),
+    service: AgentRuntimeService = Depends(get_agent_runtime_service),
+) -> Result[dict[str, Any]]:
+    """创建空白 Agent 会话草稿，首次发送消息后才入队执行。"""
+    return Result.success(execute("创建 Agent 空白会话", lambda: service.create_conversation(user_id, object_payload(payload))))
+
+
+@router.post("/tasks/{task_id}/messages", response_model=Result[dict[str, Any]])
+def continue_task(
+    task_id: str,
+    payload: Any = Body(default_factory=dict),
+    user_id: str = Depends(current_agent_user_id),
+    service: AgentRuntimeService = Depends(get_agent_runtime_service),
+) -> Result[dict[str, Any]]:
+    """为当前用户已结束的任务追加一轮消息，并由 Worker 继续同一线程。"""
+    return Result.success(execute("追加 Agent 会话轮次", lambda: service.continue_task(task_id, user_id, object_payload(payload))))
+
+
+@router.post("/benchmarks/runs", response_model=Result[dict[str, Any]])
+def start_online_benchmark(user_id: str = Depends(current_agent_user_id)) -> Result[dict[str, Any]]:
+    """仅在显式本地开关下从前端启动固定 Agent 线上 A/B 基准。"""
+    return Result.success(execute("启动 Agent 线上 A/B 基准", lambda: get_agent_online_benchmark_registry().start(user_id)))
+
+
+@router.get("/benchmarks/runs/{run_id}", response_model=Result[dict[str, Any]])
+def get_online_benchmark(run_id: str, user_id: str = Depends(current_agent_user_id)) -> Result[dict[str, Any]]:
+    """返回当前用户发起的基准后台状态和摘要。"""
+    return Result.success(execute("查询 Agent 线上 A/B 基准", lambda: get_agent_online_benchmark_registry().get(run_id, user_id)))
 
 
 @router.get("/tasks", response_model=Result[list[dict[str, Any]]])

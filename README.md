@@ -1,6 +1,6 @@
-# 学迹智配 Agent
+# 学迹智配 Agent：多模态 RAG 学习证据与岗位适配平台
 
-学迹智配 Agent 是面向学习证据沉淀、资料检索和岗位准备的多模态 RAG 与 Agent 项目。当前完整运行形态为 **`React + FastAPI + PostgreSQL/pgvector`**：React 只调用 FastAPI `8090`，Python 直接负责认证、页面数据、日志、RAG、Agent、记忆、SSE 和耐久任务。Spring Boot、JDK、Maven 和 `7080` 都不是当前运行依赖。
+学迹智配 Agent 是面向学习证据沉淀、资料检索和岗位准备的多模态 RAG 与 Agent 平台，英文仓库名为 **`Multimodal-RAG-Agent-Learning-Evidence-Platform`**。当前完整运行形态为 **`React + FastAPI + PostgreSQL/pgvector`**：React 只调用 FastAPI `8090`，Python 直接负责认证、页面数据、日志、RAG、Agent、记忆、SSE 和耐久任务；仓库中没有 Java 源码，Spring Boot、JDK、Maven 和 `7080` 都不是运行依赖。
 
 ![React](https://img.shields.io/badge/React-18-149ECA?logo=react&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-Python-009688?logo=fastapi&logoColor=white)
@@ -26,7 +26,7 @@ npm run dev
 - 数据库：PostgreSQL + pgvector，默认 `127.0.0.1:5433`
 - 原始文件：本地目录或阿里 OSS；Kafka 仅在需要高吞吐索引时启用。
 
-`ai-python/run.py` 是后端唯一启动入口。默认会监督 FastAPI、Agent worker、RAG durable worker 和已启用的 cron；Kafka 配置为开启时才会额外启动 Kafka worker。Java 代码只应视为迁移历史，不应启动或配置为联调依赖。
+`ai-python/run.py` 是后端唯一启动入口。默认会监督 FastAPI、Agent worker、RAG durable worker 和已启用的 cron；Kafka 配置为开启时才会额外启动 Kafka worker。旧文档中的 Java 架构仅作为迁移历史，不是当前代码、启动或联调依据。
 
 ## 项目能力
 
@@ -37,7 +37,10 @@ npm run dev
 - 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
 - Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示都由 DeepSeek 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
 - 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
-- Agent 工作台：LangGraph PAE/ReAct 编排、受控工具、记忆、审批、撤销、任务消息、事件投影与 SSE。
+- Agent 工作台：支持在未分类或指定文件夹创建空白 `DRAFT` 会话、在同一 `taskId/threadId` 上多轮续聊、历史消息分页、LangGraph PAE/ReAct、受控工具、记忆、审批、撤销、事件投影与 SSE。
+- 长会话上下文：使用 `tiktoken` 做本地预算，未摘要原文超过 Token 阈值后才生成滚动摘要；PostgreSQL 保存消息与摘要事实，Redis 只缓存可重建的 L2 运行态快照。
+- Prompt 与模型观测：Agent、RAG、复习、简历、OCR 和 ASR Prompt 集中在 `ai-python/prompts/`；Agent Qwen 调用保留 provider usage，支持审计输入 Token、输出 Token 和总 Token。
+- 工程基准：提供默认关闭的固定场景 Agent A/B 基准，验证同线程长会话、工具安全和 Redis miss/Worker 重启恢复，不接受浏览器注入任意测试工具或测试正文。
 - 统一业务边界：所有公开接口保持 React 既有 `/api/*` 路径、Bearer Token、camelCase 字段和 `{code,msg,data}` 响应信封。
 
 ## 系统总览
@@ -73,18 +76,23 @@ flowchart TB
     CRON <--> DB
     KAFKAW <--> DB
 
+    API -. "追加消息时失效旧快照" .-> REDIS[("Redis 可选 L2\nAgent 上下文运行态快照")]
+    AGW -. "读取可重建快照" .-> REDIS
+    REDIS -. "命中则加速；miss 时不返回" .-> AGW
+
     API <--> STORE["原始文件存储\nlocal 或 Aliyun OSS"]
     RAGW <--> STORE
     KAFKAW <--> STORE
     RAGW --> MODEL["MinerU / OCR / ASR\nEmbedding / Rerank / LLM"]
     KAFKAW --> MODEL
     REVIEW --> DEEPSEEK["DeepSeek 官方 API\nLangExtract 8 路 I/O 并发\n卡片生成 + max reasoning"]
+    AGW --> QWEN["Qwen Agent 节点\n结构化决策 + usage 观测"]
 
     CRON -->|"可选 Outbox 发布"| KAFKA[("Kafka")]
     KAFKA <--> KAFKAW
 ```
 
-**数据事实源：** PostgreSQL/pgvector 同时保存认证、资料、任务、消息、审批、记忆、日志和向量索引。Redis 如启用只用于可丢失的运行态加速，原始文件保存在本地受控目录或 OSS。没有任何业务状态需要回写 Java。
+**数据事实源：** PostgreSQL/pgvector 同时保存认证、资料、任务、消息、上下文摘要、审批、记忆、日志和向量索引。Redis 如启用只保存带 `userId + taskId + threadId` 身份校验和 TTL 的可丢失快照；miss、不可用或进程重启均回源 PostgreSQL。原始文件保存在本地受控目录或 OSS，没有任何业务状态需要回写 Java。
 
 ## 资料入库与索引流程
 
@@ -131,15 +139,22 @@ flowchart TB
 
 ## 视频证据处理流程
 
-视频与字幕资料走同一份 Python 索引状态机。字幕、语音、关键帧和 OCR 文本都带有时间位置，最终 evidence 可以让前端定位到对应播放片段。
+视频与字幕资料走同一份 Python 索引状态机。前端上传分片和后端媒体解析均以约 `20MiB` 为目标；大视频合并后会再次用 FFmpeg 无转码切成独立媒体片段，再由共享队列和有界 Worker 聚合。字幕、语音、关键帧和 OCR 文本都带有时间位置，最终 evidence 可以让前端定位到对应播放片段。
 
 ```mermaid
 flowchart TB
     V["视频、字幕或转写文本"] --> STORE["受控原始文件存储\nlocal / OSS"]
     STORE --> WORKER["Python RAG worker"]
-    WORKER --> SUB["内嵌/同目录字幕\n或 FFmpeg 分段 ASR"]
-    WORKER --> FRAME["关键帧采样\nPPT 翻页检测"]
-    FRAME --> OCR["OCR 与近重复去重"]
+    WORKER --> SIZE{"是否超过媒体分片目标"}
+    SIZE -->|"否"| PARSER["整文件视频解析器"]
+    SIZE -->|"是"| SPLIT["FFmpeg 无转码分片\n默认目标约 20MiB"]
+    SPLIT --> POOL["共享任务队列\n默认 2 个媒体 Worker"]
+    POOL --> PARSER
+    PARSER --> SUB["侧车/内嵌字幕优先\n否则音频分段 ASR"]
+    PARSER --> FRAME["关键帧采样\nPPT 翻页检测"]
+    FRAME --> FEATURE["灰度缩略图 + aHash/dHash\n单次解码缓存复用"]
+    FEATURE --> DEDUP["视觉分组、近重复过滤\n代表帧选择"]
+    DEDUP --> OCR["OCR 微批与有界并发"]
     SUB --> BLOCK["带 startTime / endTime 的证据块"]
     OCR --> BLOCK
     BLOCK --> SUMMARY["视频片段摘要"]
@@ -147,6 +162,8 @@ flowchart TB
     CHUNK --> INDEX["pgvector 索引\nBM25 + embedding"]
     INDEX --> EVIDENCE["含时间定位的 evidence\n前端可跳转播放"]
 ```
+
+媒体分片大小是按码率和时长估算的目标值，无转码切片还要服从关键帧边界，因此单片不保证严格等于 `20MiB`。分片失败、FFmpeg 不可用或并发解析没有形成有效字幕/OCR evidence 时，会回落到原整视频解析路径。`RAG_VIDEO_PARALLEL_WORKERS` 默认保持 `2`，避免常见开发机在抽帧、OCR 和 ASR 同时执行时出现无界资源竞争。
 
 ## RAG 查询与证据回答流程
 
@@ -240,15 +257,20 @@ flowchart LR
 
 ## Agent、记忆与审批闭环
 
-Agent 不通过内部 HTTP 或 Java gateway 回调自身。FastAPI 将任务和用户操作持久化后，Agent worker 使用进程内 `LocalAgentGateway` 调用受控 RAG、记忆和业务服务；每个事件先落 PostgreSQL，再通过 SSE 投影到前端。
+Agent 不通过内部 HTTP 或 Java gateway 回调自身。FastAPI 将会话、消息和用户操作持久化后，Agent worker 使用进程内 `LocalAgentGateway` 调用受控 RAG、记忆和业务服务；每个事件先落 PostgreSQL，再通过 SSE 投影到前端。空白会话使用 `DRAFT` 状态且不会被 Worker 领取，第一次发送或在终态会话中续聊时才进入 `CREATED`，并复用原 `taskId/threadId`。
 
 ### 耐久任务与事件投影
 
 ```mermaid
 flowchart TB
-    U["用户输入任务"] --> FE["React Agent 工作台"]
-    FE --> API["FastAPI /api/agent/*\n认证、所有权与 Result 信封"]
-    API --> TASK["PostgreSQL\nagent_task / message / event / review / operation"]
+    U["用户进入 Agent 工作台"] --> FE["React 会话侧边栏 + 对话区"]
+    FE --> ENTRY{"创建或续聊方式"}
+    ENTRY -->|"直接提交目标"| CREATE["POST /api/agent/tasks\nCREATED + 首条消息"]
+    ENTRY -->|"在未分类/文件夹新建"| DRAFT["POST /api/agent/conversations\nDRAFT，不进入 Worker"]
+    DRAFT -->|"发送第一条消息"| CONTINUE["POST /tasks/{taskId}/messages"]
+    ENTRY -->|"在终态会话中继续提问"| CONTINUE
+    CONTINUE --> CREATE
+    CREATE --> TASK["PostgreSQL\nagent_task / message / event / review / operation"]
     TASK --> AGW["Agent durable worker\nPostgreSQL advisory lock"]
     AGW --> GRAPH["LangGraph PAE + ReAct\n稳定 threadId 执行或恢复"]
     GRAPH --> GATE["LocalAgentGateway\n白名单、所有权、审批与幂等边界"]
@@ -274,16 +296,18 @@ flowchart TB
     DB --> AGW
 ```
 
+长会话使用三层上下文：L1 是本轮 Prompt 中的摘要段和阈值内最近原文；L2 是 Redis `agent:ctx:{userId}:{taskId}` 可重建快照；L3 是 PostgreSQL `agent_chat_message` 与 `agent_conversation_summary` 权威事实。恢复层不再固定截取最近 12 条消息，而是从未摘要原文中按 Token 预算拆分 `messageWindow` 和 `compressionCandidateMessages`。追加新轮次会失效旧 Redis 快照，下一次 Worker 从 PostgreSQL 重建。
+
 ### LangGraph PAE + ReAct 节点编排
 
-这组图严格按 `ai-python/agents/orchestration/pae_react_graph.py` 的 `build_unified_graph()` 重绘。第一张是**整个 Agent 的主调用图**：从真实入口 `conversation_title` 开始，覆盖任务路由、规划审批、ReAct 执行、修补、验收、回答、记忆和人工审批恢复；简历证据改写在主图中折叠为一个子图节点。第二张只展开这个简历子图，避免主图被简历细节淹没。
+这组图严格按 `ai-python/agents/orchestration/pae_react_graph.py` 的 `build_unified_graph()` 重绘。第一张是**整个 Agent 的主调用图**：从真实入口 `conversation_title` 开始，覆盖任务路由、规划审批、ReAct 执行、修补、验收、回答、记忆和人工审批恢复；简历证据改写在主图中折叠为一个子图节点。第二张只展开这个简历子图，避免主图被简历细节淹没。`context_budget_guard` 与 `conversation_compression` 是节点内部调用的预算守卫和压缩辅助函数，不是 `StateGraph.add_node()` 注册节点，因此不伪画成主图节点。
 
 #### Agent 主调用图
 
 ```mermaid
 flowchart TB
-    START["start_unified_agent / resume_unified_agent<br/>构造 initial_state 后启动完整 StateGraph"] --> TITLE["conversation_title<br/>生成侧边栏会话标题"]
-    TITLE --> CONTEXT["context_restore<br/>恢复消息、摘要与上下文预算"]
+    START["首次消息 / 同线程续聊 / 审批恢复<br/>构造 initial_state 后启动完整 StateGraph"] --> TITLE["conversation_title<br/>仅首轮生成侧边栏会话标题"]
+    TITLE --> CONTEXT["context_restore<br/>Redis 命中加速或 PostgreSQL 回源<br/>按 Token 阈值恢复消息与摘要"]
     CONTEXT --> ROUTER{"task_router<br/>判断任务进入规划子图还是只读子图"}
 
     ROUTER -->|"规划任务 planning_task"| PLANNER["planner<br/>生成 PAE 计划、完成标准与工具范围"]
@@ -368,7 +392,9 @@ flowchart TB
 
 `resume_output_review` 和 `execute_approved_mutation` 是审批恢复函数，不是 `StateGraph` 节点。当前生产运行面不提供在线 DOCX 导出；若未来接入模板导出，仍需在该受控审批链外补充独立 API 契约、原文 hash、evidence、长度与版式校验。
 
-任务、消息、审批、操作快照和记忆都以 PostgreSQL 为权威记录。工具失败只能有限重试、降级、重新规划或受控失败；`AGENT_GRAPH_RECURSION_LIMIT=24` 会终止异常循环。连接中断后的前端可以重新读取任务快照并重新连接 SSE；worker 重启后可继续领取未完成的耐久任务。
+业务节点在组装长 Prompt 前统一执行 `context_budget_guard`。默认触发窗口为 `256000` Token，单段摘要目标 `25000`、硬上限 `30000`，单次图执行最多压缩 2 段；本地预算由 `tiktoken/cl100k_base` 估算，真实计费口径以 DashScope `usage.prompt_tokens` 为准。摘要必须先保存到 PostgreSQL 才能进入后续 Prompt，保存失败不会把临时摘要伪装成长期记忆。
+
+任务、消息、上下文摘要、审批、操作快照和记忆都以 PostgreSQL 为权威记录。工具失败只能有限重试、降级、重新规划或受控失败；`AGENT_GRAPH_RECURSION_LIMIT=24` 会终止异常循环。连接中断后的前端可以重新读取任务快照并重新连接 SSE；worker 重启后可继续领取未完成的耐久任务。
 
 ## 运行模式与进程职责
 
@@ -386,14 +412,17 @@ flowchart TB
 | --- | --- |
 | `frontend-react/` | React + Vite 管理后台，开发端口 `5178` |
 | `ai-python/app/` | FastAPI 公开 API、认证、页面数据、日志、持久任务、对象存储和 worker |
+| `ai-python/app/agent_runtime/` | Agent 会话、消息、事件、审批、操作、上下文摘要的 PostgreSQL 事实服务与 Redis L2 快照 |
 | `ai-python/app/review/` | 复习领域服务、独立 PAE/ReAct 生成图、质量门禁、文件夹仓储与 FSRS 排程 |
 | `ai-python/rag/` | 解析、递归切块、摘要、pgvector、混合检索、融合、重排与 evidence |
 | `ai-python/agents/` | LangGraph 编排与进程内 Agent gateway |
-| `ai-python/prompts/review.py` | DeepSeek 复习摘要与卡片生成 Prompt 的唯一维护入口 |
+| `ai-python/prompts/` | Agent、RAG、复习、简历、视觉 OCR 和音频 ASR Prompt 及版本号的集中维护入口 |
+| `ai-python/app/services/agent_online_benchmark.py` | 默认关闭的固定场景 Agent 长会话、工具边界和恢复工程基准 |
 | `ai-python/run.py` | FastAPI 与所有受管 Python worker 的唯一启动入口 |
 | `infra/sql/` | PostgreSQL/pgvector 初始化脚本与增量迁移 |
 | `docs/api/` | Auth、PageData、Logs、RAG、Review、Agent 和 Memory API 契约 |
 | `docs/architecture/` | 纯 Python 后端、RAG、复习生成图、文件夹与 FSRS 架构说明 |
+| `docs/testing/` | RAG、Agent 运行效率、长期记忆和在线工程基准的测试计划与结果口径 |
 
 ## 首次初始化与数据库
 
@@ -418,7 +447,7 @@ conda run -n learning-evidence-rag python -B -m app.core.database_bootstrap
 conda run -n learning-evidence-rag python -B ai-python/run.py --bootstrap-database
 ```
 
-`backend-java/src/main/resources/application.yml` 的 Spring 配置没有被 Python 复用。Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允许 `ai-python/config/application.local.yml` 和环境变量覆盖；业务数据、任务与索引统一使用 PostgreSQL `learning_evidence` schema。详细说明见 [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)。
+Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允许 `ai-python/config/application.local.yml` 和环境变量覆盖；业务数据、任务与索引统一使用 PostgreSQL `learning_evidence` schema，不读取任何历史 Spring 配置。详细说明见 [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)。
 
 ## 配置与启动
 
@@ -438,8 +467,20 @@ conda run -n learning-evidence-rag python -B ai-python/run.py --bootstrap-databa
 | `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮卡片生成模型调用上限，默认 `8`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
 | `RAG_EMBEDDING_MAX_IN_FLIGHT` | 百炼 embedding 远程批次并发，默认 `8`、硬上限 `10` |
 | `RAG_RETRIEVAL_IO_WORKERS` | Multi-Query pgvector I/O worker，默认 `8`、硬上限 `10` |
-| `REDIS_URL` | 可选复习资料生成短锁和 Agent 运行态缓存；PostgreSQL 仍是复习排程事实源 |
+| `RAG_VIDEO_PARALLEL_SEGMENT_TARGET_MIB` | 后端大视频媒体分片目标，默认 `20`；实际边界受关键帧影响 |
+| `RAG_VIDEO_PARALLEL_WORKERS` | 大视频片段解析 Worker，默认 `2`；该任务同时消耗 CPU、内存和外部 I/O |
+| `RAG_KAFKA_MAX_POLL_INTERVAL_MS` | Kafka RAG Worker 单次处理允许的最大轮询间隔，默认 `21600000`（6 小时），覆盖长视频任务 |
+| `REDIS_URL` | 可选复习资料生成短锁和 Agent L2 运行态缓存；PostgreSQL 始终是恢复事实源 |
 | `REVIEW_GENERATION_LOCK_TTL_SECONDS` | 复习资料级生成锁 TTL，默认 `180` 秒 |
+| `AGENT_CONTEXT_BEST_WINDOW_TOKENS` | Agent 未摘要原文的压缩触发窗口，默认 `256000` |
+| `AGENT_CONTEXT_SUMMARY_TARGET_TOKENS` | 单段滚动摘要目标，默认 `25000` Token |
+| `AGENT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS` | 单段滚动摘要硬上限，默认 `30000` Token |
+| `AGENT_CONTEXT_RAW_MESSAGE_FETCH_LIMIT` | 单次恢复最多从 PostgreSQL 读取的原文消息数，默认 `2000` |
+| `AGENT_CONTEXT_MAX_COMPRESSIONS` | 单次图执行最多生成的摘要段数，默认 `2`、上限 `4` |
+| `EVIDENCE_AGENT_REDIS_RUNNING_CONTEXT_TTL_HOURS` | Agent 运行中上下文快照 TTL，默认 `24` 小时 |
+| `EVIDENCE_AGENT_REDIS_COMPLETED_CONTEXT_TTL_DAYS` | Agent 终态上下文快照 TTL，默认 `7` 天 |
+| `AGENT_BENCHMARK_ENABLED` | 开放固定场景 Agent 工程基准 API，默认 `false` |
+| `VITE_AGENT_ONLINE_BENCHMARK_UI` | 显示前端工程基准入口，默认不显示；仍需后端开关和登录鉴权 |
 | `TAVILY_API_KEY` | 预留配置；当前纯 Python Agent 尚未启用联网搜索，默认留空 |
 
 启动后端：
@@ -476,6 +517,8 @@ npm run dev
 | 学习复习与提醒 | `/api/reviews/*` |
 | Agent、审批、记忆和 SSE | `/api/agent/*` |
 
+Agent 会话可通过 `POST /api/agent/conversations` 创建不入队的 `DRAFT`，再通过 `POST /api/agent/tasks/{taskId}/messages` 发送首轮或继续终态会话；会话文件夹、消息分页、审批和 SSE 都保持当前登录用户所有权边界。工程基准接口位于 `/api/agent/benchmarks/runs`，只有显式开启服务端开关后才可调用。
+
 完整请求、鉴权、错误和异步状态说明见 [API 文档](docs/api/)。
 
 ## 验证
@@ -493,6 +536,24 @@ RAG 小样本评估入口：
 conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_small_eval.py --mode offline
 ```
 
+Agent 会话、上下文缓存和固定基准的确定性测试：
+
+```powershell
+conda run -n learning-evidence-rag python -B -m pytest `
+  ai-python/tests/test_agent_api.py `
+  ai-python/tests/test_public_agent_runtime_api.py `
+  ai-python/tests/test_agent_online_benchmark.py -q
+```
+
+开发环境如需运行连接真实基础设施的工程基准，必须同时准备 PostgreSQL、Redis 和 `DASHSCOPE_API_KEY`，再显式打开后端与前端入口：
+
+```powershell
+$env:AGENT_BENCHMARK_ENABLED='true'
+$env:VITE_AGENT_ONLINE_BENCHMARK_UI='true'
+```
+
+该基准只展开服务端冻结的 `agent-control-long-context-v1` 场景，并将审计产物写入 `test-results/agent-online-ab-<runId>/`。它用于验证恢复链路和工具安全，不应在没有正式样本量、置信区间和完整审计包时表述为真实用户效果提升。
+
 ## 设计资料
 
 - [纯 Python FastAPI 后端迁移计划](docs/architecture/python-backend-migration-plan.md)
@@ -503,5 +564,7 @@ conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_
 - [复习卡片 PAE/ReAct 生成图](docs/architecture/review-pae-react-generation.md)
 - [复习文件夹与结构化卡片保真设计](docs/architecture/review-folder-and-structured-card-preservation.md)
 - [Agent 接口契约](docs/api/agent.md)
+- [Agent 运行效率工程基准](docs/testing/agent-runtime-efficiency-benchmark.md)
+- [Agent 长期记忆三臂评测计划](docs/testing/agent-memory-three-arm-evaluation-plan.md)
 - [日志接口契约](docs/api/logs.md)
 - [PostgreSQL/pgvector 建库说明](docs/database/postgresql-pgvector.md)

@@ -1,6 +1,6 @@
 # Agent 接口文档
 
-更新日期：2026-07-23
+更新日期：2026-07-31
 
 > 迁移状态：本文开头的“纯 Python 对外契约”是唯一生效契约。文末保留的旧 Gateway、内部 callback 和 Java Redis 章节仅为历史迁移背景；当前代码、配置和启动流程不得读取这些地址或令牌。
 
@@ -20,15 +20,17 @@
 - 所有 JSON 接口返回 `Result<T>`：成功为 `{"code":1,"data":...}`，受控业务失败为 `{"code":0,"msg":"中文错误说明","data":null}`。
 - 除 SSE 外，所有路径要求 `Authorization: Bearer <token>`。缺失、过期或被撤销的令牌返回 `登录状态已失效`。
 - 当前用户无权访问的任务、审批、操作、文件夹或记忆统一按“不存在或不属于当前用户”处理，不泄露其他用户资源。
-- 任务状态：`CREATED`、`RUNNING`、`WAITING_PLAN_REVIEW`、`WAITING_OUTPUT_REVIEW`、`WAITING_CRUD_REVIEW`、`COMPLETED`、`CANCELED`、`FAILED`。终态为 `COMPLETED`、`CANCELED`、`FAILED`；三个 `WAITING_*` 状态均表示等待当前用户审批。
+- 任务状态：`DRAFT`、`CREATED`、`RUNNING`、`WAITING_PLAN_REVIEW`、`WAITING_OUTPUT_REVIEW`、`WAITING_CRUD_REVIEW`、`COMPLETED`、`CANCELED`、`FAILED`。`DRAFT` 表示只创建了空会话，不会被 Worker 领取；用户第一次发送消息后才切换为 `CREATED` 并入队。终态为 `COMPLETED`、`CANCELED`、`FAILED`；三个 `WAITING_*` 状态均表示等待当前用户审批。
 
 ### 公开路径
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `POST` | `/api/agent/tasks` | 创建任务并入队执行 |
+| `POST` | `/api/agent/conversations` | 创建空会话草稿，支持 `folderId=null` 未分类或指定文件夹 |
 | `GET` | `/api/agent/tasks?limit=20` | 查询当前用户最近任务 |
 | `GET` | `/api/agent/tasks/{taskId}` | 查询任务详情、消息、审批与操作 |
+| `POST` | `/api/agent/tasks/{taskId}/messages` | 向终态或 `DRAFT` 会话追加用户消息；`DRAFT` 首发会切为 `CREATED` |
 | `GET` | `/api/agent/tasks/{taskId}/messages` | 按 `beforeSequenceNo` / `afterSequenceNo` 分页消息 |
 | `GET` | `/api/agent/tasks/{taskId}/stream?token=...` | 订阅 `task`、`agent_event`、`done` SSE 事件 |
 | `POST` | `/api/agent/tasks/{taskId}/folder` | 移动会话，`folderId=null` 表示未分类 |
@@ -67,6 +69,21 @@
 ```
 
 服务端写入 `agent_task` 和首条 `agent_chat_message` 后返回 `CREATED`。Worker 将其更新为 `RUNNING`，并持续写入 `agent_event` 与消息投影。只读任务可使用进程内 RAG/记忆 gateway；规划或变更任务需要写入 `agent_human_review` 后进入 `WAITING_REVIEW`。审批恢复也由 Python Worker 完成，前端以详情轮询或 SSE 获取最终快照。
+
+`POST /api/agent/conversations` 用于 Codex 类侧边栏体验：只创建空会话，不写入用户消息，也不触发 Worker。请求体：
+
+```json
+{
+  "folderId": "agent-folder-xxx",
+  "title": "新对话",
+  "taskType": "pure_read_query",
+  "input": {
+    "workspaceMode": "read"
+  }
+}
+```
+
+`folderId=null` 或缺省表示创建到“未分类”。服务端验证指定文件夹归属于当前用户，返回 `status=DRAFT` 的 `AgentTask`。前端第一次发送时调用 `POST /api/agent/tasks/{taskId}/messages`，请求体可携带 `content`、`clientTurnId`、`taskType`、`title` 和 `input`；服务端在同一任务线程内写入首条 `USER_GOAL` 消息，将 `input.goal` 更新为用户内容，把状态切为 `CREATED`，随后由 Worker 领取。
 
 失败示例：
 
@@ -199,11 +216,11 @@ Redis key 与 TTL：
 
 2026-06-29 新增 Agent 上下文超限压缩闭环。Agent 采用三层上下文记忆：
 
-- L1 当前 prompt 窗口：保留系统提示、当前用户问题、最近原文窗口、审批状态、当前计划、工具观察摘要、相关长期记忆和 RAG evidence 引用；不直接注入大量压缩候选原文。
+- L1 当前 prompt 窗口：保留系统提示、当前用户问题、token 阈值内的最近原文窗口、审批状态、当前计划、工具观察摘要、相关长期记忆和 RAG evidence 引用；不直接注入大量压缩候选原文。
 - L2 Redis 热态工作记忆：已由 Java adapter 写入 `agent:ctx:{userId}:{taskId}`、`agent:ctx:messages:{userId}:{taskId}` 和 `agent:sse:{taskId}`；Redis miss、未配置或异常时自动回源 PostgreSQL，不影响恢复能力。
 - L3 PostgreSQL 持久上下文：`agent_chat_message` 保存原文消息投影，`agent_conversation_summary` 保存上下文压缩摘要段，是长期恢复的权威来源。
 
-默认 best window 为 16k-18k token，可通过 Python 环境变量 `AGENT_CONTEXT_BEST_WINDOW_TOKENS` 调整。`context_budget_guard` 会在 planner、executor、repair、acceptance、resume_rewrite_*、answer_writer 等会组装长 prompt 或调用 Qwen 的节点前统一估算 prompt 负载；`post_answer_memory` 当前不调用 Qwen，但会在请求 `agent_memory_candidate_proposer` 工具前执行同一预算守卫。超过阈值且 Java 返回了 `compressionCandidateMessages` 时进入 `conversation_compression`，压缩节点只读取候选窗口，业务节点 prompt 仍只注入摘要段和最近原文窗口。压缩先抽取 key facts，再生成摘要和完整性诊断。压缩输出包含：
+默认按 1M 上下文模型预留约 25% 作为触发窗口：`AGENT_CONTEXT_BEST_WINDOW_TOKENS=256000`；单段滚动摘要目标约为 25K token：`AGENT_CONTEXT_SUMMARY_TARGET_TOKENS=25000`，硬上限默认为 30K：`AGENT_CONTEXT_SUMMARY_HARD_LIMIT_TOKENS=30000`。`context_budget_guard` 会在 planner、executor、repair、acceptance、resume_rewrite_*、answer_writer 等会组装长 prompt 或调用 Qwen 的节点前统一估算 prompt 负载；`post_answer_memory` 当前不调用 Qwen，但会在请求 `agent_memory_candidate_proposer` 工具前执行同一预算守卫。未摘要原文估算未超过触发窗口时全部保留；超过阈值时，`LocalAgentGateway` 和图侧预算守卫按 token 预算把较早的未摘要消息划入 `compressionCandidateMessages`，仅由 `conversation_compression` 压缩，业务节点 prompt 仍只注入摘要段和阈值内最近原文窗口。压缩先抽取 key facts，再生成摘要和完整性诊断。压缩输出包含：
 
 ```json
 {
@@ -223,7 +240,7 @@ Redis key 与 TTL：
 }
 ```
 
-`lossRisk=HIGH` 时摘要状态可标为 `HIGH_LOSS_RISK`，Python 会保留更多最近原文窗口并在 diagnostics 中标注风险。无 `DASHSCOPE_API_KEY` 或 `AGENT_LLM_ENABLED=false` 时，压缩节点使用确定性 fallback summary，保证本地测试和离线开发可运行。
+`lossRisk=HIGH` 时摘要状态可标为 `HIGH_LOSS_RISK`，Python 会在 diagnostics 中标注风险并保留可回捞的原文覆盖范围。无 `DASHSCOPE_API_KEY` 或 `AGENT_LLM_ENABLED=false` 时，压缩节点使用确定性 fallback summary，保证本地测试和离线开发可运行。
 
 ### `agent_conversation_summary`
 
@@ -231,22 +248,24 @@ Redis key 与 TTL：
 
 `agent_chat_message` 使用 `sequence_no` 保存同一任务内的稳定消息顺序。Java 新增消息时先在同一事务内对 `agent_task` 行执行 `FOR UPDATE`，再按当前任务最大 `sequence_no + 1` 分配，并通过 `(task_id, sequence_no)` 唯一索引兜底，避免并发写入拿到重复序号。查询最近窗口、压缩候选、before/core/after 回捞和最新覆盖端点时都按 `sequence_no` 比较，不依赖随机 UUID 或同事务内可能相同的 `created_at` 作为顺序依据。
 
-### Java 内部上下文接口
+### 进程内上下文恢复契约
 
 #### 恢复上下文
 
-`GET /api/internal/agent/tasks/{taskId}/context`
+`LocalAgentGateway.restore_context(taskId, query, summary_limit, best_window_tokens, summary_target_tokens)`
 
-Header：`X-Agent-Internal-Token`
+当前实现为 Python 进程内调用，不经过 HTTP Header、Java URL 或 callback；旧 Java 内部接口仅保留在文末历史迁移记录。
 
-Query：
+参数：
 
 | 参数 | 说明 |
 | --- | --- |
 | `query` | 当前问题或任务目标，用于 Java 侧摘要段关键词 scoring |
-| `recentLimit` | 最近原文窗口条数，默认 12 |
 | `summaryLimit` | 返回摘要段数量，默认 6 |
-| `bestWindowTokens` | prompt 目标窗口，默认 18000 |
+| `bestWindowTokens` | 压缩触发窗口，默认 256000 |
+| `summaryTargetTokens` | 单段摘要目标 token，默认 25000 |
+| `summaryHardLimitTokens` | 单段摘要硬上限，默认 30000 |
+| `rawMessageFetchLimit` | 恢复层最多回源读取的原文消息数量，默认 2000 |
 
 响应：
 
@@ -259,10 +278,18 @@ Query：
   "activeSummaries": [],
   "summarySegments": [],
   "budgetMetadata": {
-    "promptTargetTokens": 18000,
-    "recentMessageLimit": 12,
-    "uncompressedMessageCount": 18,
+    "promptTargetTokens": 256000,
+    "summaryTargetTokens": 25000,
+    "summaryHardLimitTokens": 30000,
+    "rawMessageFetchLimit": 2000,
+    "rawMessageCount": 240,
+    "unsummarizedMessageCount": 40,
+    "messageWindowCount": 32,
     "compressionCandidateCount": 8,
+    "rawTokenEstimate": 270000,
+    "messageWindowTokenEstimate": 231000,
+    "compressionCandidateTokenEstimate": 39000,
+    "windowPolicy": "token_threshold_v2",
     "latestCoveredMessageEndId": "agent-msg-012",
     "restoreSource": "postgresql",
     "redisPolicy": "Redis 仅作短期热态缓存；恢复能力以 PostgreSQL 消息和摘要段为准"
@@ -270,39 +297,39 @@ Query：
 }
 ```
 
-规则：Java 从 `taskId` 反查 `agent_task.user_id`，不信任 Python 传入用户范围。`messageWindow` 只返回最近原文窗口；`compressionCandidateMessages` 返回“尚未被历史摘要覆盖、且不属于最近原文窗口”的较早消息。如果没有任何摘要，候选窗口从最早消息开始取一批并保留最近 `recentLimit` 条原文；如果已有摘要，则从最新 `covered_message_end_id` 之后继续取未覆盖候选。候选窗口通过 SQL 小窗口查询返回，不全量加载长会话消息后内存切片。摘要段检索当前使用 Java 侧小规模关键词 scoring fallback，覆盖 `summaryText/keyFacts/evidenceRefs/summaryJson`；无关键词命中时回退最近 `ACTIVE/SUPERSEDED/HIGH_LOSS_RISK` 摘要，当前没有实现数据库 BM25。
+规则：服务端从 `taskId` 反查 `agent_task.user_id`，不信任请求体或图状态中的用户范围。`messageWindow` 返回尚未被摘要覆盖、且估算 token 仍在触发窗口内的最近原文；`compressionCandidateMessages` 返回同一批未摘要消息中更早、需要被压缩的原文。没有摘要且未超过阈值时，全部未摘要原文仍留在 `messageWindow`，不会因为固定条数被提前丢弃；已有摘要时，从最新 `covered_message_end_id` 之后继续选择未覆盖消息。摘要段检索当前使用小规模关键词 scoring fallback，覆盖 `summaryText/keyFacts/evidenceRefs/summaryJson`；无关键词命中时回退最近 `ACTIVE/SUPERSEDED/HIGH_LOSS_RISK` 摘要，当前没有实现数据库 BM25。
 
 #### 保存压缩摘要
 
-`POST /api/internal/agent/tasks/{taskId}/summaries`
+`LocalAgentGateway.save_context_summary(taskId, payload)`
 
-Header：`X-Agent-Internal-Token`
+当前实现直接写入 Python Agent Runtime 的 PostgreSQL 事实记录；Redis L2 只在保存后重建热态缓存，失败不影响长期恢复。
 
-请求体为压缩摘要结构，包含 `summaryId`、`coveredMessageStartId`、`coveredMessageEndId`、`summary`、`summaryText`、`keyFacts`、`evidenceRefs`、`compressionModel`、`compressionPromptVersion`、`compressionVersion`、`status` 和 `diagnostics`。同任务同 `summaryId` 重试时直接返回已有摘要，避免 Python 重试或事件重放造成主键冲突。Java 保存前会校验 `coveredMessageStartId/coveredMessageEndId` 非空时必须属于当前任务的 `agent_chat_message`，且 start 的 `sequence_no` 不能大于 end；校验失败时拒绝保存，不写 `agent_conversation_summary`，也不追加 `CONTEXT_SUMMARY` 消息。保存新的 `ACTIVE` 摘要时，Java 将同任务旧 `ACTIVE` 摘要标为 `SUPERSEDED`，不直接覆盖历史行。
+请求体为压缩摘要结构，包含 `summaryId`、`coveredMessageStartId`、`coveredMessageEndId`、`summary`、`summaryText`、`keyFacts`、`evidenceRefs`、`compressionModel`、`compressionPromptVersion`、`compressionVersion`、`status` 和 `diagnostics`。同任务同 `summaryId` 重试时直接返回已有摘要，避免 Python 重试或事件重放造成主键冲突。保存前会校验 `coveredMessageStartId/coveredMessageEndId` 非空时必须属于当前任务的 `agent_chat_message`，且 start 的 `sequence_no` 不能大于 end；校验失败时拒绝保存，不写 `agent_conversation_summary`，也不追加 `CONTEXT_SUMMARY` 消息。保存新的 `ACTIVE` 摘要时，同任务旧 `ACTIVE` 摘要会被标为 `SUPERSEDED`，不直接覆盖历史行。
 
 #### 回捞覆盖范围附近原文
 
-`GET /api/internal/agent/tasks/{taskId}/context/messages`
+`LocalAgentGateway.recall_context_messages(taskId, params)`
 
-Header：`X-Agent-Internal-Token`
+当前实现从 Python Runtime Service 按当前任务所有者回捞消息，不接受前端直接指定用户身份。
 
-Query 支持 `summaryId`、`coveredMessageStartId`、`coveredMessageEndId`、`anchorMessageId`、`before`、`after`、`limit`。Java 仍从 `taskId` 反查用户并只返回当前任务消息；实现使用 SQL 级 before/core/after 小窗口查询，不全量加载长会话消息后内存切片。Python `context_restore` 不允许直连 `agent_task`、`agent_chat_message` 或 `agent_conversation_summary`。
+参数支持 `summaryId`、`coveredMessageStartId`、`coveredMessageEndId`、`anchorMessageId`、`before`、`after`、`limit`。服务端仍从 `taskId` 反查用户并只返回当前任务消息；实现使用小窗口查询，不允许浏览器绕过 Agent Runtime 直接指定用户或读取跨任务消息。
 
 长期恢复流程：
 
 1. 用户很久后打开同一会话，前端读取 Java `GET /api/agent/tasks/{taskId}`，展示消息流和 summaries 简要状态。
-2. Python 图入口 `conversation_title -> context_restore -> task_router`，通过 Java 内部 `/context` 恢复最近原文窗口、ACTIVE 摘要、按 query 命中的摘要段，以及压缩专用候选窗口。
-3. 若候选窗口导致估算 token 超过 best window，Python 先压缩候选窗口并保存到 `agent_conversation_summary`；只有 Java 保存成功后，Python 才把新摘要加入本轮 `summarySegments`、更新 `activeSummaryId` 并清空候选。若保存失败，本轮不把未落库摘要当作长期恢复摘要注入 prompt，而是记录 `save_failed` diagnostics，并保留候选窗口和既有摘要。单次图执行默认最多压缩 2 段，可通过 `AGENT_CONTEXT_MAX_COMPRESSIONS` 调整。
+2. Python 图入口 `conversation_title -> context_restore -> task_router`，通过进程内 `LocalAgentGateway.restore_context()` 恢复 ACTIVE 摘要、按 query 命中的摘要段、阈值内最近原文窗口，以及压缩专用候选窗口。
+3. 若未摘要原文估算 token 超过 best window，Python 先压缩候选窗口并保存到 `agent_conversation_summary`；只有保存成功后，Python 才把新摘要加入本轮 `summarySegments`、更新 `activeSummaryId` 并清空候选。若保存失败，本轮不把未落库摘要当作长期恢复摘要注入 prompt，而是记录 `save_failed` diagnostics，并保留候选窗口和既有摘要。单次图执行默认最多压缩 2 段，可通过 `AGENT_CONTEXT_MAX_COMPRESSIONS` 调整。
 4. 若用户追问压缩范围附近细节，Python 可通过 `/context/messages` 传 `summaryId` 或 `anchorMessageId` 回捞少量原文，再组装到 L1 prompt。
 5. Redis 命中时只加速热态恢复；Redis miss 或未配置时仍从 PostgreSQL 的 `agent_task`、`agent_chat_message`、`agent_conversation_summary` 重建，并回填 Redis。
 
 核心边界：
 
-- React 只调用 Java `/api/agent/*`。
-- Java 是唯一对外 API、登录用户、业务权限、审计、幂等和错误映射边界。
-- Python Agent 只负责编排、计划、工具观察整合、草稿生成和 citation guard。
-- Python Agent 只能通过 Java Tool Gateway 调业务能力，不能直连数据库、对象存储、Java Mapper、Python RAG `/internal/*` 或 `create_rag_store()`。
-- Python Agent 只能通过 Java Tool Gateway 使用 Agent 记忆能力；记忆状态、确认、归档、删除和审计以 Java 为准。
+- React 只调用 Python FastAPI `/api/agent/*`。
+- Python FastAPI 是当前 Agent 对外 API、登录用户、业务权限、审计、幂等和错误映射边界。
+- Python Agent 统一图负责编排、计划、工具观察整合、草稿生成和 citation guard。
+- Python Agent 只能通过进程内 `LocalAgentGateway` 调受控业务能力，不能绕过 Runtime Service 直接扩大用户范围或读取跨任务数据。
+- Python Agent 记忆候选默认只生成 `PENDING_REVIEW`，记忆状态、确认、归档、删除和审计以 Python Agent Runtime 为准。
 - 普通上传、分片上传和确定性 RAG 入库不纳入 Agent 工具。
 - 当前版本未实现授权表，`explicitGrant` 只是预留语义；除 `ownerUserId == currentUserId` 外全部拒绝。
 
@@ -1543,3 +1570,115 @@ Python 侧工具节点在调用 mutation gateway 前也会做硬门禁：缺少 
 - Agent 工作台不再提供独立“JD 视频”或视频资料类型筛选；视频 evidence 作为普通知识库证据参与自由探索和 RAG 召回。
 - 当前运行图已在统一 `pae_react_graph` 中加入简历证据改写子图语义，节点为 `resume_rewrite_decision`、`resume_jd_analyzer`、`resume_evidence_retriever`、`resume_evidence_summarizer`、`resume_revision_advisor`、`resume_patch_builder` 和 `resume_rewrite_acceptance`。
 - `resume_template_fill` 和 `resume_revision_save` 仍然只生成待确认候选或审批请求；Python Agent 不直接写 DOCX、不直接保存业务数据。
+
+## 2026-07-25 Agent 线上 A/B 基准接口
+
+本节用于可追溯地验证 Agent 长会话、工具执行控制和 Worker 重启恢复。所有基准入口默认关闭，必须同时满足以下条件才可使用：
+
+- Python 服务进程显式设置 `AGENT_BENCHMARK_ENABLED=true`。
+- 调用者已通过普通 Agent 工作台的 Bearer Token 鉴权。
+- 浏览器不能提交工具名、审批 ID、Redis 键、任务状态或任意测试文本；服务端只展开固定的场景集 `agent-control-long-context-v1`。
+
+基准任务会写入当前用户的 PostgreSQL `agent_*` 事实表，但标题均带 `[线上基准]` 前缀，输入、每轮指标、模型 usage、Worker stdout/stderr 和最终报告会额外写入 `test-results/agent-online-ab-<runId>/`。该目录是审计产物，不是生产业务数据源。
+
+### 追加同一会话轮次
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/agent/tasks/{taskId}/messages` |
+| 鉴权 | Bearer Token |
+| 用途 | 为当前用户已结束的会话追加一条用户消息，并将同一 `pythonThreadId` 重新排入 Worker。 |
+
+请求：
+
+```json
+{
+  "content": "请基于此前的学习计划，说明下一步验证优先级。",
+  "clientTurnId": "web-turn-20260725-001"
+}
+```
+
+响应仍使用 `Result<AgentTaskVO>`。服务端会锁定任务、校验任务归属和上一轮终态、写入 `USER_TURN` 消息，将 `input.goal` 更新为本轮内容，并仅把 `status` 重置为 `CREATED`；不会接受浏览器传入的工具、审批、任务状态或线程 ID。`pythonThreadId` 保持不变。
+
+失败情形：
+
+- `AGENT_TASK_NOT_FOUND`：任务不存在或不属于当前用户。
+- `AGENT_TASK_NOT_TERMINAL`：上一轮仍在执行或等待审批，不能插入并发轮次。
+- `AGENT_VALIDATION_FAILED`：`content` 或 `clientTurnId` 为空、过长或格式非法。
+
+### 启动线上 A/B 基准
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `POST` |
+| 路径 | `/api/agent/benchmarks/runs` |
+| 鉴权 | Bearer Token |
+| 用途 | 从开发态 Agent 工作台启动固定的线上 A/B 集成基准。 |
+
+请求体为空：`{}`。
+
+成功响应示例：
+
+```json
+{
+  "code": 1,
+  "data": {
+    "runId": "agent-online-ab-20260725-153000",
+    "scenarioSetId": "agent-control-long-context-v1",
+    "status": "RUNNING",
+    "resultDir": "test-results/agent-online-ab-20260725-153000"
+  }
+}
+```
+
+服务端固定执行以下项目：
+
+| 项目 | A 组 | B 组 | 安全边界 |
+| --- | --- | --- | --- |
+| 工具控制 | 历史宽松策略的 dry-run 探针，只记录“本会下发”，不调用任何业务写工具 | 真实 `tool_adapter_node` 白名单和 HITL 审批门禁 | 50 条未审批变更加 50 条未知只读工具；A 组永不触达业务下游。 |
+| 长会话 Token | 关闭摘要压缩和 Redis L2，保留同一任务所有未摘要原文作为对照 | 开启摘要压缩、Redis L2 和 token 阈值窗口；超过 `bestWindowTokens` 时把早期原文压缩为约 `summaryTargetTokens` 的摘要，阈值内最近原文继续保留 | Token 子测试只写入固定的用户上下文和 30 条用户轮次，不运行 Worker，避免节点事件污染 A/B 提示词；同一模型、温度 `0`，记录 DashScope `usage.prompt_tokens`。 |
+| Worker 恢复 | 不单独宣称宽松组恢复能力 | 在独立的 B 组恢复任务中，每轮在 `context_restore` 持久化屏障后终止独立 Worker，再启动新 Worker | 30 次独立进程恢复；恢复时延从新进程启动计至第二个持久化 `context_restore` 事件，不以完整任务结束时间替代；记录 task/thread、摘要 ID、恢复来源、终态和 P95。 |
+
+`usage.prompt_tokens` 由 DashScope OpenAI 兼容响应返回，是本基准唯一用于简历 Token 统计的数字。字符数估算只保留为运行时预算回退，不能写入基准结果。正常线上默认按 1M 上下文的约 25%（256K）触发、摘要目标约 25K；基准为了在固定小样本里验证同一机制，会显式调低 `bestWindowTokens/summaryTargetTokens`，但不再通过固定最近 12 条制造差异。Token 子测试和 Worker 恢复子测试使用不同的隔离 `taskId`，两者都保持单一稳定的 `pythonThreadId`；报告会分别保留输入、每轮模型 usage、持久化事件和 Worker 日志。
+
+### 查询线上 A/B 基准
+
+| 项目 | 内容 |
+| --- | --- |
+| 方法 | `GET` |
+| 路径 | `/api/agent/benchmarks/runs/{runId}` |
+| 鉴权 | Bearer Token |
+| 用途 | 查询当前用户发起的基准进度、阶段、错误和已完成摘要。 |
+
+基准在后台线程中运行，前端每 `1s` 轮询本接口。完整原始产物不会内嵌到接口响应，避免把 24 条长上下文和模型 usage 日志注入浏览器内存；完成后接口只返回报告相对路径、汇总指标和结果状态。
+
+### Redis 与持久化约定
+
+- Redis 键格式：`agent:ctx:{userId}:{taskId}`，只缓存最近窗口、摘要段 ID、线程 ID 和恢复元数据，TTL 由 `EVIDENCE_AGENT_REDIS_RUNNING_CONTEXT_TTL_HOURS` 控制。
+- Redis 不可用、缓存失效或 JSON 校验失败时，`LocalAgentGateway.restore_context()` 必须从 PostgreSQL 重新构建上下文，并在结果中标记 `restoreSource=postgresql`。
+- PostgreSQL 的 `agent_chat_message`、`agent_conversation_summary` 和 `agent_task.python_thread_id` 是唯一权威事实记录。Redis 命中只能缩短恢复路径，不能替代可审计的长会话历史。
+
+## 2026-07-31 Agent 运行态效率复测约定
+
+本次复测不新增或修改 HTTP 接口，只通过本地 CLI 调用生产 `LocalAgentGateway`、`AgentRuntimeService` 和 `PostgresAgentRepository`。结果不得与模型生成时延、Prompt Token 或旧版三臂语义评分拼接。
+
+| 子测试 | 基线 | 当前实现 | 主要指标 | 正确性门禁 |
+| --- | --- | --- | --- | --- |
+| 上下文恢复 | 删除 L2 键后由 PostgreSQL 消息与摘要重建 | 命中 Redis L2 热态快照 | P50、P95、配对降幅、连续时间窗口 P95 降幅范围 | 两组上下文规范化 SHA-256 必须一致；来源分别为 `postgresql` 和 `redis_l2` |
+| 会话写入与任务重排 | `append_message()` 与 `update_task()` 两个事务 | `append_turn_and_requeue()` 单事务 | P50、P95、配对降幅、连续时间窗口 P95 降幅范围 | 两组消息增量必须一致；重复 `dedupe_key` 不得新增消息 |
+
+复测固定执行 20 组预热和 300 组正式配对样本。正式样本按固定随机种子交错执行 A/B 顺序，划分为 6 个连续时间窗口，每窗 50 组；不删除异常值，不用三次重复冒充独立样本。这里的时间窗口只用于观察运行期间的时序稳定性，与 RAG 文档递归切块无关。报告必须保存逐调用原始耗时、执行顺序、恢复来源、上下文哈希、窗口统计、环境快照和完整计算公式。
+
+Redis 指标只能表述为“上下文恢复链路耗时下降”，不能写成模型回答时延、端到端请求时延或 Redis 单独降低 Prompt Token。PostgreSQL 单事务指标只能表述为“消息追加与任务重排链路”，不能外推为整个 API 或 Kafka/Outbox 链路的吞吐提升。
+
+### 复测结果（2026-07-31）
+
+正式结果目录：`_qa_resume_memory_ab/runtime_efficiency_v1/runtime-efficiency-20260731-161836/`。固定 20 组预热、300 组正式配对、6 个连续时间窗口，A/B 执行顺序各 150 组；所有正式样本和计算轨迹均保留。
+
+| 指标 | 基线 P50/P95 | 当前实现 P50/P95 | P95 降幅 | 复算证据 |
+| --- | ---: | ---: | ---: | --- |
+| Redis L2 上下文恢复 | PostgreSQL `288.49/369.40ms` | Redis `25.66/45.43ms` | `87.70%` | `redis_restore_samples.csv`、`summary.json` |
+| PostgreSQL 消息追加+任务重排 | 拆分事务 `79.22/104.22ms` | 单事务 `31.50/49.71ms` | `52.30%` | `transaction_samples.csv`、`summary.json` |
+
+两项 bootstrap 配对降幅 95% CI 分别为 `90.89%-91.31%` 和 `58.04%-60.12%`；6/6 分块 P50/P95 均改善。Redis 300 组恢复来源和上下文规范化哈希均通过门禁；单事务 30 次重复键重放均未新增消息。门禁只证明正确性，不作为简历百分比成果。
