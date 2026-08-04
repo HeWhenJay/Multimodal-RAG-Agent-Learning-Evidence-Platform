@@ -19,6 +19,10 @@ storage:
     public-base-url: ${ALIYUN_OSS_PUBLIC_BASE_URL:}
 
 rag:
+  embedding:
+    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:8}
+  retrieval:
+    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:8}
   # 可按本机数据分布覆盖融合和无百炼时的本地重排权重。
   fusion:
     strategy: ${RAG_FUSION_STRATEGY:weighted_rrf}
@@ -42,6 +46,14 @@ review:
     base-url: https://api.deepseek.com
     api-key: ${DEEPSEEK_API_KEY:}
     timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:120}
+    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:8}
+  langextract:
+    enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
+    extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
+    max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:8}
+    max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
+    timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:120}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}

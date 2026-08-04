@@ -31,6 +31,7 @@ from app.review.knowledge_extractor import (
     stable_source_key,
 )
 from app.schemas.rag import Evidence
+from app.review.langextract_curator import CuratorCandidate
 from prompts.review import REVIEW_CARD_PROMPT_VERSION, review_card_system_prompt
 
 
@@ -143,7 +144,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v10"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v11"
     assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
     assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
     assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
@@ -155,6 +156,107 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert result.summary == payload["summary"]
     assert result.summary != "这只是 RAG 截断摘要，不应直接展示。"
     assert len(result.knowledge_points) == 1
+
+
+def test_online_langextract_candidates_are_required_by_generation_and_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """线上 LangExtract 候选必须进入 Prompt，并由最终卡片按 evidence 显式覆盖。"""
+    prompts: list[str] = []
+    events: list[dict] = []
+
+    class FakeCurator:
+        """返回一条已精确定位的候选，避免单测访问真实 DeepSeek。"""
+
+        def extract(self, _title: str, _evidences: list[Evidence]) -> SimpleNamespace:
+            return SimpleNamespace(
+                candidates=(
+                    CuratorCandidate(
+                        "ISR 保存与 Leader 保持同步的副本集合",
+                        "ISR",
+                        "定义",
+                        ("material-12-7",),
+                        0,
+                        24,
+                    ),
+                ),
+                raw_extraction_count=1,
+                grounded_extraction_count=1,
+                duplicate_count=0,
+                duration_seconds=0.01,
+                usage=SimpleNamespace(request_count=1),
+                version="langextract-curator-v1",
+            )
+
+    payload = valid_payload()
+    payload["cards"][0]["knowledgeUnitIds"] = ["KU-001"]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            prompts.append(kwargs["messages"][1]["content"])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
+            )
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    result = KnowledgePointExtractor(
+        provider="deepseek",
+        langextract_enabled=True,
+        langextract_curator=FakeCurator(),
+    ).extract(
+        LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+        [
+            evidence(
+                "material-12-7",
+                "ISR",
+                "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。",
+            )
+        ],
+        progress_callback=events.append,
+    )
+
+    assert len(result.knowledge_points) == 1
+    assert '"knowledgeUnitId":"KU-001"' in prompts[0]
+    assert [event["stageCode"] for event in events if event["stageCode"] == "review.curator"] == [
+        "review.curator",
+        "review.curator",
+    ]
+
+
+def test_langextract_candidate_missing_from_cards_triggers_repair() -> None:
+    """模型遗漏已定位候选时必须进入修复，不能静默发布不完整卡片。"""
+    extractor = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False)
+    source_evidence = evidence(
+        "material-12-7",
+        "ISR",
+        "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。",
+    )
+    curator_context = {
+        "status": "COMPLETED",
+        "knowledgeUnits": [
+            {
+                "knowledgeUnitId": "KU-001",
+                "text": "ISR 保存与 Leader 保持同步的副本集合",
+                "topic": "ISR",
+                "knowledgeType": "定义",
+                "evidenceIds": ["material-12-7"],
+            }
+        ],
+    }
+
+    with pytest.raises(ReviewExtractionError) as raised:
+        extractor._validate_model_result(
+            LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
+            [source_evidence],
+            valid_payload(),
+            curator_context=curator_context,
+        )
+
+    assert any("LangExtract 候选知识覆盖不足" in item for item in raised.value.diagnostics)
 
 
 def test_extractor_retries_with_quality_feedback_and_user_context(monkeypatch: pytest.MonkeyPatch) -> None:

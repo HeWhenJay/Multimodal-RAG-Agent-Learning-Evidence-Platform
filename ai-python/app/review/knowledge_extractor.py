@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
+from app.core.io_concurrency import configured_io_workers, process_io_limiter
 from app.review.generation_graph import (
     ProgressCallback,
     ReviewManualReviewRequired,
@@ -60,6 +61,7 @@ STANDARD_REVIEW_CARD_LIMIT = 8
 MAX_STRUCTURED_REVIEW_CARD_LIMIT = 32
 STANDARD_EVIDENCE_LIMIT = 16
 STRUCTURED_EVIDENCE_LIMIT = 48
+CURATED_EVIDENCE_LIMIT = 64
 SOURCE_QUESTION_LIMIT = 64
 REVIEW_RESPONSE_PARSE_ATTEMPTS = 3
 
@@ -114,6 +116,8 @@ class KnowledgePointExtractor:
         self,
         *,
         provider: str | None = None,
+        langextract_enabled: bool | None = None,
+        langextract_curator: Any | None = None,
     ) -> None:
         # 复习模型固定走 DeepSeek 官方入口，避免误继承通用 RAG 或代理配置。
         self.provider = (provider or os.getenv("REVIEW_EXTRACTION_PROVIDER") or "auto").strip().lower()
@@ -122,6 +126,8 @@ class KnowledgePointExtractor:
         self.reasoning_effort = REVIEW_LLM_REASONING_EFFORT
         self.timeout_seconds = float(os.getenv("REVIEW_EXTRACTION_TIMEOUT_SECONDS", "120"))
         self.base_url = REVIEW_LLM_BASE_URL
+        self._langextract_enabled_override = langextract_enabled
+        self._langextract_curator = langextract_curator
 
     def extract(
         self,
@@ -157,7 +163,7 @@ class KnowledgePointExtractor:
         try:
             source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
             required_questions = required_structured_source_questions(source_questions)
-            usable = select_review_prompt_evidences(cleaned, source_questions)
+            langextract_enabled = self._langextract_is_enabled()
             emit_progress(
                 progress_callback,
                 stageCode="review.evidence",
@@ -165,30 +171,34 @@ class KnowledgePointExtractor:
                 message="已完成 evidence 清洗，正在提取原始问题并准备模型上下文",
                 status="RUNNING",
                 currentStep=1,
-                totalSteps=4,
-                percent=12,
+                totalSteps=5 if langextract_enabled else 4,
+                percent=4 if langextract_enabled else 12,
                 attempt=0,
                 maxAttempts=None,
                 detail=(
-                    f"清洗后保留 {len(cleaned)} 条 evidence，选取 {len(usable)} 条，"
-                    f"识别 {len(source_questions)} 个候选问题，其中 {len(required_questions)} 个属于必须完整覆盖的问题清单"
+                    f"清洗后保留 {len(cleaned)} 条 evidence，识别 {len(source_questions)} 个候选问题，"
+                    f"其中 {len(required_questions)} 个属于必须完整覆盖的问题清单；"
+                    f"LangExtract {'已启用' if langextract_enabled else '未启用'}"
                 ),
             )
             outcome = run_review_generation_graph(
-                actor=lambda attempt, feedback, previous_candidate: self._generate_model_payload(
+                curator=(lambda: self._curate_material(material, cleaned)) if langextract_enabled else None,
+                actor=lambda attempt, feedback, previous_candidate, curator_context: self._generate_model_payload(
                     material,
-                    usable,
+                    cleaned,
                     source_questions=source_questions,
+                    curator_context=curator_context,
                     attempt=attempt,
                     quality_feedback=feedback,
                     user_feedback=user_feedback,
                     previous_candidate=previous_candidate,
                 ),
-                observer=lambda payload: self._validate_model_result(
+                observer=lambda payload, curator_context: self._validate_model_result(
                     material,
-                    usable,
+                    cleaned,
                     payload,
                     source_questions=source_questions,
+                    curator_context=curator_context,
                 ),
                 plan={
                     "materialId": material.material_id,
@@ -197,6 +207,7 @@ class KnowledgePointExtractor:
                     "structuredQuestionCount": len(required_questions),
                     "maxCards": review_card_limit(source_questions),
                     "hasUserFeedback": bool((user_feedback or "").strip()),
+                    "langExtractEnabled": langextract_enabled,
                 },
                 on_progress=progress_callback,
             )
@@ -221,6 +232,41 @@ class KnowledgePointExtractor:
         except Exception as exc:
             logger.exception("DeepSeek 生成复习内容失败")
             raise ReviewExtractionError("DeepSeek 复习内容生成失败，请稍后重新生成") from exc
+
+    def _langextract_is_enabled(self) -> bool:
+        """每次生成时读取线上开关，显式构造参数优先用于测试和 A/B 隔离。"""
+        if self._langextract_enabled_override is not None:
+            return self._langextract_enabled_override
+        return read_bool_environment("REVIEW_LANGEXTRACT_ENABLED", True)
+
+    def _curate_material(
+        self,
+        material: LearningMaterialContext,
+        evidences: list[Evidence],
+    ) -> dict[str, Any]:
+        """运行一次官方 LangExtract，并转换为生成图的严格 evidence 候选上下文。"""
+        from app.review.langextract_curator import (
+            LangExtractKnowledgeCurator,
+            build_production_curator_context,
+        )
+
+        curator = self._langextract_curator or LangExtractKnowledgeCurator(
+            extraction_passes=bounded_int_environment(
+                "REVIEW_LANGEXTRACT_EXTRACTION_PASSES", 2, minimum=1, maximum=5
+            ),
+            max_char_buffer=bounded_int_environment(
+                "REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER", 8000, minimum=1000, maximum=20000
+            ),
+            max_workers=bounded_int_environment(
+                "REVIEW_LANGEXTRACT_MAX_WORKERS", 8, minimum=1, maximum=10
+            ),
+            max_model_requests=bounded_int_environment(
+                "REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS", 32, minimum=1, maximum=64
+            ),
+            timeout_seconds=float(os.getenv("REVIEW_LANGEXTRACT_TIMEOUT_SECONDS", str(self.timeout_seconds))),
+        )
+        result = curator.extract(material.title, evidences)
+        return build_production_curator_context(result)
 
     def _extract_with_model(
         self,
@@ -248,6 +294,7 @@ class KnowledgePointExtractor:
         evidences: list[Evidence],
         *,
         source_questions: list[dict[str, str]] | None = None,
+        curator_context: dict[str, Any] | None = None,
         attempt: int = 1,
         quality_feedback: list[str] | None = None,
         user_feedback: str | None = None,
@@ -257,13 +304,25 @@ class KnowledgePointExtractor:
         from openai import OpenAI
 
         source_questions = source_questions or extract_source_question_candidates(evidences)
+        curated_knowledge_units = valid_curated_knowledge_units(curator_context)
+        prioritized_evidence_ids = {
+            str(evidence_id)
+            for unit in curated_knowledge_units
+            for evidence_id in unit.get("evidenceIds") or []
+        }
+        usable_evidences = select_review_prompt_evidences(
+            evidences,
+            source_questions,
+            prioritized_evidence_ids=prioritized_evidence_ids,
+            limit=CURATED_EVIDENCE_LIMIT if curated_knowledge_units else None,
+        )
         evidence_payload = [
             {
                 "evidenceId": item.evidenceId,
                 "sectionName": item.sectionName,
                 "snippet": item.snippet,
             }
-            for item in evidences[:STRUCTURED_EVIDENCE_LIMIT]
+            for item in usable_evidences
         ]
         prompt = review_card_user_prompt(
             title=material.title,
@@ -272,7 +331,8 @@ class KnowledgePointExtractor:
             evidences=evidence_payload,
             source_questions=source_questions,
             required_source_questions=required_structured_source_questions(source_questions),
-            max_cards=review_card_limit(source_questions),
+            curated_knowledge_units=curated_knowledge_units,
+            max_cards=review_card_limit(source_questions, len(curated_knowledge_units)),
             attempt=attempt,
             quality_feedback=quality_feedback,
             user_feedback=user_feedback,
@@ -282,17 +342,21 @@ class KnowledgePointExtractor:
         last_error: Exception | None = None
         for transport_attempt in range(1, REVIEW_RESPONSE_PARSE_ATTEMPTS + 1):
             try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": review_card_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    reasoning_effort=self.reasoning_effort,
-                    response_format={"type": "json_object"},
-                    extra_body={"thinking": {"type": "enabled"}},
-                    timeout=self.timeout_seconds,
-                )
+                with process_io_limiter.slot(
+                    "review.deepseek",
+                    configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
+                ):
+                    response = client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": review_card_system_prompt()},
+                            {"role": "user", "content": prompt},
+                        ],
+                        reasoning_effort=self.reasoning_effort,
+                        response_format={"type": "json_object"},
+                        extra_body={"thinking": {"type": "enabled"}},
+                        timeout=self.timeout_seconds,
+                    )
                 choices = getattr(response, "choices", None) or []
                 content = choices[0].message.content if choices else ""
                 return parse_json_object(content or "")
@@ -321,6 +385,7 @@ class KnowledgePointExtractor:
         payload: dict[str, Any],
         *,
         source_questions: list[dict[str, str]] | None = None,
+        curator_context: dict[str, Any] | None = None,
     ) -> ExtractionResult:
         """逐卡收集可修复诊断，只发布全部通过门禁且结构覆盖完整的结果。"""
         summary = normalize_generated_summary(payload.get("summary"))
@@ -338,6 +403,12 @@ class KnowledgePointExtractor:
         points: list[KnowledgePoint] = []
         seen_questions: set[str] = set()
         covered_source_questions: set[str] = set()
+        curated_units = valid_curated_knowledge_units(curator_context)
+        curated_by_id = {
+            str(unit["knowledgeUnitId"]): unit
+            for unit in curated_units
+        }
+        covered_curated_units: set[str] = set()
         diagnostics: list[str] = []
         raw_cards = payload.get("cards")
         if not isinstance(raw_cards, list):
@@ -371,6 +442,34 @@ class KnowledgePointExtractor:
             if not refs:
                 diagnostics.append(f"{label} 没有可用 evidence 引用")
                 continue
+            knowledge_unit_ids: list[str] = []
+            if curated_by_id:
+                raw_knowledge_unit_ids = raw.get("knowledgeUnitIds")
+                if raw_knowledge_unit_ids is not None and not isinstance(raw_knowledge_unit_ids, list):
+                    diagnostics.append(f"{label} 的 knowledgeUnitIds 必须是数组")
+                    continue
+                knowledge_unit_ids = list(
+                    dict.fromkeys(str(item) for item in (raw_knowledge_unit_ids or []) if str(item).strip())
+                )
+                unknown_unit_ids = [item for item in knowledge_unit_ids if item not in curated_by_id]
+                if unknown_unit_ids:
+                    diagnostics.append(
+                        f"{label} 引用了不存在的 LangExtract 候选：{'、'.join(unknown_unit_ids[:6])}"
+                    )
+                    continue
+                referenced_evidence_ids = {item.evidenceId for item in refs}
+                mismatched_unit_ids = [
+                    unit_id
+                    for unit_id in knowledge_unit_ids
+                    if not referenced_evidence_ids.intersection(
+                        str(item) for item in curated_by_id[unit_id].get("evidenceIds") or []
+                    )
+                ]
+                if mismatched_unit_ids:
+                    diagnostics.append(
+                        f"{label} 的 LangExtract 候选与 evidenceIds 不一致：{'、'.join(mismatched_unit_ids[:6])}"
+                    )
+                    continue
             if is_noise_fragment(answer) or not answer_is_grounded(answer, refs):
                 diagnostics.append(f"{label} 的 answer 含噪声或未通过逐论断 evidence 忠实度校验")
                 continue
@@ -403,6 +502,7 @@ class KnowledgePointExtractor:
             seen_questions.add(question_key)
             if source_question:
                 covered_source_questions.add(normalized_sentence(source_question))
+            covered_curated_units.update(knowledge_unit_ids)
             points.append(
                 KnowledgePoint(
                     source_key=stable_source_key(section, refs, answer),
@@ -424,6 +524,17 @@ class KnowledgePointExtractor:
                 f"应覆盖 {len(expected_structured)} 个，已覆盖 {len(expected_structured) - len(missing_structured)} 个；"
                 f"缺少：{'；'.join(missing_structured[:12])}"
             )
+        missing_curated_ids = [unit_id for unit_id in curated_by_id if unit_id not in covered_curated_units]
+        if missing_curated_ids:
+            missing_curated = [
+                f"{unit_id} {compact_text(curated_by_id[unit_id].get('topic'), 40) or compact_text(curated_by_id[unit_id].get('text'), 60) or ''}"
+                for unit_id in missing_curated_ids[:16]
+            ]
+            diagnostics.append(
+                "LangExtract 候选知识覆盖不足："
+                f"应覆盖 {len(curated_by_id)} 个，已覆盖 {len(curated_by_id) - len(missing_curated_ids)} 个；"
+                f"缺少：{'；'.join(missing_curated)}"
+            )
         if not points:
             if not diagnostics:
                 diagnostics.append("cards 为空，没有生成任何可发布的复习卡片")
@@ -434,6 +545,11 @@ class KnowledgePointExtractor:
         if missing_structured:
             raise ReviewExtractionError(
                 "DeepSeek 生成的卡片未完整覆盖资料已有的问题清单",
+                diagnostics=diagnostics[:80],
+            )
+        if missing_curated_ids:
+            raise ReviewExtractionError(
+                "DeepSeek 生成的卡片未完整覆盖 LangExtract 候选知识单元",
                 diagnostics=diagnostics[:80],
             )
         if diagnostics:
@@ -447,11 +563,65 @@ class KnowledgePointExtractor:
             True,
             None,
             "DeepSeek 已生成复习内容",
-            tuple(points[: review_card_limit(question_candidates)]),
+            tuple(points[: review_card_limit(question_candidates, len(curated_by_id))]),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
             summary,
             quality_feedback=tuple(diagnostics[:80]),
         )
+
+
+def valid_curated_knowledge_units(context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """只保留包含稳定 ID、原文和 evidence 映射的 LangExtract 线上候选。"""
+    if not isinstance(context, dict) or context.get("status") != "COMPLETED":
+        return []
+    raw_units = context.get("knowledgeUnits")
+    if not isinstance(raw_units, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_units[:MAX_STRUCTURED_REVIEW_CARD_LIMIT]:
+        if not isinstance(raw, dict):
+            continue
+        unit_id = compact_text(raw.get("knowledgeUnitId"), 40)
+        text = compact_text(raw.get("text"), 1200)
+        raw_evidence_ids = raw.get("evidenceIds")
+        evidence_ids = list(
+            dict.fromkeys(
+                str(item)
+                for item in (raw_evidence_ids if isinstance(raw_evidence_ids, list) else [])
+                if str(item).strip()
+            )
+        )
+        if not unit_id or unit_id in seen or not text or not evidence_ids:
+            continue
+        seen.add(unit_id)
+        result.append(
+            {
+                "knowledgeUnitId": unit_id,
+                "text": text,
+                "topic": compact_text(raw.get("topic"), 120),
+                "knowledgeType": compact_text(raw.get("knowledgeType"), 80),
+                "evidenceIds": evidence_ids,
+            }
+        )
+    return result
+
+
+def read_bool_environment(name: str, default: bool) -> bool:
+    """读取兼容常见真假写法的布尔环境变量。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bounded_int_environment(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """读取有上下界的整数环境变量，非法值安全回退。"""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def deduplicate_evidences(evidences: list[Evidence]) -> list[Evidence]:
@@ -540,27 +710,36 @@ def clean_review_evidences(evidences: list[Evidence]) -> list[Evidence]:
 def select_review_prompt_evidences(
     evidences: list[Evidence],
     source_questions: list[dict[str, str]],
+    *,
+    prioritized_evidence_ids: set[str] | None = None,
+    limit: int | None = None,
 ) -> list[Evidence]:
-    """结构化资料优先保留问题片段和相邻答案片段，再补充整篇均匀采样。"""
+    """优先保留 Curator/问题片段及相邻答案，再用整篇均匀采样补足上下文。"""
     required_questions = required_structured_source_questions(source_questions)
-    if not required_questions:
+    prioritized_ids = {str(item) for item in (prioritized_evidence_ids or set()) if str(item)}
+    if not required_questions and not prioritized_ids:
         return select_representative_evidences(evidences, limit=STANDARD_EVIDENCE_LIMIT)
 
     ordered = sorted(evidences, key=evidence_position)
-    preferred_ids = {str(item.get("evidenceId") or "") for item in required_questions}
+    preferred_ids = {
+        *prioritized_ids,
+        *(str(item.get("evidenceId") or "") for item in required_questions),
+    }
     expanded_ids = set(preferred_ids)
     for index, evidence in enumerate(ordered[:-1]):
         if evidence.evidenceId in preferred_ids:
             expanded_ids.add(ordered[index + 1].evidenceId)
 
+    resolved_limit = limit or (CURATED_EVIDENCE_LIMIT if prioritized_ids else STRUCTURED_EVIDENCE_LIMIT)
+    resolved_limit = max(1, min(CURATED_EVIDENCE_LIMIT, int(resolved_limit)))
     preferred = [item for item in ordered if item.evidenceId in expanded_ids]
-    selected = preferred[:STRUCTURED_EVIDENCE_LIMIT]
+    selected = preferred[:resolved_limit]
     selected_ids = {item.evidenceId for item in selected}
-    remaining = STRUCTURED_EVIDENCE_LIMIT - len(selected)
+    remaining = resolved_limit - len(selected)
     if remaining > 0:
         candidates = [item for item in ordered if item.evidenceId not in selected_ids]
         selected.extend(select_representative_evidences(candidates, limit=remaining))
-    return sorted(selected[:STRUCTURED_EVIDENCE_LIMIT], key=evidence_position)
+    return sorted(selected[:resolved_limit], key=evidence_position)
 
 
 def select_representative_evidences(evidences: list[Evidence], *, limit: int) -> list[Evidence]:
@@ -676,12 +855,18 @@ def extract_source_questions(evidence: Evidence) -> list[str]:
     return result[:32]
 
 
-def review_card_limit(source_questions: list[dict[str, str]]) -> int:
-    """普通资料保持精炼，明确列出问题清单时按原始问题数动态放宽。"""
+def review_card_limit(
+    source_questions: list[dict[str, str]],
+    curator_knowledge_unit_count: int = 0,
+) -> int:
+    """结构化问题或 Curator 候选存在时动态放宽，最高仍限制为 32 张。"""
     required_questions = required_structured_source_questions(source_questions)
-    if not required_questions:
+    if not required_questions and curator_knowledge_unit_count <= 0:
         return STANDARD_REVIEW_CARD_LIMIT
-    return min(MAX_STRUCTURED_REVIEW_CARD_LIMIT, len(required_questions))
+    return min(
+        MAX_STRUCTURED_REVIEW_CARD_LIMIT,
+        max(STANDARD_REVIEW_CARD_LIMIT, len(required_questions), curator_knowledge_unit_count),
+    )
 
 
 def structured_source_questions(source_questions: list[dict[str, str]]) -> list[tuple[str, str]]:

@@ -5,9 +5,10 @@ import math
 import os
 import re
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from app.core.io_concurrency import configured_io_workers, process_io_limiter
 from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.core.models import Chunk, utc_now_iso
@@ -520,10 +521,58 @@ class PgVectorRagStore:
         }
 
         candidate_budget = max(request.topK * request.candidateMultiplier, 20)
-        for query_index, query_text in enumerate(expanded_queries):
-            limit = candidate_budget
-            progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=8, percent=30)
-            bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=limit)
+        # Multi-Query 先批量生成向量，再用有界线程池并发执行相互独立的 pgvector I/O。
+        query_vectors = embed_texts(expanded_queries, dimensions=self.dimensions)
+
+        def retrieve_query(
+            query_index: int,
+            query_text: str,
+            query_vector: list[float],
+        ) -> tuple[int, str, list[tuple[str, float]], list[tuple[str, float]]]:
+            """召回单个查询变体的 BM25 与向量结果，供主线程按原顺序汇总。"""
+            bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=candidate_budget)
+            vector_hits = self._vector_search(
+                query_text,
+                filter_plan.effective_filter(),
+                limit=candidate_budget,
+                query_vector=query_vector,
+            )
+            return query_index, query_text, bm25_hits, vector_hits
+
+        worker_count = min(
+            len(expanded_queries),
+            configured_io_workers("RAG_RETRIEVAL_IO_WORKERS"),
+        )
+        progress_reporter.emit(
+            "query.bm25",
+            f"正在并发执行 {len(expanded_queries)} 个 Multi-Query 召回任务",
+            current_step=3,
+            total_steps=8,
+            percent=30,
+        )
+        progress_reporter.emit(
+            "query.vector",
+            f"已批量生成查询向量，正在使用 {max(1, worker_count)} 个 I/O worker 查询 pgvector",
+            current_step=4,
+            total_steps=8,
+            percent=45,
+        )
+        retrieval_results: list[
+            tuple[int, str, list[tuple[str, float]], list[tuple[str, float]]] | None
+        ] = [None] * len(expanded_queries)
+        with ThreadPoolExecutor(max_workers=max(1, worker_count), thread_name_prefix="rag-pgvector-query") as pool:
+            futures = {
+                pool.submit(retrieve_query, index, query_text, query_vectors[index]): index
+                for index, query_text in enumerate(expanded_queries)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                retrieval_results[result[0]] = result
+
+        for retrieval_result in retrieval_results:
+            if retrieval_result is None:
+                raise RuntimeError("Multi-Query 并发召回结果不完整")
+            query_index, query_text, bm25_hits, vector_hits = retrieval_result
             ranked_runs.append(RankedRetrievalRun(query_index, "bm25", bm25_hits))
             progress_reporter.emit(
                 "query.bm25",
@@ -539,8 +588,6 @@ class PgVectorRagStore:
                     else None,
                 ),
             )
-            progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=8, percent=45)
-            vector_hits = self._vector_search(query_text, filter_plan.effective_filter(), limit=limit)
             ranked_runs.append(RankedRetrievalRun(query_index, "vector", vector_hits))
             progress_reporter.emit(
                 "query.vector",
@@ -1184,28 +1231,42 @@ class PgVectorRagStore:
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
     @logged_rag_method("query.vector", "pgvector_vector_search", "执行 pgvector 向量召回")
-    def _vector_search(self, query_text: str, metadata_filter: dict[str, Any], limit: int) -> list[tuple[str, float]]:
+    def _vector_search(
+        self,
+        query_text: str,
+        metadata_filter: dict[str, Any],
+        limit: int,
+        *,
+        query_vector: list[float] | None = None,
+    ) -> list[tuple[str, float]]:
+        """使用预批量生成的向量查询 pgvector，并限制进程级数据库 I/O 并发。"""
         if not tokenize(query_text):
             return []
-        query_vector = vector_literal(embed_text(query_text, dimensions=self.dimensions))
+        query_vector_literal = vector_literal(
+            query_vector if query_vector is not None else embed_text(query_text, dimensions=self.dimensions)
+        )
         where_sql, filter_params = build_filter_clause(metadata_filter)
-        params: list[Any] = [query_vector, *filter_params, query_vector, limit]
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT
-                        c.chunk_id,
-                        1 - (c.embedding <=> %s::vector) AS score
-                    FROM {self.chunk_table} c
-                    JOIN {self.document_table} d ON d.document_id = c.document_id
-                    {where_sql}
-                    ORDER BY c.embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    params,
-                )
-                rows = cursor.fetchall()
+        params: list[Any] = [query_vector_literal, *filter_params, query_vector_literal, limit]
+        with process_io_limiter.slot(
+            "rag.pgvector",
+            configured_io_workers("RAG_RETRIEVAL_IO_WORKERS"),
+        ):
+            with self._connect() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT
+                            c.chunk_id,
+                            1 - (c.embedding <=> %s::vector) AS score
+                        FROM {self.chunk_table} c
+                        JOIN {self.document_table} d ON d.document_id = c.document_id
+                        {where_sql}
+                        ORDER BY c.embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        params,
+                    )
+                    rows = cursor.fetchall()
         return [(str(row["chunk_id"]), float(row["score"] or 0.0)) for row in rows]
 
     def _to_evidence(self, row: dict[str, Any], score: float, retrieval_source: str) -> Evidence:

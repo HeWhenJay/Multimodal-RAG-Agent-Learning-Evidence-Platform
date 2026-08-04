@@ -12,7 +12,7 @@
 
 今日资料标题上的拖拽手柄同时支持文件夹投放。用户把整份文档拖到文件夹卡片并松手后，前端调用既有批量归档接口，只改变该文档的文件夹归属；拖拽经过今日队列造成的临时排序会恢复，不额外写入资料优先级。主页面资料归档区支持逐份勾选和“全选未归档资料”，选择目标文件夹后一次批量进入；触屏与键盘用户无需使用拖拽也能完成批量归档。
 
-结构化视频不再受普通资料“最多 8 张”的固定截断影响。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，再把命中问题的 evidence 与相邻答案片段优先送给 DeepSeek。当资料明确列出超过 8 个可回答问题时，模型应逐项保留，单份资料最多 32 张；没有明确问题清单的普通资料仍以 3-8 张高价值卡片为目标。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
+结构化视频不再受普通资料“最多 8 张”的固定截断影响。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，同时由 LangExtract 从陈述式讲解中发现定义、机制、流程、因果、对比和实践结论。当结构化问题或严格定位候选超过 8 个时，单份资料动态放宽到最多 32 张；同主题连续细节可合并，但不得遗漏候选知识 ID。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
 
@@ -33,11 +33,11 @@
 - 文件夹只负责资料管理与查找，不改变到期规则。文件夹中的活动卡片继续参与 `dueCount`、每日资料额度和今日复习队列；今日资料组返回 `folderId/folderName` 供前端定位。
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
-- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—生成—质量观察—修复”循环，由 DeepSeek 完成复习摘要和该 group 的全部问题、答案与提示。图的 `recursion_limit` 固定为 `999`，真实模型调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
+- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—LangExtract Curator—生成—质量观察—修复”循环。Curator 对完整 evidence 只运行一次，Repair 复用候选，不重复执行长文抽取。图的 `recursion_limit` 固定为 `999`，卡片 DeepSeek 真实模型调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
 - `DEEPSEEK_API_KEY` 缺失等不可执行错误写入 `FAILED`。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
 - `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
-- 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、DeepSeek 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v10`。v10 会确定性过滤“对吧”“是不是很方便”“该怎么办”“它到底怎么做”等无主题口语反问，只有真正的结构化问题清单才启用完整覆盖；卡面 `question` 接受自包含疑问句或“说明/比较/列出……”式主动回忆指令，问号只是可选展示标点，不再作为发布硬门禁。`sourceQuestion` 只是资料级覆盖审计字段，允许问题与答案位于相邻 evidence；模型填错时会按卡面主题恢复唯一匹配项或忽略，不能单独导致卡片失败。Repair 会携带上一版候选结果，保留合格卡并定向替换坏卡。非结构化资料允许采用通过全部门禁的部分成功卡片，坏卡会被丢弃并写入 `qualityFeedback`；真正的结构化问题缺失或没有任何合格卡时才继续下一轮。DeepSeek 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
+- 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、LangExtract 知识发现、DeepSeek 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；Curator 会公开原始候选、精确定位候选、最终选择数与模型请求数。`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v11`。v11 在 v10 的问题清洗、可选问号、`sourceQuestion` 审计和增量 Repair 基础上，引入最多 32 个 LangExtract `knowledgeUnitId`；模型必须为卡片回传覆盖 ID，服务端校验候选 evidence 与卡片 evidence 至少有一项重合，并拒绝未完整覆盖的结果。DeepSeek 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
@@ -50,6 +50,19 @@
 ## 模型运行配置
 
 DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务固定请求 `deepseek-v4-flash`。官方说明该模型标识会滚动指向最新正式版本；思考模式请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`。参数依据：[首次 API 调用](https://api-docs.deepseek.com/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON 输出](https://api-docs.deepseek.com/guides/json_mode)。
+
+线上默认并发与预算：
+
+| 环节 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `REVIEW_LANGEXTRACT_MAX_WORKERS` | `8` | 同一 pass 内并发处理文本块，硬上限 10 |
+| `REVIEW_LANGEXTRACT_EXTRACTION_PASSES` | `2` | 两轮串行执行，提高召回；不会跨 pass 并发 |
+| `REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER` | `8000` | 单个文本块字符预算 |
+| `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | `32` | 单份资料 LangExtract 请求总预算 |
+| `REVIEW_LANGEXTRACT_TIMEOUT_SECONDS` | `120` | 单个 LangExtract 请求超时 |
+| `REVIEW_DEEPSEEK_MAX_IN_FLIGHT` | `8` | 卡片生成请求的进程级并发闸门 |
+
+LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待 DeepSeek HTTP；项目在客户端代理外再增加进程级共享闸门，保证多份资料同时生成时不会把“每份 8 个 worker”相乘成无界请求数。配置超过 10 时回退或限制在安全范围，降低配置不当造成的限流和内存压力。
 
 密钥只从用户环境变量 `DEEPSEEK_API_KEY` 读取。默认优先使用当前进程环境；Windows 进程环境缺失时，再只读当前用户的 `HKCU\Environment`，并缓存到当前进程供受监督 worker 继承。Linux、容器和服务器环境仍只使用标准进程环境。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
 
@@ -217,7 +230,7 @@ Authorization: Bearer <token>
 }
 ```
 
-`materialSummary` 只取当前 `review-card-v10` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`folderId/folderName` 表示资料当前归档位置，为空时定位到主页面“资料归档”列表；非空时前端跳转 `/reviews/folders/{folderId}?materialId={materialId}`，文件夹详情自动展开、滚动并高亮对应文档。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+`materialSummary` 只取当前 `review-card-v11` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`folderId/folderName` 表示资料当前归档位置，为空时定位到主页面“资料归档”列表；非空时前端跳转 `/reviews/folders/{folderId}?materialId={materialId}`，文件夹详情自动展开、滚动并高亮对应文档。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
 
 ### 保存资料 group 顺序
 

@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-requests", type=int, default=8)
     parser.add_argument("--extraction-passes", type=int, default=2)
     parser.add_argument("--max-char-buffer", type=int, default=8000)
+    parser.add_argument("--max-workers", type=int, default=2)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -54,6 +55,8 @@ def main() -> int:
     args = parse_args()
     if not 1 <= args.max_requests <= 64:
         raise ValueError("--max-requests 必须在 1 到 64 之间")
+    if not 1 <= args.max_workers <= 10:
+        raise ValueError("--max-workers 必须在 1 到 10 之间")
     cases = select_cases(load_cases(args.cases), args.case_ids)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results: list[CuratorCaseResult] = []
@@ -69,6 +72,7 @@ def main() -> int:
             max_requests=args.max_requests,
             extraction_passes=args.extraction_passes,
             max_char_buffer=args.max_char_buffer,
+            max_workers=args.max_workers,
         )
         result = CuratorCaseResult(
             case_id=str(case["caseId"]),
@@ -92,6 +96,7 @@ def main() -> int:
             "langextractVersion": "1.6.x",
             "extractionPasses": args.extraction_passes,
             "maxCharBuffer": args.max_char_buffer,
+            "maxWorkers": args.max_workers,
         },
         "decision": decision,
         "cases": [case_result_to_dict(result) for result in results],

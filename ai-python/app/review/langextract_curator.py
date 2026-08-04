@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 
 from app.core.environment import read_process_or_windows_user_environment
+from app.core.io_concurrency import configured_io_workers, process_io_limiter
 from app.review.knowledge_extractor import (
     REVIEW_LLM_BASE_URL,
     REVIEW_LLM_MODEL,
@@ -19,6 +20,7 @@ from app.schemas.rag import Evidence
 
 
 LANGEXTRACT_CURATOR_VERSION = "langextract-curator-v1"
+MAX_PRODUCTION_CURATOR_UNITS = 32
 
 
 @dataclass(frozen=True)
@@ -104,13 +106,16 @@ class LangExtractCuratorResult:
 class _CompletionsAuditProxy:
     """代理 OpenAI-compatible 请求并采集官方响应 usage。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit) -> None:
+    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
         self._delegate = delegate
         self._audit = audit
+        self._max_in_flight = max_in_flight
 
     def create(self, **kwargs: Any) -> Any:
         self._audit.begin_request()
-        response = self._delegate.create(**kwargs)
+        # LangExtract 会为同一批文本块创建线程；进程级闸门同时防止多份资料叠加后压垮 DeepSeek。
+        with process_io_limiter.slot("review.langextract", self._max_in_flight):
+            response = self._delegate.create(**kwargs)
         self._audit.record_response(kwargs, response)
         return response
 
@@ -121,9 +126,9 @@ class _CompletionsAuditProxy:
 class _ChatAuditProxy:
     """只替换 chat.completions，其余官方客户端能力保持透明。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit) -> None:
+    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
         self._delegate = delegate
-        self.completions = _CompletionsAuditProxy(delegate.completions, audit)
+        self.completions = _CompletionsAuditProxy(delegate.completions, audit, max_in_flight)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -132,9 +137,9 @@ class _ChatAuditProxy:
 class _OpenAIClientAuditProxy:
     """为 LangExtract 官方 OpenAI provider 增加只读成本审计。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit) -> None:
+    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
         self._delegate = delegate
-        self.chat = _ChatAuditProxy(delegate.chat, audit)
+        self.chat = _ChatAuditProxy(delegate.chat, audit, max_in_flight)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -151,9 +156,9 @@ class LangExtractKnowledgeCurator:
         base_url: str = REVIEW_LLM_BASE_URL,
         reasoning_effort: str = REVIEW_LLM_REASONING_EFFORT,
         extraction_passes: int = 2,
-        max_char_buffer: int = 6000,
-        max_workers: int = 2,
-        max_model_requests: int = 8,
+        max_char_buffer: int = 8000,
+        max_workers: int | None = None,
+        max_model_requests: int = 32,
         timeout_seconds: float = 120.0,
         extract_function: Callable[..., Any] | None = None,
     ) -> None:
@@ -163,7 +168,10 @@ class LangExtractKnowledgeCurator:
         self.reasoning_effort = reasoning_effort
         self.extraction_passes = max(1, min(5, int(extraction_passes)))
         self.max_char_buffer = max(1000, min(20000, int(max_char_buffer)))
-        self.max_workers = max(1, min(8, int(max_workers)))
+        resolved_workers = max_workers if max_workers is not None else configured_io_workers(
+            "REVIEW_LANGEXTRACT_MAX_WORKERS"
+        )
+        self.max_workers = max(1, min(10, int(resolved_workers)))
         self.max_model_requests = max(1, min(64, int(max_model_requests)))
         self.timeout_seconds = max(5.0, min(600.0, float(timeout_seconds)))
         self._extract_function = extract_function
@@ -224,6 +232,7 @@ class LangExtractKnowledgeCurator:
         model._client = _OpenAIClientAuditProxy(  # noqa: SLF001
             OpenAI(api_key=api_key, base_url=self.base_url, timeout=self.timeout_seconds),
             audit,
+            self.max_workers,
         )
         extractor = self._extract_function or lx.extract
         return extractor(
@@ -368,6 +377,98 @@ def deduplicate_curator_candidates(
         seen.add(key)
         result.append(candidate)
     return result, duplicates
+
+
+def build_production_curator_context(
+    result: LangExtractCuratorResult,
+    *,
+    limit: int = MAX_PRODUCTION_CURATOR_UNITS,
+) -> dict[str, Any]:
+    """把严格定位候选整理为线上生成图可消费的主题多样化知识单元。"""
+    selected = select_production_curator_candidates(list(result.candidates), limit=limit)
+    knowledge_units = [
+        {
+            "knowledgeUnitId": f"KU-{index:03d}",
+            "text": candidate.text,
+            "topic": candidate.topic,
+            "knowledgeType": candidate.knowledge_type,
+            # 卡片发布契约最多允许两个 evidenceId，候选上下文保持相同边界。
+            "evidenceIds": list(candidate.evidence_ids[:2]),
+        }
+        for index, candidate in enumerate(selected, start=1)
+    ]
+    return {
+        "status": "COMPLETED",
+        "version": result.version,
+        "knowledgeUnits": knowledge_units,
+        "rawCandidateCount": result.raw_extraction_count,
+        "groundedCandidateCount": result.grounded_extraction_count,
+        "acceptedCandidateCount": len(result.candidates),
+        "selectedKnowledgeUnitCount": len(knowledge_units),
+        "duplicateCount": result.duplicate_count,
+        "requestCount": result.usage.request_count,
+        "durationSeconds": result.duration_seconds,
+    }
+
+
+def select_production_curator_candidates(
+    candidates: list[CuratorCandidate],
+    *,
+    limit: int = MAX_PRODUCTION_CURATOR_UNITS,
+) -> list[CuratorCandidate]:
+    """先消除近重复，再按 topic 轮询，避免长资料前半段独占候选预算。"""
+    bounded_limit = max(1, min(MAX_PRODUCTION_CURATOR_UNITS, int(limit)))
+    unique: list[CuratorCandidate] = []
+    for candidate in sorted(candidates, key=lambda item: (item.char_start, item.char_end)):
+        if any(curator_candidates_are_near_duplicates(candidate, accepted) for accepted in unique):
+            continue
+        unique.append(candidate)
+
+    groups: dict[str, list[CuratorCandidate]] = {}
+    group_order: list[str] = []
+    for candidate in unique:
+        topic_key = normalized_sentence(candidate.topic or "")
+        if not topic_key:
+            # 缺少 topic 时使用较短原文前缀，避免把所有未知主题错误合并为一组。
+            topic_key = f"unknown:{normalized_sentence(candidate.text)[:24]}"
+        if topic_key not in groups:
+            groups[topic_key] = []
+            group_order.append(topic_key)
+        groups[topic_key].append(candidate)
+
+    selected: list[CuratorCandidate] = []
+    offset = 0
+    while len(selected) < bounded_limit:
+        appended = False
+        for group_key in group_order:
+            group = groups[group_key]
+            if offset >= len(group):
+                continue
+            selected.append(group[offset])
+            appended = True
+            if len(selected) >= bounded_limit:
+                break
+        if not appended:
+            break
+        offset += 1
+    return sorted(selected, key=lambda item: (item.char_start, item.char_end))
+
+
+def curator_candidates_are_near_duplicates(left: CuratorCandidate, right: CuratorCandidate) -> bool:
+    """用保守的包含关系和字符二元组识别跨 pass 的近重复原文。"""
+    left_text = normalized_sentence(left.text)
+    right_text = normalized_sentence(right.text)
+    if not left_text or not right_text:
+        return False
+    shorter, longer = sorted((left_text, right_text), key=len)
+    if len(shorter) >= 10 and shorter in longer:
+        return True
+    left_pairs = {left_text[index : index + 2] for index in range(max(0, len(left_text) - 1))}
+    right_pairs = {right_text[index : index + 2] for index in range(max(0, len(right_text) - 1))}
+    if not left_pairs or not right_pairs:
+        return False
+    union = left_pairs | right_pairs
+    return bool(union) and len(left_pairs & right_pairs) / len(union) >= 0.88
 
 
 def estimate_chat_tokens(messages: list[dict[str, Any]]) -> int:

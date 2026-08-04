@@ -149,6 +149,27 @@ def test_pgvector_store_rejects_invalid_table_prefix(monkeypatch):
         PgVectorRagStore("postgresql://unused", ensure_schema=False)
 
 
+def test_pgvector_search_uses_prebatched_query_vector_without_second_embedding(monkeypatch):
+    """Multi-Query 已批量向量化后，单个数据库查询不得再次访问 embedding 服务。"""
+    store = PgVectorRagStore("postgresql://unused", ensure_schema=False)
+    cursor = FakeCursor(rows=[{"chunk_id": "chunk-1", "score": 0.82}])
+    monkeypatch.setattr(store, "_connect", lambda: FakeConnection(cursor))
+    monkeypatch.setattr(
+        "rag.indexes.pgvector_store.embed_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应重复生成查询向量")),
+    )
+
+    hits = store._vector_search(
+        "Kafka 如何保证高性能",
+        {},
+        limit=5,
+        query_vector=[0.1, 0.2, 0.3],
+    )
+
+    assert hits == [("chunk-1", 0.82)]
+    assert cursor.executed[0][1][0] == "[0.10000000,0.20000000,0.30000000]"
+
+
 def test_pgvector_parser_varchar_guard_keeps_storage_compatible() -> None:
     """超长 parser 仅截断展示字段，避免数据库事务因 VARCHAR(80) 回滚。"""
 

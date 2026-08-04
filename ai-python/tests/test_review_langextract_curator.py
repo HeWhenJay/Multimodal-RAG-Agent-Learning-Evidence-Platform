@@ -9,8 +9,10 @@ from app.review.langextract_curator import (
     EvidenceTextSpan,
     ModelUsageAudit,
     build_source_document,
+    build_production_curator_context,
     deduplicate_curator_candidates,
     grounded_candidate,
+    select_production_curator_candidates,
 )
 from app.schemas.rag import Evidence
 from rag.evaluation.review_curator_ab_common import (
@@ -145,10 +147,74 @@ def test_usage_audit_enforces_equal_request_budget() -> None:
 
 
 def test_langextract_curator_uses_same_model_timeout_as_baseline() -> None:
-    """B 臂默认单请求超时必须与当前生成器的 120 秒保持一致。"""
+    """线上默认使用 8 个 I/O worker，单请求超时仍与当前生成器保持一致。"""
     from app.review.langextract_curator import LangExtractKnowledgeCurator
 
     assert LangExtractKnowledgeCurator(api_key="test-key").timeout_seconds == 120.0
+    assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 8
+
+
+def test_langextract_passes_eight_workers_to_official_thread_pool() -> None:
+    """官方 provider 与分块批次都必须收到 8，确保不是只改了展示配置。"""
+    from app.review.langextract_curator import LangExtractKnowledgeCurator
+
+    captured = {}
+
+    def fake_extract(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(extractions=[])
+
+    result = LangExtractKnowledgeCurator(
+        api_key="test-key",
+        max_workers=8,
+        extract_function=fake_extract,
+    ).extract("Kafka 高性能", [evidence("e-1", "页缓存减少磁盘读取。")])
+
+    assert result.candidates == ()
+    assert captured["max_workers"] == 8
+    assert captured["batch_length"] == 8
+    assert captured["extraction_passes"] == 2
+
+
+def test_production_candidates_round_robin_topics_before_second_detail() -> None:
+    """候选预算应先覆盖不同 topic，再补充同主题的第二条细节。"""
+    candidates = [
+        CuratorCandidate("GIL 定义", "GIL", "定义", ("e-1",), 0, 6),
+        CuratorCandidate("GIL 作用", "GIL", "作用", ("e-2",), 10, 16),
+        CuratorCandidate("浅拷贝定义", "拷贝", "定义", ("e-3",), 20, 26),
+        CuratorCandidate("浅拷贝适用场景", "拷贝", "场景", ("e-4",), 30, 38),
+    ]
+
+    selected = select_production_curator_candidates(candidates, limit=2)
+
+    assert [item.text for item in selected] == ["GIL 定义", "浅拷贝定义"]
+
+
+def test_production_context_assigns_stable_ids_and_keeps_usage() -> None:
+    """线上上下文必须保留稳定候选 ID、真实 evidence 和调用审计。"""
+    usage = ModelUsageAudit(request_count=2)
+    result = SimpleNamespace(
+        candidates=(CuratorCandidate("页缓存减少磁盘读取", "页缓存", "作用", ("e-1",), 0, 10),),
+        raw_extraction_count=2,
+        grounded_extraction_count=1,
+        duplicate_count=0,
+        duration_seconds=1.25,
+        usage=usage,
+        version="langextract-curator-v1",
+    )
+
+    context = build_production_curator_context(result)
+
+    assert context["knowledgeUnits"] == [
+        {
+            "knowledgeUnitId": "KU-001",
+            "text": "页缓存减少磁盘读取",
+            "topic": "页缓存",
+            "knowledgeType": "作用",
+            "evidenceIds": ["e-1"],
+        }
+    ]
+    assert context["requestCount"] == 2
 
 
 def test_expected_point_matching_uses_frozen_aliases() -> None:

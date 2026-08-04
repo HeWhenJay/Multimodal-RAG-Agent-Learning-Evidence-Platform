@@ -160,7 +160,7 @@ def run_baseline_arm(
     os.environ["REVIEW_GENERATION_MAX_ATTEMPTS"] = str(max_requests)
     try:
         with audit_openai_calls(audit):
-            result = KnowledgePointExtractor(provider="deepseek").extract(
+            result = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False).extract(
                 LearningMaterialContext(
                     material.id,
                     material.title,
@@ -214,12 +214,14 @@ def run_langextract_arm(
     max_requests: int,
     extraction_passes: int,
     max_char_buffer: int,
+    max_workers: int,
 ) -> CuratorArmResult:
     """运行官方 LangExtract 候选发现，作为 B 臂。"""
     started_at = time.perf_counter()
     curator = LangExtractKnowledgeCurator(
         extraction_passes=extraction_passes,
         max_char_buffer=max_char_buffer,
+        max_workers=max_workers,
         max_model_requests=max_requests,
     )
     try:

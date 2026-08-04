@@ -1,6 +1,12 @@
 import pytest
 
-from rag.retrievers.retrieval import cached_embedding, embed_text, embed_texts, embedding_provider_name
+from rag.retrievers.retrieval import (
+    cached_embedding,
+    embed_text,
+    embed_texts,
+    embedding_batch_config,
+    embedding_provider_name,
+)
 from rag.retrievers.retrieval import (
     FusionConfig,
     InMemoryRagStore,
@@ -477,6 +483,15 @@ def test_dashscope_embedding_batch_preserves_response_index_order(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer batch-test-key"
     assert captured["json"]["input"] == ["第一段", "第二段"]
     assert captured["json"]["model"] == "text-embedding-v4"
+
+
+def test_embedding_io_concurrency_defaults_to_eight_and_caps_at_ten(monkeypatch):
+    """Embedding 外部 I/O 默认并发 8，并允许显式上调但不超过 10。"""
+    monkeypatch.delenv("RAG_EMBEDDING_MAX_IN_FLIGHT", raising=False)
+    assert embedding_batch_config().max_in_flight == 8
+
+    monkeypatch.setenv("RAG_EMBEDDING_MAX_IN_FLIGHT", "10")
+    assert embedding_batch_config().max_in_flight == 10
 
 
 def test_weighted_rrf_uses_channel_weights_and_exposes_raw_rank_details():

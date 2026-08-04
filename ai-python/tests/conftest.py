@@ -13,3 +13,5 @@ os.environ.setdefault("RAG_VECTOR_DIMENSIONS", "1024")
 os.environ.setdefault("RAG_ANSWER_PROVIDER", "local")
 os.environ.setdefault("RAG_RERANK_PROVIDER", "local")
 os.environ["RAG_QUERY_EXPANSION_PROVIDER"] = "local"
+# 仅显式的 LangExtract 集成测试启用真实候选节点，避免普通单测访问 DeepSeek。
+os.environ.setdefault("REVIEW_LANGEXTRACT_ENABLED", "false")

@@ -32,8 +32,8 @@ npm run dev
 
 - 多模态资料入库：文本、PDF、Office 文档、图片、字幕与视频；PDF 优先 MinerU，失败时走本地降级解析。
 - 可追溯 RAG：结构化解析、递归切块、文档/章节摘要、元数据隔离、BM25 与 pgvector 向量召回、Multi-Query、RRF/RAG-Fusion、重排和 evidence 引用。
-- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；结构化视频会优先保留原始问题清单，普通资料最多 8 张，明确问题清单最多 32 张。
-- 复习质量闭环：独立 LangGraph 按 Planner → Actor → Observer → Repair 循环调用 DeepSeek；质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`，允许用户补充说明后继续生成。
+- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，结构化问题或候选较多时最多生成 32 张。
+- 复习质量闭环：独立 LangGraph 按 Planner → LangExtract Curator → Actor → Observer → Repair 运行；Curator 候选精确回指 evidence 并只执行一次，质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`。
 - 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
 - Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示都由 DeepSeek 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
 - 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
@@ -52,7 +52,7 @@ flowchart TB
         API["FastAPI 公开控制面\nAuth / PageData / Logs\nRAG / Agent / Memory / SSE"]
         AGW["Agent durable worker\nLangGraph PAE/ReAct"]
         RAGW["RAG durable worker\n查询任务 + LOCAL 索引"]
-        REVIEW["复习领域服务\nDeepSeek PAE/ReAct\nFSRS + 文件夹"]
+        REVIEW["复习领域服务\nLangExtract + DeepSeek PAE/ReAct\nFSRS + 文件夹"]
         CRON["cron\nOutbox / staging 清理"]
         KAFKAW["Kafka worker\n仅 Kafka 模式"]
         SUP --> API
@@ -78,7 +78,7 @@ flowchart TB
     KAFKAW <--> STORE
     RAGW --> MODEL["MinerU / OCR / ASR\nEmbedding / Rerank / LLM"]
     KAFKAW --> MODEL
-    REVIEW --> DEEPSEEK["DeepSeek 官方 API\ndeepseek-v4-flash\nthinking + max reasoning"]
+    REVIEW --> DEEPSEEK["DeepSeek 官方 API\nLangExtract 8 路 I/O 并发\n卡片生成 + max reasoning"]
 
     CRON -->|"可选 Outbox 发布"| KAFKA[("Kafka")]
     KAFKA <--> KAFKAW
@@ -161,10 +161,10 @@ flowchart TB
     TASK --> RETRIEVE
 
     subgraph RETRIEVE["Python RAG 检索流水线"]
-        MQ["Multi-Query\n原问题 + 查询变体"]
+        MQ["Multi-Query\n原问题 + 查询变体\n查询向量一次批量生成"]
         FILTER["元数据过滤\nuserId + visibilityScope=private\n类型、来源、章节等"]
         BM25["BM25 词项召回"]
-        VECTOR["pgvector 语义召回"]
+        VECTOR["pgvector 语义召回\n最多 8 个 I/O worker"]
         FUSION["weighted RRF\nRAG-Fusion"]
         PARENT["父段聚合"]
         RERANK["百炼 rerank\n或可解释本地重排"]
@@ -186,7 +186,7 @@ flowchart TB
     HISTORY --> FE
 ```
 
-RAG 检索设计采用 Multi-Query 扩展召回范围，再对每个查询的 BM25 与向量排名执行 RRF 融合。这样既保留关键词精确匹配，也保留语义召回，并能在 evidence guard 前保留可解释的检索诊断。
+RAG 检索设计采用 Multi-Query 扩展召回范围，查询变体先通过一次批量 embedding 生成全部向量，再以默认 8、硬上限 10 的有界线程池并发查询 pgvector；结果按原查询下标复位后执行 RRF 融合。这样既减少串行网络等待，也保留关键词精确匹配、语义召回和可解释检索诊断。
 
 ## 复习生成、文件夹与 FSRS 闭环
 
@@ -201,10 +201,12 @@ flowchart TB
     LEARNING -->|"否"| SKIPPED["SKIPPED\n不调用模型"]
     LEARNING -->|"是"| CONFIG{"DeepSeek 配置与 evidence\n是否可执行"}
     CONFIG -->|"否"| FAILED["FAILED\n保存可诊断原因"]
-    CONFIG -->|"是"| QUESTIONS["提取原始问题清单\n普通资料 3-8 张\n明确问题清单最多 32 张"]
+    CONFIG -->|"是"| QUESTIONS["提取原始问题清单\n准备完整 evidence"]
     QUESTIONS --> PLANNER["planner\n固定目标、覆盖范围和完成标准"]
-    PLANNER --> ACTOR["actor\nDeepSeek 生成唯一 JSON"]
-    ACTOR --> OBSERVER{"observer 质量门禁\n摘要、完整问句、hint、sourceQuestion\nevidenceId、逐论断忠实度、问题覆盖率"}
+    PLANNER --> CURATOR["LangExtract curator\n2 个串行 passes\n每轮最多 8 个文本块并发"]
+    CURATOR --> GROUND["原文精确定位 + evidenceId 映射\n近重复过滤 + topic 轮询\n最多 32 个 knowledgeUnitId"]
+    GROUND --> ACTOR["actor\nDeepSeek 生成唯一 JSON"]
+    ACTOR --> OBSERVER{"observer 质量门禁\n摘要、问题、hint、sourceQuestion\nknowledgeUnitId 完整覆盖\nevidenceId 与逐论断忠实度"}
     OBSERVER -->|"通过"| GENERATED["GENERATED\n持久化卡片并继承或初始化 FSRS"]
     OBSERVER -->|"拒绝"| REPAIR["repair\n整理逐项中文诊断并写入下一轮 Prompt"]
     REPAIR --> BUDGET{"模型尝试预算是否耗尽"}
@@ -214,7 +216,7 @@ flowchart TB
     FEEDBACK --> PLANNER
 ```
 
-LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制每轮真实模型预算，默认 6 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。缺少密钥或 evidence 等无法靠修复 Prompt 解决的问题直接进入 `FAILED`。
+LangExtract Curator 在一轮图中只运行一次，Repair 会复用同一候选上下文；默认每轮最多 8 个并发 DeepSeek 请求、整个进程也限制为 8，避免多资料叠加后无界扩张。LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制卡片生成的真实模型预算，默认 8 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。
 
 ### 文件夹归档与文件夹内复习
 
@@ -431,7 +433,11 @@ conda run -n learning-evidence-rag python -B ai-python/run.py --bootstrap-databa
 | `RAG_KAFKA_ENABLED` | 启用 Kafka 索引通道；默认 `false` |
 | `DEEPSEEK_API_KEY` | 复习摘要与卡片生成密钥；只调用 DeepSeek 官方 `deepseek-v4-flash`，不继承通用 RAG 模型配置 |
 | `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | 单次复习模型请求超时秒数，默认 `120` |
-| `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮真实模型调用上限，默认 `6`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
+| `REVIEW_LANGEXTRACT_MAX_WORKERS` | 单份资料 LangExtract 同一 pass 的 I/O worker，默认 `8`、硬上限 `10` |
+| `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | 单份资料 LangExtract 总请求预算，默认 `32` |
+| `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮卡片生成模型调用上限，默认 `8`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
+| `RAG_EMBEDDING_MAX_IN_FLIGHT` | 百炼 embedding 远程批次并发，默认 `8`、硬上限 `10` |
+| `RAG_RETRIEVAL_IO_WORKERS` | Multi-Query pgvector I/O worker，默认 `8`、硬上限 `10` |
 | `REDIS_URL` | 可选复习资料生成短锁和 Agent 运行态缓存；PostgreSQL 仍是复习排程事实源 |
 | `REVIEW_GENERATION_LOCK_TTL_SECONDS` | 复习资料级生成锁 TTL，默认 `180` 秒 |
 | `TAVILY_API_KEY` | 预留配置；当前纯 Python Agent 尚未启用联网搜索，默认留空 |

@@ -53,6 +53,7 @@ from app.schemas.rag import (
     QueryRequest,
     QueryResponse,
 )
+from app.core.io_concurrency import configured_io_workers, process_io_limiter
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
@@ -506,6 +507,8 @@ class InMemoryRagStore:
         }
 
         candidate_budget = max(request.topK * request.candidateMultiplier, 20)
+        # Multi-Query 向量一次批量送模，避免为每个查询变体串行等待一次 embedding HTTP。
+        query_vectors = embed_texts(expanded_queries)
         for query_index, query_text in enumerate(expanded_queries):
             progress_reporter.emit("query.bm25", f"BM25 召回：{query_text}", current_step=3, total_steps=8, percent=30)
             bm25_hits = self._bm25_search(query_text, filtered_chunks, limit=candidate_budget)
@@ -520,7 +523,12 @@ class InMemoryRagStore:
                 detail=format_ranked_hits(bm25_hits, lambda chunk_id: self._to_evidence(chunk_id, 0.0, retrieval_source="bm25")),
             )
             progress_reporter.emit("query.vector", f"向量召回：{query_text}", current_step=4, total_steps=8, percent=45)
-            vector_hits = self._vector_search(query_text, filtered_chunks, limit=candidate_budget)
+            vector_hits = self._vector_search(
+                query_text,
+                filtered_chunks,
+                limit=candidate_budget,
+                query_vector=query_vectors[query_index],
+            )
             ranked_runs.append(RankedRetrievalRun(query_index, "vector", vector_hits))
             progress_reporter.emit(
                 "query.vector",
@@ -827,11 +835,19 @@ class InMemoryRagStore:
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
 
     @logged_rag_method("query.vector", "memory_vector_search", "执行内存向量召回")
-    def _vector_search(self, query_text: str, chunks: list[Chunk], limit: int) -> list[tuple[str, float]]:
-        query_vector = embed_text(query_text)
+    def _vector_search(
+        self,
+        query_text: str,
+        chunks: list[Chunk],
+        limit: int,
+        *,
+        query_vector: list[float] | None = None,
+    ) -> list[tuple[str, float]]:
+        """使用预批量生成的查询向量召回；兼容直接调用时再单条向量化。"""
+        resolved_vector = query_vector if query_vector is not None else embed_text(query_text)
         scores = []
         for chunk in chunks:
-            score = cosine_similarity(query_vector, self.embeddings.get(chunk.chunk_id, []))
+            score = cosine_similarity(resolved_vector, self.embeddings.get(chunk.chunk_id, []))
             if score > 0:
                 scores.append((chunk.chunk_id, score))
         return sorted(scores, key=lambda item: item[1], reverse=True)[:limit]
@@ -1011,7 +1027,7 @@ def embedding_batch_config() -> EmbeddingBatchConfig:
     )
     wait_ms = read_bounded_int_env("RAG_EMBEDDING_BATCH_WAIT_MS", 1000, minimum=0, maximum=10000, warnings=warnings)
     max_in_flight = read_bounded_int_env(
-        "RAG_EMBEDDING_MAX_IN_FLIGHT", 2, minimum=1, maximum=8, warnings=warnings
+        "RAG_EMBEDDING_MAX_IN_FLIGHT", 8, minimum=1, maximum=10, warnings=warnings
     )
     for warning in warnings:
         process_event(
@@ -1120,8 +1136,12 @@ def dashscope_embed_texts(texts: list[str], *, model: str, dimensions: int) -> l
             "textLengths": [len(text) for text in texts],
         },
     ):
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(f"{base_url}/embeddings", headers=headers, json=payload)
+        with process_io_limiter.slot(
+            "rag.embedding",
+            configured_io_workers("RAG_EMBEDDING_MAX_IN_FLIGHT"),
+        ):
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(f"{base_url}/embeddings", headers=headers, json=payload)
     if response.status_code >= 400:
         raise RuntimeError(f"百炼 embedding 调用失败: HTTP {response.status_code} {response.text[:500]}")
     data = response.json()

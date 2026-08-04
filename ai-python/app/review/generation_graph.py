@@ -27,6 +27,7 @@ class ReviewGenerationState(TypedDict, total=False):
     attempt_feedback: list[str]
     repair_feedback: list[str]
     feedback_history: list[str]
+    curator_context: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -47,8 +48,9 @@ class ReviewManualReviewRequired(RuntimeError):
         self.quality_feedback = tuple(unique_feedback(quality_feedback))
 
 
-Actor = Callable[[int, list[str], dict[str, Any]], dict[str, Any]]
-Observer = Callable[[dict[str, Any]], Any]
+Curator = Callable[[], dict[str, Any]]
+Actor = Callable[[int, list[str], dict[str, Any], dict[str, Any]], dict[str, Any]]
+Observer = Callable[[dict[str, Any], dict[str, Any]], Any]
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -67,12 +69,15 @@ def run_review_generation_graph(
     actor: Actor,
     observer: Observer,
     plan: dict[str, Any],
+    curator: Curator | None = None,
     max_attempts: int | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> ReviewGenerationOutcome:
     """执行复习生成图，把质量门禁诊断反馈给下一次模型生成。"""
     bounded_attempts = max_attempts or configured_review_graph_max_attempts()
     bounded_attempts = max(1, min(MAX_REVIEW_GRAPH_MODEL_ATTEMPTS, int(bounded_attempts)))
+    has_curator = curator is not None
+    total_steps = 5 if has_curator else 4
     initial: ReviewGenerationState = {
         "plan": dict(plan),
         "attempt": 0,
@@ -81,6 +86,7 @@ def run_review_generation_graph(
         "attempt_feedback": [],
         "repair_feedback": [],
         "feedback_history": [],
+        "curator_context": {},
     }
     attempts_seen = 0
 
@@ -88,14 +94,20 @@ def run_review_generation_graph(
         attempt: int,
         feedback: list[str],
         previous_candidate: dict[str, Any],
+        curator_context: dict[str, Any],
     ) -> dict[str, Any]:
         """记录递归异常发生前实际进入 actor 的尝试次数。"""
         nonlocal attempts_seen
         attempts_seen = max(attempts_seen, attempt)
-        return actor(attempt, feedback, previous_candidate)
+        return actor(attempt, feedback, previous_candidate, curator_context)
 
     try:
-        state = build_review_generation_graph(tracked_actor, observer, on_progress=on_progress).invoke(
+        state = build_review_generation_graph(
+            tracked_actor,
+            observer,
+            curator=curator,
+            on_progress=on_progress,
+        ).invoke(
             initial,
             {"recursion_limit": REVIEW_GRAPH_RECURSION_LIMIT},
         )
@@ -106,8 +118,8 @@ def run_review_generation_graph(
             stageLabel="等待人工处理",
             message="生成图达到递归上限，已停止自动循环",
             status="NEEDS_REVIEW",
-            currentStep=4,
-            totalSteps=4,
+            currentStep=total_steps,
+            totalSteps=total_steps,
             percent=100,
             attempt=attempts_seen,
             maxAttempts=bounded_attempts,
@@ -137,18 +149,60 @@ def build_review_generation_graph(
     actor: Actor,
     observer: Observer,
     *,
+    curator: Curator | None = None,
     on_progress: ProgressCallback | None = None,
 ):
-    """构建规划、生成、观察、修复与人工终态组成的复习图。"""
+    """构建知识发现、生成、观察、修复与人工终态组成的复习图。"""
+    has_curator = curator is not None
+    total_steps = 5 if has_curator else 4
     workflow = StateGraph(ReviewGenerationState)
-    workflow.add_node("planner", lambda state: planner_progress_node(state, on_progress))
-    workflow.add_node("actor", lambda state: actor_progress_node(state, actor, on_progress))
-    workflow.add_node("observer", lambda state: observer_progress_node(state, observer, on_progress))
-    workflow.add_node("repair", lambda state: repair_progress_node(state, on_progress))
-    workflow.add_node("human_review", lambda state: human_review_progress_node(state, on_progress))
+    workflow.add_node(
+        "planner",
+        lambda state: planner_progress_node(state, on_progress, has_curator=has_curator),
+    )
+    if curator is not None:
+        workflow.add_node(
+            "curator",
+            lambda state: curator_progress_node(state, curator, on_progress, total_steps=total_steps),
+        )
+    workflow.add_node(
+        "actor",
+        lambda state: actor_progress_node(
+            state,
+            actor,
+            on_progress,
+            total_steps=total_steps,
+            has_curator=has_curator,
+        ),
+    )
+    workflow.add_node(
+        "observer",
+        lambda state: observer_progress_node(
+            state,
+            observer,
+            on_progress,
+            total_steps=total_steps,
+            has_curator=has_curator,
+        ),
+    )
+    workflow.add_node(
+        "repair",
+        lambda state: repair_progress_node(
+            state,
+            on_progress,
+            total_steps=total_steps,
+            has_curator=has_curator,
+        ),
+    )
+    workflow.add_node(
+        "human_review",
+        lambda state: human_review_progress_node(state, on_progress, total_steps=total_steps),
+    )
 
     workflow.set_entry_point("planner")
-    workflow.add_edge("planner", "actor")
+    workflow.add_edge("planner", "curator" if curator is not None else "actor")
+    if curator is not None:
+        workflow.add_edge("curator", "actor")
     workflow.add_edge("actor", "observer")
     workflow.add_conditional_edges(
         "observer",
@@ -167,6 +221,8 @@ def build_review_generation_graph(
 def planner_progress_node(
     state: ReviewGenerationState,
     on_progress: ProgressCallback | None,
+    *,
+    has_curator: bool = False,
 ) -> ReviewGenerationState:
     """规划目标并上报图已开始执行。"""
     result = planner_node(state)
@@ -178,8 +234,8 @@ def planner_progress_node(
         message="正在确认资料结构、卡片目标和质量标准",
         status="RUNNING",
         currentStep=1,
-        totalSteps=4,
-        percent=18,
+        totalSteps=5 if has_curator else 4,
+        percent=8 if has_curator else 18,
         attempt=0,
         maxAttempts=int(state.get("max_attempts") or 1),
         detail=(
@@ -190,10 +246,63 @@ def planner_progress_node(
     return result
 
 
+def curator_progress_node(
+    state: ReviewGenerationState,
+    curator: Curator,
+    on_progress: ProgressCallback | None,
+    *,
+    total_steps: int,
+) -> ReviewGenerationState:
+    """执行一次 LangExtract 长文知识发现，并公开候选数量和降级状态。"""
+    emit_progress(
+        on_progress,
+        stageCode="review.curator",
+        stageLabel="LangExtract 知识发现",
+        message="正在并发扫描完整资料并定位候选知识单元",
+        status="RUNNING",
+        currentStep=2,
+        totalSteps=total_steps,
+        percent=14,
+        attempt=0,
+        maxAttempts=int(state.get("max_attempts") or 1),
+        detail="同一轮最多并发处理 8 个文本块，多轮结果将按 topic 去重并回指 evidenceId",
+    )
+    result = curator_node(state, curator)
+    context = dict(result.get("curator_context") or {})
+    completed = context.get("status") == "COMPLETED"
+    emit_progress(
+        on_progress,
+        stageCode="review.curator",
+        stageLabel="LangExtract 知识发现" if completed else "LangExtract 降级",
+        message=(
+            f"知识发现完成：保留 {int(context.get('selectedKnowledgeUnitCount') or 0)} 个候选单元"
+            if completed
+            else "LangExtract 本次未完成，已保留原有 DeepSeek 生成链路继续处理"
+        ),
+        status="COMPLETED" if completed else "DEGRADED",
+        currentStep=2,
+        totalSteps=total_steps,
+        percent=30,
+        attempt=0,
+        maxAttempts=int(state.get("max_attempts") or 1),
+        detail=(
+            f"原始 {int(context.get('rawCandidateCount') or 0)} 个，精确定位后 "
+            f"{int(context.get('acceptedCandidateCount') or 0)} 个，模型请求 "
+            f"{int(context.get('requestCount') or 0)} 次"
+            if completed
+            else str(context.get("error") or "知识发现不可用")[:500]
+        ),
+    )
+    return result
+
+
 def actor_progress_node(
     state: ReviewGenerationState,
     actor: Actor,
     on_progress: ProgressCallback | None,
+    *,
+    total_steps: int = 4,
+    has_curator: bool = False,
 ) -> ReviewGenerationState:
     """在模型调用前上报尝试轮次，避免长请求期间界面静默。"""
     attempt = int(state.get("attempt") or 0) + 1
@@ -205,12 +314,21 @@ def actor_progress_node(
         stageLabel="DeepSeek 生成",
         message=f"正在请求 DeepSeek 生成第 {attempt}/{max_attempts} 版复习卡片",
         status="RUNNING",
-        currentStep=2,
-        totalSteps=4,
-        percent=attempt_percent(attempt, max_attempts, phase=0),
+        currentStep=3 if has_curator else 2,
+        totalSteps=total_steps,
+        percent=attempt_percent(attempt, max_attempts, phase=0, start_percent=32 if has_curator else 25),
         attempt=attempt,
         maxAttempts=max_attempts,
-        detail=(f"本轮将修复：{'；'.join(feedback[:2])}" if feedback else "正在基于清洗后的 evidence 生成摘要、问题、答案和提示"),
+        detail=(
+            f"本轮将修复：{'；'.join(feedback[:2])}"
+            if feedback
+            else (
+                f"正在结合 {int((state.get('curator_context') or {}).get('selectedKnowledgeUnitCount') or 0)} "
+                "个 LangExtract 候选生成摘要、问题、答案和提示"
+                if has_curator
+                else "正在基于清洗后的 evidence 生成摘要、问题、答案和提示"
+            )
+        ),
     )
     return actor_node(state, actor)
 
@@ -219,6 +337,9 @@ def observer_progress_node(
     state: ReviewGenerationState,
     observer: Observer,
     on_progress: ProgressCallback | None,
+    *,
+    total_steps: int = 4,
+    has_curator: bool = False,
 ) -> ReviewGenerationState:
     """在质量门禁前后上报校验与保存阶段。"""
     attempt = int(state.get("attempt") or 0)
@@ -229,9 +350,9 @@ def observer_progress_node(
         stageLabel="质量校验",
         message=f"正在校验第 {attempt}/{max_attempts} 版卡片的完整性与 evidence 忠实度",
         status="RUNNING",
-        currentStep=3,
-        totalSteps=4,
-        percent=attempt_percent(attempt, max_attempts, phase=1),
+        currentStep=4 if has_curator else 3,
+        totalSteps=total_steps,
+        percent=attempt_percent(attempt, max_attempts, phase=1, start_percent=32 if has_curator else 25),
         attempt=attempt,
         maxAttempts=max_attempts,
         detail="检查摘要、卡面回忆提示、evidenceId、逐论断忠实度和结构化知识覆盖率",
@@ -244,8 +365,8 @@ def observer_progress_node(
             stageLabel="保存卡片",
             message="质量门禁已通过，正在保存卡片并初始化 FSRS",
             status="RUNNING",
-            currentStep=4,
-            totalSteps=4,
+            currentStep=total_steps,
+            totalSteps=total_steps,
             percent=94,
             attempt=attempt,
             maxAttempts=max_attempts,
@@ -256,6 +377,9 @@ def observer_progress_node(
 def repair_progress_node(
     state: ReviewGenerationState,
     on_progress: ProgressCallback | None,
+    *,
+    total_steps: int = 4,
+    has_curator: bool = False,
 ) -> ReviewGenerationState:
     """整理质量反馈并说明是否继续自动修复。"""
     result = repair_node(state)
@@ -273,9 +397,9 @@ def repair_progress_node(
             else f"第 {attempt}/{max_attempts} 版仍未通过，准备转入人工处理"
         ),
         status="RUNNING" if not exhausted else "NEEDS_REVIEW",
-        currentStep=3,
-        totalSteps=4,
-        percent=attempt_percent(attempt, max_attempts, phase=2),
+        currentStep=4 if has_curator else 3,
+        totalSteps=total_steps,
+        percent=attempt_percent(attempt, max_attempts, phase=2, start_percent=32 if has_curator else 25),
         attempt=attempt,
         maxAttempts=max_attempts,
         detail="；".join(feedback[:3]) or "模型结果未达到发布条件",
@@ -286,6 +410,8 @@ def repair_progress_node(
 def human_review_progress_node(
     state: ReviewGenerationState,
     on_progress: ProgressCallback | None,
+    *,
+    total_steps: int = 4,
 ) -> ReviewGenerationState:
     """自动预算耗尽时上报稳定人工终态。"""
     result = human_review_node(state)
@@ -297,8 +423,8 @@ def human_review_progress_node(
         stageLabel="等待人工处理",
         message=f"自动修复 {attempt} 次后仍未通过，请补充说明后重新生成",
         status="NEEDS_REVIEW",
-        currentStep=4,
-        totalSteps=4,
+        currentStep=total_steps,
+        totalSteps=total_steps,
         percent=100,
         attempt=attempt,
         maxAttempts=max_attempts,
@@ -306,13 +432,14 @@ def human_review_progress_node(
     return result
 
 
-def attempt_percent(attempt: int, max_attempts: int, *, phase: int) -> int:
+def attempt_percent(attempt: int, max_attempts: int, *, phase: int, start_percent: int = 25) -> int:
     """按轮次和节点位置提供不会在下一轮回退的进度。"""
     bounded_max = max(1, max_attempts)
     bounded_attempt = max(1, min(attempt, bounded_max))
     bounded_phase = max(0, min(2, phase))
     completed_units = ((bounded_attempt - 1) * 3) + bounded_phase
-    return min(90, 25 + round((completed_units / (bounded_max * 3)) * 65))
+    bounded_start = max(0, min(80, start_percent))
+    return min(90, bounded_start + round((completed_units / (bounded_max * 3)) * (90 - bounded_start)))
 
 
 def emit_progress(
@@ -340,8 +467,9 @@ def actor_node(state: ReviewGenerationState, actor: Actor) -> ReviewGenerationSt
     attempt = int(state.get("attempt") or 0) + 1
     feedback = list(state.get("repair_feedback") or [])
     previous_candidate = dict(state.get("candidate") or {})
+    curator_context = dict(state.get("curator_context") or {})
     try:
-        candidate = actor(attempt, feedback, previous_candidate)
+        candidate = actor(attempt, feedback, previous_candidate, curator_context)
         return {
             "attempt": attempt,
             "candidate": candidate,
@@ -363,13 +491,37 @@ def observer_node(state: ReviewGenerationState, observer: Observer) -> ReviewGen
     if actor_feedback:
         return {"status": "REJECTED", "attempt_feedback": actor_feedback}
     try:
-        result = observer(dict(state.get("candidate") or {}))
+        result = observer(
+            dict(state.get("candidate") or {}),
+            dict(state.get("curator_context") or {}),
+        )
         return {"result": result, "status": "COMPLETED", "attempt_feedback": []}
     except Exception as exc:  # noqa: BLE001 - 门禁异常必须进入修复循环。
         return {
             "status": "REJECTED",
             "attempt_feedback": diagnostics_from_exception(exc),
         }
+
+
+def curator_node(state: ReviewGenerationState, curator: Curator) -> ReviewGenerationState:
+    """调用一次候选发现；失败只标记降级，不消耗 DeepSeek 卡片修复次数。"""
+    try:
+        context = dict(curator() or {})
+        context.setdefault("status", "COMPLETED")
+    except Exception as exc:  # noqa: BLE001 - Curator 不可用时保留原有生成能力。
+        context = {
+            "status": "FAILED",
+            "knowledgeUnits": [],
+            "selectedKnowledgeUnitCount": 0,
+            "error": "；".join(diagnostics_from_exception(exc)),
+        }
+    plan = dict(state.get("plan") or {})
+    unit_count = int(context.get("selectedKnowledgeUnitCount") or 0)
+    plan["langExtractStatus"] = context.get("status")
+    plan["curatorKnowledgeUnitCount"] = unit_count
+    if unit_count > 0:
+        plan["maxCards"] = min(32, max(int(plan.get("maxCards") or 0), unit_count))
+    return {"plan": plan, "curator_context": context, "status": "GENERATING"}
 
 
 def repair_node(state: ReviewGenerationState) -> ReviewGenerationState:

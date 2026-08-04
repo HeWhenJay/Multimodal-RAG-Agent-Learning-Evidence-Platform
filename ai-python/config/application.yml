@@ -21,7 +21,10 @@ rag:
     timeout-seconds: ${RAG_EMBEDDING_TIMEOUT_SECONDS:30}
     batch-max-size: ${RAG_EMBEDDING_BATCH_MAX_SIZE:10}
     batch-wait-ms: ${RAG_EMBEDDING_BATCH_WAIT_MS:1000}
-    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:2}
+    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:8}
+  retrieval:
+    # Multi-Query 的 pgvector 请求属于外部 I/O，本机 28 线程/16GB 内存默认使用 8 个有界 worker。
+    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:8}
   rerank:
     provider: ${RAG_RERANK_PROVIDER:auto}
     model: ${RAG_RERANK_MODEL:qwen3-rerank}
@@ -100,6 +103,14 @@ review:
     base-url: https://api.deepseek.com
     api-key: ${DEEPSEEK_API_KEY:}
     timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:120}
+    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:8}
+  langextract:
+    enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
+    extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
+    max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:8}
+    max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
+    timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:120}
 
 workers:
   # run.py 统一监督 API、cron、RAG、Agent 和 Kafka worker；worker 均不在 Web 进程内执行。

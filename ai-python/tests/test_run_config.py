@@ -90,6 +90,15 @@ def test_review_llm_config_uses_dedicated_environment_variables():
                     "reasoning-effort": "max",
                     "api-key": "test-review-key",
                     "timeout-seconds": 45,
+                    "max-in-flight": 8,
+                },
+                "langextract": {
+                    "enabled": True,
+                    "extraction-passes": 2,
+                    "max-char-buffer": 8000,
+                    "max-workers": 8,
+                    "max-model-requests": 32,
+                    "timeout-seconds": 120,
                 }
             }
         }
@@ -97,6 +106,13 @@ def test_review_llm_config_uses_dedicated_environment_variables():
 
     assert env_defaults["DEEPSEEK_API_KEY"] == "test-review-key"
     assert env_defaults["REVIEW_EXTRACTION_TIMEOUT_SECONDS"] == "45"
+    assert env_defaults["REVIEW_DEEPSEEK_MAX_IN_FLIGHT"] == "8"
+    assert env_defaults["REVIEW_LANGEXTRACT_ENABLED"] == "true"
+    assert env_defaults["REVIEW_LANGEXTRACT_EXTRACTION_PASSES"] == "2"
+    assert env_defaults["REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER"] == "8000"
+    assert env_defaults["REVIEW_LANGEXTRACT_MAX_WORKERS"] == "8"
+    assert env_defaults["REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS"] == "32"
+    assert env_defaults["REVIEW_LANGEXTRACT_TIMEOUT_SECONDS"] == "120"
     assert "SUBAI_BASE_URL" not in env_defaults
     assert "SU_BAI_API_KEY" not in env_defaults
     assert "DASHSCOPE_API_KEY" not in env_defaults
@@ -125,7 +141,8 @@ def test_model_dynamic_batch_config_env_mapping_is_effective():
                     "batch-max-size": 10,
                     "batch-wait-ms": 1000,
                     "max-in-flight": 2,
-                }
+                },
+                "retrieval": {"io-workers": 8},
             },
             "asr": {
                 "batch-max-size": 4,
@@ -139,6 +156,7 @@ def test_model_dynamic_batch_config_env_mapping_is_effective():
     assert env_defaults["RAG_EMBEDDING_BATCH_MAX_SIZE"] == "10"
     assert env_defaults["RAG_EMBEDDING_BATCH_WAIT_MS"] == "1000"
     assert env_defaults["RAG_EMBEDDING_MAX_IN_FLIGHT"] == "2"
+    assert env_defaults["RAG_RETRIEVAL_IO_WORKERS"] == "8"
     assert env_defaults["RAG_ASR_BATCH_MAX_SIZE"] == "4"
     assert env_defaults["RAG_ASR_BATCH_WAIT_MS"] == "1000"
     assert env_defaults["RAG_ASR_MAX_IN_FLIGHT"] == "2"

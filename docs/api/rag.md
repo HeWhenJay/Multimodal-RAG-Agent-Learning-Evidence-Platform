@@ -2271,7 +2271,8 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 | --- | --- | --- | --- |
 | 视频 OCR | `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800`、`RAG_VIDEO_OCR_MAX_IN_FLIGHT=2` | 满 4 帧立即派发，未满从首帧最多等待 800ms；批内以最多 2 个线程并发执行单帧 OCR | 队列容量受批大小和并发数约束；每帧独立重试、降级和 evidence 时间戳 |
 | 视频 ASR | `RAG_ASR_BATCH_MAX_SIZE=4`、`RAG_ASR_BATCH_WAIT_MS=1000`、`RAG_ASR_MAX_IN_FLIGHT=2` | 满 4 段立即派发，尾批立即刷出；单个视频处理上下文内最多 2 个线程并发执行单段 ASR/filetrans | 单视频节流与进程共享限流器均按 `RAG_ASR_RPM_LIMIT=90` 限制启动速率 |
-| 切块 embedding | `RAG_EMBEDDING_BATCH_MAX_SIZE=10`、`RAG_EMBEDDING_BATCH_WAIT_MS=1000`、`RAG_EMBEDDING_MAX_IN_FLIGHT=2` | 已完成解析的切块按最多 10 条组成一个 `input` 数组，并发最多 2 个远程批次；响应按原始输入顺序复位 | token 统计使用受限线程池，向量数量不完整即中止本次索引，避免错配 chunk |
+| 切块 embedding | `RAG_EMBEDDING_BATCH_MAX_SIZE=10`、`RAG_EMBEDDING_BATCH_WAIT_MS=1000`、`RAG_EMBEDDING_MAX_IN_FLIGHT=8` | 已完成解析的切块按最多 10 条组成一个 `input` 数组，并发最多 8 个远程批次；响应按原始输入顺序复位 | 进程级共享闸门同样限制为 8；向量数量不完整即中止本次索引，避免错配 chunk |
+| Multi-Query pgvector | `RAG_RETRIEVAL_IO_WORKERS=8` | 一次批量生成全部查询变体向量，再以最多 8 个线程并发执行相互独立的 pgvector 查询；结果按原查询下标复位后进入 RRF/RAG-Fusion | 当前 Multi-Query 默认 5 条，因此通常实际使用 5 个 worker；数据库 I/O 有进程级共享闸门，BM25 与融合顺序保持确定性 |
 
 OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多张图片或多个音频段拼进一个未经验证的
 模型请求。OCR 仍发送一张 Base64 图片，ASR/filetrans 仍发送一个音频文件 URL；这样保留每帧/每段
@@ -2280,7 +2281,7 @@ OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多�
 
 `RAG_EMBEDDING_BATCH_WAIT_MS` 预留给持续流式生产切块的调度诊断。当前一次 `index_blocks` 在切块集合
 已完整就绪后才进入向量化，因此不会为了等待更多文本额外阻塞 1000ms；实际分批由 10 条上限和
-`max-in-flight` 控制。所有三类配置均接受环境变量覆盖；非法值回退默认值，超过实现上限的并发或批量值会被限制在安全范围内。
+`max-in-flight` 控制。Embedding 和 pgvector Multi-Query 都属于等待外部服务的 I/O 密集阶段，默认并发提升为 8，硬上限 10；非法值回退默认值，超过实现上限的并发或批量值会被限制在安全范围内。解析、视频解码、BM25 全量打分等 CPU/内存密集阶段不使用该 I/O 并发值。
 
 ### 模型限制、兼容性和可观测性
 
@@ -2289,7 +2290,7 @@ OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多�
 | `qwen3.5-ocr` | Base64 图片字符串上限为 10,000,000 字节；原图默认上限为 7,499,952 字节，避免 data URL 头和 Base64 膨胀越界 | 使用 OpenAI 兼容 `chat/completions` 单图 schema；不假设存在多图单请求能力 |
 | `qwen3-asr-flash` | ASR 启动速率实现上限为 100 RPM，默认保守设置为 90 RPM | 单音频段同步请求；超出同步音频大小限制时不提交，并继续可用降级链路 |
 | `qwen3-asr-flash-filetrans` | 一个异步任务对应一个可访问的 `http(s)` 文件 URL，等待轮数默认 `30`、间隔默认 `2s` | 采用百炼异步任务 API 并把句级 `begin_time/end_time` 转为 SRT；不兼容时不再把该模型错误地当成 Chat Completions ASR |
-| `text-embedding-v4` | 每个远程 `input` 批次最多 10 条文本，默认 1024 维 | 使用 OpenAI 兼容数组 `input`，结果强制按输入下标映射回 chunk；每批最大并发 2 |
+| `text-embedding-v4` | 每个远程 `input` 批次最多 10 条文本，默认 1024 维 | 使用 OpenAI 兼容数组 `input`，结果强制按输入下标映射回 chunk；远程批次默认最大并发 8、硬上限 10 |
 
 账户、地域或模型版本的实时配额低于上述保护值时，以百炼返回的限流响应为准，应相应调低并发与 RPM；
 这些参数不是提高账户配额的手段。运行时可通过下列过程事件定位实际批次，而不需要读取敏感请求内容：
@@ -2301,6 +2302,8 @@ OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多�
 - embedding：`dashscope_embedding_batch_start`、`dashscope_embedding_batch_completed`、
   `dashscope_embedding_batch_finished`，上下文含 `textCount`、`batchCount`、`batchMaxSize` 和
   `maxInFlight`。
+- pgvector Multi-Query：`query.bm25` 与 `query.vector` 会先报告批量向量已完成及实际 I/O worker 数，
+  随后按原查询顺序写入各召回列表，最终融合诊断仍保留 `queryIndex`。
 
 单个 OCR/ASR 子任务失败不会自动抹去已完成的字幕、关键帧或向量；聚合后仍可返回 `READY` 或 `PARTIAL`。
 若没有任何可索引文本、向量批次缺失或索引事务失败，则按既有失败规则进入 `FAILED`，前端通过资料状态接口
