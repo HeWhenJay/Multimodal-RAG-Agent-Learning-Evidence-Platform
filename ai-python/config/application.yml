@@ -96,21 +96,37 @@ rag:
 
 review:
   llm:
-    # 固定使用 DeepSeek 官方最新正式版别名与最高思考强度，不继承通用 RAG 配置。
-    model: deepseek-v4-flash
-    reasoning-effort: max
-    thinking-enabled: true
-    base-url: https://api.deepseek.com
-    api-key: ${DEEPSEEK_API_KEY:}
-    timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:120}
+    # 复习请求统一走本机 OpenAI-compatible 中转；密钥只从环境变量或本地未提交配置读取。
+    model: ${REVIEW_LLM_MODEL:gpt-5.6-terra}
+    reasoning-effort: ${REVIEW_LLM_REASONING_EFFORT:max}
+    thinking-enabled: ${REVIEW_LLM_THINKING_ENABLED:true}
+    base-url: ${REVIEW_LLM_BASE_URL:http://localhost:58966/v1}
+    api-key: ${REVIEW_LLM_API_KEY:}
+    fallback:
+      # 本机中转不可用时才直连 DeepSeek；密钥优先读 REVIEW_LLM_FALLBACK_API_KEY，兼容 DEEPSEEK_API_KEY。
+      enabled: ${REVIEW_LLM_FALLBACK_ENABLED:true}
+      model: ${REVIEW_LLM_FALLBACK_MODEL:deepseek-v4-flash}
+      base-url: ${REVIEW_LLM_FALLBACK_BASE_URL:https://api.deepseek.com}
+      api-key: ${REVIEW_LLM_FALLBACK_API_KEY:}
+    # 615 秒覆盖 Cockpit 两次 180 秒流打开、240 秒流空闲和 15 秒余量。
+    timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:615}
     max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:8}
+    cockpit:
+      retry-enabled: ${REVIEW_COCKPIT_RETRY_ENABLED:true}
+      stream-open-timeout-seconds: ${REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS:180}
+      stream-idle-timeout-seconds: ${REVIEW_COCKPIT_STREAM_IDLE_TIMEOUT_SECONDS:240}
+      bootstrap-retries: ${REVIEW_COCKPIT_BOOTSTRAP_RETRIES:1}
+      request-retries: ${REVIEW_COCKPIT_REQUEST_RETRIES:1}
+      retry-base-delay-ms: ${REVIEW_COCKPIT_RETRY_BASE_DELAY_MS:300}
+      retry-max-delay-ms: ${REVIEW_COCKPIT_RETRY_MAX_DELAY_MS:1500}
+      keepalive-seconds: ${REVIEW_COCKPIT_KEEPALIVE_SECONDS:15}
   langextract:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
     max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
     max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:8}
     max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
-    timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:120}
+    timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:615}
 
 workers:
   # run.py 统一监督 API、cron、RAG、Agent 和 Kafka worker；worker 均不在 Web 进程内执行。
@@ -209,6 +225,17 @@ asr:
   batch-wait-ms: ${RAG_ASR_BATCH_WAIT_MS:1000}
   max-in-flight: ${RAG_ASR_MAX_IN_FLIGHT:2}
   rpm-limit: ${RAG_ASR_RPM_LIMIT:90}
+
+remote-video:
+  douyin:
+    # API Key 仅通过环境变量或未提交的 application.local.yml 注入。
+    enabled: ${RAG_DOUYIN_MCP_ENABLED:true}
+    mcp-endpoint: ${RAG_DOUYIN_MCP_ENDPOINT:https://mcp.52choujiang.com/douyin/mcp}
+    api-key: ${SOCIALDATAX_API_KEY:}
+    connection-timeout-seconds: ${RAG_DOUYIN_MCP_CONNECTION_TIMEOUT_SECONDS:30}
+    tool-timeout-seconds: ${RAG_DOUYIN_MCP_TOOL_TIMEOUT_SECONDS:60}
+    poll-interval-seconds: ${RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS:5}
+    max-wait-seconds: ${RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS:900}
 
 video:
   ffmpeg-command: ${FFMPEG_COMMAND:}

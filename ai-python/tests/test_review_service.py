@@ -260,28 +260,60 @@ def test_current_generation_requires_a_stable_terminal_status() -> None:
     assert material_generation_is_current(replace(base, synced_index_request_version=0), 1) is False
 
 
-def test_material_queries_only_expose_deepseek_review_summary() -> None:
-    """复习资料列表只展示复习提炼摘要，不回退到 RAG 截断摘要。"""
+def test_material_queries_only_expose_generated_review_summary() -> None:
+    """复习资料列表先读取资料，再按 ID 读取复习摘要且不使用联表。"""
     class RecordingCursor:
-        """记录资料列表查询。"""
+        """记录两阶段资料列表查询并返回一条可合并记录。"""
+
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+            self.rows: list[dict] = []
 
         def execute(self, statement, _params):
-            self.statement = statement
+            self.statements.append(statement)
+            if "learning_material lm" in statement and "SELECT material_id," not in statement:
+                self.rows = [{
+                    "material_id": 12,
+                    "title": "Kafka 高可用",
+                    "document_type": "pdf",
+                    "material_status": "READY",
+                    "index_request_version": 2,
+                    "material_updated_at": NOW,
+                }]
+            else:
+                self.rows = [{
+                    "material_id": 12,
+                    "synced_index_request_version": 2,
+                    "is_learning_content": True,
+                    "category": "面试复习",
+                    "review_status": "GENERATED",
+                    "reason": None,
+                    "card_count": 3,
+                    "extractor": "review-card-v11",
+                    "material_summary": "复习模型总结",
+                    "generation_attempts": 1,
+                    "quality_feedback": [],
+                    "generation_progress": {},
+                    "review_updated_at": NOW,
+                }]
 
         def fetchall(self):
-            return []
+            rows, self.rows = self.rows, []
+            return rows
 
     cursor = RecordingCursor()
     transaction = DatabaseReviewTransaction(cursor, "learning_evidence")
     transaction._statement = lambda query: query  # type: ignore[method-assign]
 
-    assert transaction.list_review_materials("7") == []
-    assert "THEN rm.summary" in cursor.statement
-    assert "ELSE NULL" in cursor.statement
-    assert "lm.document_summary" not in cursor.statement
-    assert "learning_review_folder_material" in cursor.statement
-    assert "folder_material.material_id = lm.id" in cursor.statement
-    assert "generation_progress" in cursor.statement
+    materials = transaction.list_review_materials("7")
+
+    assert materials[0].summary == "复习模型总结"
+    assert materials[0].card_count == 3
+    assert all(" JOIN " not in " ".join(statement.split()).upper() for statement in cursor.statements)
+    assert "NOT EXISTS" in cursor.statements[0]
+    assert "ANY(%s::BIGINT[])" in cursor.statements[1]
+    assert "lm.document_summary" not in " ".join(cursor.statements)
+    assert "generation_progress" in cursor.statements[1]
 
 
 class SummaryGenerationTransaction:
@@ -330,7 +362,7 @@ class SummaryGenerationTransaction:
 
 
 class SummaryExtractor:
-    """提供可区分的 DeepSeek 提炼摘要，验证 RAG 摘要不会覆盖它。"""
+    """提供可区分的复习模型摘要，验证 RAG 摘要不会覆盖它。"""
 
     def __init__(self, summary: str) -> None:
         self.summary = summary
@@ -350,10 +382,10 @@ class SummaryExtractor:
     "document_summary",
     [None, "RAG 截断摘要"],
 )
-def test_generation_always_persists_deepseek_review_summary(
+def test_generation_always_persists_generated_review_summary(
     document_summary: str | None,
 ) -> None:
-    """无论 RAG 索引摘要是否存在，复习中心都保存同次 DeepSeek 总结。"""
+    """无论 RAG 索引摘要是否存在，复习中心都保存同次模型总结。"""
     transaction = SummaryGenerationTransaction()
     service = ReviewService(
         repository=FakeReviewRepository(transaction),
@@ -371,13 +403,13 @@ def test_generation_always_persists_deepseek_review_summary(
     assert transaction.saved["generation_progress_event"]["stageCode"] == "review.skipped"
 
 
-def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
+def test_review_model_failure_is_persisted_and_deactivates_old_cards() -> None:
     """密钥、请求或质量失败必须保存 FAILED + 空卡片，不能继续展示旧坏卡。"""
     class FailingExtractor:
-        """模拟 DeepSeek 质量门禁失败。"""
+        """模拟复习模型质量门禁失败。"""
 
         def extract(self, _material, _evidences):
-            raise ReviewExtractionError("DeepSeek 生成的卡片未通过质量门禁")
+            raise ReviewExtractionError("gpt-5.6-terra 生成的卡片未通过质量门禁")
 
     transaction = SummaryGenerationTransaction()
     service = ReviewService(
@@ -393,9 +425,9 @@ def test_deepseek_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert result.status == "FAILED"
     assert result.cardCount == 0
     assert result.summary is None
-    assert result.reason == "DeepSeek 生成的卡片未通过质量门禁"
+    assert result.reason == "gpt-5.6-terra 生成的卡片未通过质量门禁"
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v11"
+    assert transaction.saved["extractor"] == "failed:review-card-v12"
     assert transaction.saved["cards"] == []
     assert transaction.saved["generation_progress_event"]["stageCode"] == "review.failed"
 
@@ -423,7 +455,7 @@ def test_unexpected_extractor_failure_is_persisted_instead_of_remaining_pending(
     assert result.reason == "复习生成遇到未预期错误（RuntimeError），请稍后重新生成"
     assert "不应直接暴露" not in result.reason
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v11"
+    assert transaction.saved["extractor"] == "failed:review-card-v12"
     assert transaction.saved["quality_feedback"] == [result.reason]
 
 

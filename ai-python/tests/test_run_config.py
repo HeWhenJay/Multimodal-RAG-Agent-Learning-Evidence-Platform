@@ -80,17 +80,34 @@ def test_answer_guard_config_env_mapping_is_effective():
 
 
 def test_review_llm_config_uses_dedicated_environment_variables():
-    """复习模型只映射 DeepSeek 密钥，官方 URL 与模型不允许环境覆盖。"""
+    """复习模型的中转地址、模型、思考强度和密钥均映射到专用环境变量。"""
     env_defaults = build_env_defaults(
         {
             "review": {
                 "llm": {
-                    "base-url": "https://api.deepseek.com",
-                    "model": "deepseek-v4-flash",
+                    "base-url": "http://localhost:58966/v1",
+                    "model": "gpt-5.6-terra",
                     "reasoning-effort": "max",
+                    "thinking-enabled": True,
                     "api-key": "test-review-key",
+                    "fallback": {
+                        "enabled": True,
+                        "model": "deepseek-v4-flash",
+                        "base-url": "https://api.deepseek.com",
+                        "api-key": "test-fallback-key",
+                    },
                     "timeout-seconds": 45,
                     "max-in-flight": 8,
+                    "cockpit": {
+                        "retry-enabled": True,
+                        "stream-open-timeout-seconds": 180,
+                        "stream-idle-timeout-seconds": 240,
+                        "bootstrap-retries": 1,
+                        "request-retries": 1,
+                        "retry-base-delay-ms": 300,
+                        "retry-max-delay-ms": 1500,
+                        "keepalive-seconds": 15,
+                    },
                 },
                 "langextract": {
                     "enabled": True,
@@ -104,9 +121,25 @@ def test_review_llm_config_uses_dedicated_environment_variables():
         }
     )
 
-    assert env_defaults["DEEPSEEK_API_KEY"] == "test-review-key"
+    assert env_defaults["REVIEW_LLM_API_KEY"] == "test-review-key"
+    assert env_defaults["REVIEW_LLM_BASE_URL"] == "http://localhost:58966/v1"
+    assert env_defaults["REVIEW_LLM_MODEL"] == "gpt-5.6-terra"
+    assert env_defaults["REVIEW_LLM_REASONING_EFFORT"] == "max"
+    assert env_defaults["REVIEW_LLM_THINKING_ENABLED"] == "true"
+    assert env_defaults["REVIEW_LLM_FALLBACK_ENABLED"] == "true"
+    assert env_defaults["REVIEW_LLM_FALLBACK_MODEL"] == "deepseek-v4-flash"
+    assert env_defaults["REVIEW_LLM_FALLBACK_BASE_URL"] == "https://api.deepseek.com"
+    assert env_defaults["REVIEW_LLM_FALLBACK_API_KEY"] == "test-fallback-key"
     assert env_defaults["REVIEW_EXTRACTION_TIMEOUT_SECONDS"] == "45"
     assert env_defaults["REVIEW_DEEPSEEK_MAX_IN_FLIGHT"] == "8"
+    assert env_defaults["REVIEW_COCKPIT_RETRY_ENABLED"] == "true"
+    assert env_defaults["REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS"] == "180"
+    assert env_defaults["REVIEW_COCKPIT_STREAM_IDLE_TIMEOUT_SECONDS"] == "240"
+    assert env_defaults["REVIEW_COCKPIT_BOOTSTRAP_RETRIES"] == "1"
+    assert env_defaults["REVIEW_COCKPIT_REQUEST_RETRIES"] == "1"
+    assert env_defaults["REVIEW_COCKPIT_RETRY_BASE_DELAY_MS"] == "300"
+    assert env_defaults["REVIEW_COCKPIT_RETRY_MAX_DELAY_MS"] == "1500"
+    assert env_defaults["REVIEW_COCKPIT_KEEPALIVE_SECONDS"] == "15"
     assert env_defaults["REVIEW_LANGEXTRACT_ENABLED"] == "true"
     assert env_defaults["REVIEW_LANGEXTRACT_EXTRACTION_PASSES"] == "2"
     assert env_defaults["REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER"] == "8000"
@@ -120,7 +153,8 @@ def test_review_llm_config_uses_dedicated_environment_variables():
 
 
 def test_missing_review_key_is_reported_during_startup(monkeypatch, capsys):
-    """缺少 DeepSeek 密钥时启动日志应给出可操作提示，但不阻止其他接口启动。"""
+    """缺少复习中转密钥时启动日志应给出可操作提示，但不阻止其他接口启动。"""
+    monkeypatch.delenv("REVIEW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(
         "app.core.runtime_config.read_process_or_windows_user_environment",
@@ -129,7 +163,7 @@ def test_missing_review_key_is_reported_during_startup(monkeypatch, capsys):
 
     load_runtime_config(parse_args(["--skip-default-config"]))
 
-    assert "未配置 DEEPSEEK_API_KEY" in capsys.readouterr().out
+    assert "未配置 REVIEW_LLM_API_KEY" in capsys.readouterr().out
 
 
 def test_model_dynamic_batch_config_env_mapping_is_effective():
@@ -210,6 +244,33 @@ def test_video_v6_config_env_mapping_is_effective():
     assert env_defaults["RAG_VIDEO_OCR_BATCH_MAX_SIZE"] == "4"
     assert env_defaults["RAG_VIDEO_OCR_BATCH_WAIT_MS"] == "800"
     assert env_defaults["RAG_VIDEO_OCR_MAX_IN_FLIGHT"] == "2"
+
+
+def test_douyin_mcp_config_env_mapping_is_effective():
+    """抖音 MCP 开关、固定 endpoint、密钥和轮询参数可由本地 YAML 注入。"""
+    env_defaults = build_env_defaults(
+        {
+            "remote-video": {
+                "douyin": {
+                    "enabled": True,
+                    "mcp-endpoint": "https://mcp.52choujiang.com/douyin/mcp",
+                    "api-key": "unit-socialdatax-key",
+                    "connection-timeout-seconds": 20,
+                    "tool-timeout-seconds": 45,
+                    "poll-interval-seconds": 3,
+                    "max-wait-seconds": 600,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["RAG_DOUYIN_MCP_ENABLED"] == "true"
+    assert env_defaults["RAG_DOUYIN_MCP_ENDPOINT"] == "https://mcp.52choujiang.com/douyin/mcp"
+    assert env_defaults["SOCIALDATAX_API_KEY"] == "unit-socialdatax-key"
+    assert env_defaults["RAG_DOUYIN_MCP_CONNECTION_TIMEOUT_SECONDS"] == "20"
+    assert env_defaults["RAG_DOUYIN_MCP_TOOL_TIMEOUT_SECONDS"] == "45"
+    assert env_defaults["RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS"] == "3"
+    assert env_defaults["RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS"] == "600"
 
 
 def test_worker_cron_config_env_mapping_is_effective():

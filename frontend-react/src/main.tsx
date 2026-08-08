@@ -9,6 +9,7 @@ import { Settings } from './pages/Settings';
 import { VideoReview } from './pages/video-review/VideoReview';
 import { ReviewCenter } from './pages/reviews/ReviewCenter';
 import { ReviewFolderDetail } from './pages/reviews/ReviewFolderDetail';
+import { ReviewCardLibrary } from './pages/reviews/ReviewCardLibrary';
 import { RequireAuth } from './routes/RequireAuth';
 import { AppLayout } from './layouts/AppLayout';
 import { AuthProvider } from './stores/auth';
@@ -43,6 +44,7 @@ const router = createBrowserRouter([
       { path: 'preview/material/:id', element: <MaterialPreview /> },
       { path: 'videos', element: <VideoReview /> },
       { path: 'reviews', element: <ReviewCenter /> },
+      { path: 'reviews/cards', element: <ReviewCardLibrary /> },
       { path: 'reviews/folders/:folderId', element: <ReviewFolderDetail /> },
       { path: 'agent', element: <AgentWorkspace /> },
       { path: 'settings', element: <Settings /> },

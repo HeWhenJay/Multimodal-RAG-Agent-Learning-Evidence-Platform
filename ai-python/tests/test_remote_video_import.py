@@ -56,6 +56,27 @@ def test_share_text_extracts_bilibili_url_and_preserves_page() -> None:
     assert remote.canonical_url == "https://www.bilibili.com/video/BV1yT411H7YK?p=32"
 
 
+def test_douyin_video_url_is_canonicalized_without_tracking_parameters() -> None:
+    """抖音完整视频页只保留作品 ID，避免追踪参数进入资料幂等键。"""
+    remote = validate_remote_video_url(
+        "https://www.douyin.com/video/6961737553342991651?previous_page=web_code_link&modal_id=ignored"
+    )
+
+    assert remote.platform == "douyin"
+    assert remote.video_id == "6961737553342991651"
+    assert remote.canonical_url == "https://www.douyin.com/video/6961737553342991651"
+    assert remote.placeholder_title == "抖音视频 6961737553342991651"
+
+
+def test_douyin_short_url_stays_on_whitelisted_host_without_following_redirects() -> None:
+    """API 只规范化短链本身，真实跳转解析交给固定 MCP 服务。"""
+    remote = validate_remote_video_url("https://v.douyin.com/iRNBho6u/?from=copy")
+
+    assert remote.platform == "douyin"
+    assert remote.canonical_url == "https://v.douyin.com/iRNBho6u/"
+    assert remote.video_id.startswith("DYSHORT")
+
+
 def test_url_extraction_handles_markdown_chinese_punctuation_and_multiple_lines() -> None:
     """批量提取应清理 Markdown/中文尾标点，并保留每条候选的原始行号。"""
     extracted = extract_remote_video_urls(
@@ -84,27 +105,46 @@ def test_remote_video_url_rejects_an_oversized_candidate() -> None:
         ("https://127.0.0.1/video/BV1xx411c7mD", "当前仅支持"),
         ("https://user:pass@www.bilibili.com/video/BV1xx411c7mD", "当前仅支持"),
         ("https://b23.tv/example", "展开后的"),
-        ("https://www.douyin.com/video/6961737553342991651", "抖音链接暂不支持"),
+        ("https://www.douyin.com/note/6961737553342991651", "仅支持视频作品页"),
+        ("https://www.douyin.com.evil.example/video/6961737553342991651", "当前仅支持"),
+        ("https://v.douyin.com/", "有效的"),
     ],
 )
 def test_remote_video_url_rejects_untrusted_or_unsupported_targets(url: str, message: str) -> None:
-    """任意网络目标、短链接和抖音挑战链路必须在 API 阶段拒绝。"""
+    """任意网络目标、非视频作品和无效短链接必须在 API 阶段拒绝。"""
     with pytest.raises(BusinessError, match=message):
         validate_remote_video_url(url)
 
 
 def test_remote_video_kafka_reference_requires_matching_canonical_id() -> None:
     """内部消息不能用合法 URL 搭配另一个视频 ID，或重新带回追踪参数。"""
-    with pytest.raises(ValidationError, match="规范化 Bilibili 地址"):
+    with pytest.raises(ValidationError, match="平台、地址或视频标识不一致"):
         RemoteVideoSourceRef(
             url="https://www.bilibili.com/video/BV1xx411c7mD",
             videoId="BV1nx411u79K",
         )
-    with pytest.raises(ValidationError, match="规范化 Bilibili 地址"):
+    with pytest.raises(ValidationError, match="平台、地址或视频标识不一致"):
         RemoteVideoSourceRef(
             url="https://www.bilibili.com/video/BV1xx411c7mD?spm_id_from=333.1",
             videoId="BV1xx411c7mD",
         )
+    with pytest.raises(ValidationError, match="平台、地址或视频标识不一致"):
+        RemoteVideoSourceRef(
+            platform="bilibili",
+            url="https://www.douyin.com/video/6961737553342991651",
+            videoId="6961737553342991651",
+        )
+
+
+def test_remote_video_kafka_reference_accepts_canonical_douyin_video() -> None:
+    """规范化抖音作品可以作为耐久任务的强类型来源。"""
+    source = RemoteVideoSourceRef(
+        platform="douyin",
+        url="https://www.douyin.com/video/6961737553342991651",
+        videoId="6961737553342991651",
+    )
+
+    assert source.platform == "douyin"
 
 
 def test_public_metadata_rejects_live_duration_and_wrong_extractor(monkeypatch) -> None:

@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | `DASHSCOPE_API_KEY` | 真实 RAG 联调必填 | 百炼 embedding、rerank、LLM、OCR、ASR 共用。推荐配置为系统环境变量，不要写入 Git。 |
 | `MINERU_TOKEN` / `MINERU_API_TOKEN` / `MINERU_API_KEY` | 使用 MinerU 云端能力时必填 | 仅在 MinerU 命令或封装需要云端鉴权时配置。 |
+| `SOCIALDATAX_API_KEY` | 抖音 URL 语音转写 RAG 必填 | 只发送到固定 SocialDataX 抖音 MCP endpoint，不写入仓库。 |
 
 可配置的联调项和选填项已集中放在 `ai-python/config/application.yml`：
 
@@ -30,12 +31,20 @@ dashscope:
 - `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
 - `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
 - `RAG_LLM_MODEL`：默认 `qwen-plus`
-- `DEEPSEEK_API_KEY`：复习摘要、知识单元发现和卡片生成使用的 DeepSeek 官方 API Key；缺失时返回可诊断失败，不生成本地伪内容
+- `REVIEW_LLM_API_KEY`：复习摘要、知识单元发现和卡片生成使用的本机中转密钥；缺失时返回可诊断失败，不生成本地伪内容
+- `DEEPSEEK_API_KEY`：可选的复习降级密钥；Cockpit 按长等待方案完成 Terra 重试后仍失败时才直连 DeepSeek
+- `REVIEW_COCKPIT_REQUEST_RETRIES`：项目在 DeepSeek 降级前重新请求 Cockpit 的次数，默认 `1`
+- `REVIEW_EXTRACTION_TIMEOUT_SECONDS`：单次 Cockpit 客户端等待窗口，默认 `615` 秒
+- `RAG_DOUYIN_MCP_ENABLED`：抖音 MCP 语音转写路线开关，默认 `true`
+- `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS`：抖音转写任务轮询间隔，默认 `5`
+- `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS`：抖音单次转写最大等待时间，默认 `900`
 - `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料同一 pass 的 LangExtract I/O 并发，默认 `8`、硬上限 `10`
 - `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 
 Agent、RAG、复习、简历、视觉 OCR 和音频 ASR Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
+
+抖音 URL 接入流程与 SocialDataX MCP 工具契约见 `docs/api/remote-video-import.md`。
 
 本机覆盖时复制 `ai-python/config/application.local.example.yml` 为 `ai-python/config/application.local.yml` 后修改。`application.local.yml` 已加入 `.gitignore`，可用于填写本机路径或临时离线模式。
 
@@ -83,6 +92,20 @@ PyCharm 的 Parameters 可以留空；如需额外指定配置文件，可填写
 
 ### 命令行启动
 
+Windows PowerShell 推荐使用项目启动脚本。脚本会统一控制台、Conda 和 Python 的 UTF-8 编码，并关闭 `conda run` 的输出捕获层，避免中文日志被按 GBK 错误解码：
+
+```powershell
+.\ai-python\start.ps1
+```
+
+需要向 `run.py` 传递排障参数时直接追加，例如：
+
+```powershell
+.\ai-python\start.ps1 --without-kafka --without-agent-worker
+```
+
+也可以激活环境后直接启动：
+
 ```powershell
 conda env create -f ai-python/environment.yml
 conda activate learning-evidence-rag
@@ -108,12 +131,12 @@ python run.py
 
 ```powershell
 # 默认启动 FastAPI、Agent worker 和 RAG 任务 worker。
-conda run -n learning-evidence-rag python -B ai-python/run.py
+.\ai-python\start.ps1
 
 # 使用 Kafka 索引链路时再显式启用 broker worker。
 $env:RAG_KAFKA_ENABLED='true'
 $env:AI_KAFKA_WORKER_ENABLED='true'
-conda run -n learning-evidence-rag python -B ai-python/run.py
+.\ai-python\start.ps1
 ```
 
 可使用 `--without-cron`、`--without-kafka`、`--without-agent-worker` 或 `--without-rag-worker` 做本地排障；`--with-*` 参数可以临时覆盖 YAML 开关。`--without-kafka` 会同时关闭 Kafka 投递模式，资料任务自动改由 PostgreSQL `LOCAL` durable worker 执行；`--with-kafka` 会同时启用 Kafka 投递和 worker。`app.workers.kafka_worker` 是正式 Kafka 入口，`ai-python/run_kafka_worker.py` 仅保留兼容转发。
@@ -148,7 +171,7 @@ Agent 任务、消息、上下文摘要、审批、会话文件夹和记忆状�
 Python 测试必须在 `learning-evidence-rag` Conda 环境中执行：
 
 ```powershell
-conda run -n learning-evidence-rag python -B -m pytest ai-python/tests -q
+conda run --no-capture-output -n learning-evidence-rag python -B -m pytest ai-python/tests -q
 ```
 
 GitHub Actions 同样根据 `ai-python/environment.yml` 创建该环境，并与 React `npm run build` 分别在独立 job 中验证。

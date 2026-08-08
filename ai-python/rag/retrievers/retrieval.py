@@ -912,6 +912,9 @@ def build_playback_url(*, document_id: str, title: str, metadata: dict[str, Any]
     start_time = as_optional_str(metadata.get("startTime"))
     if not start_time:
         return None
+    if str(metadata.get("sourcePlatform") or "").strip().lower() == "douyin":
+        # 抖音当前只保存作品页和转写文本，不能把网页地址交给站内 HTML5 播放器。
+        return public_http_source(first_present(metadata, "sourceVideoUrl", "sourcePath"))
     start_seconds = timestamp_to_seconds(start_time)
     media_url = public_http_source(first_present(metadata, "playbackUrl", "videoUrl", "mediaUrl", "sourceVideoUrl"))
     if not media_url:

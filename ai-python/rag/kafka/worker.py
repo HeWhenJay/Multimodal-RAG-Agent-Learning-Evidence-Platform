@@ -23,6 +23,10 @@ from app.storage.object_storage import (
 )
 from app.schemas.rag import IndexResponse
 from app.services.video_parallel_indexing import parse_video_source_with_worker_pool
+from app.services.douyin_mcp_client import (
+    SocialDataXDouyinClient,
+    annotate_douyin_transcript_result,
+)
 from app.services.remote_video_import import (
     RemoteVideoError,
     RemoteVideoPermanentError,
@@ -83,6 +87,7 @@ class RagKafkaIndexWorker:
         progress_producer: KafkaProgressProducer | None = None,
         job_repository: RagJobRepository | None = None,
         object_storage: RagObjectStorage | None = None,
+        douyin_client: SocialDataXDouyinClient | None = None,
         execution_owner_id: str | None = None,
         execution_lease_seconds: int | None = None,
         execution_heartbeat_seconds: float | None = None,
@@ -97,6 +102,7 @@ class RagKafkaIndexWorker:
         self.progress_producer = progress_producer or KafkaProgressProducer(self.producer)
         self.job_repository = job_repository
         self.object_storage = object_storage
+        self.douyin_client = douyin_client
         self.execution_owner_id = execution_owner_id
         self.execution_lease_seconds = execution_lease_seconds or positive_int_env(
             "RAG_INDEX_EXECUTION_LEASE_SECONDS",
@@ -321,22 +327,38 @@ class RagKafkaIndexWorker:
             )
             source_path = None
         elif payload.sourceRef.type == "REMOTE_VIDEO":
-            progress.emit("upload.remote_video", "正在读取 Bilibili 公开视频", current_step=1, total_steps=8, percent=6)
-
-            def report_download(download_percent: int | None) -> None:
-                mapped = 6 + round(max(0, min(download_percent or 0, 100)) * 0.09)
+            if payload.sourceRef.platform == "douyin":
                 progress.emit(
                     "upload.remote_video",
-                    "正在获取 Bilibili 视频资源",
+                    "正在通过抖音 MCP 提交语音转写",
                     current_step=1,
                     total_steps=8,
-                    percent=mapped,
+                    percent=6,
                 )
 
-            downloaded = download_bilibili_video(payload.sourceRef.url, on_progress=report_download)
-            try:
-                source_path = downloaded.source_url
-                source_title = downloaded.title
+                def report_transcript_poll(poll_count: int, _status: str) -> None:
+                    progress.emit(
+                        "upload.remote_video",
+                        "抖音视频正在进行语音转写",
+                        current_step=1,
+                        total_steps=8,
+                        percent=min(14, 7 + poll_count),
+                    )
+
+                def check_transcript_execution() -> None:
+                    self._assert_execution_active(execution, verify_repository=False)
+
+                douyin_client = self.douyin_client
+                if douyin_client is None:
+                    douyin_client = SocialDataXDouyinClient()
+                    self.douyin_client = douyin_client
+                transcript = douyin_client.transcribe_video(
+                    payload.sourceRef.url,
+                    on_poll=report_transcript_poll,
+                    cancel_check=check_transcript_execution,
+                )
+                source_path = transcript.source_url
+                source_title = transcript.title
                 self._assert_execution_active(execution, verify_repository=True)
                 if self.job_repository is not None and not self.job_repository.update_remote_material_source(
                     payload.materialId,
@@ -344,50 +366,97 @@ class RagKafkaIndexWorker:
                     payload.requestVersion,
                     execution_owner=execution.owner_id if execution is not None else None,
                     title=source_title,
-                    filename=f"{payload.sourceRef.videoId}{downloaded.path.suffix.lower()}",
-                    source_url=downloaded.source_url,
+                    filename=transcript.filename(payload.sourceRef.videoId),
+                    source_url=transcript.source_url,
                     platform=payload.sourceRef.platform,
                 ):
                     raise PermanentSourceError("远程视频任务已过期")
                 progress.emit(
                     "upload.remote_video",
-                    "Bilibili 视频获取完成，开始多模态解析",
+                    "抖音语音转写完成，开始构建 RAG 索引",
                     status="COMPLETED",
                     current_step=1,
                     total_steps=8,
                     percent=15,
                 )
-                parsed = parse_video_source_with_worker_pool(
-                    parser_router=self.parser_router,
+                parsed = self.parser_router.parse_text(
                     document_id=payload.stagingDocumentId,
                     title=source_title,
-                    document_type=payload.documentType,
-                    source=payload.source,
-                    user_id=payload.userId,
-                    visibility_scope=payload.stagingVisibilityScope,
-                    source_path=str(downloaded.path),
-                    source_reference=downloaded.source_url,
-                    filename=downloaded.filename,
-                    content_type=downloaded.content_type,
-                    high_precision=payload.highPrecision,
-                    progress_reporter=progress,
-                ) or self.parser_router.parse_video_source(
-                    document_id=payload.stagingDocumentId,
-                    title=source_title,
-                    document_type=payload.documentType,
-                    source=payload.source,
-                    user_id=payload.userId,
-                    visibility_scope=payload.stagingVisibilityScope,
-                    source_path=str(downloaded.path),
-                    source_reference=downloaded.source_url,
-                    filename=downloaded.filename,
-                    content_type=downloaded.content_type,
-                    high_precision=payload.highPrecision,
+                    document_type="srt",
+                    source_path=transcript.source_url,
+                    content=transcript.text,
+                    parser=transcript.parser,
                     progress_reporter=progress,
                 )
-                parsed = sanitize_remote_video_parse_result(parsed)
-            finally:
-                downloaded.cleanup()
+                parsed = annotate_douyin_transcript_result(parsed, transcript)
+            else:
+                progress.emit("upload.remote_video", "正在读取 Bilibili 公开视频", current_step=1, total_steps=8, percent=6)
+
+                def report_download(download_percent: int | None) -> None:
+                    mapped = 6 + round(max(0, min(download_percent or 0, 100)) * 0.09)
+                    progress.emit(
+                        "upload.remote_video",
+                        "正在获取 Bilibili 视频资源",
+                        current_step=1,
+                        total_steps=8,
+                        percent=mapped,
+                    )
+
+                downloaded = download_bilibili_video(payload.sourceRef.url, on_progress=report_download)
+                try:
+                    source_path = downloaded.source_url
+                    source_title = downloaded.title
+                    self._assert_execution_active(execution, verify_repository=True)
+                    if self.job_repository is not None and not self.job_repository.update_remote_material_source(
+                        payload.materialId,
+                        payload.jobId,
+                        payload.requestVersion,
+                        execution_owner=execution.owner_id if execution is not None else None,
+                        title=source_title,
+                        filename=f"{payload.sourceRef.videoId}{downloaded.path.suffix.lower()}",
+                        source_url=downloaded.source_url,
+                        platform=payload.sourceRef.platform,
+                    ):
+                        raise PermanentSourceError("远程视频任务已过期")
+                    progress.emit(
+                        "upload.remote_video",
+                        "Bilibili 视频获取完成，开始多模态解析",
+                        status="COMPLETED",
+                        current_step=1,
+                        total_steps=8,
+                        percent=15,
+                    )
+                    parsed = parse_video_source_with_worker_pool(
+                        parser_router=self.parser_router,
+                        document_id=payload.stagingDocumentId,
+                        title=source_title,
+                        document_type=payload.documentType,
+                        source=payload.source,
+                        user_id=payload.userId,
+                        visibility_scope=payload.stagingVisibilityScope,
+                        source_path=str(downloaded.path),
+                        source_reference=downloaded.source_url,
+                        filename=downloaded.filename,
+                        content_type=downloaded.content_type,
+                        high_precision=payload.highPrecision,
+                        progress_reporter=progress,
+                    ) or self.parser_router.parse_video_source(
+                        document_id=payload.stagingDocumentId,
+                        title=source_title,
+                        document_type=payload.documentType,
+                        source=payload.source,
+                        user_id=payload.userId,
+                        visibility_scope=payload.stagingVisibilityScope,
+                        source_path=str(downloaded.path),
+                        source_reference=downloaded.source_url,
+                        filename=downloaded.filename,
+                        content_type=downloaded.content_type,
+                        high_precision=payload.highPrecision,
+                        progress_reporter=progress,
+                    )
+                    parsed = sanitize_remote_video_parse_result(parsed)
+                finally:
+                    downloaded.cleanup()
         else:
             downloaded = open_storage_source(
                 payload.sourceRef,

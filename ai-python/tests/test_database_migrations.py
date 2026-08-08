@@ -92,6 +92,41 @@ def test_review_folder_migration_is_registered_and_idempotent() -> None:
     assert "CREATE INDEX IF NOT EXISTS idx_learning_review_folder_material_folder" in sql
 
 
+def test_review_folder_material_order_migration_is_registered_and_idempotent() -> None:
+    """文件夹内文档顺序列、历史回填和查询索引必须进入启动迁移。"""
+    filename = "20260805_0100_add_review_folder_material_display_order.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "ADD COLUMN IF NOT EXISTS display_order INTEGER" in sql
+    assert "ROW_NUMBER() OVER" in sql
+    assert "CREATE INDEX IF NOT EXISTS idx_learning_review_folder_material_order" in sql
+
+
+def test_review_query_index_migration_is_registered_and_idempotent() -> None:
+    """复习中心高频过滤和排序条件必须有对应联合索引。"""
+    filename = "20260805_0200_optimize_review_query_indexes.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "idx_learning_material_user_status_updated_id" in sql
+    assert "idx_learning_review_material_user_status_version_material" in sql
+    assert "idx_learning_review_card_user_active_due_material_id" in sql
+    assert "idx_learning_review_card_material_user_active_id" in sql
+    assert "idx_learning_review_log_user_reviewed_material" in sql
+
+
+def test_remote_video_platform_guard_migration_covers_douyin() -> None:
+    """远程视频 URL 唯一约束必须同时覆盖 Bilibili 和抖音。"""
+    filename = "20260807_0100_add_remote_video_platform_import_guard.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "DROP INDEX IF EXISTS learning_evidence.uq_learning_material_user_bilibili_url" in sql
+    assert "source IN ('bilibili', 'douyin')" in sql
+    assert "uq_learning_material_user_remote_url" in sql
+
+
 def test_review_generation_repair_state_migration_is_registered() -> None:
     """多轮生成尝试、质量反馈和人工终态必须可安全迁移。"""
     filename = "20260803_0200_add_review_generation_repair_state.sql"

@@ -1,27 +1,38 @@
 # 公公开视频链接接入 API
 
-更新日期：2026-08-02
+更新日期：2026-08-07
 
-## 可行性与范围
+## 能力范围
 
-当前版本只支持 Bilibili 完整公开视频链接，例如：
+当前支持 Bilibili 与抖音两种接入路线：
+
+| 平台 | 支持链接 | 获取方式 | RAG 内容 |
+| --- | --- | --- | --- |
+| Bilibili | `bilibili.com/video/{BV/av}` 完整 HTTPS 链接 | worker 用匿名 `yt-dlp` 下载临时视频 | 字幕/ASR、关键帧 OCR、视频片段摘要 |
+| 抖音 | `douyin.com/video/{aweme_id}`、`iesdouyin.com/share/video/{aweme_id}`、带 `modal_id` 的作品页、`v.douyin.com` 视频短链 | worker 调用 SocialDataX Streamable HTTP MCP | 视频语音转写文本，不包含画面 OCR/视觉理解 |
+
+示例：
 
 ```text
 https://www.bilibili.com/video/BV1xx411c7mD
+https://www.douyin.com/video/6961737553342991651
+https://v.douyin.com/iRNBho6u/
 ```
 
-不支持抖音、Bilibili 短链接、直播、登录可见、会员、付费、番剧、DRM 或地区受限内容。服务端不读取浏览器 Cookie，不接受用户提交 Cookie，也不执行验证码、挑战签名或 DRM 绕过。
+抖音路线不在本项目下载视频，不读取浏览器 Cookie，也不执行验证码、挑战签名、登录态或 DRM 绕过。MCP 服务负责解析作品链接并生成语音转写，本项目只接收转写结果并进入现有 RAG 索引。
 
-调研依据：
+抖音接入依赖 [SocialDataX 抖音 MCP](https://github.com/DevinChen2014/douyin-mcp)：
 
-- [yt-dlp 支持站点](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) 当前列出 BiliBili 与 Douyin。
-- [Bilibili 提取器](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py) 支持公开视频播放信息；部分格式明确需要登录或会员。
-- [Douyin 提取器](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/tiktok.py) 明确要求新鲜 Cookie，挑战签名仍为待实现项，因此不作为生产能力开放。
-- [抖音开放平台视频管理](https://open.douyin.com/platform/resource/docs/openapi/video-management/video-list/) 面向已授权账号的视频数据，不提供任意分享链接的公开视频下载能力。
+- Endpoint：`https://mcp.52choujiang.com/douyin/mcp`
+- Transport：`streamable-http`
+- 鉴权：`Authorization: Bearer <SOCIALDATAX_API_KEY>`
+- 使用工具：`douyin_get_video_detail_by_url`、`douyin_submit_video_speech_text_by_video_url`、`douyin_get_video_speech_text_job`
+
+真实密钥只能通过进程/用户环境变量或未提交的 `application.local.yml` 注入，不得写入仓库。
 
 ## 公开接口
 
-### 创建链接导入任务
+### 创建单条任务
 
 ```http
 POST /api/rag/materials/url
@@ -29,25 +40,21 @@ Authorization: Bearer <token>
 Content-Type: application/json
 ```
 
-请求：
-
 ```json
 {
-  "url": "https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+  "url": "https://www.douyin.com/video/6961737553342991651?previous_page=web_code_link",
   "highPrecision": false,
   "confirmedAuthorized": true
 }
 ```
 
-字段：
-
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `url` | 是 | 只允许 `https://www.bilibili.com/video/{BV/av}` 完整链接；仅保留合法分 P 参数 |
-| `highPrecision` | 否 | 是否启用现有高精度视频解析 |
+| `url` | 是 | Bilibili 完整作品页，或受支持的抖音作品页/视频短链 |
+| `highPrecision` | 否 | Bilibili 是否启用高精度视频解析；抖音语音转写路线不执行画面解析 |
 | `confirmedAuthorized` | 是 | 用户确认有权为学习目的处理该内容 |
 
-成功响应沿用 `Result<RagMaterialResponse>`。接口返回时资料通常为 `PENDING`，下载、ASR、关键帧 OCR、递归切块、索引和复习卡片生成均在后台继续：
+接口只完成校验、建档和耐久任务入队，返回 `Result<RagMaterialResponse>`。资料通常先处于 `PENDING`：
 
 ```json
 {
@@ -55,21 +62,21 @@ Content-Type: application/json
   "msg": "success",
   "data": {
     "id": 31,
-    "title": "Bilibili 视频 BV1xx411c7mD",
+    "title": "抖音视频 6961737553342991651",
     "userId": "7",
     "documentType": "mp4",
-    "source": "bilibili",
+    "source": "douyin",
     "status": "PENDING",
     "storageType": "remote",
-    "publicUrl": "https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+    "publicUrl": "https://www.douyin.com/video/6961737553342991651",
     "chunkCount": 0
   }
 }
 ```
 
-同一用户重复提交相同规范化 URL 时，如果已有活动或已完成资料，直接返回既有资料；已有 `FAILED` 资料时复用原资料并创建更高 `requestVersion` 的重试任务。数据库通过部分唯一索引保证同一用户不会重复创建相同远程资料。
+worker 获得真实标题后会更新资料标题。相同用户重复提交同一规范化 URL 时复用活动或已完成资料；`FAILED` 资料会复用原记录并创建更高 `requestVersion` 的任务。
 
-### 批量创建链接导入任务
+### 批量创建任务
 
 ```http
 POST /api/rag/materials/url/batch
@@ -77,11 +84,9 @@ Authorization: Bearer <token>
 Content-Type: application/json
 ```
 
-请求体使用一段可直接粘贴的文本，支持一行一个链接，也支持平台“复制分享文案”中夹带中文标题、Markdown 括号或多个链接：
-
 ```json
 {
-  "text": "【新版 Java 面试专题】https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=tracking\nhttps://www.bilibili.com/video/BV1xx411c7mD",
+  "text": "【Bilibili 课程】https://www.bilibili.com/video/BV1xx411c7mD?vd_source=tracking\n7.23 复制打开抖音 https://v.douyin.com/iRNBho6u/",
   "highPrecision": false,
   "confirmedAuthorized": true
 }
@@ -89,119 +94,112 @@ Content-Type: application/json
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `text` | 是 | 多行 URL 或平台分享原文，最多 1,000,000 个字符；不另设 URL 条数上限 |
-| `highPrecision` | 否 | 是否为本批次新建任务启用高精度视频解析 |
-| `confirmedAuthorized` | 是 | 用户统一确认有权为学习目的处理本批次内容 |
+| `text` | 是 | 多行 URL 或平台分享文案，最多 1,000,000 个字符 |
+| `highPrecision` | 否 | 为本批次 Bilibili 新任务启用高精度解析 |
+| `confirmedAuthorized` | 是 | 用户统一确认有权处理本批次内容 |
 
-服务端先用 URL 正则提取所有 `http://` 或 `https://` 候选，再逐条执行现有平台白名单校验和规范化；追踪参数会被删除，合法 `p` 分 P 参数会保留。批次内相同规范化 URL 只入队一次。单条校验失败不会阻断同批次其他 URL，返回 `REJECTED` 项供前端展示。
+服务端从分享文案中提取 HTTP(S) URL，再逐条执行平台白名单和规范化：
 
-成功响应仍使用 `Result<T>`，资料任务已经写入耐久队列后立即返回：
+- Bilibili 删除追踪参数，只保留合法 `p` 分 P。
+- 抖音完整作品页统一为 `https://www.douyin.com/video/{aweme_id}`。
+- 抖音短链删除 query/fragment，但 API 进程不跟随重定向；固定 MCP 服务负责解析。
+- 批次内相同规范化 URL 只入队一次。
+- 单条失败不阻断其他链接。
 
-```json
-{
-  "code": 1,
-  "msg": null,
-  "data": {
-    "candidateCount": 2,
-    "queuedCount": 2,
-    "reusedCount": 0,
-    "duplicateCount": 0,
-    "rejectedCount": 0,
-    "items": [
-      {
-        "lineNumber": 1,
-        "url": "https://www.bilibili.com/video/BV1yT411H7YK?p=32&vd_source=tracking",
-        "canonicalUrl": "https://www.bilibili.com/video/BV1yT411H7YK?p=32",
-        "status": "QUEUED",
-        "message": "已加入 RAG 处理队列",
-        "material": { "id": 31, "status": "PENDING" }
-      },
-      {
-        "lineNumber": 2,
-        "url": "https://www.bilibili.com/video/BV1xx411c7mD",
-        "canonicalUrl": "https://www.bilibili.com/video/BV1xx411c7mD",
-        "status": "QUEUED",
-        "message": "已加入 RAG 处理队列",
-        "material": { "id": 32, "status": "PENDING" }
-      }
-    ]
-  }
-}
-```
+逐条 `status` 为 `QUEUED`、`REUSED`、`DUPLICATE` 或 `REJECTED`。批量接口没有“每次最多 2 条”的业务限制，超出 worker 槽位的任务保留在耐久队列中。
 
-`status` 取值为 `QUEUED`（新建任务）、`REUSED`（复用已有资料）、`DUPLICATE`（批次内重复）或 `REJECTED`（候选链接不合法/平台不支持）。批量请求不设置“每次最多 2 条”的业务条数限制；文本长度只受 HTTP 请求体和服务端安全配置约束，任务会按照 Worker 可用槽位自动排队。批次完成后只广播一次 `MATERIAL_UPLOADED_EVENT`，由已有资料进度轮询统一刷新，避免 N 条链接触发 N 轮列表查询。
+## 处理流程
 
-## 异步生命周期
+### Bilibili 多模态路线
 
 ```text
-校验 Bilibili URL 与用户授权确认
-  -> 同事务创建 learning_material 与 INDEX_REMOTE_VIDEO 耐久任务
-  -> worker 获取任务并下载到受控临时目录
-  -> 校验非直播、DRM、访问级别、元数据时长、真实媒体时长、累计下载字节和 Bilibili extractor
-  -> 复用现有视频 ASR、关键帧 OCR、递归切块与索引
-  -> 提升 staging 索引并更新资料 READY/PARTIAL/FAILED
-  -> 删除临时视频和字幕文件
+校验并规范化 URL
+  -> 同事务创建 learning_material 与 INDEX_REMOTE_VIDEO
+  -> worker 匿名下载到受控临时目录
+  -> 校验直播、DRM、访问级别、时长和累计字节
+  -> 字幕/ASR + 关键帧 OCR + 视频片段摘要
+  -> 递归切块 + BM25/向量索引 + staging 提升
+  -> 更新 READY/PARTIAL/FAILED
+  -> 删除临时视频和字幕
 ```
 
-远程视频不永久复制到本地上传目录或 OSS。资料只保存规范化 Bilibili 页面 URL；重建索引时重新创建 `INDEX_REMOTE_VIDEO` 任务。
+### 抖音语音转写路线
 
-## 安全与资源约束
+```text
+校验 HTTPS、域名、路径并规范化 URL
+  -> 同事务创建 learning_material 与 INDEX_REMOTE_VIDEO
+  -> worker 使用 SOCIALDATAX_API_KEY 建立 MCP 会话
+  -> douyin_get_video_detail_by_url 获取标题和 aweme_id
+  -> douyin_submit_video_speech_text_by_video_url 提交转写
+  -> 未完成时按 job_id 调用 douyin_get_video_speech_text_job
+  -> 分段结果转换为 SRT；纯文本结果按文本解析
+  -> 标注 sourcePlatform/douyin、awemeId、原始 URL、subtitle evidence
+  -> 现有递归切块 + BM25/向量索引 + staging 提升
+  -> 更新 READY/FAILED
+```
 
-- URL 必须使用 HTTPS，禁止用户名密码、非默认端口、IP 地址、任意域名和开放重定向输入。
-- 只允许 `bilibili.com`、`www.bilibili.com`、`m.bilibili.com` 的 `/video/BV...` 或 `/video/av...` 路径；`b23.tv` 短链接要求用户先展开。
-- 默认最大 `512 MiB`、最长 `4 小时`、网络超时 `20 秒`、下载重试 `2` 次、单次远程资源获取总墙钟时限 `5 小时`，单链接单视频，不处理播放列表、直播和未知时长视频。DASH 音视频分流按任务累计字节，下载后再次检查媒体文件与整个临时目录占用。
-- 不设置单用户每日接入次数或活动任务数限制；提交只负责把任务写入耐久队列，不因排队深度拒绝。实际下载、解析和索引并发由 Kafka/本地 Worker 槽位控制，超出槽位的任务等待领取。
-- 不将第三方响应正文、临时路径、Cookie 或签名 URL 写入日志、Kafka、evidence 或前端。
-- 元数据读取、媒体下载、DASH 合并和字幕等后处理共用同一个绝对截止时间；watchdog 在到期时取消 downloader，下载与后处理 hook 也会拒绝继续执行，FFmpeg 子进程使用任务剩余时间作为超时并在到期后终止。超时使用受控中文错误进入既有耐久重试。
-- 下载失败时临时目录必须清理；网络瞬时错误和平台 `exceeded the rate limit. Try again later` 等限流提示进入既有耐久重试，权限/会员/删除/格式不支持直接失败。
-- FFmpeg 或解析器异常只保留受控中文摘要；包含 `rag-remote-video-*` 的临时目录、第三方命令输出和原始异常文本不得进入 `parseQuality`、Kafka 消息或任务 `result_json`。
-- 本地耐久 worker 只按空闲执行槽领取任务，并在远程任务执行期间持续续租；失去租约后停止 staging 写入和终态发布。Kafka poll 与长任务线程解耦，同一分区保持单消息串行提交，数据库执行令牌阻止重复索引，并为 progress/result/DLQ 保留独立控制线程。
-- 进程异常遗留的 `rag-remote-video-*` 目录默认在 48 小时后清理，TTL 始终至少比允许的视频时长多 12 小时。
-- 生产下载 worker 必须使用独立低权限账号和隔离网络；出站策略需阻断 loopback、RFC1918、link-local、云 metadata 与内部服务网段。应用 URL 白名单不能替代部署层 egress 策略。
+MCP 的 `structuredContent` 和 TextContent JSON 两种响应均可解析。限流、网络、5xx 和超时进入既有耐久重试；缺密钥、鉴权失败、资源失效、无语音或不支持转写属于永久失败。第三方原始错误正文和密钥不会进入日志、Kafka、资料结果或前端。
 
-环境变量：
+## 安全约束
+
+- 所有平台 URL 必须使用 HTTPS，禁止用户名密码和非 443 端口。
+- 只允许精确白名单域名，不接受后缀伪造域名、IP 地址或任意网络目标。
+- Bilibili 只允许完整 `/video/BV...` 或 `/video/av...`；`b23.tv` 仍要求先展开。
+- 抖音只允许视频作品页、受控 `modal_id` 作品页和 `v.douyin.com` 短链；图文 `note`、用户页和任意路径不接入语音转写。
+- 本项目不跟随抖音短链，不下载抖音媒体，不接收 Cookie/账号口令。
+- `SOCIALDATAX_API_KEY` 只允许发送到固定 `https://mcp.52choujiang.com/douyin/mcp`；endpoint 配置若改为其他主机、路径或 HTTP 会拒绝启动该客户端。
+- MCP 客户端默认绕过系统 `HTTP_PROXY`/`HTTPS_PROXY`，直接连接固定 endpoint，避免把 SocialDataX 密钥交给通用代理；部署网络若禁止直连，需要先提供受控的网络出口。
+- worker 在 MCP 轮询期间继续续租；失去执行权后停止后续轮询、staging 写入和终态发布。
+- evidence 保留规范化作品页、作品 ID、转写供应商、字幕片段和可用时间段。
+
+## 配置
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_REMOTE_VIDEO_MAX_BYTES` | `536870912` | 单个远程视频最大字节数 |
-| `RAG_REMOTE_VIDEO_MAX_DURATION_SECONDS` | `14400` | 最大时长 |
-| `RAG_REMOTE_VIDEO_SOCKET_TIMEOUT_SECONDS` | `20` | 单次网络超时 |
-| `RAG_REMOTE_VIDEO_RETRIES` | `2` | yt-dlp 下载重试次数 |
-| `RAG_REMOTE_VIDEO_TASK_TIMEOUT_SECONDS` | `18000` | 元数据、下载和 yt-dlp 后处理共用的单次任务总墙钟时限；长任务在线程池执行并由租约/看门狗约束，不要求小于 Kafka `max.poll.interval.ms` |
-| `RAG_REMOTE_VIDEO_TEMP_ROOT` | 系统临时目录 | 受控临时下载目录 |
-| `RAG_REMOTE_VIDEO_TEMP_TTL_SECONDS` | `172800` | 崩溃遗留临时目录清理 TTL |
-| `RAG_KAFKA_HANDLER_CONCURRENCY` | `4` | 单个 Kafka worker 的索引长任务并发上限 |
-| `RAG_TASK_WORKER_CONCURRENCY` | `2` | 未启用 Kafka 时本地耐久 worker 的并发槽位；其余任务留在 PostgreSQL 队列 |
-| `RAG_KAFKA_CONTROL_CONCURRENCY` | `1` | 为 progress/result/promote/DLQ 保留的控制消息线程数 |
-| `RAG_INDEX_EXECUTION_LEASE_SECONDS` | `180` | Kafka 索引执行令牌租约时长，worker 按不高于三分之一租期续租 |
+| `SOCIALDATAX_API_KEY` | 空 | 抖音 MCP Bearer 密钥；抖音接入必填 |
+| `RAG_DOUYIN_MCP_ENABLED` | `true` | 是否启用抖音 MCP 路线 |
+| `RAG_DOUYIN_MCP_ENDPOINT` | 官方 endpoint | 仅接受固定 SocialDataX HTTPS 地址 |
+| `RAG_DOUYIN_MCP_CONNECTION_TIMEOUT_SECONDS` | `30` | MCP 建连超时，范围 1-120 秒 |
+| `RAG_DOUYIN_MCP_TOOL_TIMEOUT_SECONDS` | `60` | 单次 MCP 工具调用超时，范围 5-180 秒 |
+| `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS` | `5` | 转写任务轮询间隔，范围 0.1-60 秒 |
+| `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS` | `900` | 单次 worker 转写总等待时限，范围 30-3600 秒 |
+| `RAG_REMOTE_VIDEO_MAX_BYTES` | `536870912` | Bilibili 临时视频最大字节数 |
+| `RAG_REMOTE_VIDEO_MAX_DURATION_SECONDS` | `14400` | Bilibili 最大时长 |
+| `RAG_REMOTE_VIDEO_TASK_TIMEOUT_SECONDS` | `18000` | Bilibili 下载和后处理总墙钟时限 |
+| `RAG_KAFKA_HANDLER_CONCURRENCY` | `4` | Kafka 索引长任务并发上限 |
+| `RAG_TASK_WORKER_CONCURRENCY` | `2` | 本地耐久 worker 并发槽位 |
+| `RAG_INDEX_EXECUTION_LEASE_SECONDS` | `180` | 索引执行租约时长 |
 
-Kafka 模式的真实长任务并发数为 `min(RAG_KAFKA_HANDLER_CONCURRENCY, 索引请求 topic 分区数)`；由于同一分区必须保持顺序，部署时应将 `rag.material.index.request.v1` 配置为至少 `4` 个分区，才能用满默认 4 个 handler。扩大既有 topic 分区不可回退，且会改变 key 到分区的映射，生产环境应在索引积压清空后由运维显式执行；本地未启用 Kafka 时不受该分区数影响，由 PostgreSQL local worker 线程池并发领取。
+本地 PowerShell 示例：
+
+```powershell
+$env:SOCIALDATAX_API_KEY='<从 SocialDataX 获取的密钥>'
+conda run -n learning-evidence-rag python -B ai-python/run.py
+```
 
 ## 错误契约
 
 | 场景 | 中文错误或终态 |
 | --- | --- |
 | 未确认内容处理权 | `请先确认你有权处理该视频内容` |
-| 批量原文没有 HTTP(S) URL | `未识别到 HTTP(S) 视频链接` |
-| 抖音链接 | `抖音链接暂不支持：平台要求动态 Cookie 和挑战签名，本系统不绕过访问限制` |
+| 未提取到 URL | `未识别到 HTTP(S) 视频链接` |
+| HTTP、非默认端口、非白名单域名 | `当前仅支持 Bilibili 或抖音 HTTPS 公公开视频链接` |
 | Bilibili 短链接 | `请粘贴展开后的 Bilibili 完整视频链接` |
-| 任意其他 URL / HTTP / 非默认端口 | `当前仅支持 Bilibili 完整公开视频链接` |
-| 直播、超时长、超大小 | 资料进入 `FAILED`，错误信息使用受控中文摘要 |
-| 单次远程资源获取超过总墙钟时限 | 提示 `Bilibili 视频处理超过任务总时限`，按瞬时故障进入耐久重试，耗尽重试后进入 `FAILED` |
-| 平台提示请求频率超限 | 提示 `Bilibili 视频下载暂时失败`，进入耐久重试 |
-| DRM、未知时长或真实媒体时长无法校验 | 资料进入 `FAILED`，不进入 ASR/OCR |
-| 登录、会员、付费、删除或地区限制 | 资料进入 `FAILED`，提示 `Bilibili 视频无法公开访问` |
-| yt-dlp 或 FFmpeg 未安装 | 资料进入 `FAILED`，提示服务端远程视频组件不可用 |
+| 抖音非视频作品 | `当前抖音接入仅支持视频作品页或 v.douyin.com 视频短链接` |
+| 未配置抖音密钥 | `未配置 SOCIALDATAX_API_KEY，暂时无法接入抖音视频` |
+| 抖音 MCP 鉴权失败 | `抖音 MCP 鉴权失败，请检查 SOCIALDATAX_API_KEY` |
+| 抖音限流/网络/5xx | 受控提示后进入耐久重试 |
+| 抖音无语音或资源失效 | 资料进入 `FAILED`，不创建空索引 |
+| Bilibili 下载、时长、DRM 或组件失败 | 沿用既有受控错误和重试分类 |
 
-## 前端影响
+## 前端行为
 
-- 工作台“多模态数据接入通道”和“学习资料”页新增公开视频链接输入。
-- 输入改为多行文本框，支持一行一个 URL 或整段分享文案；前端显示识别、重复、排队和失败的逐条状态，不限制批次只能包含 2 条。
-- 新增批量 API 客户端类型与 `POST /api/rag/materials/url/batch` 调用；批量响应只触发一次 `MATERIAL_UPLOADED_EVENT` 刷新资料列表。
-- 提交成功后复用现有资料进度轮询和 `MATERIAL_UPLOADED_EVENT`，不新增第二套状态机。
-- 页面明确展示 Bilibili 可用、抖音暂不支持；不提供 Cookie 上传或登录态导入入口。
-- 视频 evidence 使用规范化 Bilibili 页面 URL，并通过 `t` 参数跳到命中的秒点；不会把平台网页 URL 交给站内 HTML5 播放器。
+- 工作台和学习资料页复用同一批量链接入口。
+- 本地预检规则与后端一致，显示可接入、重复和不支持数量。
+- 平台标识同时展示 Bilibili 和“抖音语音 RAG”。
+- 页面明确说明抖音当前不包含画面 OCR，避免把文本 RAG 误认为完整多模态解析。
+- 提交后复用现有资料进度轮询和 `MATERIAL_UPLOADED_EVENT`，不增加第二套状态机。
 
-## Java/Python 集成说明
+## Java/Python 边界
 
-当前仓库的公开控制面由 Python FastAPI 承载，批量接口不在 HTTP 请求中执行下载、ASR、OCR 或 embedding。若后续恢复 Java 业务壳，Java 只需透传本节请求/响应并注入认证用户；Python 继续通过 PostgreSQL durable job、Kafka 或 local worker 负责排队和受控线程并发。阻塞式 `yt-dlp`/FFmpeg 调用运行在 Worker 线程池中，不占用 FastAPI 事件循环。
+公开控制面仍由 Python FastAPI 承载。若恢复 Java 业务壳，Java 只透传请求、用户身份与统一 `Result`，不调用 MCP、不下载视频，也不实现转写、切块或检索逻辑。MCP、RAG 和 evidence 处理继续由 Python worker 负责。

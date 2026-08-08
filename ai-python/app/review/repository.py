@@ -114,6 +114,7 @@ class ReviewCardRecord:
     active: bool
     created_at: datetime | None
     updated_at: datetime | None
+    source_key: str = ""
     material_summary: str | None = None
     folder_id: int | None = None
     folder_name: str | None = None
@@ -162,6 +163,15 @@ class ReviewTransaction(Protocol):
         material: MaterialSourceRecord,
         cards: list[ReviewCardDraft],
     ) -> list[ReviewCardRecord]: ...
+
+    def replace_active_cards_for_material(
+        self,
+        material: MaterialSourceRecord,
+        original_card_ids: list[int],
+        cards: list[ReviewCardDraft],
+        *,
+        summary: str | None = None,
+    ) -> list[ReviewCardRecord] | None: ...
 
     def save_generation(
         self,
@@ -213,6 +223,13 @@ class ReviewTransaction(Protocol):
         folder_id: int | None,
     ) -> list[int] | None: ...
 
+    def reorder_review_folder_materials(
+        self,
+        folder_id: int,
+        user_id: str,
+        material_ids: list[int],
+    ) -> list[int] | None: ...
+
     def list_review_materials_in_folder(
         self,
         folder_id: int,
@@ -221,6 +238,8 @@ class ReviewTransaction(Protocol):
     ) -> list[ReviewMaterialRecord]: ...
 
     def list_review_cards_in_folder(self, folder_id: int, user_id: str) -> list[ReviewCardRecord]: ...
+
+    def list_all_active_cards(self, user_id: str) -> list[ReviewCardRecord]: ...
 
     def find_review_material(self, material_id: int, user_id: str) -> ReviewMaterialRecord | None: ...
 
@@ -283,6 +302,17 @@ class ReviewTransaction(Protocol):
     def find_card(self, card_id: int, user_id: str) -> ReviewCardRecord | None: ...
 
     def find_card_for_update(self, card_id: int, user_id: str) -> ReviewCardRecord | None: ...
+
+    def update_card_content(
+        self,
+        card_id: int,
+        user_id: str,
+        *,
+        question: str,
+        answer: str,
+        hint: str | None,
+        evidence_refs_json: str | None = None,
+    ) -> ReviewCardRecord | None: ...
 
     def save_grade(
         self,
@@ -413,6 +443,144 @@ class DatabaseReviewTransaction:
                 "WHERE c.material_id = %s AND c.user_id = %s AND lm.user_id = %s AND c.active = TRUE ORDER BY c.id ASC"
             ),
             (material_id, user_id, user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def replace_active_cards_for_material(
+        self,
+        material: MaterialSourceRecord,
+        original_card_ids: list[int],
+        cards: list[ReviewCardDraft],
+        *,
+        summary: str | None = None,
+    ) -> list[ReviewCardRecord] | None:
+        """在资料锁内停用旧卡片并原子插入用户确认的新卡片。"""
+        if not cards or not original_card_ids:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.index_request_version,
+                       rm.id AS review_material_id,
+                       rm.status AS review_status
+                FROM {schema}.learning_material lm
+                JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = lm.id AND rm.user_id = lm.user_id
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm, rm
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        current = self._cursor.fetchone()
+        if current is None or int(current.get("index_request_version") or 0) != material.index_request_version:
+            return None
+        if str(current.get("review_status") or "") != "GENERATED":
+            return None
+        review_material_id = int(current["review_material_id"])
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT id, source_key
+                FROM {schema}.learning_review_card
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                ORDER BY id ASC
+                FOR UPDATE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        old_rows = self._cursor.fetchall()
+        old_ids = [int(row["id"]) for row in old_rows]
+        if old_ids != sorted(set(original_card_ids)):
+            return None
+        for row in old_rows:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_card_exclusion (
+                        original_card_id, material_id, user_id, source_key
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                (int(row["id"]), material.id, material.user_id, str(row["source_key"])),
+            )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_card
+                SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        inserted_ids: list[int] = []
+        for card in cards:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_card (
+                        review_material_id, material_id, user_id, source_key,
+                        question, answer, hint, evidence_refs, fsrs_card_json,
+                        due_at, retrievability, review_count, lapse_count, active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 0, 0, 0, TRUE)
+                    ON CONFLICT (material_id, source_key) DO UPDATE SET
+                        review_material_id = EXCLUDED.review_material_id,
+                        question = EXCLUDED.question,
+                        answer = EXCLUDED.answer,
+                        hint = EXCLUDED.hint,
+                        evidence_refs = EXCLUDED.evidence_refs,
+                        active = TRUE,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING id
+                    """
+                ),
+                (
+                    review_material_id,
+                    material.id,
+                    material.user_id,
+                    card.source_key,
+                    card.question,
+                    card.answer,
+                    card.hint,
+                    card.evidence_refs_json,
+                    card.fsrs_card_json,
+                    card.due_at,
+                ),
+            )
+            inserted = self._cursor.fetchone()
+            if inserted is not None:
+                inserted_ids.append(int(inserted["id"]))
+        summary_clause = "" if summary is None else ", summary = %s"
+        update_params: list[Any] = [material.id, material.user_id]
+        if summary is not None:
+            update_params.append(summary)
+        update_params.extend([review_material_id, material.user_id])
+        self._cursor.execute(
+            self._statement(
+                f"""
+                UPDATE {{schema}}.learning_review_material
+                SET card_count = (
+                    SELECT COUNT(1)
+                    FROM {{schema}}.learning_review_card c
+                    WHERE c.material_id = %s AND c.user_id = %s AND c.active = TRUE
+                ), updated_at = CURRENT_TIMESTAMP{summary_clause}
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            tuple(update_params),
+        )
+        if not inserted_ids:
+            return []
+        self._cursor.execute(
+            self._card_select(
+                "WHERE c.id = ANY(%s::BIGINT[]) AND c.user_id = %s AND lm.user_id = %s ORDER BY c.id ASC"
+            ),
+            (inserted_ids, material.user_id, material.user_id),
         )
         return [self._to_card(row) for row in self._cursor.fetchall()]
 
@@ -730,6 +898,8 @@ class DatabaseReviewTransaction:
                 UPDATE {schema}.learning_review_card
                 SET active = FALSE, updated_at = CURRENT_TIMESTAMP
                 WHERE material_id = %s AND user_id = %s
+                  AND source_key NOT LIKE 'manual:%%'
+                  AND source_key NOT LIKE 'custom:%%'
                 """
             ),
             (material.id, material.user_id),
@@ -790,10 +960,17 @@ class DatabaseReviewTransaction:
         return record
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]:
-        """展示资料当前索引版本及其复习同步状态。"""
+        """先读取未归档资料，再按资料 ID 批量读取复习状态，避免资料列表多表联查。"""
         self._cursor.execute(
-            self._review_material_select(
+            self._statement(
                 """
+                SELECT lm.id AS material_id,
+                       lm.title,
+                       lm.document_type,
+                       lm.status AS material_status,
+                       lm.index_request_version,
+                       lm.updated_at AS material_updated_at
+                FROM {schema}.learning_material lm
                 WHERE lm.user_id = %s
                   AND NOT EXISTS (
                       SELECT 1
@@ -813,7 +990,12 @@ class DatabaseReviewTransaction:
             ),
             (user_id, limit),
         )
-        return [self._to_review_material(row) for row in self._cursor.fetchall()]
+        base_rows = self._cursor.fetchall()
+        if not base_rows:
+            return []
+        material_ids = [int(row["material_id"]) for row in base_rows]
+        review_rows = self._load_review_material_states(user_id, material_ids)
+        return self._merge_review_material_rows(base_rows, review_rows)
 
     def list_review_folders(self, user_id: str, *, now: datetime) -> list[ReviewFolderRecord]:
         """按最近更新顺序读取当前用户文件夹及实时卡片统计。"""
@@ -986,13 +1168,19 @@ class DatabaseReviewTransaction:
                 self._statement(
                     """
                     INSERT INTO {schema}.learning_review_folder_material (
-                        material_id, folder_id, user_id
+                        material_id, folder_id, user_id, display_order
                     )
-                    SELECT material_id, %s, %s
-                    FROM UNNEST(%s::BIGINT[]) AS selected(material_id)
+                    SELECT selected.material_id, %s, %s,
+                           next_position.position + selected.ordinality - 1
+                    FROM UNNEST(%s::BIGINT[]) WITH ORDINALITY AS selected(material_id, ordinality)
+                    CROSS JOIN (
+                        SELECT COALESCE(MAX(display_order), -1) AS position
+                        FROM {schema}.learning_review_folder_material
+                        WHERE folder_id = %s AND user_id = %s
+                    ) next_position
                     """
                 ),
-                (folder_id, user_id, material_ids),
+                (folder_id, user_id, material_ids, folder_id, user_id),
             )
             self._cursor.execute(
                 self._statement(
@@ -1006,32 +1194,140 @@ class DatabaseReviewTransaction:
             )
         return list(material_ids)
 
+    def reorder_review_folder_materials(
+        self,
+        folder_id: int,
+        user_id: str,
+        material_ids: list[int],
+    ) -> list[int] | None:
+        """锁定文件夹内归属后原子保存文档顺序，任一越权资料都会失败。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT id
+                FROM {schema}.learning_review_folder
+                WHERE id = %s AND user_id = %s
+                FOR UPDATE
+                """
+            ),
+            (folder_id, user_id),
+        )
+        if self._cursor.fetchone() is None:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT folder_material.material_id
+                FROM {schema}.learning_review_folder_material folder_material
+                WHERE folder_material.folder_id = %s
+                  AND folder_material.user_id = %s
+                ORDER BY folder_material.display_order ASC NULLS LAST,
+                         folder_material.material_id ASC
+                FOR UPDATE
+                """
+            ),
+            (folder_id, user_id),
+        )
+        stable_ids = [int(row["material_id"]) for row in self._cursor.fetchall()]
+        if not set(material_ids).issubset(set(stable_ids)):
+            return None
+        requested_set = set(material_ids)
+        complete_order = [
+            *material_ids,
+            *(material_id for material_id in stable_ids if material_id not in requested_set),
+        ]
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_folder_material target
+                SET display_order = ordered.position,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT material_id, CAST(ordinality - 1 AS INTEGER) AS position
+                    FROM UNNEST(%s::BIGINT[]) WITH ORDINALITY AS values_with_order(material_id, ordinality)
+                ) ordered
+                WHERE target.material_id = ordered.material_id
+                  AND target.folder_id = %s
+                  AND target.user_id = %s
+                  AND target.display_order IS DISTINCT FROM ordered.position
+                """
+            ),
+            (complete_order, folder_id, user_id),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_folder
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (folder_id, user_id),
+        )
+        return list(complete_order)
+
     def list_review_materials_in_folder(
         self,
         folder_id: int,
         user_id: str,
         limit: int = 100,
     ) -> list[ReviewMaterialRecord]:
-        """按归档更新时间读取文件夹中的文档。"""
+        """先读取文件夹关联顺序，再按资料 ID 批量读取资料与复习状态。"""
         self._cursor.execute(
-            self._review_material_select(
+            self._statement(
                 """
-                WHERE review_folder_material.folder_id = %s
-                  AND review_folder_material.user_id = %s
-                  AND lm.user_id = %s
+                SELECT material_id, display_order
+                FROM {schema}.learning_review_folder_material folder_material
+                WHERE folder_material.folder_id = %s AND folder_material.user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = folder_material.material_id
+                        AND excluded_material.user_id = folder_material.user_id
+                  )
+                ORDER BY folder_material.display_order ASC NULLS LAST, folder_material.material_id ASC
+                LIMIT %s
+                """
+            ),
+            (folder_id, user_id, limit),
+        )
+        folder_rows = self._cursor.fetchall()
+        if not folder_rows:
+            return []
+        material_ids = [int(row["material_id"]) for row in folder_rows]
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.id AS material_id,
+                       lm.title,
+                       lm.document_type,
+                       lm.status AS material_status,
+                       lm.index_request_version,
+                       lm.updated_at AS material_updated_at
+                FROM {schema}.learning_material lm
+                WHERE lm.user_id = %s
+                  AND lm.id = ANY(%s::BIGINT[])
                   AND NOT EXISTS (
                       SELECT 1
                       FROM {schema}.learning_review_material_exclusion excluded_material
                       WHERE excluded_material.material_id = lm.id
                         AND excluded_material.user_id = lm.user_id
                   )
-                ORDER BY review_folder_material.updated_at DESC, lm.id DESC
-                LIMIT %s
                 """
             ),
-            (folder_id, user_id, user_id, limit),
+            (user_id, material_ids),
         )
-        return [self._to_review_material(row) for row in self._cursor.fetchall()]
+        base_rows = self._cursor.fetchall()
+        if not base_rows:
+            return []
+        review_rows = self._load_review_material_states(user_id, material_ids)
+        folder_order = {int(row["material_id"]): index for index, row in enumerate(folder_rows)}
+        merged = self._merge_review_material_rows(
+            base_rows,
+            review_rows,
+            folder_id=folder_id,
+        )
+        return sorted(merged, key=lambda item: folder_order.get(item.material_id, len(folder_order)))[:limit]
 
     def list_review_cards_in_folder(self, folder_id: int, user_id: str) -> list[ReviewCardRecord]:
         """读取文件夹内全部活动卡片，不应用今日到期或每日额度过滤。"""
@@ -1045,10 +1341,27 @@ class DatabaseReviewTransaction:
                   AND c.user_id = %s
                   AND lm.user_id = %s
                   AND c.active = TRUE
-                ORDER BY review_folder_material.updated_at DESC, c.material_id DESC, c.id ASC
+                ORDER BY review_folder_material.display_order ASC NULLS LAST, c.material_id ASC, c.id ASC
                 """
             ),
             (folder_id, user_id, user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def list_all_active_cards(self, user_id: str) -> list[ReviewCardRecord]:
+        """读取当前用户所有活动卡片，不应用到期、文件夹或已复习过滤。"""
+        self._cursor.execute(
+            self._card_select(
+                """
+                WHERE c.user_id = %s
+                  AND lm.user_id = %s
+                  AND c.active = TRUE
+                ORDER BY folder_material.folder_id ASC NULLS FIRST,
+                         c.material_id ASC,
+                         c.id ASC
+                """
+            ),
+            (user_id, user_id),
         )
         return [self._to_card(row) for row in self._cursor.fetchall()]
 
@@ -1344,8 +1657,8 @@ class DatabaseReviewTransaction:
                 """
                 SELECT c.*, lm.title AS material_title, lm.document_type,
                        rm.summary AS material_summary,
-                       folder_material.folder_id,
-                       folder.name AS folder_name,
+                       NULL::BIGINT AS folder_id,
+                       NULL::VARCHAR AS folder_name,
                        MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                 FROM {schema}.learning_review_card c
                 JOIN {schema}.learning_material lm ON lm.id = c.material_id
@@ -1354,17 +1667,16 @@ class DatabaseReviewTransaction:
                  AND rm.user_id = c.user_id
                  AND rm.status = 'GENERATED'
                  AND rm.index_request_version = lm.index_request_version
-                LEFT JOIN {schema}.learning_review_folder_material folder_material
-                  ON folder_material.material_id = c.material_id
-                 AND folder_material.user_id = c.user_id
-                LEFT JOIN {schema}.learning_review_folder folder
-                  ON folder.id = folder_material.folder_id
-                 AND folder.user_id = c.user_id
                 WHERE c.user_id = %s
                   AND lm.user_id = %s
                   AND c.active = TRUE
                   AND c.due_at <= %s
-                  AND folder_material.material_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_folder_material folder_material
+                      WHERE folder_material.material_id = c.material_id
+                        AND folder_material.user_id = c.user_id
+                  )
                 ORDER BY group_due_at ASC, c.material_id ASC, c.due_at ASC, c.id ASC
                 LIMIT %s
                 """
@@ -1397,9 +1709,13 @@ class DatabaseReviewTransaction:
                     SELECT c.*, lm.title AS material_title, lm.document_type,
                            rm.summary AS material_summary,
                            rm.display_order AS material_display_order,
-                           folder_material.folder_id,
-                           folder.name AS folder_name,
-                           (reviewed_materials.material_id IS NOT NULL) AS started_today,
+                           NULL::BIGINT AS folder_id,
+                           NULL::VARCHAR AS folder_name,
+                           EXISTS (
+                               SELECT 1
+                               FROM reviewed_materials
+                               WHERE reviewed_materials.material_id = c.material_id
+                           ) AS started_today,
                            MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at
                     FROM {schema}.learning_review_card c
                     JOIN {schema}.learning_material lm ON lm.id = c.material_id
@@ -1408,19 +1724,16 @@ class DatabaseReviewTransaction:
                      AND rm.user_id = c.user_id
                      AND rm.status = 'GENERATED'
                      AND rm.index_request_version = lm.index_request_version
-                    LEFT JOIN reviewed_materials
-                        ON reviewed_materials.material_id = c.material_id
-                    LEFT JOIN {schema}.learning_review_folder_material folder_material
-                      ON folder_material.material_id = c.material_id
-                     AND folder_material.user_id = c.user_id
-                    LEFT JOIN {schema}.learning_review_folder folder
-                      ON folder.id = folder_material.folder_id
-                     AND folder.user_id = c.user_id
                     WHERE c.user_id = %s
                       AND lm.user_id = %s
                       AND c.active = TRUE
                       AND c.due_at <= %s
-                      AND folder_material.material_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.learning_review_folder_material folder_material
+                          WHERE folder_material.material_id = c.material_id
+                            AND folder_material.user_id = c.user_id
+                      )
                 ),
                 due_materials AS (
                     SELECT material_id,
@@ -1582,6 +1895,44 @@ class DatabaseReviewTransaction:
         row = self._cursor.fetchone()
         return self._to_card(row) if row else None
 
+    def update_card_content(
+        self,
+        card_id: int,
+        user_id: str,
+        *,
+        question: str,
+        answer: str,
+        hint: str | None,
+        evidence_refs_json: str | None = None,
+    ) -> ReviewCardRecord | None:
+        """更新用户卡片正文并保留 FSRS 状态；模型卡转为用户自定义来源键。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_card c
+                SET question = %s,
+                    answer = %s,
+                    hint = %s,
+                    evidence_refs = COALESCE(%s::jsonb, c.evidence_refs),
+                    source_key = CASE
+                        WHEN c.source_key LIKE 'manual:%%' OR c.source_key LIKE 'custom:%%' THEN c.source_key
+                        ELSE 'custom:' || c.id::TEXT
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM {schema}.learning_material lm
+                WHERE c.id = %s
+                  AND c.user_id = %s
+                  AND c.active = TRUE
+                  AND lm.id = c.material_id
+                  AND lm.user_id = %s
+                """
+            ),
+            (question, answer, hint, evidence_refs_json, card_id, user_id, user_id),
+        )
+        if self._cursor.rowcount != 1:
+            return None
+        return self.find_card(card_id, user_id)
+
     def save_grade(
         self,
         card: ReviewCardRecord,
@@ -1667,6 +2018,77 @@ class DatabaseReviewTransaction:
         )
         row = self._cursor.fetchone()
         return self._to_review_material(row) if row else None
+
+    def _load_review_material_states(self, user_id: str, material_ids: list[int]) -> list[dict[str, Any]]:
+        """按资料 ID 批量读取复习状态，避免把资料基础表和状态表联表扫描。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT material_id,
+                       index_request_version AS synced_index_request_version,
+                       is_learning_content,
+                       category,
+                       status AS review_status,
+                       reason,
+                       card_count,
+                       extractor,
+                       summary AS material_summary,
+                       generation_attempts,
+                       quality_feedback,
+                       generation_progress,
+                       updated_at AS review_updated_at
+                FROM {schema}.learning_review_material
+                WHERE user_id = %s
+                  AND material_id = ANY(%s::BIGINT[])
+                """
+            ),
+            (user_id, material_ids),
+        )
+        return list(self._cursor.fetchall())
+
+    def _merge_review_material_rows(
+        self,
+        base_rows: list[dict[str, Any]],
+        review_rows: list[dict[str, Any]],
+        *,
+        folder_id: int | None = None,
+    ) -> list[ReviewMaterialRecord]:
+        """在后端合并资料基础信息与复习状态，保持旧接口的版本语义。"""
+        review_by_material = {int(row["material_id"]): row for row in review_rows}
+        merged_rows: list[dict[str, Any]] = []
+        for base in base_rows:
+            material_id = int(base["material_id"])
+            review = review_by_material.get(material_id)
+            current_version = int(base.get("index_request_version") or 0)
+            synced_version = int(review["synced_index_request_version"]) if review and review.get("synced_index_request_version") is not None else None
+            is_current = review is not None and synced_version == current_version
+            merged_rows.append(
+                {
+                    "material_id": material_id,
+                    "title": base["title"],
+                    "document_type": base["document_type"],
+                    "material_status": base["material_status"],
+                    "index_request_version": current_version,
+                    "synced_index_request_version": synced_version,
+                    "is_learning_content": review.get("is_learning_content") if is_current and review else None,
+                    "category": review.get("category") if is_current and review else None,
+                    "review_status": str(review.get("review_status") or "PENDING") if is_current and review else "PENDING",
+                    "reason": (
+                        review.get("reason") if is_current and review else
+                        "资料内容已更新，等待生成当前索引版本的复习卡片" if review else None
+                    ),
+                    "card_count": int(review.get("card_count") or 0) if is_current and review and review.get("review_status") == "GENERATED" else 0,
+                    "extractor": review.get("extractor") if review else None,
+                    "material_summary": review.get("material_summary") if is_current and review else None,
+                    "folder_id": folder_id,
+                    "folder_name": None,
+                    "generation_attempts": int(review.get("generation_attempts") or 0) if is_current and review else 0,
+                    "quality_feedback": review.get("quality_feedback") if is_current and review else [],
+                    "generation_progress": review.get("generation_progress") if is_current and review else {},
+                    "review_updated_at": review.get("review_updated_at") if review else base.get("material_updated_at"),
+                }
+            )
+        return [self._to_review_material(row) for row in merged_rows]
 
     def _review_material_select(self, suffix: str) -> Any:
         """构造资料列表的统一 SELECT。"""
@@ -1916,6 +2338,7 @@ class DatabaseReviewTransaction:
             active=bool(row.get("active")),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
+            source_key=str(row.get("source_key") or ""),
             material_summary=row.get("material_summary"),
             folder_id=(int(row["folder_id"]) if row.get("folder_id") is not None else None),
             folder_name=row.get("folder_name"),

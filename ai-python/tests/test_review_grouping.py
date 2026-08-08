@@ -139,8 +139,8 @@ def test_selected_document_returns_all_six_due_cards_without_group_truncation() 
     assert len(result.groups[0].cards) == 6
 
 
-def test_due_card_query_maps_deepseek_review_summary() -> None:
-    """数据库到期队列只联结当前已生成的 DeepSeek 复习摘要。"""
+def test_due_card_query_maps_generated_review_summary() -> None:
+    """数据库到期队列只联结当前已生成的复习模型摘要。"""
     class DueCursor:
         """返回一张带资料摘要的数据库卡片行。"""
 
@@ -155,9 +155,9 @@ def test_due_card_query_maps_deepseek_review_summary() -> None:
                     "material_id": 12,
                     "user_id": "7",
                     "material_title": "Kafka 高可用",
-                    "material_summary": "DeepSeek 复习总结",
-                    "folder_id": 7,
-                    "folder_name": "消息中间件",
+                    "material_summary": "复习模型总结",
+                        "folder_id": None,
+                        "folder_name": None,
                     "document_type": "pdf",
                     "question": "ISR 有什么作用？",
                     "answer": "ISR 跟踪同步副本。",
@@ -172,13 +172,13 @@ def test_due_card_query_maps_deepseek_review_summary() -> None:
 
     records = transaction.list_due_cards("7", now=NOW, limit=20)
 
-    assert records[0].material_summary == "DeepSeek 复习总结"
-    assert records[0].folder_id == 7
-    assert records[0].folder_name == "消息中间件"
+    assert records[0].material_summary == "复习模型总结"
+    assert records[0].folder_id is None
+    assert records[0].folder_name is None
     assert "rm.summary AS material_summary" in cursor.statement
-    assert "folder_material.folder_id" in cursor.statement
+    assert "NULL::BIGINT AS folder_id" in cursor.statement
     assert "rm.status = 'GENERATED'" in cursor.statement
-    assert "folder_material.material_id IS NULL" in cursor.statement
+    assert "NOT EXISTS" in cursor.statement
     assert "lm.document_summary" not in cursor.statement
     assert "display_order" not in cursor.statement
 
@@ -210,10 +210,10 @@ def test_due_group_query_applies_material_order_without_changing_card_rank() -> 
     ) == []
     normalized_sql = " ".join(cursor.statement.split())
     assert "rm.display_order AS material_display_order" in normalized_sql
-    assert "LEFT JOIN {schema}.learning_review_folder_material folder_material" in normalized_sql
-    assert "folder_material.folder_id" in normalized_sql
-    assert "folder.name AS folder_name" in normalized_sql
-    assert "folder_material.material_id IS NULL" in normalized_sql
+    assert "LEFT JOIN {schema}.learning_review_folder_material folder_material" not in normalized_sql
+    assert "NULL::BIGINT AS folder_id" in normalized_sql
+    assert "NULL::VARCHAR AS folder_name" in normalized_sql
+    assert "NOT EXISTS" in normalized_sql
     assert "ORDER BY due_cards.material_display_order ASC NULLS LAST" in normalized_sql
     assert "MIN(c.due_at) OVER (PARTITION BY c.material_id) AS group_due_at" in normalized_sql
     assert "material_rank <= 4" not in normalized_sql

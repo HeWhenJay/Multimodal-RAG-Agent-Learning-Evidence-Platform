@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import hashlib
 import itertools
 import logging
 import mimetypes
@@ -24,8 +25,16 @@ from app.core.result import BusinessError
 
 logger = logging.getLogger(__name__)
 BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}
-DOUYIN_HOSTS = {"douyin.com", "www.douyin.com", "v.douyin.com", "iesdouyin.com"}
+DOUYIN_HOSTS = {
+    "douyin.com",
+    "www.douyin.com",
+    "v.douyin.com",
+    "iesdouyin.com",
+    "www.iesdouyin.com",
+}
 BILIBILI_VIDEO_PATTERN = re.compile(r"^(?:BV[0-9A-Za-z]{8,20}|av[0-9]+)$", re.IGNORECASE)
+DOUYIN_VIDEO_ID_PATTERN = re.compile(r"^[0-9]{5,32}$")
+DOUYIN_SHORT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,80}$")
 REMOTE_VIDEO_URL_CANDIDATE_PATTERN = re.compile(
     r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+",
     re.IGNORECASE,
@@ -47,6 +56,8 @@ class RemoteVideoUrl:
     @property
     def placeholder_title(self) -> str:
         """在后台元数据尚未获取时生成资料标题。"""
+        if self.platform == "douyin":
+            return f"抖音视频 {self.video_id}"
         page_suffix = f" P{self.page}" if self.page and self.page > 1 else ""
         return f"Bilibili 视频 {self.video_id}{page_suffix}"
 
@@ -157,7 +168,7 @@ class RemoteVideoTaskDeadline:
 
 
 def validate_remote_video_url(value: str) -> RemoteVideoUrl:
-    """仅接受 Bilibili 完整公开视频 URL，拒绝任意网络目标。"""
+    """仅接受白名单内的 Bilibili 或抖音公开视频 URL。"""
     raw = str(value or "").strip()
     if not raw:
         raise BusinessError("视频链接不能为空")
@@ -167,20 +178,21 @@ def validate_remote_video_url(value: str) -> RemoteVideoUrl:
         parsed = urlsplit(raw)
         port = parsed.port
     except ValueError as exc:
-        raise BusinessError("当前仅支持 Bilibili 完整公开视频链接") from exc
+        raise BusinessError("当前仅支持 Bilibili 或抖音公开视频链接") from exc
     host = (parsed.hostname or "").rstrip(".").lower()
-    if host in DOUYIN_HOSTS:
-        raise BusinessError("抖音链接暂不支持：平台要求动态 Cookie 和挑战签名，本系统不绕过访问限制")
     if host == "b23.tv" or host.endswith(".b23.tv"):
         raise BusinessError("请粘贴展开后的 Bilibili 完整视频链接")
     if (
         parsed.scheme.lower() != "https"
-        or host not in BILIBILI_HOSTS
         or parsed.username is not None
         or parsed.password is not None
         or port not in {None, 443}
     ):
-        raise BusinessError("当前仅支持 Bilibili 完整公开视频链接")
+        raise BusinessError("当前仅支持 Bilibili 或抖音 HTTPS 公公开视频链接")
+    if host in DOUYIN_HOSTS:
+        return validate_douyin_video_url(parsed, host)
+    if host not in BILIBILI_HOSTS:
+        raise BusinessError("当前仅支持 Bilibili 或抖音公开视频链接")
     path_parts = [part for part in parsed.path.split("/") if part]
     if len(path_parts) != 2 or path_parts[0].lower() != "video" or not BILIBILI_VIDEO_PATTERN.fullmatch(path_parts[1]):
         raise BusinessError("当前仅支持 Bilibili 完整公开视频链接")
@@ -189,6 +201,30 @@ def validate_remote_video_url(value: str) -> RemoteVideoUrl:
     query = urlencode({"p": page}) if page and page > 1 else ""
     canonical = urlunsplit(("https", "www.bilibili.com", f"/video/{video_id}", query, ""))
     return RemoteVideoUrl("bilibili", canonical, video_id, page)
+
+
+def validate_douyin_video_url(parsed: Any, host: str) -> RemoteVideoUrl:
+    """规范化抖音视频页和 v.douyin.com 短链接，不在 API 进程跟随重定向。"""
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if host == "v.douyin.com":
+        if len(path_parts) != 1 or not DOUYIN_SHORT_CODE_PATTERN.fullmatch(path_parts[0]):
+            raise BusinessError("请粘贴有效的 v.douyin.com 视频短链接")
+        canonical = f"https://v.douyin.com/{path_parts[0]}/"
+        short_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+        return RemoteVideoUrl("douyin", canonical, f"DYSHORT{short_id}", None)
+
+    video_id: str | None = None
+    if len(path_parts) == 2 and path_parts[0].lower() == "video":
+        video_id = path_parts[1]
+    elif len(path_parts) == 3 and path_parts[0].lower() == "share" and path_parts[1].lower() == "video":
+        video_id = path_parts[2]
+    else:
+        modal_ids = parse_qs(parsed.query).get("modal_id", [])
+        video_id = next((item for item in modal_ids if DOUYIN_VIDEO_ID_PATTERN.fullmatch(item)), None)
+    if not video_id or not DOUYIN_VIDEO_ID_PATTERN.fullmatch(video_id):
+        raise BusinessError("当前抖音接入仅支持视频作品页或 v.douyin.com 视频短链接")
+    canonical = f"https://www.douyin.com/video/{video_id}"
+    return RemoteVideoUrl("douyin", canonical, video_id, None)
 
 
 def extract_remote_video_urls(text: str) -> list[ExtractedRemoteVideoUrl]:

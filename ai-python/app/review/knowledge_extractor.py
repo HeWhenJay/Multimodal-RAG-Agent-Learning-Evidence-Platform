@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
+from math import ceil
 import os
 import re
 import time
@@ -13,6 +14,7 @@ from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
 from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.generation_graph import (
     ProgressCallback,
     ReviewManualReviewRequired,
@@ -29,9 +31,12 @@ from prompts.review import (
 
 
 logger = logging.getLogger(__name__)
-REVIEW_LLM_MODEL = "deepseek-v4-flash"
+REVIEW_LLM_MODEL = "gpt-5.6-terra"
 REVIEW_LLM_REASONING_EFFORT = "max"
-REVIEW_LLM_BASE_URL = "https://api.deepseek.com"
+REVIEW_LLM_BASE_URL = "http://localhost:58966/v1"
+REVIEW_LLM_THINKING_ENABLED = True
+REVIEW_LLM_FALLBACK_MODEL = "deepseek-v4-flash"
+REVIEW_LLM_FALLBACK_BASE_URL = "https://api.deepseek.com"
 TIMECODE_TOKEN_PATTERN = r"\d{1,2}:\d{2}(?::\d{2})?(?:[,.]\d{1,3})?"
 TIMECODE_RANGE_PATTERN = (
     rf"\s*[\[(]?{TIMECODE_TOKEN_PATTERN}"
@@ -64,6 +69,10 @@ STRUCTURED_EVIDENCE_LIMIT = 48
 CURATED_EVIDENCE_LIMIT = 64
 SOURCE_QUESTION_LIMIT = 64
 REVIEW_RESPONSE_PARSE_ATTEMPTS = 3
+SPEECH_QUESTION_MARKER_PATTERN = re.compile(
+    r"(?:嗯|啊|呃|哎|就是|可能|然后|还有|这时候|他会问|面试官|"
+    r"第[一二三四五六七八九十百千万0-9]+个)"
+)
 
 
 @dataclass(frozen=True)
@@ -101,8 +110,18 @@ class ExtractionResult:
     quality_feedback: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ReviewLlmEndpoint:
+    """一条复习模型调用端点及其面向用户的模型标识。"""
+
+    api_key: str
+    model: str
+    base_url: str
+    display_name: str
+
+
 class ReviewExtractionError(RuntimeError):
-    """DeepSeek 复习内容未能生成或未通过质量门禁。"""
+    """复习模型内容未能生成或未通过质量门禁。"""
 
     def __init__(self, message: str, *, diagnostics: list[str] | tuple[str, ...] | None = None) -> None:
         super().__init__(message)
@@ -110,7 +129,7 @@ class ReviewExtractionError(RuntimeError):
 
 
 class KnowledgePointExtractor:
-    """只使用 DeepSeek 生成复习内容，本地代码仅清洗和拒绝坏结果。"""
+    """只使用复习模型生成内容，本地代码仅清洗和拒绝坏结果。"""
 
     def __init__(
         self,
@@ -119,15 +138,11 @@ class KnowledgePointExtractor:
         langextract_enabled: bool | None = None,
         langextract_curator: Any | None = None,
     ) -> None:
-        # 复习模型固定走 DeepSeek 官方入口，避免误继承通用 RAG 或代理配置。
         self.provider = (provider or os.getenv("REVIEW_EXTRACTION_PROVIDER") or "auto").strip().lower()
-        self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
-        self.model = REVIEW_LLM_MODEL
-        self.reasoning_effort = REVIEW_LLM_REASONING_EFFORT
-        self.timeout_seconds = float(os.getenv("REVIEW_EXTRACTION_TIMEOUT_SECONDS", "120"))
-        self.base_url = REVIEW_LLM_BASE_URL
+        self.timeout_seconds = cockpit_retry_policy().request_timeout_seconds
         self._langextract_enabled_override = langextract_enabled
         self._langextract_curator = langextract_curator
+        self._refresh_llm_config()
 
     def extract(
         self,
@@ -137,10 +152,9 @@ class KnowledgePointExtractor:
         user_feedback: str | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> ExtractionResult:
-        """只根据 evidence 运行多轮 DeepSeek 生成图，失败时不发布降级内容。"""
+        """只根据 evidence 运行多轮复习模型生成图，失败时不发布降级内容。"""
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
-        # 每次生成前刷新一次密钥，但仍只允许使用 DEEPSEEK_API_KEY，绝不借用其他供应商配置。
-        self.api_key = read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
+        self._refresh_llm_config()
         cleaned = clean_review_evidences(deduplicate_evidences(evidences))
         if not cleaned:
             return ExtractionResult(
@@ -157,9 +171,9 @@ class KnowledgePointExtractor:
                 False, category, reason, (), f"filter:{REVIEW_CARD_PROMPT_VERSION}", None
             )
         if self.provider not in {"auto", "deepseek"}:
-            raise ReviewExtractionError("复习内容只允许使用 DeepSeek 生成")
+            raise ReviewExtractionError(f"复习内容只允许使用 {self.model} 生成")
         if not self.api_key:
-            raise ReviewExtractionError("未配置 DEEPSEEK_API_KEY，无法生成复习内容")
+            raise ReviewExtractionError("未配置 REVIEW_LLM_API_KEY，无法生成复习内容")
         try:
             source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
             required_questions = required_structured_source_questions(source_questions)
@@ -192,6 +206,7 @@ class KnowledgePointExtractor:
                     quality_feedback=feedback,
                     user_feedback=user_feedback,
                     previous_candidate=previous_candidate,
+                    progress_callback=progress_callback,
                 ),
                 observer=lambda payload, curator_context: self._validate_model_result(
                     material,
@@ -208,6 +223,7 @@ class KnowledgePointExtractor:
                     "maxCards": review_card_limit(source_questions),
                     "hasUserFeedback": bool((user_feedback or "").strip()),
                     "langExtractEnabled": langextract_enabled,
+                    "llmModel": self.model,
                 },
                 on_progress=progress_callback,
             )
@@ -227,17 +243,29 @@ class KnowledgePointExtractor:
         except ReviewExtractionError:
             raise
         except json.JSONDecodeError as exc:
-            logger.warning("DeepSeek 复习内容响应不是合法 JSON")
-            raise ReviewExtractionError("DeepSeek 返回的复习内容格式无效，请重新生成") from exc
+            logger.warning("%s 响应不是合法 JSON", self.active_model_name)
+            raise ReviewExtractionError(f"{self.active_model_name} 返回的复习内容格式无效，请重新生成") from exc
         except Exception as exc:
-            logger.exception("DeepSeek 生成复习内容失败")
-            raise ReviewExtractionError("DeepSeek 复习内容生成失败，请稍后重新生成") from exc
+            logger.exception("%s 生成复习内容失败", self.active_model_name)
+            raise ReviewExtractionError(f"{self.active_model_name} 生成复习内容失败，请稍后重新生成") from exc
 
     def _langextract_is_enabled(self) -> bool:
         """每次生成时读取线上开关，显式构造参数优先用于测试和 A/B 隔离。"""
         if self._langextract_enabled_override is not None:
             return self._langextract_enabled_override
         return read_bool_environment("REVIEW_LANGEXTRACT_ENABLED", True)
+
+    def _refresh_llm_config(self) -> None:
+        """刷新复习模型连接配置，支持启动后注入本机中转密钥。"""
+        self.timeout_seconds = cockpit_retry_policy().request_timeout_seconds
+        self.primary_endpoint = review_llm_primary_endpoint()
+        self.fallback_endpoint = review_llm_deepseek_fallback_endpoint(self.primary_endpoint)
+        self.api_key = self.primary_endpoint.api_key
+        self.model = self.primary_endpoint.model
+        self.reasoning_effort = review_llm_reasoning_effort()
+        self.base_url = self.primary_endpoint.base_url
+        self.thinking_enabled = review_llm_thinking_enabled()
+        self.active_model_name = self.primary_endpoint.display_name
 
     def _curate_material(
         self,
@@ -266,7 +294,9 @@ class KnowledgePointExtractor:
             timeout_seconds=float(os.getenv("REVIEW_LANGEXTRACT_TIMEOUT_SECONDS", str(self.timeout_seconds))),
         )
         result = curator.extract(material.title, evidences)
-        return build_production_curator_context(result)
+        context = build_production_curator_context(result)
+        context["llmModel"] = getattr(curator, "active_model_name", self.model)
+        return context
 
     def _extract_with_model(
         self,
@@ -299,8 +329,9 @@ class KnowledgePointExtractor:
         quality_feedback: list[str] | None = None,
         user_feedback: str | None = None,
         previous_candidate: dict[str, Any] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        """调用 DeepSeek；空响应或非法 JSON 在当前质量轮内短程重试。"""
+        """调用复习模型；空响应或非法 JSON 在当前质量轮内短程重试。"""
         from openai import OpenAI
 
         source_questions = source_questions or extract_source_question_candidates(evidences)
@@ -338,32 +369,42 @@ class KnowledgePointExtractor:
             user_feedback=user_feedback,
             previous_candidate=previous_candidate,
         )
-        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        # 关闭 SDK 隐式重试，由统一 Cockpit 策略记录每次尝试并在耗尽后决定是否降级。
+        client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+            max_retries=0,
+        )
         last_error: Exception | None = None
         for transport_attempt in range(1, REVIEW_RESPONSE_PARSE_ATTEMPTS + 1):
             try:
-                with process_io_limiter.slot(
-                    "review.deepseek",
-                    configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
-                ):
-                    response = client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": review_card_system_prompt()},
-                            {"role": "user", "content": prompt},
-                        ],
-                        reasoning_effort=self.reasoning_effort,
-                        response_format={"type": "json_object"},
-                        extra_body={"thinking": {"type": "enabled"}},
-                        timeout=self.timeout_seconds,
-                    )
+                request: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": review_card_system_prompt()},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "reasoning_effort": self.reasoning_effort,
+                    "response_format": {"type": "json_object"},
+                    "timeout": self.timeout_seconds,
+                }
+                if self.thinking_enabled:
+                    request["extra_body"] = {"thinking": {"type": "enabled"}}
+                response = self._create_completion(
+                    client,
+                    request,
+                    attempt=attempt,
+                    progress_callback=progress_callback,
+                )
                 choices = getattr(response, "choices", None) or []
                 content = choices[0].message.content if choices else ""
                 return parse_json_object(content or "")
             except (json.JSONDecodeError, IndexError, AttributeError, TypeError, ValueError) as exc:
                 last_error = exc
                 logger.warning(
-                    "DeepSeek 复习内容第 %s 轮的响应解析失败，传输重试 %s/%s：%s",
+                    "%s 第 %s 轮的响应解析失败，传输重试 %s/%s：%s",
+                    self.active_model_name,
                     attempt,
                     transport_attempt,
                     REVIEW_RESPONSE_PARSE_ATTEMPTS,
@@ -372,11 +413,102 @@ class KnowledgePointExtractor:
                 if transport_attempt < REVIEW_RESPONSE_PARSE_ATTEMPTS:
                     time.sleep(0.25 * transport_attempt)
         raise ReviewExtractionError(
-            "DeepSeek 连续返回空响应或非法 JSON",
+            f"{self.active_model_name} 连续返回空响应或非法 JSON",
             diagnostics=[
                 f"模型响应连续 {REVIEW_RESPONSE_PARSE_ATTEMPTS} 次为空或不是合法 JSON，下一轮将重新请求完整 JSON 对象"
             ],
         ) from last_error
+
+    def _create_completion(
+        self,
+        client: Any,
+        request: dict[str, Any],
+        *,
+        attempt: int,
+        progress_callback: ProgressCallback | None,
+    ) -> Any:
+        """先按 Cockpit 长等待策略重试，尝试耗尽后才降级 DeepSeek。"""
+        from openai import OpenAI, OpenAIError
+
+        try:
+            def request_primary() -> Any:
+                with process_io_limiter.slot(
+                    "review.llm",
+                    configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
+                ):
+                    return client.chat.completions.create(**request)
+
+            def report_cockpit_retry(
+                error: Exception,
+                next_attempt: int,
+                max_attempts: int,
+                delay: float,
+            ) -> None:
+                emit_progress(
+                    progress_callback,
+                    stageCode="review.actor",
+                    stageLabel="Cockpit 重试",
+                    message=(
+                        f"{self.primary_endpoint.display_name} 的 Cockpit 请求未成功，"
+                        f"正在等待 Cockpit 切换账号或上游后重试 {next_attempt}/{max_attempts}"
+                    ),
+                    status="RUNNING",
+                    currentStep=2,
+                    totalSteps=4,
+                    percent=26,
+                    attempt=attempt,
+                    maxAttempts=None,
+                    detail=f"{type(error).__name__}；退避 {delay:.1f} 秒",
+                )
+
+            response = call_cockpit_with_retry(
+                request_primary,
+                operation=self.primary_endpoint.display_name,
+                logger=logger,
+                on_retry=report_cockpit_retry,
+            )
+            self.active_model_name = self.primary_endpoint.display_name
+            return response
+        except OpenAIError as primary_error:
+            fallback = self.fallback_endpoint
+            if fallback is None:
+                raise
+            logger.warning(
+                "%s Cockpit 重试已耗尽，切换至 DeepSeek：%s",
+                self.primary_endpoint.display_name,
+                type(primary_error).__name__,
+            )
+            emit_progress(
+                progress_callback,
+                stageCode="review.actor",
+                stageLabel="DeepSeek 降级",
+                message=(
+                    f"{self.primary_endpoint.display_name} 的 Cockpit 尝试已耗尽，正在切换至 "
+                    f"DeepSeek（{fallback.model}）"
+                ),
+                status="RUNNING",
+                currentStep=2,
+                totalSteps=4,
+                percent=28,
+                attempt=attempt,
+                maxAttempts=None,
+                detail=f"主中转失败：{type(primary_error).__name__}",
+            )
+            fallback_client = OpenAI(
+                api_key=fallback.api_key,
+                base_url=fallback.base_url,
+                timeout=self.timeout_seconds,
+                max_retries=0,
+            )
+            fallback_request = dict(request)
+            fallback_request["model"] = fallback.model
+            with process_io_limiter.slot(
+                "review.llm",
+                configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
+            ):
+                response = fallback_client.chat.completions.create(**fallback_request)
+            self.active_model_name = fallback.display_name
+            return response
 
     def _validate_model_result(
         self,
@@ -391,7 +523,7 @@ class KnowledgePointExtractor:
         summary = normalize_generated_summary(payload.get("summary"))
         if summary is None:
             raise ReviewExtractionError(
-                "DeepSeek 未生成有效的资料总结",
+                f"{self.active_model_name} 未生成有效的资料总结",
                 diagnostics=["资料总结为空、过短、包含检索产物或仍是噪声，请重新生成 2-5 句资料级总结"],
             )
         evidence_by_id = {item.evidenceId: item for item in evidences}
@@ -413,7 +545,7 @@ class KnowledgePointExtractor:
         raw_cards = payload.get("cards")
         if not isinstance(raw_cards, list):
             raise ReviewExtractionError(
-                "DeepSeek 未返回有效的复习卡片数组",
+                f"{self.active_model_name} 未返回有效的复习卡片数组",
                 diagnostics=["cards 必须是 JSON 数组，不能缺失、为 null 或使用其他结构"],
             )
         for card_index, raw in enumerate(raw_cards, start=1):
@@ -501,7 +633,7 @@ class KnowledgePointExtractor:
                 continue
             seen_questions.add(question_key)
             if source_question:
-                covered_source_questions.add(normalized_sentence(source_question))
+                covered_source_questions.add(canonical_source_question_key(source_question))
             covered_curated_units.update(knowledge_unit_ids)
             points.append(
                 KnowledgePoint(
@@ -518,12 +650,30 @@ class KnowledgePointExtractor:
             question for key, question in expected_structured
             if key not in covered_source_questions
         ]
+        covered_structured_count = len(expected_structured) - len(missing_structured)
+        minimum_structured_count = minimum_structured_question_coverage(
+            question_candidates,
+            len(expected_structured),
+        )
         if missing_structured:
-            diagnostics.append(
-                "结构化原始问题覆盖不足："
-                f"应覆盖 {len(expected_structured)} 个，已覆盖 {len(expected_structured) - len(missing_structured)} 个；"
-                f"缺少：{'；'.join(missing_structured[:12])}"
-            )
+            if minimum_structured_count < len(expected_structured) and covered_structured_count >= minimum_structured_count:
+                diagnostics.append(
+                    "结构化原始问题未完全覆盖，但已按口语资料门槛通过："
+                    f"规范化后应覆盖 {len(expected_structured)} 个，已覆盖 {covered_structured_count} 个，"
+                    f"至少需要 {minimum_structured_count} 个；缺少：{'；'.join(missing_structured[:12])}"
+                )
+            elif minimum_structured_count < len(expected_structured):
+                diagnostics.append(
+                    "结构化原始问题覆盖不足（口语资料门槛仍未达到）："
+                    f"规范化后应覆盖 {len(expected_structured)} 个，已覆盖 {covered_structured_count} 个，"
+                    f"至少需要 {minimum_structured_count} 个；缺少：{'；'.join(missing_structured[:12])}"
+                )
+            else:
+                diagnostics.append(
+                    "结构化原始问题覆盖不足："
+                    f"应覆盖 {len(expected_structured)} 个，已覆盖 {covered_structured_count} 个；"
+                    f"缺少：{'；'.join(missing_structured[:12])}"
+                )
         missing_curated_ids = [unit_id for unit_id in curated_by_id if unit_id not in covered_curated_units]
         if missing_curated_ids:
             missing_curated = [
@@ -539,17 +689,17 @@ class KnowledgePointExtractor:
             if not diagnostics:
                 diagnostics.append("cards 为空，没有生成任何可发布的复习卡片")
             raise ReviewExtractionError(
-                "DeepSeek 生成的卡片未通过问题完整性与 evidence 质量门禁",
+            f"{self.active_model_name} 生成的卡片未通过问题完整性与 evidence 质量门禁",
                 diagnostics=diagnostics[:80],
             )
-        if missing_structured:
+        if missing_structured and covered_structured_count < minimum_structured_count:
             raise ReviewExtractionError(
-                "DeepSeek 生成的卡片未完整覆盖资料已有的问题清单",
+            f"{self.active_model_name} 生成的卡片未完整覆盖资料已有的问题清单",
                 diagnostics=diagnostics[:80],
             )
         if missing_curated_ids:
             raise ReviewExtractionError(
-                "DeepSeek 生成的卡片未完整覆盖 LangExtract 候选知识单元",
+            f"{self.active_model_name} 生成的卡片未完整覆盖 LangExtract 候选知识单元",
                 diagnostics=diagnostics[:80],
             )
         if diagnostics:
@@ -562,7 +712,7 @@ class KnowledgePointExtractor:
         return ExtractionResult(
             True,
             None,
-            "DeepSeek 已生成复习内容",
+            f"{self.active_model_name} 已生成复习内容",
             tuple(points[: review_card_limit(question_candidates, len(curated_by_id))]),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
             summary,
@@ -615,6 +765,71 @@ def read_bool_environment(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def review_llm_api_key() -> str:
+    """读取本机复习中转密钥，不借用 DeepSeek 降级密钥。"""
+    return read_process_or_windows_user_environment("REVIEW_LLM_API_KEY")
+
+
+def review_llm_model() -> str:
+    """读取复习模型名称，默认使用本机中转提供的模型。"""
+    return (os.getenv("REVIEW_LLM_MODEL") or REVIEW_LLM_MODEL).strip() or REVIEW_LLM_MODEL
+
+
+def review_llm_reasoning_effort() -> str:
+    """读取复习模型思考强度，默认固定为最高档。"""
+    return (
+        (os.getenv("REVIEW_LLM_REASONING_EFFORT") or REVIEW_LLM_REASONING_EFFORT).strip()
+        or REVIEW_LLM_REASONING_EFFORT
+    )
+
+
+def review_llm_base_url() -> str:
+    """读取复习模型 OpenAI-compatible 中转地址。"""
+    return (os.getenv("REVIEW_LLM_BASE_URL") or REVIEW_LLM_BASE_URL).strip().rstrip("/")
+
+
+def review_llm_thinking_enabled() -> bool:
+    """读取是否发送供应商兼容的 thinking 开关。"""
+    return read_bool_environment("REVIEW_LLM_THINKING_ENABLED", REVIEW_LLM_THINKING_ENABLED)
+
+
+def review_llm_primary_endpoint() -> ReviewLlmEndpoint:
+    """构建默认本机中转端点。"""
+    model = review_llm_model()
+    return ReviewLlmEndpoint(
+        api_key=review_llm_api_key(),
+        model=model,
+        base_url=review_llm_base_url(),
+        display_name=model,
+    )
+
+
+def review_llm_deepseek_fallback_endpoint(
+    primary: ReviewLlmEndpoint,
+) -> ReviewLlmEndpoint | None:
+    """本机中转异常时返回可直连的 DeepSeek 降级端点，未配置密钥时不降级。"""
+    if not read_bool_environment("REVIEW_LLM_FALLBACK_ENABLED", True):
+        return None
+    api_key = (
+        read_process_or_windows_user_environment("REVIEW_LLM_FALLBACK_API_KEY")
+        or read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
+    )
+    if not api_key:
+        return None
+    model = (os.getenv("REVIEW_LLM_FALLBACK_MODEL") or REVIEW_LLM_FALLBACK_MODEL).strip()
+    base_url = (
+        os.getenv("REVIEW_LLM_FALLBACK_BASE_URL") or REVIEW_LLM_FALLBACK_BASE_URL
+    ).strip().rstrip("/")
+    if not model or not base_url or (primary.model == model and primary.base_url == base_url):
+        return None
+    return ReviewLlmEndpoint(
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        display_name="DeepSeek",
+    )
+
+
 def bounded_int_environment(name: str, default: int, *, minimum: int, maximum: int) -> int:
     """读取有上下界的整数环境变量，非法值安全回退。"""
     try:
@@ -644,7 +859,7 @@ def classify_learning_content(
     material: LearningMaterialContext,
     evidences: list[Evidence],
 ) -> tuple[bool, str, str]:
-    """在调用 DeepSeek 前用可解释信号过滤杂项，只决定是否送模和资料类别。"""
+    """在调用复习模型前用可解释信号过滤杂项，只决定是否送模和资料类别。"""
     title = material.title.lower()
     corpus = " ".join(
         [material.title, material.summary or "", *(item.sectionName for item in evidences), *(item.snippet for item in evidences)]
@@ -875,7 +1090,7 @@ def structured_source_questions(source_questions: list[dict[str, str]]) -> list[
     seen: set[str] = set()
     for item in source_questions:
         question = compact_text(item.get("question"), 180)
-        key = normalized_sentence(question)
+        key = canonical_source_question_key(question)
         if not key or key in seen or not is_structured_source_question(question):
             continue
         seen.add(key)
@@ -892,11 +1107,70 @@ def required_structured_source_questions(
     required_keys = {key for key, _question in structured_source_questions(source_questions)}
     if not required_keys:
         return []
-    return [
-        item
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in source_questions:
+        question = compact_text(item.get("question"), 180)
+        key = canonical_source_question_key(question)
+        if not question or key not in required_keys or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= MAX_STRUCTURED_REVIEW_CARD_LIMIT:
+            break
+    return result
+
+
+def canonical_source_question_key(value: str | None) -> str:
+    """把 ASR 口语前缀、重复引导语和同义复述归并为稳定的原始问题键。"""
+    question = compact_text(value, 180) or ""
+    if not question:
+        return ""
+
+    # 面经视频常把“就是可能他会问你，嗯”这类引导语混在真正问题前面。
+    question = re.sub(
+        r"^(?:(?:就是|可能|然后|还有|嗯|啊|呃|哎|好|就比如说|我就被问过|"
+        r"他会问你|他会问|面试官(?:可能)?(?:会)?问你|"
+        r"第[一二三四五六七八九十百千万0-9]+个(?:说|是)?)[，,、:：\s]*)+",
+        "",
+        question,
+    )
+    question = re.sub(
+        r"^(?:(?:嗯|啊|呃|哎|就是|可能|然后|还有)[，,、:：\s]*)+",
+        "",
+        question,
+    )
+    question = re.sub(r"^(?:那|那么|这时候)\s*", "", question)
+
+    # “不可变数据，不可变数据有哪些”只保留真正承担疑问含义的尾部。
+    parts = [part.strip() for part in re.split(r"[，,、]", question) if part.strip()]
+    if len(parts) >= 2:
+        previous = normalized_sentence(parts[-2])
+        tail = normalized_sentence(parts[-1])
+        if len(previous) >= 4 and previous in tail:
+            question = parts[-1]
+
+    # 结尾语气词不应让同一问题产生不同覆盖键。
+    question = re.sub(r"[，,、\s]*(?:呢|啊|呀|吧)+[？?。！!]*$", "", question)
+    return normalized_sentence(question)
+
+
+def minimum_structured_question_coverage(
+    source_questions: list[dict[str, str]],
+    expected_count: int,
+) -> int:
+    """为口语化 ASR 资料提供有限容错，干净的结构化资料仍要求百分之百覆盖。"""
+    if expected_count <= 0:
+        return 0
+    speech_markers = sum(
+        bool(SPEECH_QUESTION_MARKER_PATTERN.search(str(item.get("question") or "")))
         for item in source_questions
-        if normalized_sentence(str(item.get("question") or "")) in required_keys
-    ][:MAX_STRUCTURED_REVIEW_CARD_LIMIT]
+    )
+    is_speech_material = speech_markers >= 3 and speech_markers / max(1, len(source_questions)) >= 0.08
+    if not is_speech_material:
+        return expected_count
+    # 口语重复已先归并；剩余问题仍需至少覆盖 75%，且不能低于普通卡片上限。
+    return max(STANDARD_REVIEW_CARD_LIMIT, ceil(expected_count * 0.75))
 
 
 def is_structured_source_question(value: str | None) -> bool:
@@ -1074,7 +1348,7 @@ def source_question_similarity(left: str, right: str) -> float:
 
 
 def normalize_generated_summary(value: object) -> str | None:
-    """只清洗并校验 DeepSeek 摘要，不从 evidence 或本地规则补写内容。"""
+    """只清洗并校验复习模型摘要，不从 evidence 或本地规则补写内容。"""
     summary = compact_text(value, 500)
     if not summary:
         return None
@@ -1157,9 +1431,13 @@ def split_answer_claims(answer: str) -> list[str]:
         rf"^(?:{ANSWER_CLAIM_CONNECTOR_PATTERN})[，,:：\s]*"
     )
     for sentence in sentences:
+        if sentence.lstrip().startswith("#"):
+            # Markdown 标题只用于组织层次，不把“核心机制”等标题误判为独立事实。
+            continue
         # 模型常用“此外/并通过/它使用”等在同一句追加新事实，不能让前半句的原文重合掩盖后半句幻觉。
         for raw_claim in connector_boundary.split(sentence):
-            claim = leading_connector.sub("", raw_claim.strip())
+            claim = re.sub(r"^(?:[-*+]>|\d+[.)])\s+", "", raw_claim.strip())
+            claim = leading_connector.sub("", claim)
             if normalized_sentence(claim):
                 claims.append(claim)
     return claims
@@ -1343,11 +1621,35 @@ def clean_content_text(value: str) -> str:
 
 
 def normalize_answer_text(value: object, maximum_length: int) -> str | None:
-    """清理模型答案前置时间码，避免把视频定位信息当成知识正文。"""
-    text = compact_text(value, maximum_length)
-    if not text:
+    """清理模型答案噪声并保留 Markdown 换行、列表和代码块结构。"""
+    return normalize_markdown_text(value, maximum_length)
+
+
+def normalize_markdown_text(value: object, maximum_length: int) -> str | None:
+    """规范 Markdown 文本换行，避免再把结构化答案压成单行。"""
+    if value is None:
         return None
-    return compact_text(clean_content_text(text), maximum_length)
+    raw = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return None
+    lines = [line.rstrip() for line in raw.split("\n")]
+    filtered = [
+        line
+        for line in lines
+        if not re.match(
+            r"^\s*(?:OCR\s*出现时间|视频画面(?:聚合)?|多一句没有[，,、 ]*少一句不行|高级软件人才培训专家)",
+            line,
+            flags=re.IGNORECASE,
+        )
+    ]
+    text = "\n".join(filtered)
+    text = re.sub(r"^\s*父段摘要[：:]\s*", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text or contains_review_artifact(text):
+        return None
+    if len(text) <= maximum_length:
+        return text
+    return text[:maximum_length].rstrip() + "..."
 
 
 def stable_source_key(

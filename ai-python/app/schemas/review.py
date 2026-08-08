@@ -34,6 +34,7 @@ class ReviewCard(BaseModel):
     materialTitle: str
     documentType: str
     question: str
+    sourceType: Literal["RAG", "MANUAL"] = "RAG"
     # 到期列表隐藏答案，用户主动揭示后才返回正文。
     answer: str | None = None
     hint: str | None = None
@@ -42,6 +43,191 @@ class ReviewCard(BaseModel):
     retrievability: float = Field(default=0.0, ge=0.0, le=1.0)
     reviewCount: int = Field(default=0, ge=0)
     lapseCount: int = Field(default=0, ge=0)
+    isUserEdited: bool = False
+    updatedAt: datetime | None = None
+
+
+class ReviewCardContent(BaseModel):
+    """卡片编辑和 AI 对比预览共用的可修改正文。"""
+
+    question: str = Field(..., min_length=1, max_length=500)
+    answer: str = Field(..., min_length=1, max_length=5000)
+    hint: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        """问题保持单行，允许保留行内 Markdown。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("问题不能为空")
+        return normalized
+
+    @field_validator("answer")
+    @classmethod
+    def normalize_answer(cls, value: str) -> str:
+        """答案保留 Markdown 换行和代码块结构。"""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("答案不能为空")
+        return normalized
+
+    @field_validator("hint")
+    @classmethod
+    def normalize_hint(cls, value: str | None) -> str | None:
+        """空提示按未填写处理，其余内容保留 Markdown 结构。"""
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+
+class ReviewCardUpdateRequest(ReviewCardContent):
+    """应用人工编辑或 AI 候选时使用的卡片内容。"""
+
+    rewriteMode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"] | None = None
+    evidenceIds: list[str] | None = Field(default=None, max_length=4)
+
+    @field_validator("evidenceIds")
+    @classmethod
+    def normalize_evidence_ids(cls, value: list[str] | None) -> list[str] | None:
+        """保留模型引用顺序并拒绝空 ID，服务层再校验资料归属。"""
+        if value is None:
+            return None
+        normalized = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+        return normalized
+
+
+class ReviewCardRewriteRequest(BaseModel):
+    """用户对单张卡片提出的自然语言改写想法和来源档位。"""
+
+    instruction: str = Field(..., min_length=1, max_length=2000)
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"] = "SOURCE_FIRST"
+
+    @field_validator("instruction")
+    @classmethod
+    def normalize_instruction(cls, value: str) -> str:
+        """压缩说明中的冗余空白，避免空提示进入模型。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("卡片改写想法不能为空")
+        return normalized
+
+
+class ReviewCardRewritePreview(BaseModel):
+    """原卡片与 LLM 候选的无副作用对比结果。"""
+
+    cardId: int = Field(ge=1)
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    original: ReviewCardContent
+    proposed: ReviewCardContent
+    evidenceRefs: list[Evidence] = Field(default_factory=list)
+    modelName: str
+
+
+class ReviewMaterialCardSnapshot(BaseModel):
+    """资料级改写预览中的一张原卡片或候选卡片。"""
+
+    cardId: int | None = Field(default=None, ge=1)
+    content: ReviewCardContent
+    evidenceRefs: list[Evidence] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list, max_length=4)
+
+
+class ReviewMaterialRewriteRequest(BaseModel):
+    """请求把资料当前卡片重新组织为新的资料级卡片集合。"""
+
+    instruction: str = Field(..., min_length=1, max_length=2000)
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"] = "SOURCE_FIRST"
+
+    @field_validator("instruction")
+    @classmethod
+    def normalize_instruction(cls, value: str) -> str:
+        """压缩资料改写说明，避免无意义空白进入模型。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("资料改写想法不能为空")
+        return normalized
+
+
+class ReviewMaterialRewritePreview(BaseModel):
+    """资料级改写的无副作用前后对比结果。"""
+
+    materialId: int = Field(ge=1)
+    title: str
+    sourceVersion: int = Field(ge=0)
+    originalFingerprint: str = Field(..., min_length=16, max_length=128)
+    originalCardIds: list[int] = Field(default_factory=list, max_length=100)
+    originalCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list, max_length=100)
+    proposedCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list, min_length=1, max_length=8)
+    originalSummary: str | None = None
+    proposedSummary: str | None = None
+    mergeNote: str | None = None
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    modelName: str
+
+
+class ReviewRewriteProgressEvent(BaseModel):
+    """单卡片或资料级后台改写任务的一条阶段事件。"""
+
+    stageCode: str
+    stageLabel: str
+    message: str
+    status: Literal["RUNNING", "SUCCEEDED", "FAILED"] = "RUNNING"
+    percent: int = Field(default=0, ge=0, le=100)
+    createdAt: datetime | None = None
+
+
+class ReviewRewriteTaskProgress(ReviewRewriteProgressEvent):
+    """后台改写任务当前阶段和最近事件。"""
+
+    events: list[ReviewRewriteProgressEvent] = Field(default_factory=list, max_length=12)
+
+
+class ReviewCardRewriteTask(BaseModel):
+    """可关闭弹窗后继续查询的单卡片改写任务。"""
+
+    taskId: str = Field(min_length=1, max_length=80)
+    cardId: int = Field(ge=1)
+    instruction: str
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    progress: ReviewRewriteTaskProgress
+    result: ReviewCardRewritePreview | None = None
+    error: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
+
+
+class ReviewMaterialRewriteTask(BaseModel):
+    """可关闭弹窗后继续查询的资料级合并改写任务。"""
+
+    taskId: str = Field(min_length=1, max_length=80)
+    materialId: int = Field(ge=1)
+    instruction: str
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    progress: ReviewRewriteTaskProgress
+    result: ReviewMaterialRewritePreview | None = None
+    error: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
+
+
+class ReviewMaterialRewriteApplyRequest(BaseModel):
+    """携带预览版本与用户确认后的候选内容，原子覆盖资料卡片。"""
+
+    sourceVersion: int = Field(ge=0)
+    originalFingerprint: str = Field(..., min_length=16, max_length=128)
+    originalCardIds: list[int] = Field(..., min_length=1, max_length=100)
+    proposedCards: list[ReviewCardUpdateRequest] = Field(..., min_length=1, max_length=8)
+    proposedSummary: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("originalCardIds")
+    @classmethod
+    def normalize_original_card_ids(cls, value: list[int]) -> list[int]:
+        """去重并排序原卡片 ID，确保并发校验稳定。"""
+        if any(item <= 0 for item in value):
+            raise ValueError("原卡片 ID 必须是正整数")
+        return sorted(set(value))
 
 
 class ReviewOverview(BaseModel):
@@ -93,8 +279,12 @@ class ReviewGroupOrderRequest(BaseModel):
         return value
 
 
+class ReviewFolderMaterialOrderRequest(ReviewGroupOrderRequest):
+    """保存一个复习文件夹内文档顺序的批量请求。"""
+
+
 class ReviewGroupOrderResult(BaseModel):
-    """成功持久化的今日资料分组顺序。"""
+    """成功持久化的复习资料顺序。"""
 
     materialIds: list[int] = Field(..., min_length=1, max_length=100)
     orderedCount: int = Field(ge=1, le=100)
@@ -148,6 +338,39 @@ class ReviewMissingKnowledgeRequest(BaseModel):
         return normalized
 
 
+class ReviewManualCardRequest(BaseModel):
+    """用户直接创建一张复习卡片时使用的内容。"""
+
+    question: str = Field(..., min_length=1, max_length=500)
+    answer: str = Field(..., min_length=1, max_length=5000)
+    hint: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        """压缩问题中的多余空白，保持手动卡片易于回忆。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("问题不能为空")
+        return normalized
+
+    @field_validator("answer")
+    @classmethod
+    def normalize_answer(cls, value: str) -> str:
+        """只去掉答案首尾空白，保留用户输入的 Markdown 换行结构。"""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("答案不能为空")
+        return normalized
+
+    @field_validator("hint")
+    @classmethod
+    def normalize_hint(cls, value: str | None) -> str | None:
+        """空提示按未填写处理，非空提示只去除首尾空白。"""
+        normalized = value.strip() if value else ""
+        return normalized or None
+
+
 class ReviewMissingKnowledgeResult(BaseModel):
     """只追加新卡片后的对话答复与实际写入结果。"""
 
@@ -156,6 +379,37 @@ class ReviewMissingKnowledgeResult(BaseModel):
     addedCount: int = Field(default=0, ge=0)
     skippedCount: int = Field(default=0, ge=0)
     cards: list[ReviewCard] = Field(default_factory=list)
+
+
+class ReviewMissingKnowledgeProgressEvent(BaseModel):
+    """后台补漏任务的一条可展示阶段事件。"""
+
+    stageCode: str
+    stageLabel: str
+    message: str
+    status: Literal["RUNNING", "SUCCEEDED", "FAILED"] = "RUNNING"
+    percent: int = Field(default=0, ge=0, le=100)
+    createdAt: datetime | None = None
+
+
+class ReviewMissingKnowledgeTaskProgress(ReviewMissingKnowledgeProgressEvent):
+    """后台补漏任务当前阶段和最近事件。"""
+
+    events: list[ReviewMissingKnowledgeProgressEvent] = Field(default_factory=list, max_length=12)
+
+
+class ReviewMissingKnowledgeTask(BaseModel):
+    """可关闭对话窗口后继续查询的补漏任务。"""
+
+    taskId: str = Field(min_length=1, max_length=80)
+    materialId: int = Field(ge=1)
+    message: str
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    progress: ReviewMissingKnowledgeTaskProgress
+    result: ReviewMissingKnowledgeResult | None = None
+    error: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
 
 
 class ReviewGenerationProgressEvent(BaseModel):
@@ -204,6 +458,14 @@ class ReviewMaterial(BaseModel):
     updatedAt: datetime | None = None
 
 
+class ReviewMaterialRewriteApplyResult(BaseModel):
+    """资料级改写确认后的资料状态和新卡片。"""
+
+    material: ReviewMaterial
+    cards: list[ReviewCard] = Field(default_factory=list)
+    replacedCardIds: list[int] = Field(default_factory=list)
+
+
 class ReviewFolderNameRequest(BaseModel):
     """创建或重命名复习文件夹时使用的名称。"""
 
@@ -237,6 +499,12 @@ class ReviewFolderMaterial(BaseModel):
     title: str
     summary: str | None = None
     documentType: str
+    materialStatus: str | None = None
+    category: str | None = None
+    status: Literal["PENDING", "GENERATING", "GENERATED", "SKIPPED", "FAILED", "NEEDS_REVIEW"] | str = "PENDING"
+    reason: str | None = None
+    generationProgress: ReviewGenerationProgress | None = None
+    indexRequestVersion: int = Field(default=0, ge=0)
     cardCount: int = Field(default=0, ge=0)
     cards: list[ReviewCard] = Field(default_factory=list)
 
@@ -246,6 +514,29 @@ class ReviewFolderDetail(BaseModel):
 
     folder: ReviewFolder
     materials: list[ReviewFolderMaterial] = Field(default_factory=list)
+
+
+class ReviewCardLibraryMaterial(BaseModel):
+    """卡片库中按文档聚合的全部活动卡片。"""
+
+    materialId: int
+    title: str
+    summary: str | None = None
+    documentType: str
+    folderId: int | None = Field(default=None, ge=1)
+    folderName: str | None = None
+    cardCount: int = Field(default=0, ge=0)
+    reviewedCardCount: int = Field(default=0, ge=0)
+    cards: list[ReviewCard] = Field(default_factory=list)
+
+
+class ReviewCardLibrary(BaseModel):
+    """不提供评分能力的当前用户全量卡片库。"""
+
+    totalMaterialCount: int = Field(default=0, ge=0)
+    totalCardCount: int = Field(default=0, ge=0)
+    reviewedCardCount: int = Field(default=0, ge=0)
+    materials: list[ReviewCardLibraryMaterial] = Field(default_factory=list)
 
 
 class ReviewMaterialFolderRequest(BaseModel):

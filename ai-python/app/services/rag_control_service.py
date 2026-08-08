@@ -223,7 +223,7 @@ class RagControlService:
         request: RagIndexRemoteVideoPublicRequest,
         user_id: str,
     ) -> RagMaterialResponse:
-        """创建 Bilibili 公公开视频耐久下载和索引任务。"""
+        """创建 Bilibili 多模态或抖音语音转写耐久索引任务。"""
         if not request.confirmedAuthorized:
             raise BusinessError("请先确认你有权处理该视频内容")
         remote = validate_remote_video_url(request.url)
@@ -309,8 +309,9 @@ class RagControlService:
         user_id: str,
     ) -> tuple[RagMaterialResponse, bool]:
         """幂等创建单条远程资料任务，返回资料及本次是否真正投递新任务。"""
+        source_filename = f"{remote.video_id}.srt" if remote.platform == "douyin" else f"{remote.video_id}.mp4"
         with self.repository.transaction() as transaction:
-            existing = transaction.find_material_by_public_url(remote.canonical_url, user_id)
+            existing = transaction.find_material_by_public_url(remote.canonical_url, user_id, remote.platform)
             if existing is not None and existing.status != "FAILED":
                 return self._material_response(transaction, existing), False
             material = existing or transaction.insert_material(
@@ -319,7 +320,7 @@ class RagControlService:
                 document_type="mp4",
                 source=remote.platform,
                 status="PENDING",
-                original_filename=f"{remote.video_id}.mp4",
+                original_filename=source_filename,
                 original_file_path=None,
                 storage_type="remote",
                 object_key=None,
@@ -866,7 +867,7 @@ class RagControlService:
                 remote = validate_remote_video_url(material.public_url or "")
                 if material.status in {"PENDING", "PARSING", "REINDEXING"}:
                     return self._material_response(transaction, material)
-                locked_material = transaction.find_material_by_public_url(remote.canonical_url, user_id)
+                locked_material = transaction.find_material_by_public_url(remote.canonical_url, user_id, remote.platform)
                 if locked_material is None or locked_material.id != material.id:
                     raise BusinessError("远程视频资料状态已变化，请刷新后重试")
                 if locked_material.status in {"PENDING", "PARSING", "REINDEXING"}:

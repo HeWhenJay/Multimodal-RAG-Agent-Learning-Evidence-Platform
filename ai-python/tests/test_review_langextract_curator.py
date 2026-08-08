@@ -8,6 +8,7 @@ from app.review.langextract_curator import (
     CuratorCandidate,
     EvidenceTextSpan,
     ModelUsageAudit,
+    _CompletionsAuditProxy,
     build_source_document,
     build_production_curator_context,
     deduplicate_curator_candidates,
@@ -146,11 +147,51 @@ def test_usage_audit_enforces_equal_request_budget() -> None:
         raise AssertionError("第二次请求应被相同预算拦截")
 
 
+def test_langextract_proxy_retries_with_deepseek_after_primary_connection_failure() -> None:
+    """LangExtract 的 OpenAI 代理遇到本机中转连接失败时应改用 DeepSeek。"""
+    from httpx import Request
+    from openai import APIConnectionError
+
+    fallback_used: list[bool] = []
+    fallback_requests: list[dict] = []
+    primary_requests: list[dict] = []
+
+    class FailingDelegate:
+        def create(self, **kwargs):
+            primary_requests.append(kwargs)
+            raise APIConnectionError(request=Request("POST", "http://localhost:58966/v1/chat/completions"))
+
+    class FallbackDelegate:
+        def create(self, **kwargs):
+            fallback_requests.append(kwargs)
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=5),
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+            )
+
+    proxy = _CompletionsAuditProxy(
+        FailingDelegate(),
+        ModelUsageAudit(max_requests=2),
+        1,
+        True,
+        FallbackDelegate(),
+        "deepseek-v4-flash",
+        lambda: fallback_used.append(True),
+    )
+
+    proxy.create(model="gpt-5.6-terra", messages=[])
+
+    assert len(primary_requests) == 2
+    assert fallback_used == [True]
+    assert fallback_requests[0]["model"] == "deepseek-v4-flash"
+    assert fallback_requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
 def test_langextract_curator_uses_same_model_timeout_as_baseline() -> None:
     """线上默认使用 8 个 I/O worker，单请求超时仍与当前生成器保持一致。"""
     from app.review.langextract_curator import LangExtractKnowledgeCurator
 
-    assert LangExtractKnowledgeCurator(api_key="test-key").timeout_seconds == 120.0
+    assert LangExtractKnowledgeCurator(api_key="test-key").timeout_seconds == 615.0
     assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 8
 
 

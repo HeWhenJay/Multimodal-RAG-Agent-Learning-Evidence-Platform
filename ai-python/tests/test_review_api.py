@@ -1,6 +1,8 @@
 """复习公开路由、认证归属与参数校验测试。"""
 
 from datetime import datetime, timezone
+from threading import Event
+import time
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,10 @@ from app.schemas.auth import AuthUserResponse
 from app.schemas.review import (
     ReviewCard,
     ReviewBatchDeletionResult,
+    ReviewCardContent,
+    ReviewCardLibrary,
+    ReviewCardLibraryMaterial,
+    ReviewCardRewritePreview,
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
@@ -23,6 +29,8 @@ from app.schemas.review import (
     ReviewGroupOrderResult,
     ReviewGradeResult,
     ReviewMaterial,
+    ReviewMaterialCardSnapshot,
+    ReviewMaterialRewritePreview,
     ReviewMissingKnowledgeResult,
     ReviewMaterialFolderRequest,
     ReviewOverview,
@@ -50,6 +58,7 @@ class StubReviewService:
     def __init__(self) -> None:
         self.users: list[str] = []
         self.feedbacks: list[str | None] = []
+        self.generation_event = Event()
 
     def remember(self, user_id: str) -> None:
         """记录一次服务调用。"""
@@ -102,6 +111,78 @@ class StubReviewService:
         assert card_id == 81
         return sample_card()
 
+    def list_card_library(self, user_id: str) -> ReviewCardLibrary:
+        """模拟返回包含已复习卡片的全量卡片库。"""
+        self.remember(user_id)
+        return ReviewCardLibrary(
+            totalMaterialCount=1,
+            totalCardCount=1,
+            reviewedCardCount=1,
+            materials=[
+                ReviewCardLibraryMaterial(
+                    materialId=12,
+                    title="Kafka 高可用",
+                    documentType="mp4",
+                    cardCount=1,
+                    reviewedCardCount=1,
+                    cards=[sample_card().model_copy(update={"reviewCount": 2})],
+                )
+            ],
+        )
+
+    def preview_card_rewrite(self, card_id: int, payload, user_id: str) -> ReviewCardRewritePreview:
+        """模拟生成不落库的单卡片改写候选。"""
+        self.remember(user_id)
+        assert card_id == 81 and payload.mode == "SOURCE_FIRST"
+        return ReviewCardRewritePreview(
+            cardId=card_id,
+            mode=payload.mode,
+            original=ReviewCardContent(question="ISR 有什么作用？", answer="原答案"),
+            proposed=ReviewCardContent(question="ISR 的核心作用是什么？", answer="- **跟踪**同步副本"),
+            evidenceRefs=[],
+            modelName="gpt-5.6-terra",
+        )
+
+    def preview_material_rewrite(self, material_id: int, payload, user_id: str) -> ReviewMaterialRewritePreview:
+        """模拟生成不落库的资料合并候选。"""
+        self.remember(user_id)
+        assert material_id == 12 and payload.mode == "SOURCE_FIRST"
+        return ReviewMaterialRewritePreview(
+            materialId=material_id,
+            title="Kafka 高可用",
+            sourceVersion=7,
+            originalFingerprint="0123456789abcdef",
+            originalCardIds=[81],
+            originalCards=[
+                ReviewMaterialCardSnapshot(
+                    cardId=81,
+                    content=ReviewCardContent(question="ISR 有什么作用？", answer="原答案"),
+                )
+            ],
+            proposedCards=[
+                ReviewMaterialCardSnapshot(
+                    content=ReviewCardContent(question="Kafka 如何保证高可用？", answer="综合答案"),
+                )
+            ],
+            originalSummary="原摘要",
+            proposedSummary="新摘要",
+            mode=payload.mode,
+            modelName="gpt-5.6-terra",
+        )
+
+    def update_card(self, card_id: int, payload, user_id: str) -> ReviewCard:
+        """模拟应用用户确认后的 Markdown 卡片正文。"""
+        self.remember(user_id)
+        assert card_id == 81
+        return sample_card().model_copy(
+            update={
+                "question": payload.question,
+                "answer": payload.answer,
+                "hint": payload.hint,
+                "isUserEdited": True,
+            }
+        )
+
     def reorder_due_groups(self, material_ids: list[int], user_id: str) -> ReviewGroupOrderResult:
         """记录排序接口使用的认证用户与拖拽顺序。"""
         self.remember(user_id)
@@ -137,6 +218,12 @@ class StubReviewService:
             ],
         )
 
+    def reorder_folder_materials(self, folder_id: int, material_ids: list[int], user_id: str) -> ReviewGroupOrderResult:
+        """记录文件夹排序接口使用的认证用户与完整顺序。"""
+        self.remember(user_id)
+        assert folder_id == 7 and material_ids == [13, 12]
+        return ReviewGroupOrderResult(materialIds=material_ids, orderedCount=2)
+
     def rename_folder(self, folder_id: int, name: str, user_id: str) -> ReviewFolder:
         self.remember(user_id)
         assert folder_id == 7 and name == "后端面试"
@@ -160,12 +247,47 @@ class StubReviewService:
         self.remember(user_id)
         assert material_id == 12
         self.feedbacks.append(user_feedback)
+        self.generation_event.set()
         return sample_material()
 
-    def supplement_missing_knowledge(self, material_id: int, payload, user_id: str) -> ReviewMissingKnowledgeResult:
+    def prepare_material_generation(self, material_id: int, user_id: str) -> ReviewMaterial:
+        """模拟立即入队并返回后台生成状态。"""
+        self.remember(user_id)
+        assert material_id == 12
+        return sample_material().model_copy(
+            update={
+                "status": "GENERATING",
+                "reason": "已收到人工说明，生成请求已转入后台队列",
+                "needsManualReview": False,
+            }
+        )
+
+    def create_manual_card(self, material_id: int, payload, user_id: str) -> ReviewCard:
+        """模拟用户手动建卡，并记录认证用户。"""
+        self.remember(user_id)
+        assert material_id == 12
+        assert payload.question == "类方法如何定义和调用？"
+        return sample_card().model_copy(
+            update={
+                "question": payload.question,
+                "answer": payload.answer,
+                "hint": payload.hint,
+                "sourceType": "MANUAL",
+                "evidenceRefs": [],
+            }
+        )
+
+    def supplement_missing_knowledge(self, material_id: int, payload, user_id: str, progress_callback=None) -> ReviewMissingKnowledgeResult:
         self.remember(user_id)
         assert material_id == 12
         assert payload.message == "还讲了零拷贝"
+        if progress_callback:
+            progress_callback({
+                "stageCode": "missing.test",
+                "stageLabel": "测试阶段",
+                "message": "测试补漏处理中",
+                "percent": 60,
+            })
         return ReviewMissingKnowledgeResult(
             materialId=material_id,
             assistantMessage="已追加 1 张卡片。",
@@ -256,7 +378,7 @@ def sample_folder() -> ReviewFolder:
 
 
 def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
-    """21 个公开端点只能使用认证用户并保持 Result 信封。"""
+    """24 个公开端点只能使用认证用户并保持 Result 信封。"""
     service = StubReviewService()
     app.dependency_overrides[get_auth_service] = StaticAuthService
     app.dependency_overrides[get_review_service] = lambda: service
@@ -281,6 +403,9 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
             client.post("/api/reviews/materials/batch-delete", headers=headers, json={"materialIds": [13, 12]}),
             client.delete("/api/reviews/materials/12", headers=headers),
             client.get("/api/reviews/cards/81", headers=headers),
+            client.get("/api/reviews/cards/library", headers=headers),
+            client.post("/api/reviews/cards/81/rewrite-preview", headers=headers, json={"instruction": "改成列表", "mode": "SOURCE_FIRST"}),
+            client.put("/api/reviews/cards/81", headers=headers, json={"question": "ISR 的核心作用是什么？", "answer": "- **跟踪**同步副本", "hint": "回忆 Leader"}),
             client.post("/api/reviews/cards/81/grade", headers=headers, json={"rating": 3}),
             client.post("/api/reviews/cards/batch-delete", headers=headers, json={"cardIds": [82, 81]}),
             client.delete("/api/reviews/cards/81", headers=headers),
@@ -299,8 +424,205 @@ def test_review_routes_keep_result_contract_and_authenticated_owner() -> None:
         assert responses[8].json()["data"]["materials"][0]["cards"][0]["answer"] is None
         assert responses[11].json()["data"] == {"folderId": 7, "materialIds": [12, 13], "movedCount": 2}
         assert responses[13].json()["data"]["addedCount"] == 1
-        assert service.users == ["42"] * 21
+        assert responses[13].json()["data"]["cards"][0]["id"] == 81
+        assert service.generation_event.wait(1)
+        assert responses[17].json()["data"]["reviewedCardCount"] == 1
+        assert responses[18].json()["data"]["proposed"]["answer"].startswith("-")
+        assert responses[19].json()["data"]["isUserEdited"] is True
+        assert service.users == ["42"] * 25
     finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_folder_order_route_keeps_result_contract_and_authenticated_owner() -> None:
+    """文件夹排序接口必须使用认证用户，并返回统一 Result 信封。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/api/reviews/folders/7/materials/order",
+            headers={"Authorization": "Bearer review-token"},
+            json={"materialIds": [13, 12]},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"code": 1, "msg": None, "data": {"materialIds": [13, 12], "orderedCount": 2}}
+        assert service.users[-1] == "42"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_missing_knowledge_task_returns_immediately_and_can_be_reopened() -> None:
+    """后台补漏接口提交后立即返回，并允许通过任务编号读取完成结果。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    try:
+        created = client.post(
+            "/api/reviews/materials/12/missing-knowledge/tasks",
+            headers=headers,
+            json={"message": "还讲了零拷贝"},
+        )
+        assert created.status_code == 200
+        task = created.json()["data"]
+        assert task["materialId"] == 12
+        assert task["status"] in {"QUEUED", "RUNNING", "SUCCEEDED"}
+        assert task["progress"]["stageCode"] in {"missing.queue", "missing.prepare", "missing.test", "missing.completed"}
+
+        latest = None
+        for _ in range(50):
+            response = client.get(
+                f"/api/reviews/materials/12/missing-knowledge/tasks/{task['taskId']}",
+                headers=headers,
+            )
+            latest = response.json()["data"]
+            if latest["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+
+        assert latest is not None
+        assert latest["status"] == "SUCCEEDED"
+        assert latest["result"]["addedCount"] == 1
+        assert any(event["stageCode"] == "missing.test" for event in latest["progress"]["events"])
+        reopened = client.get(
+            "/api/reviews/materials/12/missing-knowledge/tasks/latest",
+            headers=headers,
+        )
+        assert reopened.status_code == 200
+        assert reopened.json()["data"]["taskId"] == task["taskId"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_card_rewrite_task_runs_in_background_and_restores_comparison() -> None:
+    """单卡片改写提交不能等待 LLM，完成后可按最近任务恢复对比。"""
+
+    class BlockingCardRewriteService(StubReviewService):
+        """用事件模拟耗时模型，验证 HTTP 请求先于模型完成返回。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.rewrite_started = Event()
+            self.rewrite_release = Event()
+
+        def preview_card_rewrite(self, card_id: int, payload, user_id: str) -> ReviewCardRewritePreview:
+            self.rewrite_started.set()
+            self.rewrite_release.wait(3)
+            return super().preview_card_rewrite(card_id, payload, user_id)
+
+    service = BlockingCardRewriteService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    try:
+        started_at = time.monotonic()
+        created = client.post(
+            "/api/reviews/cards/81/rewrite-tasks",
+            headers=headers,
+            json={"instruction": "改成列表", "mode": "SOURCE_FIRST"},
+        )
+        assert time.monotonic() - started_at < 1
+        assert created.status_code == 200
+        task = created.json()["data"]
+        assert task["cardId"] == 81
+        assert task["status"] in {"QUEUED", "RUNNING"}
+        assert service.rewrite_started.wait(1)
+
+        reused = client.post(
+            "/api/reviews/cards/81/rewrite-tasks",
+            headers=headers,
+            json={"instruction": "不应重复调用", "mode": "SOURCE_REFERENCE"},
+        )
+        assert reused.json()["data"]["taskId"] == task["taskId"]
+        service.rewrite_release.set()
+
+        latest = None
+        for _ in range(100):
+            latest = client.get(
+                f"/api/reviews/cards/81/rewrite-tasks/{task['taskId']}",
+                headers=headers,
+            ).json()["data"]
+            if latest["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert latest["status"] == "SUCCEEDED"
+        assert latest["result"]["proposed"]["answer"].startswith("-")
+        assert latest["progress"]["stageCode"] == "rewrite.card.completed"
+        reopened = client.get("/api/reviews/cards/81/rewrite-tasks/latest", headers=headers)
+        assert reopened.json()["data"]["taskId"] == task["taskId"]
+        applied = client.put(
+            "/api/reviews/cards/81",
+            headers=headers,
+            json={"question": "ISR 的核心作用是什么？", "answer": "应用候选"},
+        )
+        assert applied.json()["code"] == 1
+        assert client.get(
+            "/api/reviews/cards/81/rewrite-tasks/latest",
+            headers=headers,
+        ).json()["data"] is None
+        mismatched = client.get(
+            f"/api/reviews/cards/82/rewrite-tasks/{task['taskId']}",
+            headers=headers,
+        )
+        assert mismatched.json()["code"] == 0
+    finally:
+        service.rewrite_release.set()
+        app.dependency_overrides.clear()
+
+
+def test_material_rewrite_task_runs_in_background_and_restores_comparison() -> None:
+    """资料合并预览后台生成，完成后仍只返回待确认的前后对比。"""
+
+    class BlockingMaterialRewriteService(StubReviewService):
+        """阻塞资料合并模型调用，验证创建任务立即返回。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.rewrite_release = Event()
+
+        def preview_material_rewrite(self, material_id: int, payload, user_id: str) -> ReviewMaterialRewritePreview:
+            self.rewrite_release.wait(3)
+            return super().preview_material_rewrite(material_id, payload, user_id)
+
+    service = BlockingMaterialRewriteService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    try:
+        started_at = time.monotonic()
+        created = client.post(
+            "/api/reviews/materials/12/rewrite-tasks",
+            headers=headers,
+            json={"instruction": "合并成一张", "mode": "SOURCE_FIRST"},
+        )
+        assert time.monotonic() - started_at < 1
+        task = created.json()["data"]
+        assert task["materialId"] == 12
+        assert task["status"] in {"QUEUED", "RUNNING"}
+        service.rewrite_release.set()
+
+        latest = None
+        for _ in range(100):
+            latest = client.get(
+                f"/api/reviews/materials/12/rewrite-tasks/{task['taskId']}",
+                headers=headers,
+            ).json()["data"]
+            if latest["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert latest["status"] == "SUCCEEDED"
+        assert len(latest["result"]["originalCards"]) == 1
+        assert len(latest["result"]["proposedCards"]) == 1
+        assert latest["progress"]["stageCode"] == "rewrite.material.completed"
+        reopened = client.get("/api/reviews/materials/12/rewrite-tasks/latest", headers=headers)
+        assert reopened.json()["data"]["taskId"] == task["taskId"]
+    finally:
+        service.rewrite_release.set()
         app.dependency_overrides.clear()
 
 
@@ -335,7 +657,33 @@ def test_generate_review_accepts_optional_human_feedback() -> None:
         )
         assert response.status_code == 200
         assert response.json()["code"] == 1
+        assert response.json()["data"]["status"] == "GENERATING"
+        assert service.generation_event.wait(1)
         assert service.feedbacks == ["只保留视频中的 Kafka 原始问题"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_card_route_keeps_result_contract_and_authenticated_owner() -> None:
+    """用户手动建卡接口必须使用当前认证用户并返回手动来源标识。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/reviews/materials/12/cards",
+            headers={"Authorization": "Bearer review-token"},
+            json={
+                "question": "类方法如何定义和调用？",
+                "answer": "使用 @classmethod 定义，第一个参数通常命名为 cls。",
+                "hint": "回忆 cls 与 self 的区别",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["code"] == 1
+        assert response.json()["data"]["sourceType"] == "MANUAL"
+        assert service.users == ["42"]
     finally:
         app.dependency_overrides.clear()
 

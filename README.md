@@ -14,7 +14,7 @@
 完整程序只需要启动以下两个应用进程：
 
 ```powershell
-conda run -n learning-evidence-rag python -B ai-python/run.py
+.\ai-python\start.ps1
 
 cd frontend-react
 npm run dev
@@ -35,7 +35,7 @@ npm run dev
 - 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，结构化问题或候选较多时最多生成 32 张。
 - 复习质量闭环：独立 LangGraph 按 Planner → LangExtract Curator → Actor → Observer → Repair 运行；Curator 候选精确回指 evidence 并只执行一次，质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`。
 - 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
-- Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示都由 DeepSeek 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
+- Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
 - 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
 - Agent 工作台：支持在未分类或指定文件夹创建空白 `DRAFT` 会话、在同一 `taskId/threadId` 上多轮续聊、历史消息分页、LangGraph PAE/ReAct、受控工具、记忆、审批、撤销、事件投影与 SSE。
 - 长会话上下文：使用 `tiktoken` 做本地预算，未摘要原文超过 Token 阈值后才生成滚动摘要；PostgreSQL 保存消息与摘要事实，Redis 只缓存可重建的 L2 运行态快照。
@@ -55,7 +55,7 @@ flowchart TB
         API["FastAPI 公开控制面\nAuth / PageData / Logs\nRAG / Agent / Memory / SSE"]
         AGW["Agent durable worker\nLangGraph PAE/ReAct"]
         RAGW["RAG durable worker\n查询任务 + LOCAL 索引"]
-        REVIEW["复习领域服务\nLangExtract + DeepSeek PAE/ReAct\nFSRS + 文件夹"]
+        REVIEW["复习领域服务\nLangExtract + Terra PAE/ReAct\nFSRS + 文件夹"]
         CRON["cron\nOutbox / staging 清理"]
         KAFKAW["Kafka worker\n仅 Kafka 模式"]
         SUP --> API
@@ -85,7 +85,7 @@ flowchart TB
     KAFKAW <--> STORE
     RAGW --> MODEL["MinerU / OCR / ASR\nEmbedding / Rerank / LLM"]
     KAFKAW --> MODEL
-    REVIEW --> DEEPSEEK["DeepSeek 官方 API\nLangExtract 8 路 I/O 并发\n卡片生成 + max reasoning"]
+    REVIEW --> REVIEW_LLM["本机 Cockpit 中转\ngpt-5.6-terra + max reasoning\nDeepSeek 故障降级"]
     AGW --> QWEN["Qwen Agent 节点\n结构化决策 + usage 观测"]
 
     CRON -->|"可选 Outbox 发布"| KAFKA[("Kafka")]
@@ -128,7 +128,7 @@ flowchart TB
     STATUS -->|"READY / PARTIAL"| REVIEW_SYNC["按 materialId + indexRequestVersion\n幂等触发复习生成"]
     STATUS -->|"FAILED"| FE
     FE -. "上传完成轮询兜底触发" .-> REVIEW_SYNC
-    REVIEW_SYNC --> REVIEW_FLOW["DeepSeek PAE/ReAct 质量闭环\n见复习生成章节"]
+    REVIEW_SYNC --> REVIEW_FLOW["Terra PAE/ReAct 质量闭环\n见复习生成章节"]
     REVIEW_FLOW --> DB
     REVIEW_FLOW --> FE
 ```
@@ -207,22 +207,22 @@ RAG 检索设计采用 Multi-Query 扩展召回范围，查询变体先通过一
 
 ## 复习生成、文件夹与 FSRS 闭环
 
-RAG 索引进入 `READY` 或 `PARTIAL` 后，LOCAL worker 与 Kafka worker 都会按 `materialId + indexRequestVersion + extractorVersion` 幂等触发复习生成；前端上传完成轮询也会按 `materialId` 兜底触发同一服务。系统先做确定性的 evidence 清洗和学习内容过滤，只有通过过滤的资料才交给独立复习 LangGraph，面向用户的摘要、问题、答案和提示始终由 DeepSeek 基于当前 evidence 生成。
+RAG 索引进入 `READY` 或 `PARTIAL` 后，LOCAL worker 与 Kafka worker 都会按 `materialId + indexRequestVersion + extractorVersion` 幂等触发复习生成；前端上传完成轮询也会按 `materialId` 兜底触发同一服务。系统先做确定性的 evidence 清洗和学习内容过滤，只有通过过滤的资料才交给独立复习 LangGraph，面向用户的摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成。
 
-### DeepSeek PAE/ReAct 生成质量闭环
+### Terra PAE/ReAct 生成质量闭环
 
 ```mermaid
 flowchart TB
     INDEXED["索引 READY / PARTIAL"] --> CLEAN["evidence 去重、噪声清洗\n本地学习内容过滤"]
     CLEAN --> LEARNING{"是否为可复习资料"}
     LEARNING -->|"否"| SKIPPED["SKIPPED\n不调用模型"]
-    LEARNING -->|"是"| CONFIG{"DeepSeek 配置与 evidence\n是否可执行"}
+    LEARNING -->|"是"| CONFIG{"Terra 配置与 evidence\n是否可执行"}
     CONFIG -->|"否"| FAILED["FAILED\n保存可诊断原因"]
     CONFIG -->|"是"| QUESTIONS["提取原始问题清单\n准备完整 evidence"]
     QUESTIONS --> PLANNER["planner\n固定目标、覆盖范围和完成标准"]
     PLANNER --> CURATOR["LangExtract curator\n2 个串行 passes\n每轮最多 8 个文本块并发"]
     CURATOR --> GROUND["原文精确定位 + evidenceId 映射\n近重复过滤 + topic 轮询\n最多 32 个 knowledgeUnitId"]
-    GROUND --> ACTOR["actor\nDeepSeek 生成唯一 JSON"]
+    GROUND --> ACTOR["actor\ngpt-5.6-terra 生成唯一 JSON"]
     ACTOR --> OBSERVER{"observer 质量门禁\n摘要、问题、hint、sourceQuestion\nknowledgeUnitId 完整覆盖\nevidenceId 与逐论断忠实度"}
     OBSERVER -->|"通过"| GENERATED["GENERATED\n持久化卡片并继承或初始化 FSRS"]
     OBSERVER -->|"拒绝"| REPAIR["repair\n整理逐项中文诊断并写入下一轮 Prompt"]
@@ -233,7 +233,7 @@ flowchart TB
     FEEDBACK --> PLANNER
 ```
 
-LangExtract Curator 在一轮图中只运行一次，Repair 会复用同一候选上下文；默认每轮最多 8 个并发 DeepSeek 请求、整个进程也限制为 8，避免多资料叠加后无界扩张。LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制卡片生成的真实模型预算，默认 8 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。
+LangExtract Curator 在一轮图中只运行一次，Repair 会复用同一候选上下文；默认每轮最多 8 个并发复习模型请求、整个进程也限制为 8，避免多资料叠加后无界扩张。LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制卡片生成的真实模型预算，默认 8 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。
 
 ### 文件夹归档与文件夹内复习
 
@@ -460,8 +460,15 @@ Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允�
 | `MINERU_COMMAND` | 可选 MinerU 命令模板，使用 `{input}` 与 `{output}` 占位符 |
 | `EVIDENCE_STORAGE_PROVIDER` | `local` 或 `oss` 原始文件存储 |
 | `RAG_KAFKA_ENABLED` | 启用 Kafka 索引通道；默认 `false` |
-| `DEEPSEEK_API_KEY` | 复习摘要与卡片生成密钥；只调用 DeepSeek 官方 `deepseek-v4-flash`，不继承通用 RAG 模型配置 |
-| `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | 单次复习模型请求超时秒数，默认 `120` |
+| `SOCIALDATAX_API_KEY` | 抖音语音转写 RAG 使用的 SocialDataX MCP Bearer 密钥；不写入仓库 |
+| `RAG_DOUYIN_MCP_ENABLED` | 启用抖音 MCP 转写路线；默认 `true` |
+| `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS` | 抖音转写任务轮询间隔；默认 `5` 秒 |
+| `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS` | 单次抖音转写最大等待时间；默认 `900` 秒 |
+| `REVIEW_LLM_API_KEY` | 复习摘要、知识单元发现和卡片生成使用的本机中转密钥；不继承通用 RAG 模型配置 |
+| `DEEPSEEK_API_KEY` | 可选的复习降级密钥；本机中转连接、超时或 OpenAI API 错误时才直连 DeepSeek |
+| `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | 单次 Cockpit 复习模型等待窗口，默认 `615` 秒，覆盖两次流打开、空闲窗口和余量 |
+| `REVIEW_COCKPIT_REQUEST_RETRIES` | Terra 在降级 DeepSeek 前重新请求 Cockpit 的次数，默认 `1` |
+| `REVIEW_COCKPIT_RETRY_BASE_DELAY_MS` | Cockpit 首次重试退避，默认 `300` 毫秒；最大值由 `REVIEW_COCKPIT_RETRY_MAX_DELAY_MS=1500` 限制 |
 | `REVIEW_LANGEXTRACT_MAX_WORKERS` | 单份资料 LangExtract 同一 pass 的 I/O worker，默认 `8`、硬上限 `10` |
 | `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | 单份资料 LangExtract 总请求预算，默认 `32` |
 | `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮卡片生成模型调用上限，默认 `8`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
@@ -482,6 +489,8 @@ Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允�
 | `AGENT_BENCHMARK_ENABLED` | 开放固定场景 Agent 工程基准 API，默认 `false` |
 | `VITE_AGENT_ONLINE_BENCHMARK_UI` | 显示前端工程基准入口，默认不显示；仍需后端开关和登录鉴权 |
 | `TAVILY_API_KEY` | 预留配置；当前纯 Python Agent 尚未启用联网搜索，默认留空 |
+
+公开视频链接接入（包括抖音 MCP 语音转写路线）的请求、流程和安全边界见 [公公开视频链接接入 API](docs/api/remote-video-import.md)。
 
 启动后端：
 

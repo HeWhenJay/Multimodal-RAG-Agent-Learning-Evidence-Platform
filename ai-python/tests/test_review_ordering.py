@@ -113,3 +113,73 @@ def test_service_returns_stable_order_and_hides_ownership_failures() -> None:
     missing_service = ReviewService(repository=OrderingRepository(OrderingServiceTransaction(None)))
     with pytest.raises(BusinessError, match="复习资料不存在"):
         missing_service.reorder_due_groups([13, 99], "7")
+
+
+class FolderOrderingCursor:
+    """模拟文件夹锁、归属行锁和顺序更新所需的最小游标。"""
+
+    def __init__(self, material_ids: list[int]) -> None:
+        self.material_ids = material_ids
+        self.fetchone_value = None
+        self.fetchall_value: list[dict[str, int]] = []
+        self.executions: list[tuple[str, object]] = []
+
+    def execute(self, statement, params) -> None:
+        """根据文件夹排序 SQL 准备下一次读取结果并记录参数。"""
+        normalized = " ".join(str(statement).split())
+        self.executions.append((normalized, params))
+        self.fetchone_value = None
+        self.fetchall_value = []
+        if "SELECT id FROM learning_evidence.learning_review_folder" in normalized:
+            self.fetchone_value = {"id": 9}
+        elif "SELECT folder_material.material_id" in normalized:
+            self.fetchall_value = [{"material_id": item} for item in self.material_ids]
+
+    def fetchone(self):
+        return self.fetchone_value
+
+    def fetchall(self):
+        return self.fetchall_value
+
+
+def test_folder_reorder_places_requested_materials_first_and_updates_folder_order() -> None:
+    """文件夹内拖拽顺序应在文件夹边界内连续编号并保存。"""
+    cursor = FolderOrderingCursor([12, 14, 13])
+    transaction = DatabaseReviewTransaction(cursor, "learning_evidence")
+    transaction._statement = lambda query: query.format(schema="learning_evidence")  # type: ignore[method-assign]
+
+    assert transaction.reorder_review_folder_materials(9, "7", [13, 12]) == [13, 12, 14]
+
+    update_sql, update_params = next(
+        (sql, params) for sql, params in cursor.executions if "SET display_order = ordered.position" in sql
+    )
+    assert update_params == ([13, 12, 14], 9, "7")
+    assert "target.folder_id = %s" in update_sql
+    assert "target.user_id = %s" in update_sql
+
+
+class FolderOrderingServiceTransaction:
+    """向服务层返回可控的文件夹排序结果。"""
+
+    def __init__(self, result: list[int] | None) -> None:
+        self.result = result
+        self.calls: list[tuple[int, str, list[int]]] = []
+
+    def reorder_review_folder_materials(self, folder_id: int, user_id: str, material_ids: list[int]) -> list[int] | None:
+        self.calls.append((folder_id, user_id, material_ids))
+        return self.result
+
+
+def test_folder_reorder_service_keeps_folder_boundary() -> None:
+    """服务层应返回文件夹顺序，并把不存在或越权资料转成业务错误。"""
+    success_transaction = FolderOrderingServiceTransaction([13, 12])
+    service = ReviewService(repository=OrderingRepository(success_transaction))
+
+    result = service.reorder_folder_materials(9, [13, 12], "7")
+
+    assert result.model_dump() == {"materialIds": [13, 12], "orderedCount": 2}
+    assert success_transaction.calls == [(9, "7", [13, 12])]
+
+    missing_service = ReviewService(repository=OrderingRepository(FolderOrderingServiceTransaction(None)))
+    with pytest.raises(BusinessError, match="复习文件夹不存在或资料不属于该文件夹"):
+        missing_service.reorder_folder_materials(9, [13, 99], "7")

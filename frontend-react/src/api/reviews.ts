@@ -22,6 +22,7 @@ export interface ReviewCard {
   materialTitle: string;
   documentType: string;
   question: string;
+  sourceType?: 'RAG' | 'MANUAL';
   answer?: string | null;
   hint?: string | null;
   evidenceRefs?: RagEvidence[];
@@ -29,6 +30,115 @@ export interface ReviewCard {
   retrievability?: number | null;
   reviewCount: number;
   lapseCount: number;
+  isUserEdited?: boolean;
+  updatedAt?: string | null;
+}
+
+export interface ReviewCardContent {
+  question: string;
+  answer: string;
+  hint?: string | null;
+}
+
+export type ReviewCardRewriteMode = 'STRICT_SOURCE' | 'SOURCE_FIRST' | 'SOURCE_REFERENCE';
+
+export interface ReviewCardUpdatePayload extends ReviewCardContent {
+  rewriteMode?: ReviewCardRewriteMode;
+  evidenceIds?: string[];
+}
+
+export interface ReviewCardRewritePayload {
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+}
+
+export interface ReviewCardRewritePreview {
+  cardId: number;
+  mode: ReviewCardRewriteMode;
+  original: ReviewCardContent;
+  proposed: ReviewCardContent;
+  evidenceRefs: RagEvidence[];
+  modelName: string;
+}
+
+export interface ReviewMaterialCardSnapshot {
+  cardId?: number | null;
+  content: ReviewCardContent;
+  evidenceRefs: RagEvidence[];
+  evidenceIds: string[];
+}
+
+export interface ReviewMaterialRewritePayload {
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+}
+
+export interface ReviewMaterialRewritePreview {
+  materialId: number;
+  title: string;
+  sourceVersion: number;
+  originalFingerprint: string;
+  originalCardIds: number[];
+  originalCards: ReviewMaterialCardSnapshot[];
+  proposedCards: ReviewMaterialCardSnapshot[];
+  originalSummary?: string | null;
+  proposedSummary?: string | null;
+  mergeNote?: string | null;
+  mode: ReviewCardRewriteMode;
+  modelName: string;
+}
+
+export interface ReviewRewriteProgressEvent {
+  stageCode: string;
+  stageLabel: string;
+  message: string;
+  status: 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  percent: number;
+  createdAt?: string | null;
+}
+
+export interface ReviewRewriteTaskProgress extends ReviewRewriteProgressEvent {
+  events: ReviewRewriteProgressEvent[];
+}
+
+export interface ReviewCardRewriteTask {
+  taskId: string;
+  cardId: number;
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  progress: ReviewRewriteTaskProgress;
+  result?: ReviewCardRewritePreview | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewMaterialRewriteTask {
+  taskId: string;
+  materialId: number;
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  progress: ReviewRewriteTaskProgress;
+  result?: ReviewMaterialRewritePreview | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewMaterialRewriteApplyPayload {
+  sourceVersion: number;
+  originalFingerprint: string;
+  originalCardIds: number[];
+  proposedCards: ReviewCardUpdatePayload[];
+  proposedSummary?: string | null;
+}
+
+export interface ReviewMaterialRewriteApplyResult {
+  material: ReviewMaterial;
+  cards: ReviewCard[];
+  replacedCardIds: number[];
 }
 
 export interface ReviewOverview {
@@ -88,12 +198,43 @@ export interface ReviewMissingKnowledgeMessage {
   content: string;
 }
 
+export interface ReviewManualCardPayload {
+  question: string;
+  answer: string;
+  hint?: string;
+}
+
 export interface ReviewMissingKnowledgeResult {
   materialId: number;
   assistantMessage: string;
   addedCount: number;
   skippedCount: number;
   cards: ReviewCard[];
+}
+
+export interface ReviewMissingKnowledgeProgressEvent {
+  stageCode: string;
+  stageLabel: string;
+  message: string;
+  status: 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  percent: number;
+  createdAt?: string | null;
+}
+
+export interface ReviewMissingKnowledgeTaskProgress extends ReviewMissingKnowledgeProgressEvent {
+  events: ReviewMissingKnowledgeProgressEvent[];
+}
+
+export interface ReviewMissingKnowledgeTask {
+  taskId: string;
+  materialId: number;
+  message: string;
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  progress: ReviewMissingKnowledgeTaskProgress;
+  result?: ReviewMissingKnowledgeResult | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ReviewMaterial {
@@ -139,6 +280,12 @@ export interface ReviewFolderMaterial {
   title: string;
   summary?: string | null;
   documentType: string;
+  materialStatus?: string | null;
+  category?: string | null;
+  status?: string;
+  reason?: string | null;
+  generationProgress?: ReviewGenerationProgress | null;
+  indexRequestVersion?: number;
   cardCount: number;
   cards: ReviewCard[];
 }
@@ -146,6 +293,25 @@ export interface ReviewFolderMaterial {
 export interface ReviewFolderDetail {
   folder: ReviewFolder;
   materials: ReviewFolderMaterial[];
+}
+
+export interface ReviewCardLibraryMaterial {
+  materialId: number;
+  title: string;
+  summary?: string | null;
+  documentType: string;
+  folderId?: number | null;
+  folderName?: string | null;
+  cardCount: number;
+  reviewedCardCount: number;
+  cards: ReviewCard[];
+}
+
+export interface ReviewCardLibrary {
+  totalMaterialCount: number;
+  totalCardCount: number;
+  reviewedCardCount: number;
+  materials: ReviewCardLibraryMaterial[];
 }
 
 export interface ReviewFolderAssignmentResult {
@@ -247,6 +413,85 @@ export function fetchReviewCard(cardId: number): Promise<ReviewCard> {
   return request<ReviewCard>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}`);
 }
 
+// 读取当前用户所有文档的全部活动卡片，包括已经复习过的卡片；此接口不提供评分队列。
+export function fetchReviewCardLibrary(): Promise<ReviewCardLibrary> {
+  return request<ReviewCardLibrary>('/api/reviews/cards/library');
+}
+
+// 保存用户编辑后的卡片正文，可选更新经过服务端校验的 evidence 引用。
+export function updateReviewCard(cardId: number, payload: ReviewCardUpdatePayload): Promise<ReviewCard> {
+  return request<ReviewCard>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 请求 LLM 生成单卡片的原文约束改写预览，不会直接写入数据库。
+export function previewReviewCardRewrite(cardId: number, payload: ReviewCardRewritePayload): Promise<ReviewCardRewritePreview> {
+  return request<ReviewCardRewritePreview>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}/rewrite-preview`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 创建单卡片后台改写任务，调用返回后模型仍会继续生成候选。
+export function startReviewCardRewriteTask(cardId: number, payload: ReviewCardRewritePayload): Promise<ReviewCardRewriteTask> {
+  return request<ReviewCardRewriteTask>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}/rewrite-tasks`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 重新打开单卡片改写弹窗时恢复该卡片最近一次任务。
+export function fetchLatestReviewCardRewriteTask(cardId: number): Promise<ReviewCardRewriteTask | null> {
+  return request<ReviewCardRewriteTask | null>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}/rewrite-tasks/latest`);
+}
+
+// 轮询一条单卡片后台改写任务。
+export function fetchReviewCardRewriteTask(cardId: number, taskId: string): Promise<ReviewCardRewriteTask> {
+  return request<ReviewCardRewriteTask>(`/api/reviews/cards/${encodeURIComponent(String(cardId))}/rewrite-tasks/${encodeURIComponent(taskId)}`);
+}
+
+// 请求资料级 AI 合并预览，不会直接覆盖任何现有卡片。
+export function previewReviewMaterialRewrite(materialId: number, payload: ReviewMaterialRewritePayload): Promise<ReviewMaterialRewritePreview> {
+  return request<ReviewMaterialRewritePreview>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-preview`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 创建资料级后台合并/重新生成任务，立即返回可查询状态。
+export function startReviewMaterialRewriteTask(materialId: number, payload: ReviewMaterialRewritePayload): Promise<ReviewMaterialRewriteTask> {
+  return request<ReviewMaterialRewriteTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-tasks`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 重新打开资料改写弹窗时恢复该资料最近一次任务。
+export function fetchLatestReviewMaterialRewriteTask(materialId: number): Promise<ReviewMaterialRewriteTask | null> {
+  return request<ReviewMaterialRewriteTask | null>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-tasks/latest`);
+}
+
+// 轮询一条资料级后台合并/重新生成任务。
+export function fetchReviewMaterialRewriteTask(materialId: number, taskId: string): Promise<ReviewMaterialRewriteTask> {
+  return request<ReviewMaterialRewriteTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-tasks/${encodeURIComponent(taskId)}`);
+}
+
+// 应用用户确认后的资料级候选，服务端会校验原卡片版本并原子替换。
+export function applyReviewMaterialRewrite(materialId: number, payload: ReviewMaterialRewriteApplyPayload): Promise<ReviewMaterialRewriteApplyResult> {
+  return request<ReviewMaterialRewriteApplyResult>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-apply`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
 // 读取资料分类、卡片生成状态和卡片数量。
 export function fetchReviewMaterials(): Promise<ReviewMaterial[]> {
   return request<ReviewMaterial[]>('/api/reviews/materials');
@@ -260,6 +505,15 @@ export function fetchReviewFolders(): Promise<ReviewFolder[]> {
 // 进入文件夹后按文档读取全部活动卡片，列表阶段不预加载答案。
 export function fetchReviewFolder(folderId: number): Promise<ReviewFolderDetail> {
   return request<ReviewFolderDetail>(`/api/reviews/folders/${encodeURIComponent(String(folderId))}`);
+}
+
+// 一次提交当前文件夹内文档的完整顺序，服务端按文件夹独立保存优先级。
+export function updateReviewFolderMaterialOrder(folderId: number, materialIds: number[]): Promise<ReviewGroupOrderResult> {
+  return request<ReviewGroupOrderResult>(`/api/reviews/folders/${encodeURIComponent(String(folderId))}/materials/order`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify({ materialIds })
+  });
 }
 
 // 创建当前用户的复习文件夹。
@@ -308,6 +562,18 @@ export function generateReviewMaterial(materialId: number, userFeedback?: string
   });
 }
 
+// 由用户直接创建一张当前资料的复习卡片，不依赖模型补漏。
+export function createManualReviewCard(
+  materialId: number,
+  payload: ReviewManualCardPayload
+): Promise<ReviewCard> {
+  return request<ReviewCard>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/cards`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
 // 用户指出遗漏主题后，只从当前文档 evidence 中追加新卡片，不重建既有卡片。
 export function supplementReviewMissingKnowledge(
   materialId: number,
@@ -319,6 +585,34 @@ export function supplementReviewMissingKnowledge(
     headers: jsonHeaders,
     body: JSON.stringify({ message, conversation })
   });
+}
+
+// 创建后台补漏任务，提交后允许用户关闭对话窗口。
+export function startSupplementReviewMissingKnowledge(
+  materialId: number,
+  message: string,
+  conversation: ReviewMissingKnowledgeMessage[] = []
+): Promise<ReviewMissingKnowledgeTask> {
+  return request<ReviewMissingKnowledgeTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/missing-knowledge/tasks`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ message, conversation })
+  });
+}
+
+// 读取当前资料最近一次补漏任务，重新打开弹窗时恢复状态。
+export function fetchLatestSupplementReviewMissingKnowledge(
+  materialId: number
+): Promise<ReviewMissingKnowledgeTask | null> {
+  return request<ReviewMissingKnowledgeTask | null>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/missing-knowledge/tasks/latest`);
+}
+
+// 轮询后台补漏任务的阶段、进度和最终结果。
+export function fetchSupplementReviewMissingKnowledgeTask(
+  materialId: number,
+  taskId: string
+): Promise<ReviewMissingKnowledgeTask> {
+  return request<ReviewMissingKnowledgeTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/missing-knowledge/tasks/${encodeURIComponent(taskId)}`);
 }
 
 // 将整份资料永久移出复习中心，原始 RAG 文件和索引保持不变。

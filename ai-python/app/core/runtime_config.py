@@ -89,9 +89,25 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("rag", "llm", "timeout-seconds"): "RAG_LLM_TIMEOUT_SECONDS",
     ("rag", "llm-temperature"): "RAG_LLM_TEMPERATURE",
     ("rag", "llm", "temperature"): "RAG_LLM_TEMPERATURE",
-    ("review", "llm", "api-key"): "DEEPSEEK_API_KEY",
+    ("review", "llm", "api-key"): "REVIEW_LLM_API_KEY",
+    ("review", "llm", "model"): "REVIEW_LLM_MODEL",
+    ("review", "llm", "reasoning-effort"): "REVIEW_LLM_REASONING_EFFORT",
+    ("review", "llm", "thinking-enabled"): "REVIEW_LLM_THINKING_ENABLED",
+    ("review", "llm", "base-url"): "REVIEW_LLM_BASE_URL",
+    ("review", "llm", "fallback", "enabled"): "REVIEW_LLM_FALLBACK_ENABLED",
+    ("review", "llm", "fallback", "model"): "REVIEW_LLM_FALLBACK_MODEL",
+    ("review", "llm", "fallback", "base-url"): "REVIEW_LLM_FALLBACK_BASE_URL",
+    ("review", "llm", "fallback", "api-key"): "REVIEW_LLM_FALLBACK_API_KEY",
     ("review", "llm", "timeout-seconds"): "REVIEW_EXTRACTION_TIMEOUT_SECONDS",
     ("review", "llm", "max-in-flight"): "REVIEW_DEEPSEEK_MAX_IN_FLIGHT",
+    ("review", "llm", "cockpit", "retry-enabled"): "REVIEW_COCKPIT_RETRY_ENABLED",
+    ("review", "llm", "cockpit", "stream-open-timeout-seconds"): "REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS",
+    ("review", "llm", "cockpit", "stream-idle-timeout-seconds"): "REVIEW_COCKPIT_STREAM_IDLE_TIMEOUT_SECONDS",
+    ("review", "llm", "cockpit", "bootstrap-retries"): "REVIEW_COCKPIT_BOOTSTRAP_RETRIES",
+    ("review", "llm", "cockpit", "request-retries"): "REVIEW_COCKPIT_REQUEST_RETRIES",
+    ("review", "llm", "cockpit", "retry-base-delay-ms"): "REVIEW_COCKPIT_RETRY_BASE_DELAY_MS",
+    ("review", "llm", "cockpit", "retry-max-delay-ms"): "REVIEW_COCKPIT_RETRY_MAX_DELAY_MS",
+    ("review", "llm", "cockpit", "keepalive-seconds"): "REVIEW_COCKPIT_KEEPALIVE_SECONDS",
     ("review", "langextract", "enabled"): "REVIEW_LANGEXTRACT_ENABLED",
     ("review", "langextract", "extraction-passes"): "REVIEW_LANGEXTRACT_EXTRACTION_PASSES",
     ("review", "langextract", "max-char-buffer"): "REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER",
@@ -200,6 +216,13 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("asr", "batch-wait-ms"): "RAG_ASR_BATCH_WAIT_MS",
     ("asr", "max-in-flight"): "RAG_ASR_MAX_IN_FLIGHT",
     ("asr", "rpm-limit"): "RAG_ASR_RPM_LIMIT",
+    ("remote-video", "douyin", "enabled"): "RAG_DOUYIN_MCP_ENABLED",
+    ("remote-video", "douyin", "mcp-endpoint"): "RAG_DOUYIN_MCP_ENDPOINT",
+    ("remote-video", "douyin", "api-key"): "SOCIALDATAX_API_KEY",
+    ("remote-video", "douyin", "connection-timeout-seconds"): "RAG_DOUYIN_MCP_CONNECTION_TIMEOUT_SECONDS",
+    ("remote-video", "douyin", "tool-timeout-seconds"): "RAG_DOUYIN_MCP_TOOL_TIMEOUT_SECONDS",
+    ("remote-video", "douyin", "poll-interval-seconds"): "RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS",
+    ("remote-video", "douyin", "max-wait-seconds"): "RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS",
     ("video", "ffmpeg-command"): "FFMPEG_COMMAND",
     ("video", "ffprobe-command"): "FFPROBE_COMMAND",
     ("video", "ffmpeg-timeout-seconds"): "RAG_VIDEO_FFMPEG_TIMEOUT_SECONDS",
@@ -320,8 +343,9 @@ def load_runtime_config(args: argparse.Namespace) -> None:
 
     # Windows 下 PyCharm 可能持有旧环境快照；从当前用户环境变量只读回退后，
     # 再让受监督 API 与 worker 统一继承，仍不把密钥写入配置文件或日志。
-    if not read_process_or_windows_user_environment("DEEPSEEK_API_KEY"):
-        print("复习生成提示：未配置 DEEPSEEK_API_KEY，复习资料生成请求将记录为 FAILED；配置后请重新生成。")
+    review_api_key = read_process_or_windows_user_environment("REVIEW_LLM_API_KEY")
+    if not review_api_key:
+        print("复习生成提示：未配置 REVIEW_LLM_API_KEY，复习资料生成请求将记录为 FAILED；配置后请重新生成。")
 
     if loaded_paths:
         joined_paths = ", ".join(str(path) for path in loaded_paths)

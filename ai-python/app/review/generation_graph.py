@@ -254,6 +254,7 @@ def curator_progress_node(
     total_steps: int,
 ) -> ReviewGenerationState:
     """执行一次 LangExtract 长文知识发现，并公开候选数量和降级状态。"""
+    model_name = current_model_name(state)
     emit_progress(
         on_progress,
         stageCode="review.curator",
@@ -270,14 +271,15 @@ def curator_progress_node(
     result = curator_node(state, curator)
     context = dict(result.get("curator_context") or {})
     completed = context.get("status") == "COMPLETED"
+    curator_model_name = str(context.get("llmModel") or model_name).strip() or model_name
     emit_progress(
         on_progress,
         stageCode="review.curator",
         stageLabel="LangExtract 知识发现" if completed else "LangExtract 降级",
         message=(
-            f"知识发现完成：保留 {int(context.get('selectedKnowledgeUnitCount') or 0)} 个候选单元"
+            f"知识发现完成（{curator_model_name}）：保留 {int(context.get('selectedKnowledgeUnitCount') or 0)} 个候选单元"
             if completed
-            else "LangExtract 本次未完成，已保留原有 DeepSeek 生成链路继续处理"
+            else f"LangExtract 本次未完成，已保留原有 {model_name} 生成链路继续处理"
         ),
         status="COMPLETED" if completed else "DEGRADED",
         currentStep=2,
@@ -308,11 +310,12 @@ def actor_progress_node(
     attempt = int(state.get("attempt") or 0) + 1
     max_attempts = int(state.get("max_attempts") or 1)
     feedback = unique_feedback(state.get("repair_feedback") or [])
+    model_name = current_model_name(state)
     emit_progress(
         on_progress,
         stageCode="review.actor",
-        stageLabel="DeepSeek 生成",
-        message=f"正在请求 DeepSeek 生成第 {attempt}/{max_attempts} 版复习卡片",
+        stageLabel=f"{model_name} 生成",
+        message=f"正在请求 {model_name} 生成第 {attempt}/{max_attempts} 版复习卡片",
         status="RUNNING",
         currentStep=3 if has_curator else 2,
         totalSteps=total_steps,
@@ -463,7 +466,7 @@ def planner_node(state: ReviewGenerationState) -> ReviewGenerationState:
 
 
 def actor_node(state: ReviewGenerationState, actor: Actor) -> ReviewGenerationState:
-    """调用一次 DeepSeek，并把上一版候选交给模型做定向修复。"""
+    """调用一次复习模型，并把上一版候选交给模型做定向修复。"""
     attempt = int(state.get("attempt") or 0) + 1
     feedback = list(state.get("repair_feedback") or [])
     previous_candidate = dict(state.get("candidate") or {})
@@ -504,7 +507,7 @@ def observer_node(state: ReviewGenerationState, observer: Observer) -> ReviewGen
 
 
 def curator_node(state: ReviewGenerationState, curator: Curator) -> ReviewGenerationState:
-    """调用一次候选发现；失败只标记降级，不消耗 DeepSeek 卡片修复次数。"""
+    """调用一次候选发现；失败只标记降级，不消耗复习模型卡片修复次数。"""
     try:
         context = dict(curator() or {})
         context.setdefault("status", "COMPLETED")
@@ -548,8 +551,14 @@ def route_after_observer(state: ReviewGenerationState) -> str:
     return "complete" if state.get("status") == "COMPLETED" else "repair"
 
 
+def current_model_name(state: ReviewGenerationState) -> str:
+    """从生成计划读取当前实际模型，进度和降级说明不得伪装成固定供应商。"""
+    model_name = str((state.get("plan") or {}).get("llmModel") or "gpt-5.6-terra").strip()
+    return model_name or "gpt-5.6-terra"
+
+
 def route_after_repair(state: ReviewGenerationState) -> str:
-    """模型预算耗尽后不再继续调用 DeepSeek。"""
+    """模型预算耗尽后不再继续调用复习模型。"""
     return "human_review" if state.get("status") == "NEEDS_REVIEW" else "actor"
 
 
@@ -561,6 +570,13 @@ def diagnostics_from_exception(exc: Exception) -> list[str]:
         if diagnostics:
             return diagnostics
     message = " ".join(str(exc).split()).strip()
+    if message.lower() in {"connection error", "connection error."}:
+        cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        cause_message = " ".join(str(cause).split()).strip() if cause else ""
+        detail = f"{type(exc).__name__}: {message}"
+        if cause_message:
+            detail += f"；底层原因：{type(cause).__name__}: {cause_message}"
+        return [detail[:500]]
     return [message[:500] if message else f"{type(exc).__name__} 导致本次生成失败"]
 
 

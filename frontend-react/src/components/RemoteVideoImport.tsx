@@ -50,8 +50,16 @@ interface NormalizedRemoteVideoUrl {
 const PREVIEW_ITEM_LIMIT = 8;
 const RESULT_ITEM_LIMIT = 200;
 const BILIBILI_HOSTS = new Set(['bilibili.com', 'www.bilibili.com', 'm.bilibili.com']);
-const DOUYIN_HOSTS = new Set(['douyin.com', 'www.douyin.com', 'v.douyin.com', 'iesdouyin.com']);
+const DOUYIN_HOSTS = new Set([
+  'douyin.com',
+  'www.douyin.com',
+  'v.douyin.com',
+  'iesdouyin.com',
+  'www.iesdouyin.com'
+]);
 const BILIBILI_VIDEO_ID = /^(?:BV[0-9A-Za-z]{8,20}|av[0-9]+)$/i;
+const DOUYIN_VIDEO_ID = /^\d{5,32}$/;
+const DOUYIN_SHORT_CODE = /^[A-Za-z0-9_-]{2,80}$/;
 const HTTP_URL_PATTERN = /https?:\/\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]+/gi;
 const TRAILING_PUNCTUATION = new Set('.,;:!?，。！？、；：)]}）】》」』}>'.split(''));
 
@@ -75,7 +83,7 @@ export function RemoteVideoImport({ highPrecision = false, disabled = false }: R
     event.preventDefault();
     const sourceText = text.trim();
     if (!sourceText) {
-      showFeedback('error', '请粘贴一个或多个 Bilibili 完整视频链接');
+      showFeedback('error', '请粘贴一个或多个 Bilibili 或抖音视频链接');
       return;
     }
     if (preview.candidateCount === 0) {
@@ -143,7 +151,7 @@ export function RemoteVideoImport({ highPrecision = false, disabled = false }: R
         </div>
         <div className="remote-video-platforms" aria-label="链接平台支持情况">
           <span className="is-supported"><CircleCheck size={14} aria-hidden="true" />Bilibili</span>
-          <span className="is-unavailable"><CircleOff size={14} aria-hidden="true" />抖音暂不支持</span>
+          <span className="is-supported"><CircleCheck size={14} aria-hidden="true" />抖音语音 RAG</span>
         </div>
       </div>
 
@@ -159,7 +167,7 @@ export function RemoteVideoImport({ highPrecision = false, disabled = false }: R
               autoComplete="off"
               maxLength={1_000_000}
               spellCheck={false}
-              placeholder={'一行一个 URL，也可直接粘贴平台分享文案\n【视频标题】https://www.bilibili.com/video/BV...?p=2&vd_source=...'}
+              placeholder={'一行一个 URL，也可直接粘贴平台分享文案\nBilibili：https://www.bilibili.com/video/BV...?p=2\n抖音：https://v.douyin.com/.../'}
               value={text}
               disabled={unavailable}
               aria-describedby={describedBy}
@@ -176,7 +184,7 @@ export function RemoteVideoImport({ highPrecision = false, disabled = false }: R
           </button>
         </div>
         <p className="remote-video-help" id={helpId}>
-          自动提取文案中的 HTTP(S) 链接并移除追踪参数；不限制链接条数，超出处理槽位的任务会排队等待。
+          自动提取文案中的链接并移除追踪参数。Bilibili 走视频多模态解析；抖音通过 MCP 获取语音转写，不包含画面 OCR。
         </p>
 
         {text.trim() ? (
@@ -345,7 +353,7 @@ function previewRemoteVideoUrls(text: string): RemoteVideoUrlPreview {
   };
 }
 
-// 与服务端规则保持一致：固定 Bilibili 主站地址，仅保留合法的分 P 参数。
+// 与服务端规则保持一致：按平台白名单规范化作品页、短链和必要分页参数。
 function normalizeRemoteVideoUrl(value: string): NormalizedRemoteVideoUrl {
   let parsed: URL;
   try {
@@ -355,20 +363,22 @@ function normalizeRemoteVideoUrl(value: string): NormalizedRemoteVideoUrl {
   }
 
   const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
-  if (DOUYIN_HOSTS.has(host) || host.endsWith('.douyin.com')) {
-    return unsupportedRemoteVideoUrl('抖音链接暂不支持');
-  }
-  if (host === 'b23.tv' || host.endsWith('.b23.tv')) {
-    return unsupportedRemoteVideoUrl('请先展开 b23.tv 短链接');
-  }
   if (
     parsed.protocol !== 'https:'
-    || !BILIBILI_HOSTS.has(host)
     || parsed.username
     || parsed.password
     || (parsed.port && parsed.port !== '443')
   ) {
-    return unsupportedRemoteVideoUrl('当前仅支持 Bilibili 完整公开视频链接');
+    return unsupportedRemoteVideoUrl('当前仅支持 Bilibili 或抖音 HTTPS 公公开视频链接');
+  }
+  if (DOUYIN_HOSTS.has(host)) {
+    return normalizeDouyinVideoUrl(parsed, host);
+  }
+  if (host === 'b23.tv' || host.endsWith('.b23.tv')) {
+    return unsupportedRemoteVideoUrl('请先展开 b23.tv 短链接');
+  }
+  if (!BILIBILI_HOSTS.has(host)) {
+    return unsupportedRemoteVideoUrl('当前仅支持 Bilibili 或抖音公开视频链接');
   }
 
   const pathParts = parsed.pathname.split('/').filter(Boolean);
@@ -389,6 +399,34 @@ function normalizeRemoteVideoUrl(value: string): NormalizedRemoteVideoUrl {
     canonicalUrl.searchParams.set('p', String(pageResult.page));
   }
   return { canonicalUrl: canonicalUrl.toString(), message: '' };
+}
+
+// 抖音短链由后端固定 MCP 解析，前端不跟随重定向；完整页统一转换为作品地址。
+function normalizeDouyinVideoUrl(parsed: URL, host: string): NormalizedRemoteVideoUrl {
+  const pathParts = parsed.pathname.split('/').filter(Boolean);
+  if (host === 'v.douyin.com') {
+    if (pathParts.length !== 1 || !DOUYIN_SHORT_CODE.test(pathParts[0])) {
+      return unsupportedRemoteVideoUrl('请粘贴有效的 v.douyin.com 视频短链接');
+    }
+    return { canonicalUrl: `https://v.douyin.com/${pathParts[0]}/`, message: '' };
+  }
+
+  let videoId = '';
+  if (pathParts.length === 2 && pathParts[0].toLowerCase() === 'video') {
+    videoId = pathParts[1];
+  } else if (
+    pathParts.length === 3
+    && pathParts[0].toLowerCase() === 'share'
+    && pathParts[1].toLowerCase() === 'video'
+  ) {
+    videoId = pathParts[2];
+  } else {
+    videoId = parsed.searchParams.getAll('modal_id').find((value) => DOUYIN_VIDEO_ID.test(value)) ?? '';
+  }
+  if (!DOUYIN_VIDEO_ID.test(videoId)) {
+    return unsupportedRemoteVideoUrl('当前抖音接入仅支持视频作品页或 v.douyin.com 视频短链接');
+  }
+  return { canonicalUrl: `https://www.douyin.com/video/${videoId}`, message: '' };
 }
 
 // 空的 p 参数等同于未提供；第一个非空 p 必须是 1 到 999 的整数。

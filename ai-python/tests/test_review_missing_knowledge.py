@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+from types import SimpleNamespace
 
 from app.review.fsrs_scheduler import FsrsReviewScheduler
 from app.review.missing_knowledge import MissingKnowledgeExtraction, MissingKnowledgeExtractor
@@ -19,7 +20,7 @@ from app.review.repository import (
 )
 from app.review.service import ReviewService
 from app.schemas.rag import Evidence
-from app.schemas.review import ReviewMissingKnowledgeRequest
+from app.schemas.review import ReviewManualCardRequest, ReviewMissingKnowledgeRequest
 
 
 NOW = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
@@ -117,6 +118,41 @@ def test_missing_knowledge_validator_accepts_recall_instruction_without_question
     )
 
     assert [point.question for point in result.knowledge_points] == ["说明 Kafka 零拷贝提升数据传输性能的机制"]
+
+
+def test_missing_knowledge_falls_back_to_deepseek_after_primary_connection_failure(monkeypatch) -> None:
+    """补漏请求也必须在本机中转不可用时重试 DeepSeek。"""
+    from httpx import Request
+    from openai import APIConnectionError
+
+    requests: list[tuple[str, dict]] = []
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            requests.append(("primary", kwargs))
+            raise APIConnectionError(request=Request("POST", "http://localhost:58966/v1/chat/completions"))
+
+    class FallbackCompletions:
+        def create(self, **kwargs):
+            requests.append(("fallback", kwargs))
+            return SimpleNamespace(choices=[])
+
+    primary_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+    fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=FallbackCompletions()))
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "relay-key")
+    monkeypatch.setenv("REVIEW_LLM_FALLBACK_API_KEY", "deepseek-key")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **kwargs: primary_client if kwargs["base_url"] == "http://localhost:58966/v1" else fallback_client,
+    )
+    extractor = MissingKnowledgeExtractor(provider="deepseek")
+
+    response = extractor._create_completion(primary_client, {"model": "gpt-5.6-terra", "messages": []})
+
+    assert response.choices == []
+    assert [kind for kind, _kwargs in requests] == ["primary", "primary", "fallback"]
+    assert requests[2][1]["model"] == "deepseek-v4-flash"
+    assert extractor.active_model_name == "DeepSeek"
 
 
 class RecordingAppendCursor:
@@ -262,6 +298,7 @@ class SupplementTransaction:
             active=True,
             created_at=NOW,
             updated_at=NOW,
+            source_key=draft.source_key,
         )]
 
 
@@ -324,3 +361,27 @@ def test_service_supplement_adds_new_card_without_changing_existing_fsrs_state()
         transaction.existing.lapse_count,
     )
     assert json.loads(transaction.appended[0].evidence_refs_json)[0]["evidenceId"] == "material-12-7"
+
+
+def test_service_create_manual_card_uses_add_only_fsrs_path_without_rag_evidence() -> None:
+    """用户手动补充的问题进入同一复习队列，但不伪造 RAG 原文引用。"""
+    transaction = SupplementTransaction()
+    service = ReviewService(
+        repository=SupplementRepository(transaction),
+        now_provider=lambda: NOW,
+    )
+
+    result = service.create_manual_card(
+        12,
+        ReviewManualCardRequest(
+            question="类方法如何定义和调用？",
+            answer="使用 @classmethod 定义，第一个参数通常命名为 cls；可以通过类或实例调用。",
+            hint="回忆 cls 与 self 的区别",
+        ),
+        "42",
+    )
+
+    assert result.sourceType == "MANUAL"
+    assert result.evidenceRefs == []
+    assert result.answer is not None
+    assert transaction.appended[0].source_key.startswith("manual:")

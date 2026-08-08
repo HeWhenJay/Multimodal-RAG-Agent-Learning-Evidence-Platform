@@ -52,9 +52,10 @@ class RemoteVideoTransaction:
         self.inserted: dict | None = None
         self.enqueued: dict | None = None
 
-    def find_material_by_public_url(self, public_url: str, user_id: str):
+    def find_material_by_public_url(self, public_url: str, user_id: str, platform: str = "bilibili"):
         assert public_url == "https://www.bilibili.com/video/BV1xx411c7mD"
         assert user_id == "7"
+        assert platform == "bilibili"
         return self.current
 
     def insert_material(self, **kwargs):
@@ -84,6 +85,27 @@ class RemoteVideoRepository:
     @contextmanager
     def transaction(self):
         yield self.value
+
+
+class DouyinRemoteVideoTransaction(RemoteVideoTransaction):
+    """验证抖音平台参数会进入幂等查询和资料建档。"""
+
+    def find_material_by_public_url(self, public_url: str, user_id: str, platform: str = "bilibili"):
+        assert public_url == "https://www.douyin.com/video/6961737553342991651"
+        assert user_id == "7"
+        assert platform == "douyin"
+        return self.current
+
+    def insert_material(self, **kwargs):
+        self.inserted = kwargs
+        self.current = replace(
+            material_record(url=kwargs["public_url"]),
+            title=kwargs["title"],
+            source=kwargs["source"],
+            original_filename=kwargs["original_filename"],
+            public_url=kwargs["public_url"],
+        )
+        return self.current
 
 
 def service_for(transaction: RemoteVideoTransaction) -> RagControlService:
@@ -120,6 +142,23 @@ def test_remote_video_import_creates_one_durable_job() -> None:
         "videoId": "BV1xx411c7mD",
     }
     assert transaction.enqueued["high_precision"] is True
+
+
+def test_douyin_video_import_uses_platform_aware_idempotence_and_transcript_filename() -> None:
+    """抖音资料建档使用 douyin 来源和 SRT 转写文件名。"""
+    transaction = DouyinRemoteVideoTransaction()
+
+    response = service_for(transaction).import_remote_video(
+        RagIndexRemoteVideoPublicRequest(
+            url="https://www.douyin.com/video/6961737553342991651",
+            confirmedAuthorized=True,
+        ),
+        "7",
+    )
+
+    assert response.source == "douyin"
+    assert transaction.inserted and transaction.inserted["original_filename"] == "6961737553342991651.srt"
+    assert transaction.enqueued and transaction.enqueued["source_ref"]["platform"] == "douyin"
 
 
 def test_remote_video_import_is_idempotent_for_active_material() -> None:
@@ -182,7 +221,7 @@ def test_remote_video_batch_accepts_more_than_two_urls_and_reports_partial_resul
             title=remote.placeholder_title,
             userId=user_id,
             documentType="mp4",
-            source="bilibili",
+            source=remote.platform,
             status="PENDING",
             storageType="remote",
             publicUrl=remote.canonical_url,
@@ -205,18 +244,18 @@ def test_remote_video_batch_accepts_more_than_two_urls_and_reports_partial_resul
         "7",
     )
 
-    assert len(enqueued_urls) == 3
+    assert len(enqueued_urls) == 4
     assert enqueued_urls[0] == "https://www.bilibili.com/video/BV1yT411H7YK?p=32"
     assert response.candidateCount == 5
-    assert response.queuedCount == 3
+    assert response.queuedCount == 4
     assert response.duplicateCount == 1
-    assert response.rejectedCount == 1
+    assert response.rejectedCount == 0
     assert [item.status for item in response.items] == [
         "QUEUED",
         "QUEUED",
         "QUEUED",
         "DUPLICATE",
-        "REJECTED",
+        "QUEUED",
     ]
 
 
@@ -252,7 +291,13 @@ def test_remote_video_lookup_uses_transaction_advisory_lock() -> None:
     assert len(cursor.executed) == 2
     assert "pg_advisory_xact_lock" in str(cursor.executed[0][0])
     assert cursor.executed[0][1] == (
-        "rag-remote-video:url:7:https://www.bilibili.com/video/BV1xx411c7mD",
+        "rag-remote-video:url:7:bilibili:https://www.bilibili.com/video/BV1xx411c7mD",
+    )
+    assert "source = %s" in str(cursor.executed[1][0])
+    assert cursor.executed[1][1] == (
+        "7",
+        "bilibili",
+        "https://www.bilibili.com/video/BV1xx411c7mD",
     )
 
 

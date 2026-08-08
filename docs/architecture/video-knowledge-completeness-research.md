@@ -13,7 +13,7 @@
 
 ## LangExtract 真实 A/B 与采用决策
 
-项目已直接引入官方 `langextract==1.6.x` 作为实验依赖，不再只停留在“借鉴思路”。适配器使用 LangExtract 官方 OpenAI provider 接入同一 DeepSeek 模型，并启用中文 `UnicodeTokenizer`、长文分块、多轮 extraction passes 和原文字符定位；任何不能逐字回指原文或不能映射到真实 `evidenceId` 的候选都会被丢弃。
+项目已直接引入官方 `langextract==1.6.x` 作为实验依赖，不再只停留在“借鉴思路”。适配器使用 LangExtract 官方 OpenAI provider 接入同一复习模型端点，并启用中文 `UnicodeTokenizer`、长文分块、多轮 extraction passes 和原文字符定位；任何不能逐字回指原文或不能映射到真实 `evidenceId` 的候选都会被丢弃。
 
 2026-08-04 在 Kafka 高性能陈述式课程和带 20 项目录的 Python 基础面经上完成真实 A/B。LangExtract 将两类平均金标召回率从 47.5% 提升到 95.0%，绝对提升 47.5 个百分点；但总 Token 成本达到当前方案的 3.05 倍，Python 长视频的原始 evidence 映射成功率只有 62.8%，过滤后近重复候选约 12.4%。完整设计、冻结金标、逐例指标和复现命令见 [复习 Knowledge Curator × LangExtract A/B 方案与结果](../testing/review-curator-langextract-ab-plan.md)。
 
@@ -27,12 +27,12 @@ evidence 清洗
   → 精确原文定位
   → 跨 pass 近重复过滤
   → 按 topic 轮询选择最多 32 个知识单元
-  → DeepSeek 生成摘要与卡片
+  → gpt-5.6-terra 生成摘要与卡片
   → knowledgeUnitId 完整覆盖 + 问题/答案/evidence 门禁
   → FSRS 持久化
 ```
 
-LangExtract 在一次生成任务中只运行一次，Repair 的后续 DeepSeek 轮次复用同一候选上下文。默认每份资料最多 32 次 LangExtract 模型请求、单请求超时 120 秒；同一资料使用 8 个 worker，整个 Python 进程也通过共享闸门限制最多 8 个并发 LangExtract 请求，避免多份资料叠加后无界扩张。当前本机为 20 核/28 线程、15.78GB 内存，因此没有采用 10 个以上的默认并发。
+LangExtract 在一次生成任务中只运行一次，Repair 的后续 Terra 轮次复用同一候选上下文。默认每份资料最多 32 次 LangExtract 模型请求、单请求超时 120 秒；同一资料使用 8 个 worker，整个 Python 进程也通过共享闸门限制最多 8 个并发 LangExtract 请求，避免多份资料叠加后无界扩张。当前本机为 20 核/28 线程、15.78GB 内存，因此没有采用 10 个以上的默认并发。
 
 线上仍采用以下已验证有效的约束：
 
@@ -51,7 +51,7 @@ LangExtract 在一次生成任务中只运行一次，Repair 的后续 DeepSeek 
 用户提示与最近对话
   → 当前文档 evidence 相关片段与相邻片段
   → 当前活动卡片去重基线
-  → DeepSeek 提取补充候选
+  → gpt-5.6-terra 提取补充候选
   → 问题、答案、evidence 忠实度门禁
   → 语义、来源键和永久排除记录去重
   → add-only 插入新卡片

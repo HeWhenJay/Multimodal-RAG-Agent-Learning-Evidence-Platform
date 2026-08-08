@@ -1,6 +1,6 @@
 # 学习复习与提醒接口文档
 
-更新日期：2026-08-04
+更新日期：2026-08-08
 
 ## 变更摘要
 
@@ -10,15 +10,27 @@
 
 新增按文档“对话补漏”。用户可以用自然语言指出疑似遗漏主题，例如“还讲了页缓存和零拷贝”，服务只在该文档的 RAG evidence 中寻找有原文支撑、且未被现有活动卡片覆盖的知识点。补漏使用独立的 add-only 写入路径：只插入新卡片，不重新生成资料，不停用、更新或替换任何既有卡片，也不改变既有 `fsrs_card_json`、到期时间、评分次数、遗忘次数和复习日志。没有找到合格新知识点时返回正常的零新增结果，不把资料标记为失败。
 
-今日资料标题上的拖拽手柄同时支持文件夹投放。用户把整份文档拖到文件夹卡片并松手后，前端调用既有批量归档接口，只改变该文档的文件夹归属；拖拽经过今日队列造成的临时排序会恢复，不额外写入资料优先级。主页面资料归档区支持逐份勾选和“全选未归档资料”，选择目标文件夹后一次批量进入；触屏与键盘用户无需使用拖拽也能完成批量归档。
+新增用户手动建卡。用户可以在主页面资料行或文件夹详情的文档操作区直接填写问题、答案和可选提示；卡片以 `manual:*` 来源键进入同一 FSRS 队列，立即到期但不生成或伪造 RAG evidence，页面会明确标记“手动卡片”。手动卡片仍支持揭示答案、评分和删除，既有 AI 卡片及其复习记录不会被修改。
+
+新增卡片正文编辑与 Markdown 展示。问题、答案和提示都允许用户直接修改，答案与提示保留安全 Markdown 换行、列表、标题、代码块、引用和强调格式；复习生成 Prompt 也会优先使用 Markdown 组织步骤、并列项和关键术语。编辑只更新卡面内容，不重置 FSRS 状态、到期时间、评分次数或历史日志；AI 卡片一旦被用户编辑会转为 `custom:*` 用户编辑来源键，资料再次生成时不会自动停用该卡片。
+
+新增全量卡片库与 LLM 改写对比。`/reviews/cards` 页面按文档展示所有活动卡片，即使卡片已复习、因此从今日队列隐藏，也仍可查看和编辑；该页面不提供评分入口。LLM 改写先返回原卡片—新卡片对比预览，用户可在同一弹窗继续修改新卡片的 Markdown 内容，随后选择“回退并关闭”或“应用新卡片”。来源约束分为严格依赖原文、尽量以原文为主、原文仅参考三档；预览本身不写数据库，严格档位在应用时再次执行 evidence 忠实度校验。
+
+新增资料级 AI 合并改写。主页面和文件夹详情均提供同一入口：读取当前资料的全部活动卡片，默认要求模型把多张卡片合并成 1 张综合卡片，并返回原摘要、原卡片与候选摘要/卡片的对比。预览接口不写数据库；应用接口携带 `sourceVersion`、原卡片 ID 列表和正文指纹 `originalFingerprint`，服务端在事务内再次校验资料、卡片集合与卡片内容未变化后，写入用户确认的候选、停用旧卡片并保存来源排除记录，避免旧卡片在下一次自动同步时复活。用户在预览页可继续编辑候选摘要、问题、答案和提示，只有点击“确认覆盖”为 1 张后才会真正替换。
+
+补漏请求改为后台任务模式。提交后立即返回任务编号，用户可以关闭对话窗口，任务仍由 Python 进程继续执行；前端通过任务状态接口读取排队、证据定位、模型核对、卡片写入和成功/失败阶段。原同步补漏端点保留，供旧客户端兼容使用。
+
+今日资料标题上的拖拽手柄同时支持文件夹投放。用户把整份文档拖到文件夹卡片并松手后，前端调用既有批量归档接口，只改变该文档的文件夹归属；拖拽经过今日队列造成的临时排序会恢复，不额外写入资料优先级。主页面资料归档区支持逐份勾选和“全选未归档资料”，选择目标文件夹后一次批量进入；触屏与键盘用户无需使用拖拽也能完成批量归档。主页面和文件夹详情的文档排序均在松手位置显示虚影，松手后一次提交完整顺序，失败时恢复原顺序。
 
 结构化视频不再受普通资料“最多 8 张”的固定截断影响。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，同时由 LangExtract 从陈述式讲解中发现定义、机制、流程、因果、对比和实践结论。当结构化问题或严格定位候选超过 8 个时，单份资料动态放宽到最多 32 张；同主题连续细节可合并，但不得遗漏候选知识 ID。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
 
-每份复习资料新增一份由 DeepSeek 生成的复习摘要。`learning_material.document_summary` 是 RAG 索引摘要，可能只是截断后的开头内容，不能直接作为复习总结展示；它只作为本地前置过滤和模型判断资料范围的辅助输入。本地只判断资料是否值得进入复习中心并分配内部类别；通过过滤后的复习摘要、问题、答案和提示必须在同一次 DeepSeek 请求中完整生成并持久化，不能由本地规则拼写、补齐或降级生成。每日卡片 group 与资料列表都返回同一份模型摘要。
+每份复习资料新增一份由复习模型生成的摘要，主路径默认使用 `gpt-5.6-terra`。`learning_material.document_summary` 是 RAG 索引摘要，可能只是截断后的开头内容，不能直接作为复习总结展示；它只作为本地前置过滤和模型判断资料范围的辅助输入。本地只判断资料是否值得进入复习中心并分配内部类别；通过过滤后的复习摘要、问题、答案和提示必须在同一次模型请求中完整生成并持久化，不能由本地规则拼写、补齐或降级生成。每日卡片 group 与资料列表都返回同一份模型摘要。
 
 今日复习资料 group 支持用户拖拽排序。排序以“当前用户 + 复习资料”为持久化单位保存在 PostgreSQL；前端提交当前可见 group 的完整顺序后，服务端将这些资料置于用户队列前部，其余复习资料保持原有相对顺序。该顺序影响 `GET /api/reviews/due` 与 `GET /api/reviews/due-groups` 的资料选择顺序，但不改变卡片组内到期顺序、FSRS 状态或评分算法。
+
+复习中心的高频读取遵循“先取稳定 ID，再按 ID 批量读取状态”的策略：未归档资料列表先读取 `learning_material`，再批量读取 `learning_review_material`；文件夹详情先读取文件夹关联表中的 `material_id/display_order`，再批量读取资料和复习状态。主页面到期队列中仅用于判断“是否已归档”的文件夹联表改为带索引的 `NOT EXISTS`。需要在同一事务中锁定资料、校验索引版本或完成队列选取的查询保留必要联表，避免为减少 `JOIN` 而增加往返次数或破坏一致性。高频条件对应联合索引已登记在 `20260805_0200_optimize_review_query_indexes.sql`。
 
 复习卡片不得要求用户重新阅读整篇文档或观看整段视频。每张卡片必须保留 `evidenceRefs`，字段与现有 RAG `Evidence` 一致；视频 evidence 必须保留 `startTime/endTime/playbackUrl` 并复用 `/videos` 时间段跳转，其他格式复用 `/preview/material/{id}` 展示原始文本或带章节位置的 RAG 提取视图。
 
@@ -33,13 +45,13 @@
 - 文件夹只负责资料管理与查找，不改变到期规则。文件夹中的活动卡片继续参与 `dueCount`、每日资料额度和今日复习队列；今日资料组返回 `folderId/folderName` 供前端定位。
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
-- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 DeepSeek。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—LangExtract Curator—生成—质量观察—修复”循环。Curator 对完整 evidence 只运行一次，Repair 复用候选，不重复执行长文抽取。图的 `recursion_limit` 固定为 `999`，卡片 DeepSeek 真实模型调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
-- `DEEPSEEK_API_KEY` 缺失等不可执行错误写入 `FAILED`。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
-- `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `DEEPSEEK_API_KEY` 注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
-- 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、LangExtract 知识发现、DeepSeek 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；Curator 会公开原始候选、精确定位候选、最终选择数与模型请求数。`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前复习卡片版本为 `review-card-v11`。v11 在 v10 的问题清洗、可选问号、`sourceQuestion` 审计和增量 Repair 基础上，引入最多 32 个 LangExtract `knowledgeUnitId`；模型必须为卡片回传覆盖 ID，服务端校验候选 evidence 与卡片 evidence 至少有一项重合，并拒绝未完整覆盖的结果。DeepSeek 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
-- 所有复习 LLM 调用固定使用 DeepSeek 官方模型标识 `deepseek-v4-flash`（官方滚动指向最新正式版），显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。请求地址固定使用 DeepSeek 官方 OpenAI 兼容 Base URL `https://api.deepseek.com`，密钥只读取用户环境变量 `DEEPSEEK_API_KEY`；不得继承 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或第三方代理 URL。
-- 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 仍由 DeepSeek 输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
+- 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 `gpt-5.6-terra`。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—LangExtract Curator—生成—质量观察—修复”循环。Curator 对完整 evidence 只运行一次，Repair 复用候选，不重复执行长文抽取。图的 `recursion_limit` 固定为 `999`，卡片 `gpt-5.6-terra` 真实调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
+- `REVIEW_LLM_API_KEY` 缺失等不可执行错误写入 `FAILED`。`DEEPSEEK_API_KEY` 或 `REVIEW_LLM_FALLBACK_API_KEY` 仅用于主中转失败后的 DeepSeek 降级，不能代替主密钥。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
+- `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `REVIEW_LLM_API_KEY`、`DEEPSEEK_API_KEY` 等实际已配置密钥注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
+- 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、LangExtract 知识发现、`gpt-5.6-terra` 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；Curator 会公开原始候选、精确定位候选、最终选择数与模型请求数。`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前资料提炼卡片版本为 `review-card-v12`，单卡片改写 Prompt 为 `review-card-rewrite-v1`，资料级合并改写 Prompt 为 `review-material-rewrite-v1`。v12 在 v11 的问题清洗、可选问号、`sourceQuestion` 审计和增量 Repair 基础上，要求答案尽量使用安全 Markdown；资料提炼仍引入最多 32 个 LangExtract `knowledgeUnitId`，模型必须为卡片回传覆盖 ID，服务端校验候选 evidence 与卡片 evidence 至少有一项重合，并拒绝未完整覆盖的结果。`gpt-5.6-terra` 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
+- 所有复习 LLM 调用主路径统一使用本机 OpenAI-compatible Cockpit 中转 `http://localhost:58966/v1` 的 `gpt-5.6-terra`，显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。主密钥读取 `REVIEW_LLM_API_KEY`。项目客户端按 Cockpit“长等待方案”给内部账号与平台轮换留出完整窗口：流打开窗口 180 秒、空闲窗口 240 秒、启动重试 1 次、请求重试 1 次、退避 300-1500 毫秒；因此默认客户端等待窗口为 615 秒。连接失败、超时、429、5xx、Cockpit 账号授权失效导致的 401/403 会先向 Cockpit 重试一次，只有两次 Cockpit 请求都失败后才允许直连 DeepSeek `deepseek-v4-flash`。400、404、422 等确定性请求错误不在 Cockpit 重试，避免错误请求形成重试风暴。进度、摘要和失败原因必须区分“Cockpit 重试”与“DeepSeek 降级”。不得继承通用 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或其他代理配置。
+- 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 由本次实际调用模型输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
 - evidence 在本地前置过滤阶段会移除纯时间码、重复字幕水印和无事实内容的口头转场；未通过学习内容过滤的资料直接跳过且不创建卡片，历史旧版本卡片会在增量同步时停用并重建。本地过滤不得生成或改写资料总结、问题、答案和提示。
 - 用户删除使用 PostgreSQL tombstone 作为唯一事实来源。`learning_review_card_exclusion` 按 `materialId + sourceKey` 阻止同一卡片复活，`learning_review_material_exclusion` 按 `materialId` 永久阻止整份资料再次进入复习中心；不能只依赖前端隐藏或 Redis 缓存。
@@ -49,7 +61,20 @@
 
 ## 模型运行配置
 
-DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务固定请求 `deepseek-v4-flash`。官方说明该模型标识会滚动指向最新正式版本；思考模式请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`。参数依据：[首次 API 调用](https://api-docs.deepseek.com/)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON 输出](https://api-docs.deepseek.com/guides/json_mode)。
+复习服务默认请求本机 OpenAI-compatible Cockpit 中转 `http://localhost:58966/v1` 的 `gpt-5.6-terra`。请求同时携带 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`，不传 `temperature`；`REVIEW_LLM_BASE_URL`、`REVIEW_LLM_MODEL`、`REVIEW_LLM_REASONING_EFFORT` 和 `REVIEW_LLM_THINKING_ENABLED` 可通过环境变量覆盖。项目关闭 OpenAI SDK 的隐式重试，由统一 Cockpit 策略显式记录每次尝试。`REVIEW_LLM_FALLBACK_ENABLED=true` 且存在 `DEEPSEEK_API_KEY` 或 `REVIEW_LLM_FALLBACK_API_KEY` 时，才会在 Cockpit 尝试耗尽后执行一次 DeepSeek 降级。
+
+Cockpit 重试参数默认与本机“长等待方案”保持一致：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS` | `180` | Cockpit 等待上游开始返回流的单次窗口 |
+| `REVIEW_COCKPIT_STREAM_IDLE_TIMEOUT_SECONDS` | `240` | 流建立后允许无新数据的窗口 |
+| `REVIEW_COCKPIT_BOOTSTRAP_RETRIES` | `1` | Cockpit 流启动失败后的重试次数 |
+| `REVIEW_COCKPIT_REQUEST_RETRIES` | `1` | 项目客户端在降级前重新请求 Cockpit 的次数 |
+| `REVIEW_COCKPIT_RETRY_BASE_DELAY_MS` | `300` | 首次重试基础退避 |
+| `REVIEW_COCKPIT_RETRY_MAX_DELAY_MS` | `1500` | 指数退避上限 |
+| `REVIEW_COCKPIT_KEEPALIVE_SECONDS` | `15` | 与 Cockpit SSE keepalive 配置一致，纳入等待预算和诊断 |
+| `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | `615` | 单次 Cockpit 请求等待窗口；默认覆盖两次 180 秒流打开、一次 240 秒空闲和 15 秒余量 |
 
 线上默认并发与预算：
 
@@ -62,7 +87,7 @@ DeepSeek 官方 OpenAI 兼容入口为 `https://api.deepseek.com`，复习服务
 | `REVIEW_LANGEXTRACT_TIMEOUT_SECONDS` | `120` | 单个 LangExtract 请求超时 |
 | `REVIEW_DEEPSEEK_MAX_IN_FLIGHT` | `8` | 卡片生成请求的进程级并发闸门 |
 
-LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待 DeepSeek HTTP；项目在客户端代理外再增加进程级共享闸门，保证多份资料同时生成时不会把“每份 8 个 worker”相乘成无界请求数。配置超过 10 时回退或限制在安全范围，降低配置不当造成的限流和内存压力。
+LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待当前实际模型 HTTP；项目在客户端代理外再增加进程级共享闸门，保证多份资料同时生成时不会把“每份 8 个 worker”相乘成无界请求数。配置超过 10 时回退或限制在安全范围，降低配置不当造成的限流和内存压力。
 
 密钥只从用户环境变量 `DEEPSEEK_API_KEY` 读取。默认优先使用当前进程环境；Windows 进程环境缺失时，再只读当前用户的 `HKCU\Environment`，并缓存到当前进程供受监督 worker 继承。Linux、容器和服务器环境仍只使用标准进程环境。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
 
@@ -81,22 +106,169 @@ LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待 DeepSeek HTT
 | GET | `/api/reviews/due?limit=20` | 获取当前到期的关键知识点卡片 |
 | GET | `/api/reviews/due-groups?limit=20` | 按上传资料 group 获取今日到期卡片，列表不返回答案正文 |
 | PUT | `/api/reviews/due-groups/order` | 批量保存当前用户今日资料 group 的拖拽顺序 |
+| PUT | `/api/reviews/folders/{folderId}/materials/order` | 批量保存当前用户文件夹内文档的拖拽顺序 |
 | GET | `/api/reviews/materials` | 获取主页面未归档资料的分类、生成状态和卡片数；已归档资料仅在文件夹详情返回 |
 | PUT | `/api/reviews/materials/folder` | 以文档为单位批量移入指定文件夹，`folderId=null` 时移出文件夹 |
 | POST | `/api/reviews/materials/{materialId}/generate` | 对一条当前用户资料重新分类并生成卡片，可携带人工补充说明 |
-| POST | `/api/reviews/materials/{materialId}/missing-knowledge` | 根据用户对话提示从当前文档 evidence 中寻找遗漏知识点，只追加新卡片 |
+| POST | `/api/reviews/materials/{materialId}/rewrite-preview` | 兼容旧客户端：同步生成资料级前后对比候选，不写数据库 |
+| POST | `/api/reviews/materials/{materialId}/rewrite-tasks` | 创建资料级后台合并/重新生成任务，立即返回任务编号 |
+| GET | `/api/reviews/materials/{materialId}/rewrite-tasks/latest` | 获取当前资料最近一次合并/重新生成任务 |
+| GET | `/api/reviews/materials/{materialId}/rewrite-tasks/{taskId}` | 查询资料级改写任务的阶段、进度和对比结果 |
+| POST | `/api/reviews/materials/{materialId}/rewrite-apply` | 携带预览版本和用户确认后的 1 张候选，事务内替换旧卡片 |
+| POST | `/api/reviews/materials/{materialId}/cards` | 创建一张用户手动复习卡片，不依赖 AI 补漏 |
+| POST | `/api/reviews/materials/{materialId}/missing-knowledge` | 兼容旧客户端：同步查找并追加遗漏知识点 |
+| POST | `/api/reviews/materials/{materialId}/missing-knowledge/tasks` | 创建后台补漏任务，立即返回任务编号 |
+| GET | `/api/reviews/materials/{materialId}/missing-knowledge/tasks/latest` | 获取当前资料最近一次补漏任务，便于关闭弹窗后恢复查看 |
+| GET | `/api/reviews/materials/{materialId}/missing-knowledge/tasks/{taskId}` | 查询指定补漏任务的阶段、进度和结果 |
 | POST | `/api/reviews/materials/batch-delete` | 批量将多份资料移出复习中心 |
 | DELETE | `/api/reviews/materials/{materialId}` | 将整份资料永久移出复习中心，保留原始 RAG 文件 |
+| GET | `/api/reviews/cards/library` | 按文档读取当前用户全部活动卡片，包含已复习卡片和完整 Markdown 正文，不提供评分 |
 | GET | `/api/reviews/folders` | 获取当前用户的文件夹及文档、卡片和到期统计 |
 | POST | `/api/reviews/folders` | 新建复习文件夹 |
 | GET | `/api/reviews/folders/{folderId}` | 进入文件夹并按文档读取全部活动卡片，答案保持隐藏 |
 | PATCH | `/api/reviews/folders/{folderId}` | 重命名复习文件夹 |
 | DELETE | `/api/reviews/folders/{folderId}` | 删除文件夹并把其中资料改为未归档 |
 | GET | `/api/reviews/cards/{cardId}` | 用户主动揭示答案时获取答案、提示和原文 evidence |
+| POST | `/api/reviews/cards/{cardId}/rewrite-preview` | 兼容旧客户端：同步生成原卡片—新卡片的无副作用 LLM 对比预览 |
+| POST | `/api/reviews/cards/{cardId}/rewrite-tasks` | 创建单卡片后台改写任务，立即返回任务编号 |
+| GET | `/api/reviews/cards/{cardId}/rewrite-tasks/latest` | 获取当前卡片最近一次后台改写任务 |
+| GET | `/api/reviews/cards/{cardId}/rewrite-tasks/{taskId}` | 查询单卡片改写任务的阶段、进度和对比结果 |
+| PUT | `/api/reviews/cards/{cardId}` | 应用用户编辑或确认后的 AI 卡片正文，保留 FSRS 状态 |
 | POST | `/api/reviews/cards/{cardId}/grade` | 提交四档回忆结果并更新 FSRS 状态 |
 | POST | `/api/reviews/cards/batch-delete` | 批量删除多张复习卡片 |
 | DELETE | `/api/reviews/cards/{cardId}` | 删除一张卡片并阻止同一稳定来源卡片再次生成 |
 | PUT | `/api/reviews/settings` | 更新复习提醒开关、目标记忆率、每日上限和提醒时间 |
+
+### 查看全部卡片
+
+```http
+GET /api/reviews/cards/library
+Authorization: Bearer <token>
+```
+
+响应按文档返回全部活动卡片，`reviewCount > 0` 的已复习卡片不会被过滤；卡片答案和 evidence 在此只读管理页面中直接返回。`totalMaterialCount`、`totalCardCount`、`reviewedCardCount` 提供页面统计，文档项同时返回文件夹归属、资料总结和全部卡片。该接口不改变到期状态，也不提供评分语义。
+
+### 直接修改卡片
+
+```http
+PUT /api/reviews/cards/81
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "question": "ISR 的核心作用是什么？",
+  "answer": "- **跟踪**与 Leader 保持同步的副本\n- 为故障后的 Leader 选举提供候选",
+  "hint": "回忆 `Leader` 与同步副本集合"
+}
+```
+
+`question` 最长 500 字，`answer` 最长 5000 字，`hint` 最长 1000 字；答案和提示只去除首尾空白并保留 Markdown 结构。服务端按认证用户锁定活动卡片，只更新正文和 `updatedAt`，不修改 `fsrs_card_json`、`dueAt`、`reviewCount`、`lapseCount` 或评分日志。首次修改模型卡片后，响应中的 `isUserEdited=true`。
+
+### LLM 三档改写与对比
+
+新客户端通过后台任务接口提交改写，HTTP 请求不会等待 LLM 完成：
+
+```http
+POST /api/reviews/cards/81/rewrite-tasks
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "instruction": "把答案改成三步列表，并突出容易混淆的术语",
+  "mode": "SOURCE_FIRST"
+}
+```
+
+响应中的 `status` 为 `QUEUED`、`RUNNING`、`SUCCEEDED` 或 `FAILED`，并包含 `taskId`、原始 `instruction`、`mode`、当前 `progress`、最终 `result` 或中文 `error`。前端可关闭弹窗并继续操作；重新打开时调用 `latest`，运行中每约 1.2 秒按任务编号查询。`SUCCEEDED` 后的 `result` 与下方同步预览响应结构相同，仍只用于前后对比，必须由用户点击应用后才会覆盖原卡片。同一用户、同一卡片已有运行任务时会复用该任务，避免重复调用模型。
+
+任务进度当前保存在 Python API 进程内，服务重启后不会恢复未完成或历史任务；此时用户可以重新提交。同步 `rewrite-preview` 仅保留给旧客户端兼容。
+
+```http
+POST /api/reviews/cards/81/rewrite-preview
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "instruction": "把答案改成三步列表，并突出容易混淆的术语",
+  "mode": "SOURCE_FIRST"
+}
+```
+
+`mode` 可选：
+
+- `STRICT_SOURCE`：严格依赖原文，候选答案必须引用真实 evidence，预览和应用阶段都执行忠实度校验。
+- `SOURCE_FIRST`：尽量以原文为主，允许轻量解释与结构重组。
+- `SOURCE_REFERENCE`：原文仅参考，优先满足用户的表达和补充想法；模型没有引用原文时 `evidenceRefs` 可为空。
+
+成功响应包含 `original`、`proposed`、`evidenceRefs` 和 `modelName`，不会写入卡片。用户可直接回退关闭，也可在前端继续编辑 `proposed` 后使用 `PUT /api/reviews/cards/{cardId}` 应用；AI 应用请求额外携带本次 `rewriteMode` 与 `evidenceIds`，服务端重新校验证据属于当前用户资料。严格档位下，用户二次编辑造成答案脱离引用原文时，应用会返回“编辑后的答案未通过严格原文忠实度校验”。
+
+### 资料级合并改写与确认覆盖
+
+资料合并/重新生成同样优先使用后台任务接口：
+
+```http
+POST /api/reviews/materials/12/rewrite-tasks
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "instruction": "将当前 4 张 Kafka 卡片合并成 1 张综合卡片，保留全部核心机制",
+  "mode": "SOURCE_FIRST"
+}
+```
+
+关闭弹窗不会取消任务；重新打开时通过 `GET /api/reviews/materials/12/rewrite-tasks/latest` 恢复，再查询具体任务。完成后的 `result` 包含原卡片、综合候选、资料版本和正文指纹，数据库仍保持不变。用户确认后才调用 `rewrite-apply`；因此后台生成、关闭弹窗和恢复查看均不会绕过前后对比与并发覆盖校验。同一用户、同一资料的运行任务会被复用。任务也采用进程内状态，Python API 重启后需重新提交。
+
+```http
+POST /api/reviews/materials/12/rewrite-preview
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "instruction": "将当前 4 张 Kafka 卡片合并成 1 张综合卡片，保留零拷贝、压缩、批量发送、分区、顺序写和页缓存",
+  "mode": "SOURCE_FIRST"
+}
+```
+
+预览响应包含 `originalCards`、恰好 1 张 `proposedCards`、`originalSummary`、`proposedSummary`、`sourceVersion` 和 `originalFingerprint`，不会改变数据库。用户可以编辑候选内容后提交：
+
+```http
+POST /api/reviews/materials/12/rewrite-apply
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "sourceVersion": 7,
+  "originalFingerprint": "<预览响应中的指纹>",
+  "originalCardIds": [81, 82, 83, 84],
+  "proposedSummary": "Kafka 高性能设计的综合复习总结",
+  "proposedCards": [{
+    "question": "Kafka 如何实现高性能？",
+    "answer": "保留并组织四张原卡片的核心机制……",
+    "hint": "回忆分区、顺序写、页缓存和零拷贝",
+    "rewriteMode": "SOURCE_FIRST",
+    "evidenceIds": ["chunk-1", "chunk-2"]
+  }]
+}
+```
+
+应用时服务端会再次校验资料版本、活动卡片 ID 和正文指纹；任一变化都会拒绝覆盖并要求重新预览。确认成功后，旧卡片停用并写入来源排除记录，新卡片使用 `custom:` 来源键保留用户修改；旧卡片不会在后续自动同步中复活。
+
+### 用户手动创建复习卡片
+
+```http
+POST /api/reviews/materials/12/cards
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "question": "类方法如何定义和调用？",
+  "answer": "使用 @classmethod 定义，第一个参数通常命名为 cls；调用时可以通过类或实例调用。",
+  "hint": "回忆 cls 与 self 的区别"
+}
+```
+
+手动卡片使用与 AI 卡片相同的评分和 FSRS 排程，但 `sourceType` 为 `MANUAL`，`evidenceRefs` 为空；它表示用户主动补充的复习内容，不代表该答案已通过当前资料 RAG 原文门禁。
 
 ### 对话补充遗漏知识点
 
@@ -115,6 +287,42 @@ Authorization: Bearer <token>
 ```
 
 `message` 为本轮用户提示，长度 1-2000 字；`conversation` 是前端会话级上下文，最多携带最近 12 条用户或助手消息。服务端不会信任请求中的用户 ID，只读取当前认证用户拥有的资料、evidence 和活动卡片。对话历史默认不持久化；刷新页面后可以丢失，但已成功追加的卡片永久保存。
+
+### 后台补漏任务
+
+```http
+POST /api/reviews/materials/12/missing-knowledge/tasks
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "message": "视频后半段还讲了页缓存和零拷贝，请找出漏掉的知识点",
+  "conversation": []
+}
+```
+
+成功响应仍使用 `Result<T>`，任务状态为 `QUEUED` 或 `RUNNING`：
+
+```json
+{
+  "taskId": "missing-knowledge-7a7d4c4b",
+  "materialId": 12,
+  "message": "视频后半段还讲了页缓存和零拷贝，请找出漏掉的知识点",
+  "status": "QUEUED",
+  "progress": {
+    "stageCode": "missing.queue",
+    "stageLabel": "后台排队",
+    "message": "已收到补漏请求，任务将在后台继续执行",
+    "status": "RUNNING",
+    "percent": 0,
+    "events": []
+  },
+  "result": null,
+  "error": null
+}
+```
+
+前端关闭对话窗口不会取消任务；重新打开同一资料的“补充遗漏”入口时，先调用 `latest` 接口恢复最近任务，再按任务编号轮询详情。`status` 可能为 `QUEUED`、`RUNNING`、`SUCCEEDED` 或 `FAILED`。成功时 `result` 使用同步接口的 `ReviewMissingKnowledgeResult` 结构；失败时 `error` 为可直接展示的中文业务错误。任务状态当前保存在 Python 服务进程内，服务重启后不保留未完成任务。
 
 ```json
 {
@@ -164,9 +372,10 @@ Authorization: Bearer <token>
   "id": 81,
   "materialId": 12,
   "materialTitle": "Kafka 的高可用性（视频讲解）",
-  "documentType": "mp4",
-  "question": "Kafka 的副本机制如何保证分区高可用？",
-  "answer": null,
+      "documentType": "mp4",
+      "question": "Kafka 的副本机制如何保证分区高可用？",
+      "sourceType": "RAG",
+      "answer": null,
   "hint": "先回忆 Leader、Follower 与 ISR 的关系",
   "evidenceRefs": [
     {
@@ -230,7 +439,7 @@ Authorization: Bearer <token>
 }
 ```
 
-`materialSummary` 只取当前 `review-card-v11` 复习提炼阶段生成并持久化的 DeepSeek 摘要，不回退到 RAG 的 `document_summary`。`folderId/folderName` 表示资料当前归档位置，为空时定位到主页面“资料归档”列表；非空时前端跳转 `/reviews/folders/{folderId}?materialId={materialId}`，文件夹详情自动展开、滚动并高亮对应文档。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
+`materialSummary` 只取当前 `review-card-v12` 复习提炼阶段生成并持久化的模型摘要，不回退到 RAG 的 `document_summary`。`folderId/folderName` 表示资料当前归档位置，为空时定位到主页面“资料归档”列表；非空时前端跳转 `/reviews/folders/{folderId}?materialId={materialId}`，文件夹详情自动展开、滚动并高亮对应文档。`limit` 表示最多选择多少份资料，不是卡片数量；每个返回的 group 会包含该资料全部当前到期卡片。`remainingToday` 表示当天还可开始复习的新资料份数。
 
 ### 保存资料 group 顺序
 
@@ -258,6 +467,18 @@ Authorization: Bearer <token>
 ```
 
 `materialIds` 原样返回本次已接受的资料顺序，`orderedCount` 表示参与本次前置排序的资料数。重复提交相同顺序返回同一结果。
+
+### 保存文件夹内文档顺序
+
+```http
+PUT /api/reviews/folders/7/materials/order
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{"materialIds": [21, 12, 8]}
+```
+
+`materialIds` 使用与资料 group 排序相同的校验规则，但服务端只在指定文件夹边界内校验和写入。请求中的每个 ID 必须属于当前认证用户的目标文件夹；任一资料不属于该文件夹时整次请求失败，不会部分更新。文件夹内新归档的资料默认追加到末尾，排序成功后详情接口按 `display_order` 返回文档。
 
 ### `ReviewMaterial`
 
@@ -560,10 +781,10 @@ Authorization: Bearer <token>
 | 同一资料正在由其他请求生成 | `该资料的复习卡片正在生成，请稍后刷新` |
 | 资料尚未完成索引 | `学习资料尚未完成索引` |
 | 无可用 evidence | 分类记录为 `FAILED`，不生成无来源卡片 |
-| evidence 清洗后只剩字幕水印、时间码或口头噪声 | 本地过滤记录为 `SKIPPED`，不调用 DeepSeek，不生成卡片 |
-| `DEEPSEEK_API_KEY` 未配置 | 分类记录为 `FAILED`，停用当前活跃卡片，显示“未配置 DeepSeek 密钥”，等待重新生成 |
-| DeepSeek 请求超时、限流或服务异常 | 分类记录为 `FAILED`，停用当前活跃卡片，不发布本地降级内容，后续可重试 |
-| DeepSeek 返回非法 JSON 或未通过质量门禁 | 分类记录为 `FAILED`，记录不含模型隐私内容的中文原因，不发布部分坏卡 |
+| evidence 清洗后只剩字幕水印、时间码或口头噪声 | 本地过滤记录为 `SKIPPED`，不调用复习模型，不生成卡片 |
+| `REVIEW_LLM_API_KEY` 未配置 | 分类记录为 `FAILED`，停用当前活跃卡片，显示“未配置 REVIEW_LLM_API_KEY”，等待重新生成 |
+| Terra 主中转与可选 DeepSeek 降级均不可用 | 分类记录为 `FAILED`，停用当前活跃卡片，不发布本地降级内容，后续可重试 |
+| 复习模型返回非法 JSON 或未通过质量门禁 | 分类记录为 `FAILED`，记录不含模型隐私内容的中文原因，不发布部分坏卡 |
 | FSRS 状态损坏 | 使用当前卡片创建时间重建初始状态并记录受控日志，不回显内部状态 |
 
 ## 前端影响

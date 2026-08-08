@@ -94,7 +94,12 @@ class RagControlTransaction(Protocol):
 
     def find_material(self, material_id: int, user_id: str) -> MaterialRecord | None: ...
 
-    def find_material_by_public_url(self, public_url: str, user_id: str) -> MaterialRecord | None: ...
+    def find_material_by_public_url(
+        self,
+        public_url: str,
+        user_id: str,
+        platform: str = "bilibili",
+    ) -> MaterialRecord | None: ...
 
     def insert_material(
         self,
@@ -267,12 +272,17 @@ class DatabaseRagControlTransaction:
         )
         return self._to_material(self._cursor.fetchone())
 
-    def find_material_by_public_url(self, public_url: str, user_id: str) -> MaterialRecord | None:
-        """按规范化公开 URL 和当前用户查找可复用的链接导入资料。"""
-        # 只串行化同一用户的同一 URL，不让不同链接在批量入队时互相阻塞。
+    def find_material_by_public_url(
+        self,
+        public_url: str,
+        user_id: str,
+        platform: str = "bilibili",
+    ) -> MaterialRecord | None:
+        """按平台、规范化公开 URL 和当前用户查找可复用的链接导入资料。"""
+        # 只串行化同一用户、平台和 URL，不让不同链接在批量入队时互相阻塞。
         self._cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (f"rag-remote-video:url:{user_id}:{public_url}",),
+            (f"rag-remote-video:url:{user_id}:{platform}:{public_url}",),
         )
         self._cursor.execute(
             self._statement(
@@ -280,14 +290,14 @@ class DatabaseRagControlTransaction:
                 SELECT *
                 FROM {schema}.learning_material
                 WHERE user_id = %s
-                  AND source = 'bilibili'
+                  AND source = %s
                   AND storage_type = 'remote'
                   AND public_url = %s
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 1
                 """
             ),
-            (user_id, public_url),
+            (user_id, platform, public_url),
         )
         return self._to_material(self._cursor.fetchone())
 

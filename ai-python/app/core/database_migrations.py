@@ -19,6 +19,10 @@ PYTHON_MIGRATIONS = (
     "20260803_0100_add_review_folders.sql",
     "20260803_0200_add_review_generation_repair_state.sql",
     "20260803_0300_add_review_generation_progress.sql",
+    "20260805_0100_add_review_folder_material_display_order.sql",
+    "20260805_0200_optimize_review_query_indexes.sql",
+    "20260807_0100_add_remote_video_platform_import_guard.sql",
+    "20260807_0200_expand_review_card_hint.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

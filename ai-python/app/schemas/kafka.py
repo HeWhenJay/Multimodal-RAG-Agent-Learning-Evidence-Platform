@@ -45,7 +45,7 @@ class RemoteVideoSourceRef(BaseModel):
     """已通过公开 API 白名单校验的平台视频引用。"""
 
     type: Literal["REMOTE_VIDEO"] = "REMOTE_VIDEO"
-    platform: Literal["bilibili"] = "bilibili"
+    platform: Literal["bilibili", "douyin"] = "bilibili"
     url: str
     videoId: str
 
@@ -59,8 +59,8 @@ class RemoteVideoSourceRef(BaseModel):
             remote = validate_remote_video_url(self.url)
         except BusinessError as exc:
             raise ValueError(str(exc)) from exc
-        if remote.canonical_url != self.url or remote.video_id != self.videoId:
-            raise ValueError("远程视频引用不是规范化 Bilibili 地址")
+        if remote.platform != self.platform or remote.canonical_url != self.url or remote.video_id != self.videoId:
+            raise ValueError("远程视频引用的平台、地址或视频标识不一致")
         return self
 
 

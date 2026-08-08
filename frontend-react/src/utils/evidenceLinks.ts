@@ -48,6 +48,14 @@ export function buildVideoEvidenceLink(evidence: RagEvidence) {
   if (!startTime) return '';
 
   const metadata = evidence.metadata || {};
+  if (metadataText(metadata.sourcePlatform)?.toLowerCase() === 'douyin') {
+    // 抖音当前只保存作品页和语音转写，不能把网页地址伪装成 HTML5 媒体源。
+    return firstHttpUrl(
+      cleanValue(evidence.sourcePath),
+      metadataText(metadata.sourceVideoUrl),
+      cleanValue(evidence.source),
+    ) || '';
+  }
   const platformPage = firstBilibiliVideoPageUrl(
     cleanValue(evidence.sourcePath),
     cleanValue(evidence.source),

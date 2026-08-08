@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import threading
 import time
 from typing import Any, Callable
 
-from app.core.environment import read_process_or_windows_user_environment
 from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.knowledge_extractor import (
-    REVIEW_LLM_BASE_URL,
-    REVIEW_LLM_MODEL,
-    REVIEW_LLM_REASONING_EFFORT,
+    ReviewLlmEndpoint,
     compact_text,
     normalized_sentence,
+    review_llm_base_url,
+    review_llm_api_key,
+    review_llm_deepseek_fallback_endpoint,
+    review_llm_model,
+    review_llm_reasoning_effort,
+    review_llm_thinking_enabled,
 )
 from app.schemas.rag import Evidence
 
 
+logger = logging.getLogger(__name__)
 LANGEXTRACT_CURATOR_VERSION = "langextract-curator-v1"
 MAX_PRODUCTION_CURATOR_UNITS = 32
 
@@ -106,16 +112,54 @@ class LangExtractCuratorResult:
 class _CompletionsAuditProxy:
     """代理 OpenAI-compatible 请求并采集官方响应 usage。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        audit: ModelUsageAudit,
+        max_in_flight: int,
+        thinking_enabled: bool,
+        fallback_delegate: Any | None = None,
+        fallback_model: str | None = None,
+        on_fallback: Callable[[], None] | None = None,
+    ) -> None:
         self._delegate = delegate
         self._audit = audit
         self._max_in_flight = max_in_flight
+        self._thinking_enabled = thinking_enabled
+        self._fallback_delegate = fallback_delegate
+        self._fallback_model = fallback_model
+        self._on_fallback = on_fallback
 
     def create(self, **kwargs: Any) -> Any:
+        from openai import OpenAIError
+
         self._audit.begin_request()
-        # LangExtract 会为同一批文本块创建线程；进程级闸门同时防止多份资料叠加后压垮 DeepSeek。
-        with process_io_limiter.slot("review.langextract", self._max_in_flight):
-            response = self._delegate.create(**kwargs)
+        if self._thinking_enabled:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body.setdefault("thinking", {"type": "enabled"})
+            kwargs["extra_body"] = extra_body
+        # LangExtract 会为同一批文本块创建线程；进程级闸门同时防止多份资料叠加后压垮复习模型。
+        try:
+            def request_primary() -> Any:
+                with process_io_limiter.slot("review.langextract", self._max_in_flight):
+                    return self._delegate.create(**kwargs)
+
+            response = call_cockpit_with_retry(
+                request_primary,
+                operation="gpt-5.6-terra LangExtract",
+                logger=logger,
+            )
+        except OpenAIError:
+            if self._fallback_delegate is None or not self._fallback_model:
+                raise
+            self._audit.begin_request()
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs["model"] = self._fallback_model
+            with process_io_limiter.slot("review.langextract", self._max_in_flight):
+                response = self._fallback_delegate.create(**fallback_kwargs)
+            if self._on_fallback is not None:
+                self._on_fallback()
+            kwargs = fallback_kwargs
         self._audit.record_response(kwargs, response)
         return response
 
@@ -126,9 +170,26 @@ class _CompletionsAuditProxy:
 class _ChatAuditProxy:
     """只替换 chat.completions，其余官方客户端能力保持透明。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        audit: ModelUsageAudit,
+        max_in_flight: int,
+        thinking_enabled: bool,
+        fallback_delegate: Any | None = None,
+        fallback_model: str | None = None,
+        on_fallback: Callable[[], None] | None = None,
+    ) -> None:
         self._delegate = delegate
-        self.completions = _CompletionsAuditProxy(delegate.completions, audit, max_in_flight)
+        self.completions = _CompletionsAuditProxy(
+            delegate.completions,
+            audit,
+            max_in_flight,
+            thinking_enabled,
+            fallback_delegate,
+            fallback_model,
+            on_fallback,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -137,9 +198,26 @@ class _ChatAuditProxy:
 class _OpenAIClientAuditProxy:
     """为 LangExtract 官方 OpenAI provider 增加只读成本审计。"""
 
-    def __init__(self, delegate: Any, audit: ModelUsageAudit, max_in_flight: int) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        audit: ModelUsageAudit,
+        max_in_flight: int,
+        thinking_enabled: bool,
+        fallback_delegate: Any | None = None,
+        fallback_model: str | None = None,
+        on_fallback: Callable[[], None] | None = None,
+    ) -> None:
         self._delegate = delegate
-        self.chat = _ChatAuditProxy(delegate.chat, audit, max_in_flight)
+        self.chat = _ChatAuditProxy(
+            delegate.chat,
+            audit,
+            max_in_flight,
+            thinking_enabled,
+            fallback_delegate,
+            fallback_model,
+            on_fallback,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -152,20 +230,24 @@ class LangExtractKnowledgeCurator:
         self,
         *,
         api_key: str | None = None,
-        model: str = REVIEW_LLM_MODEL,
-        base_url: str = REVIEW_LLM_BASE_URL,
-        reasoning_effort: str = REVIEW_LLM_REASONING_EFFORT,
+        model: str | None = None,
+        base_url: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_enabled: bool | None = None,
         extraction_passes: int = 2,
         max_char_buffer: int = 8000,
         max_workers: int | None = None,
         max_model_requests: int = 32,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float | None = None,
         extract_function: Callable[..., Any] | None = None,
     ) -> None:
         self.api_key = api_key
-        self.model = model
-        self.base_url = base_url
-        self.reasoning_effort = reasoning_effort
+        self.model = model or review_llm_model()
+        self.base_url = base_url or review_llm_base_url()
+        self.reasoning_effort = reasoning_effort or review_llm_reasoning_effort()
+        self.thinking_enabled = (
+            review_llm_thinking_enabled() if thinking_enabled is None else thinking_enabled
+        )
         self.extraction_passes = max(1, min(5, int(extraction_passes)))
         self.max_char_buffer = max(1000, min(20000, int(max_char_buffer)))
         resolved_workers = max_workers if max_workers is not None else configured_io_workers(
@@ -173,18 +255,25 @@ class LangExtractKnowledgeCurator:
         )
         self.max_workers = max(1, min(10, int(resolved_workers)))
         self.max_model_requests = max(1, min(64, int(max_model_requests)))
-        self.timeout_seconds = max(5.0, min(600.0, float(timeout_seconds)))
+        resolved_timeout = (
+            cockpit_retry_policy().request_timeout_seconds
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        self.timeout_seconds = max(5.0, min(900.0, resolved_timeout))
         self._extract_function = extract_function
         self.last_usage = ModelUsageAudit(max_requests=self.max_model_requests)
+        self.active_model_name = self.model
 
     def extract(self, title: str, evidences: list[Evidence]) -> LangExtractCuratorResult:
         """抽取全部陈述式与问答式知识，并只保留能精确回指原文的结果。"""
         source_text, spans = build_source_document(evidences)
         if not source_text:
             return LangExtractCuratorResult((), 0, 0, 0, 0.0, ModelUsageAudit(), 0)
-        api_key = self.api_key or read_process_or_windows_user_environment("DEEPSEEK_API_KEY")
+        api_key = self.api_key or review_llm_api_key()
         if not api_key:
-            raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法运行 LangExtract Curator")
+            raise RuntimeError("未配置 REVIEW_LLM_API_KEY，无法运行 LangExtract Curator")
+        self.active_model_name = self.model
 
         audit = ModelUsageAudit(max_requests=self.max_model_requests)
         self.last_usage = audit
@@ -228,11 +317,35 @@ class LangExtractKnowledgeCurator:
             max_workers=self.max_workers,
             reasoning_effort=self.reasoning_effort,
         )
+        primary_endpoint = ReviewLlmEndpoint(
+            api_key=api_key,
+            model=self.model,
+            base_url=self.base_url,
+            display_name=self.model,
+        )
+        fallback_endpoint = review_llm_deepseek_fallback_endpoint(primary_endpoint)
+        fallback_client = None
+        if fallback_endpoint is not None:
+            fallback_client = OpenAI(
+                api_key=fallback_endpoint.api_key,
+                base_url=fallback_endpoint.base_url,
+                timeout=self.timeout_seconds,
+                max_retries=0,
+            )
         # 官方 provider 不暴露客户端 timeout 与 usage 聚合；这里保持其请求协议，只补齐与 A 臂相同的超时和审计。
         model._client = _OpenAIClientAuditProxy(  # noqa: SLF001
-            OpenAI(api_key=api_key, base_url=self.base_url, timeout=self.timeout_seconds),
+            OpenAI(
+                api_key=api_key,
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+                max_retries=0,
+            ),
             audit,
             self.max_workers,
+            self.thinking_enabled,
+            fallback_client.chat.completions if fallback_client is not None else None,
+            fallback_endpoint.model if fallback_endpoint is not None else None,
+            lambda: setattr(self, "active_model_name", "DeepSeek"),
         )
         extractor = self._extract_function or lx.extract
         return extractor(

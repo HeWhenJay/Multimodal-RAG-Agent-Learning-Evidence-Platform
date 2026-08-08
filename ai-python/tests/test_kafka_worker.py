@@ -711,6 +711,99 @@ def test_remote_bilibili_video_is_cleaned_when_metadata_write_fails(monkeypatch,
     assert not temp_video.exists()
 
 
+def test_remote_douyin_video_indexes_mcp_transcript_without_downloading_media():
+    """抖音任务直接索引 MCP 转写，并保留作品页和视频 evidence 元数据。"""
+    from app.services.douyin_mcp_client import DouyinTranscript
+
+    public_source = "https://www.douyin.com/video/741234567890"
+
+    class FakeDouyinClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def transcribe_video(self, url: str, **_kwargs) -> DouyinTranscript:
+            self.calls.append(url)
+            return DouyinTranscript(
+                title="RAG-Fusion 抖音课程",
+                aweme_id="741234567890",
+                source_url=url,
+                text="1\n00:00:01,000 --> 00:00:03,000\n先进行 BM25 与向量召回。",
+            )
+
+    class RecordingTextParser:
+        def __init__(self) -> None:
+            self.call: dict = {}
+
+        def parse_text(self, **kwargs) -> ParsedBlockDocument:
+            self.call = kwargs
+            block = DocumentBlock(
+                documentId=kwargs["document_id"],
+                blockId=f"{kwargs['document_id']}-subtitle-1",
+                fileType="srt",
+                blockType="text",
+                startTime="00:00:01",
+                endTime="00:00:03",
+                sectionTitle="00:00:01 - 00:00:03",
+                contentText="先进行 BM25 与向量召回。",
+                parseEngine=kwargs["parser"],
+                sourceTitle=kwargs["title"],
+                sourcePath=kwargs["source_path"],
+            )
+            return ParsedBlockDocument(
+                blocks=[block],
+                parser=kwargs["parser"],
+                status="READY",
+                parse_quality=ParseQuality(score=1.0, nativeTextChars=len(block.contentText)),
+            )
+
+    class RemoteJobRepository:
+        def __init__(self) -> None:
+            self.updated: dict | None = None
+
+        def update_remote_material_source(self, material_id, job_id, request_version, **kwargs):
+            self.updated = {"materialId": material_id, "jobId": job_id, "requestVersion": request_version, **kwargs}
+            return True
+
+    douyin_client = FakeDouyinClient()
+    parser = RecordingTextParser()
+    repository = RemoteJobRepository()
+    store = InMemoryRagStore()
+    worker = RagKafkaIndexWorker(
+        store=store,
+        parser_router=parser,
+        producer=FakeProducer(),
+        progress_producer=FakeProgressProducer(),
+        job_repository=repository,
+        douyin_client=douyin_client,
+    )
+    payload = IndexRequestPayload.model_validate({
+        **base_index_payload(),
+        "operation": "INDEX_REMOTE_VIDEO",
+        "documentType": "mp4",
+        "source": "douyin",
+        "sourceRef": {
+            "type": "REMOTE_VIDEO",
+            "platform": "douyin",
+            "url": public_source,
+            "videoId": "741234567890",
+        },
+    })
+
+    result = worker._index_to_staging(payload)
+
+    assert result.status == "READY"
+    assert douyin_client.calls == [public_source]
+    assert parser.call["document_type"] == "srt"
+    assert parser.call["source_path"] == public_source
+    assert repository.updated and repository.updated["filename"] == "741234567890.srt"
+    assert repository.updated["platform"] == "douyin"
+    chunk = next(iter(store.chunks.values()))
+    assert chunk.metadata["sourcePath"] == public_source
+    assert chunk.metadata["sourcePlatform"] == "douyin"
+    assert chunk.metadata["awemeId"] == "741234567890"
+    assert chunk.metadata["evidenceChannel"] == "subtitle"
+
+
 def test_remote_local_execution_stops_before_index_write_after_lease_loss(monkeypatch, tmp_path):
     """本地远程视频任务续租失败后不得写 staging 索引或发布完成结果。"""
     from app.services.remote_video_import import OpenedRemoteVideo

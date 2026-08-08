@@ -161,13 +161,16 @@ CREATE INDEX idx_learning_material_document_type
 CREATE INDEX idx_learning_material_user_updated
     ON learning_evidence.learning_material(user_id, updated_at DESC);
 
+CREATE INDEX idx_learning_material_user_status_updated_id
+    ON learning_evidence.learning_material(user_id, status, updated_at ASC, id ASC);
+
 CREATE INDEX idx_learning_material_active_index_job
     ON learning_evidence.learning_material(active_index_job_id);
 
-CREATE UNIQUE INDEX uq_learning_material_user_bilibili_url
+CREATE UNIQUE INDEX uq_learning_material_user_remote_url
     ON learning_evidence.learning_material(user_id, public_url)
     WHERE storage_type = 'remote'
-      AND source = 'bilibili'
+      AND source IN ('bilibili', 'douyin')
       AND public_url IS NOT NULL;
 
 CREATE TABLE learning_evidence.learning_review_setting (
@@ -200,12 +203,16 @@ CREATE TABLE learning_evidence.learning_review_folder_material (
     material_id BIGINT PRIMARY KEY REFERENCES learning_evidence.learning_material(id) ON DELETE CASCADE,
     folder_id BIGINT NOT NULL REFERENCES learning_evidence.learning_review_folder(id) ON DELETE CASCADE,
     user_id VARCHAR(120) NOT NULL,
+    display_order INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_learning_review_folder_material_folder
     ON learning_evidence.learning_review_folder_material(folder_id, updated_at DESC, material_id);
+
+CREATE INDEX idx_learning_review_folder_material_order
+    ON learning_evidence.learning_review_folder_material(folder_id, user_id, display_order, material_id);
 
 CREATE INDEX idx_learning_review_folder_material_user
     ON learning_evidence.learning_review_folder_material(user_id, folder_id, material_id);
@@ -252,6 +259,9 @@ CREATE INDEX idx_learning_review_material_user_order
     ON learning_evidence.learning_review_material(user_id, display_order, material_id)
     WHERE is_learning_content IS TRUE AND status = 'GENERATED';
 
+CREATE INDEX idx_learning_review_material_user_status_version_material
+    ON learning_evidence.learning_review_material(user_id, status, index_request_version, material_id);
+
 -- 滚动部署期间拒绝旧 Prompt 结果覆盖新版本复习资料，异常会使整次卡片写入事务回滚。
 CREATE OR REPLACE FUNCTION learning_evidence.guard_learning_review_extractor_downgrade()
 RETURNS TRIGGER
@@ -284,7 +294,7 @@ CREATE TABLE learning_evidence.learning_review_card (
     source_key VARCHAR(100) NOT NULL,
     question VARCHAR(500) NOT NULL,
     answer TEXT NOT NULL,
-    hint VARCHAR(300),
+    hint TEXT,
     evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
     fsrs_card_json TEXT NOT NULL,
     due_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -305,6 +315,12 @@ CREATE INDEX idx_learning_review_card_due
 
 CREATE INDEX idx_learning_review_card_material
     ON learning_evidence.learning_review_card(material_id, active);
+
+CREATE INDEX idx_learning_review_card_user_active_due_material_id
+    ON learning_evidence.learning_review_card(user_id, active, due_at, material_id, id);
+
+CREATE INDEX idx_learning_review_card_material_user_active_id
+    ON learning_evidence.learning_review_card(material_id, user_id, active, id);
 
 CREATE TABLE learning_evidence.learning_review_card_exclusion (
     id BIGSERIAL PRIMARY KEY,
@@ -343,6 +359,9 @@ CREATE TABLE learning_evidence.learning_review_log (
 
 CREATE INDEX idx_learning_review_log_user_reviewed
     ON learning_evidence.learning_review_log(user_id, reviewed_at DESC);
+
+CREATE INDEX idx_learning_review_log_user_reviewed_material
+    ON learning_evidence.learning_review_log(user_id, reviewed_at, material_id);
 
 CREATE INDEX idx_learning_review_log_card_reviewed
     ON learning_evidence.learning_review_log(card_id, reviewed_at DESC);

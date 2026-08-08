@@ -1,4 +1,4 @@
-"""本地学习过滤与 DeepSeek-only 复习内容提炼测试。"""
+"""本地学习过滤与远程复习模型内容提炼测试。"""
 
 import json
 import os
@@ -14,6 +14,7 @@ from app.review.knowledge_extractor import (
     REVIEW_LLM_REASONING_EFFORT,
     ReviewExtractionError,
     answer_is_grounded,
+    canonical_source_question_key,
     clean_content_text,
     clean_section_name,
     classify_learning_content,
@@ -24,6 +25,7 @@ from app.review.knowledge_extractor import (
     is_high_quality_review_question,
     is_noise_fragment,
     is_repetitive_noise,
+    minimum_structured_question_coverage,
     review_card_limit,
     sanitize_evidences,
     select_review_prompt_evidences,
@@ -33,6 +35,19 @@ from app.review.knowledge_extractor import (
 from app.schemas.rag import Evidence
 from app.review.langextract_curator import CuratorCandidate
 from prompts.review import REVIEW_CARD_PROMPT_VERSION, review_card_system_prompt
+
+
+@pytest.fixture(autouse=True)
+def isolate_review_llm_process_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """隔离开发机持久化的复习中转变量，避免单测受用户环境影响。"""
+    for name in (
+        "REVIEW_LLM_API_KEY",
+        "REVIEW_LLM_FALLBACK_API_KEY",
+        "REVIEW_LLM_FALLBACK_ENABLED",
+        "REVIEW_LLM_FALLBACK_MODEL",
+        "REVIEW_LLM_FALLBACK_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def evidence(
@@ -86,14 +101,14 @@ def valid_payload(*, summary: str = "资料说明 Kafka 通过 ISR 与副本选�
 
 def test_missing_key_fails_without_local_generated_content(monkeypatch: pytest.MonkeyPatch) -> None:
     """缺少密钥时必须明确失败，不能再用本地规则生成摘要或卡片。"""
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("REVIEW_LLM_API_KEY", raising=False)
     monkeypatch.setattr(
         "app.review.knowledge_extractor.read_process_or_windows_user_environment",
         lambda _name: "",
     )
     extractor = KnowledgePointExtractor()
 
-    with pytest.raises(ReviewExtractionError, match="DEEPSEEK_API_KEY"):
+    with pytest.raises(ReviewExtractionError, match="REVIEW_LLM_API_KEY"):
         extractor.extract(
             LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
             [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合。")],
@@ -101,11 +116,11 @@ def test_missing_key_fails_without_local_generated_content(monkeypatch: pytest.M
 
 
 def test_local_provider_is_rejected_even_when_evidence_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """显式 local provider 也不能绕过 DeepSeek-only 约束。"""
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    """显式 local provider 也不能绕过远程复习模型约束。"""
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     extractor = KnowledgePointExtractor(provider="local")
 
-    with pytest.raises(ReviewExtractionError, match="只允许使用 DeepSeek"):
+    with pytest.raises(ReviewExtractionError, match=r"只允许使用 gpt-5\.6-terra"):
         extractor.extract(
             LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
             [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合。")],
@@ -113,7 +128,7 @@ def test_local_provider_is_rejected_even_when_evidence_is_valid(monkeypatch: pyt
 
 
 def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypatch: pytest.MonkeyPatch) -> None:
-    """一份资料只调用一次 DeepSeek，并固定正式模型、官方 URL 与最高思考强度。"""
+    """一份资料只调用一次复习中转，并固定本机模型、地址与最高思考强度。"""
     calls: list[dict] = []
     clients: list[dict] = []
     payload = valid_payload()
@@ -129,7 +144,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     monkeypatch.setattr("openai.OpenAI", lambda **kwargs: clients.append(kwargs) or fake_client)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     extractor = KnowledgePointExtractor(provider="deepseek")
 
     result = extractor.extract(
@@ -144,9 +159,16 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v11"
-    assert clients == [{"api_key": "test-key", "base_url": REVIEW_LLM_BASE_URL}]
-    assert calls[0]["model"] == REVIEW_LLM_MODEL == "deepseek-v4-flash"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v12"
+    assert clients == [
+        {
+            "api_key": "test-key",
+            "base_url": REVIEW_LLM_BASE_URL,
+            "timeout": 615.0,
+            "max_retries": 0,
+        }
+    ]
+    assert calls[0]["model"] == REVIEW_LLM_MODEL == "gpt-5.6-terra"
     assert calls[0]["reasoning_effort"] == REVIEW_LLM_REASONING_EFFORT == "max"
     assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
     assert "temperature" not in calls[0]
@@ -158,6 +180,52 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert len(result.knowledge_points) == 1
 
 
+def test_model_extractor_falls_back_to_deepseek_and_reports_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本机中转连接失败时应使用 DeepSeek 重试，并把进度和结果标记为 DeepSeek。"""
+    from httpx import Request
+    from openai import APIConnectionError
+
+    calls: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    payload = valid_payload()
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            calls.append(("primary", kwargs))
+            raise APIConnectionError(request=Request("POST", "http://localhost:58966/v1/chat/completions"))
+
+    class FallbackCompletions:
+        def create(self, **kwargs):
+            calls.append(("fallback", kwargs))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+            )
+
+    primary_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+    fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=FallbackCompletions()))
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "relay-key")
+    monkeypatch.setenv("REVIEW_LLM_FALLBACK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("REVIEW_LLM_FALLBACK_ENABLED", "true")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **kwargs: primary_client if kwargs["base_url"] == REVIEW_LLM_BASE_URL else fallback_client,
+    )
+    extractor = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False)
+
+    result = extractor.extract(
+        LearningMaterialContext(12, "Kafka 的高可用性", "pdf"),
+        [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。")],
+        progress_callback=events.append,
+    )
+
+    assert [kind for kind, _kwargs in calls] == ["primary", "primary", "fallback"]
+    assert calls[0][1]["model"] == "gpt-5.6-terra"
+    assert calls[2][1]["model"] == "deepseek-v4-flash"
+    assert extractor.active_model_name == "DeepSeek"
+    assert any(event["stageLabel"] == "Cockpit 重试" for event in events)
+    assert any(event["stageLabel"] == "DeepSeek 降级" for event in events)
+
+
 def test_online_langextract_candidates_are_required_by_generation_and_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -166,7 +234,7 @@ def test_online_langextract_candidates_are_required_by_generation_and_gate(
     events: list[dict] = []
 
     class FakeCurator:
-        """返回一条已精确定位的候选，避免单测访问真实 DeepSeek。"""
+        """返回一条已精确定位的候选，避免单测访问真实复习模型。"""
 
         def extract(self, _title: str, _evidences: list[Evidence]) -> SimpleNamespace:
             return SimpleNamespace(
@@ -198,7 +266,7 @@ def test_online_langextract_candidates_are_required_by_generation_and_gate(
                 choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
             )
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         "openai.OpenAI",
         lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
@@ -276,7 +344,7 @@ def test_extractor_retries_with_quality_feedback_and_user_context(monkeypatch: p
                 choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
             )
 
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     monkeypatch.setenv("REVIEW_GENERATION_MAX_ATTEMPTS", "2")
     monkeypatch.setattr(
         "openai.OpenAI",
@@ -301,20 +369,20 @@ def test_extractor_refreshes_key_before_generation(monkeypatch: pytest.MonkeyPat
     clients: list[dict] = []
 
     class FakeCompletions:
-        """返回合法的 DeepSeek 复习结果。"""
+        """返回合法的复习模型结果。"""
 
         def create(self, **_kwargs):
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
             )
 
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("REVIEW_LLM_API_KEY", raising=False)
     monkeypatch.setattr(
         "app.review.knowledge_extractor.read_process_or_windows_user_environment",
         lambda name: (os.getenv(name) or "").strip(),
     )
     extractor = KnowledgePointExtractor(provider="deepseek")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "late-test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "late-test-key")
     monkeypatch.setattr(
         "openai.OpenAI",
         lambda **kwargs: clients.append(kwargs) or SimpleNamespace(
@@ -327,14 +395,21 @@ def test_extractor_refreshes_key_before_generation(monkeypatch: pytest.MonkeyPat
         [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合。")],
     )
 
-    assert clients == [{"api_key": "late-test-key", "base_url": REVIEW_LLM_BASE_URL}]
+    assert clients == [
+        {
+            "api_key": "late-test-key",
+            "base_url": REVIEW_LLM_BASE_URL,
+            "timeout": 615.0,
+            "max_retries": 0,
+        }
+    ]
     assert result.knowledge_points
 
 
-def test_source_question_is_audited_but_final_question_uses_deepseek_polished_text(
+def test_source_question_is_audited_but_final_question_uses_model_polished_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """原问句只作来源审计，最终卡面采用 DeepSeek 输出的自包含问题。"""
+    """原问句只作来源审计，最终卡面采用复习模型输出的自包含问题。"""
     calls: list[dict] = []
     original_question = "这时候面试官可能会问，那 Kafka 为什么能继续服务？"
     payload = valid_payload()
@@ -358,7 +433,7 @@ def test_source_question_is_audited_but_final_question_uses_deepseek_polished_te
         "openai.OpenAI",
         lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     result = KnowledgePointExtractor(provider="deepseek").extract(
         LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
         [
@@ -483,7 +558,7 @@ def test_quality_gate_accepts_self_contained_core_questions() -> None:
 
 
 def test_model_card_without_question_mark_passes_complete_validation() -> None:
-    """卡片不应只因 DeepSeek 漏写问号而被丢弃或触发下一轮。"""
+    """卡片不应只因复习模型漏写问号而被丢弃或触发下一轮。"""
     payload = valid_payload()
     payload["cards"][0]["question"] = "Kafka 的 ISR 在 Leader 故障转移中起什么作用"
 
@@ -573,9 +648,51 @@ def test_kafka_speech_questions_do_not_trigger_structured_full_coverage() -> Non
     assert review_card_limit(questions) == 8
 
 
+def test_structured_source_questions_merge_asr_prefixes_and_repeated_variants() -> None:
+    """同一面经问题的口语前缀、重复复述和结尾语气词不能重复计入覆盖门禁。"""
+    questions = [
+        {"evidenceId": "python-long", "question": "就是可能他会问你，嗯，你 Python 用的怎么样啊？"},
+        {"evidenceId": "python-short", "question": "你 Python 用的怎么样啊"},
+        {"evidenceId": "immutable-long", "question": "啊，不可变数据，不可变数据有哪些？"},
+        {"evidenceId": "immutable-short", "question": "不可变数据有哪些"},
+        {
+            "evidenceId": "default-long",
+            "question": "第七个说，函数的默认参数是可变对象会有什么影响？",
+        },
+        {"evidenceId": "default-short", "question": "函数的默认参数是可变对象会有什么影响"},
+        {"evidenceId": "context", "question": "还有什么上下文管理器"},
+    ]
+
+    assert canonical_source_question_key(questions[0]["question"]) == canonical_source_question_key(
+        questions[1]["question"]
+    )
+    assert canonical_source_question_key(questions[2]["question"]) == canonical_source_question_key(
+        questions[3]["question"]
+    )
+    assert canonical_source_question_key(questions[4]["question"]) == canonical_source_question_key(
+        questions[5]["question"]
+    )
+
+
+def test_speech_material_uses_limited_coverage_tolerance_but_clean_material_does_not() -> None:
+    """只有口语化资料使用 75% 覆盖容错，干净结构化资料仍要求全部覆盖。"""
+    clean_questions = [
+        {"evidenceId": f"clean-{index}", "question": f"Python 第 {index} 个考点是什么？"}
+        for index in range(20)
+    ]
+    speech_questions = [
+        {"evidenceId": "speech-1", "question": "嗯，Python 的 GIL 是什么？"},
+        {"evidenceId": "speech-2", "question": "还有，列表和元组有什么区别啊？"},
+        {"evidenceId": "speech-3", "question": "就是可能他会问你，函数默认参数有什么影响？"},
+    ]
+
+    assert minimum_structured_question_coverage(clean_questions, 20) == 20
+    assert minimum_structured_question_coverage(speech_questions, 20) == 15
+
+
 def test_review_model_does_not_inherit_proxy_or_other_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """缺少 DeepSeek 密钥时必须失败，不能借用代理、百炼或通用 RAG 配置。"""
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    """缺少复习中转密钥时必须失败，不能借用百炼或通用 RAG 配置。"""
+    monkeypatch.delenv("REVIEW_LLM_API_KEY", raising=False)
     monkeypatch.setenv("SUBAI_BASE_URL", "https://proxy.example/v1")
     monkeypatch.setenv("SU_BAI_API_KEY", "proxy-key")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-key")
@@ -586,7 +703,7 @@ def test_review_model_does_not_inherit_proxy_or_other_provider_keys(monkeypatch:
     )
     extractor = KnowledgePointExtractor()
 
-    with pytest.raises(ReviewExtractionError, match="DEEPSEEK_API_KEY"):
+    with pytest.raises(ReviewExtractionError, match="REVIEW_LLM_API_KEY"):
         extractor.extract(
             LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
             [evidence("material-12-1", "副本", "Kafka 通过分区副本和 Leader 选举提升可用性。")],
@@ -594,7 +711,7 @@ def test_review_model_does_not_inherit_proxy_or_other_provider_keys(monkeypatch:
 
     assert extractor.api_key == ""
     assert extractor.base_url == REVIEW_LLM_BASE_URL
-    assert extractor.model == "deepseek-v4-flash"
+    assert extractor.model == "gpt-5.6-terra"
 
 
 def test_invalid_model_content_structure_raises_instead_of_falling_back() -> None:
@@ -657,7 +774,7 @@ def test_empty_json_response_retries_without_spending_graph_quality_attempt(monk
         "openai.OpenAI",
         lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
     )
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     result = KnowledgePointExtractor(provider="deepseek").extract(
         LearningMaterialContext(12, "Kafka 高可用课程", "mp4"),
         [evidence("material-12-7", "ISR", "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。")],
@@ -816,7 +933,7 @@ def test_subtitle_and_ocr_noise_is_removed_without_deleting_knowledge() -> None:
 
 
 def test_noise_only_evidence_is_skipped_by_local_prefilter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """纯噪声应在送模前确定性跳过，不浪费 DeepSeek 调用。"""
+    """纯噪声应在送模前确定性跳过，不浪费复习模型调用。"""
     calls = 0
 
     class UnexpectedOpenAI:
@@ -827,7 +944,7 @@ def test_noise_only_evidence_is_skipped_by_local_prefilter(monkeypatch: pytest.M
             calls += 1
 
     monkeypatch.setattr("openai.OpenAI", UnexpectedOpenAI)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
     result = KnowledgePointExtractor(provider="deepseek").extract(
         LearningMaterialContext(12, "技术课程", "mp4", "课程视频"),
         [evidence("noise", "00:03:15,000 --> 00:03:20,000", "字幕由 Amara.org 社区提供")],

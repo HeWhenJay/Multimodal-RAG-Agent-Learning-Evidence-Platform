@@ -2,6 +2,7 @@ import pytest
 
 from rag.retrievers.retrieval import (
     cached_embedding,
+    build_playback_url,
     embed_text,
     embed_texts,
     embedding_batch_config,
@@ -922,6 +923,19 @@ def test_video_metadata_filter_matches_promoted_block_metadata():
 
     assert frame_response.evidences
     assert {evidence.metadata.get("evidenceChannel") for evidence in frame_response.evidences} == {"frame_ocr"}
+
+
+def test_douyin_transcript_playback_returns_source_page_instead_of_html5_player():
+    """抖音语音 evidence 应打开作品页，不构造伪造的内部视频播放器地址。"""
+    assert build_playback_url(
+        document_id="doc-douyin",
+        title="抖音 RAG 课程",
+        metadata={
+            "sourcePlatform": "douyin",
+            "sourceVideoUrl": "https://www.douyin.com/video/741234567890",
+            "startTime": "00:00:10",
+        },
+    ) == "https://www.douyin.com/video/741234567890"
 
 
 def test_query_diversity_filters_duplicate_video_frame_ocr(monkeypatch):

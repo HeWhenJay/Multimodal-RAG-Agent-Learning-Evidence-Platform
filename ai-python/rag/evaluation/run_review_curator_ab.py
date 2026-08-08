@@ -19,6 +19,7 @@ try:
         run_langextract_arm,
         select_cases,
     )
+    from app.review.knowledge_extractor import review_llm_model
 except ModuleNotFoundError:
     from review_curator_ab_common import (  # type: ignore[no-redef]
         CuratorCaseResult,
@@ -31,6 +32,7 @@ except ModuleNotFoundError:
         run_langextract_arm,
         select_cases,
     )
+    from review.knowledge_extractor import review_llm_model  # type: ignore[no-redef]
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,7 +93,7 @@ def main() -> int:
         "config": {
             "casesPath": str(args.cases),
             "caseIds": [result.case_id for result in results],
-            "sameModel": "deepseek-v4-flash",
+            "sameModel": review_llm_model(),
             "maxRequestsPerArmPerCase": args.max_requests,
             "langextractVersion": "1.6.x",
             "extractionPasses": args.extraction_passes,
@@ -118,7 +120,7 @@ def render_report(results: list[CuratorCaseResult], decision: dict[str, object])
     lines = [
         "# 复习 Knowledge Curator × LangExtract A/B 报告",
         "",
-        "两臂使用同一批真实 evidence、同一 DeepSeek 模型和相同最大请求数。",
+        "两臂使用同一批真实 evidence、同一复习模型和相同最大请求数。",
         "A 臂为当前生产 KnowledgePointExtractor；B 臂为官方 LangExtract 1.6 的分块、多轮抽取与原文定位。",
         "人工金标使用冻结别名做确定性匹配，未额外调用裁判模型。",
         "",
