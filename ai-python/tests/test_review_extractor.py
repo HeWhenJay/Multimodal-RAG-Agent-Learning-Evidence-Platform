@@ -34,7 +34,13 @@ from app.review.knowledge_extractor import (
 )
 from app.schemas.rag import Evidence
 from app.review.langextract_curator import CuratorCandidate
-from prompts.review import REVIEW_CARD_PROMPT_VERSION, review_card_system_prompt
+from prompts.review import (
+    REVIEW_CARD_PROMPT_VERSION,
+    review_card_rewrite_system_prompt,
+    review_card_system_prompt,
+    review_material_rewrite_system_prompt,
+    review_missing_knowledge_system_prompt,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -159,7 +165,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v12"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v13"
     assert clients == [
         {
             "api_key": "test-key",
@@ -178,6 +184,19 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert result.summary == payload["summary"]
     assert result.summary != "这只是 RAG 截断摘要，不应直接展示。"
     assert len(result.knowledge_points) == 1
+
+
+def test_review_prompts_require_interviewer_style_questions() -> None:
+    """生成、补漏和改写 Prompt 都必须要求使用真实面试官提问口吻。"""
+    prompts = [
+        review_card_system_prompt(),
+        review_missing_knowledge_system_prompt(),
+        review_card_rewrite_system_prompt("SOURCE_FIRST"),
+        review_material_rewrite_system_prompt("SOURCE_FIRST"),
+    ]
+
+    assert all("面试官" in prompt for prompt in prompts)
+    assert all("你会如何" in prompt for prompt in prompts)
 
 
 def test_model_extractor_falls_back_to_deepseek_and_reports_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
