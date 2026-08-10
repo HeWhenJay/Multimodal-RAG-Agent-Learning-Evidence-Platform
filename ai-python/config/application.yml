@@ -140,6 +140,9 @@ review:
       retry-base-delay-ms: ${REVIEW_COCKPIT_RETRY_BASE_DELAY_MS:300}
       retry-max-delay-ms: ${REVIEW_COCKPIT_RETRY_MAX_DELAY_MS:1500}
       keepalive-seconds: ${REVIEW_COCKPIT_KEEPALIVE_SECONDS:15}
+  segment:
+    # 单段包含 LangExtract 与多轮质量修复；超过总预算后只结束该段等待，不阻塞其他已选分段。
+    timeout-seconds: ${REVIEW_SEGMENT_TIMEOUT_SECONDS:1800}
   langextract:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}

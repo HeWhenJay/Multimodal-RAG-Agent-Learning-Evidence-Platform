@@ -16,6 +16,8 @@
 
 同一轮选中的分段会进入进程级共享 I/O 线程池并发生成，默认最多 16 个；多份资料共用这一个池，避免每个任务各建线程导致并发膨胀。LangExtract 的本地切分、映射和聚合按 CPU/内存密集阶段限制为 n+1=9，实际模型网络请求仍受 16 个 I/O 并发槽约束。
 
+分段任务会透传 evidence 清洗、LangExtract、模型第 N 轮生成、质量校验、自动修复和多卡复查事件，并每 15 秒刷新后台心跳。单段总执行预算由 `REVIEW_SEGMENT_TIMEOUT_SECONDS` 控制，默认 1800 秒；某段超时只返回该段 `FAILED`，其他段继续完成。前端超过 60 秒未收到心跳时展示失联诊断，并允许用 `forceRestart=true` 显式替代旧任务。
+
 ### 接口
 
 | 方法 | 路径 | 用途 |
@@ -35,11 +37,12 @@
     "segment-a1": "重点模拟面试官追问主从同步流程",
     "segment-b2": "保留脑裂参数及其作用"
   },
-  "mode": "RELAXED"
+  "mode": "RELAXED",
+  "forceRestart": false
 }
 ```
 
-公开响应继续使用 `Result<T>` 信封；用户身份只从 `Authorization` 对应的服务端上下文读取。分段 ID 必须属于当前资料当前索引版本，过期或跨资料 ID 返回中文业务失败。任务状态为 `QUEUED`、`RUNNING`、`SUCCEEDED` 或 `FAILED`。`SUCCEEDED` 表示任务编排完成，允许其中个别分段为 `FAILED`，前端应保留成功分段并允许用户重试失败段。
+公开响应继续使用 `Result<T>` 信封；用户身份只从 `Authorization` 对应的服务端上下文读取。分段 ID 必须属于当前资料当前索引版本，过期或跨资料 ID 返回中文业务失败。`forceRestart` 只在用户确认旧任务失联时使用：服务端先把旧任务标记为已替代，再创建新任务，旧结果不会回写。任务状态为 `QUEUED`、`RUNNING`、`SUCCEEDED` 或 `FAILED`。`SUCCEEDED` 表示任务编排完成，允许其中个别分段为 `FAILED`，前端应保留成功分段并允许用户重试失败段。
 
 ## 质量门禁分级与人工决策（2026-08-10）
 
@@ -192,6 +195,7 @@ Cockpit 重试参数默认与本机“长等待方案”保持一致：
 | `REVIEW_COCKPIT_RETRY_MAX_DELAY_MS` | `1500` | 指数退避上限 |
 | `REVIEW_COCKPIT_KEEPALIVE_SECONDS` | `15` | 与 Cockpit SSE keepalive 配置一致，纳入等待预算和诊断 |
 | `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | `615` | 单次 Cockpit 请求等待窗口；默认覆盖两次 180 秒流打开、一次 240 秒空闲和 15 秒余量 |
+| `REVIEW_SEGMENT_TIMEOUT_SECONDS` | `1800` | 交互式生成单个分段的总预算；超时只结束该段等待，不拖住整轮 |
 
 线上默认并发与预算：
 
@@ -200,7 +204,7 @@ Cockpit 重试参数默认与本机“长等待方案”保持一致：
 | 环节 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `LLM_IO_MAX_WORKERS` | `16` | Agent、RAG、复习、简历、OCR/ASR 等在线模型请求共用的专用 I/O 线程池，硬上限 64 |
-| `REVIEW_LANGEXTRACT_MAX_WORKERS` | `16` | 同一 pass 内并发处理文本块；模型等待属于 I/O，硬上限 64 |
+| `REVIEW_LANGEXTRACT_MAX_WORKERS` | `9` | LangExtract 本地切分、定位映射和聚合并发，按 CPU/内存密集型 n+1 控制，硬上限 9 |
 | `REVIEW_LANGEXTRACT_EXTRACTION_PASSES` | `2` | 两轮串行执行，提高召回；不会跨 pass 并发 |
 | `REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER` | `8000` | 单个文本块字符预算 |
 | `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | `32` | 单份资料 LangExtract 请求总预算 |

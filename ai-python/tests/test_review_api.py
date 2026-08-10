@@ -385,7 +385,19 @@ class StubReviewService:
         self.remember(user_id)
         self.segment_requests.append((material_id, list(segment_ids), dict(prompts), mode, user_id))
         if progress_callback:
-            progress_callback({"stageCode": "review.segment.test", "stageLabel": "测试段完成", "message": "测试完成", "percent": 80})
+            progress_callback({
+                "stageCode": "review.actor",
+                "stageLabel": "原文第 1 段 · 模型生成",
+                "message": "正在生成第 2/8 版复习卡片",
+                "percent": 48,
+                "attempt": 2,
+                "maxAttempts": 8,
+                "currentSegmentId": segment_ids[0],
+                "currentSegmentIndex": 1,
+                "totalSegments": len(segment_ids),
+                "completedSegments": 0,
+                "detail": "正在修复面试问题表达",
+            })
         return ReviewSegmentGenerationResult(
             materialId=material_id,
             sourceVersion=7,
@@ -829,6 +841,11 @@ def test_review_segment_workspace_task_and_merge_routes_are_resumable() -> None:
         assert latest["status"] == "SUCCEEDED"
         assert [item["status"] for item in latest["result"]["segments"]] == ["SUCCEEDED", "FAILED"]
         assert service.segment_requests[0][2] == {"segment-kafka-01": "追问 ISR", "segment-kafka-02": "追问故障转移"}
+        model_event = next(item for item in latest["progress"]["events"] if item["stageCode"] == "review.actor")
+        assert model_event["attempt"] == 2
+        assert model_event["maxAttempts"] == 8
+        assert model_event["currentSegmentId"] == "segment-kafka-01"
+        assert model_event["detail"] == "正在修复面试问题表达"
 
         merged = client.post(
             "/api/reviews/materials/12/segments/merge",
@@ -852,4 +869,80 @@ def test_review_segment_workspace_task_and_merge_routes_are_resumable() -> None:
         assert service.segment_merge_users == ["42"]
         assert client.get("/api/reviews/materials/12/segment-tasks/latest", headers=headers).json()["data"] is None
     finally:
+        app.dependency_overrides.clear()
+
+
+def test_force_restart_supersedes_stalled_segment_task_and_rejects_old_result() -> None:
+    """用户确认重启后旧分段任务必须稳定终止，迟到结果不能覆盖新任务。"""
+    class BlockingReviewService(StubReviewService):
+        """让第一轮停在模型调用，第二轮立即返回，模拟失联任务恢复。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_started = Event()
+            self.release_first = Event()
+            self.calls = 0
+
+        def generate_selected_segments(self, material_id, user_id, segment_ids, prompts, mode, progress_callback=None):
+            self.calls += 1
+            if self.calls == 1:
+                self.first_started.set()
+                self.release_first.wait(timeout=2)
+            return super().generate_selected_segments(
+                material_id,
+                user_id,
+                segment_ids,
+                prompts,
+                mode,
+                progress_callback,
+            )
+
+    service = BlockingReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    payload = {
+        "segmentIds": ["segment-kafka-01"],
+        "prompts": {"segment-kafka-01": "追问 ISR"},
+        "mode": "RELAXED",
+    }
+    try:
+        first = client.post(
+            "/api/reviews/materials/12/segment-tasks",
+            headers=headers,
+            json=payload,
+        ).json()["data"]
+        assert service.first_started.wait(timeout=1)
+
+        replacement = client.post(
+            "/api/reviews/materials/12/segment-tasks",
+            headers=headers,
+            json={**payload, "forceRestart": True},
+        ).json()["data"]
+        assert replacement["taskId"] != first["taskId"]
+
+        old_task = client.get(
+            f"/api/reviews/materials/12/segment-tasks/{first['taskId']}",
+            headers=headers,
+        ).json()["data"]
+        assert old_task["status"] == "FAILED"
+        assert old_task["progress"]["stageCode"] == "review.segment.superseded"
+
+        service.release_first.set()
+        for _ in range(100):
+            new_task = client.get(
+                f"/api/reviews/materials/12/segment-tasks/{replacement['taskId']}",
+                headers=headers,
+            ).json()["data"]
+            if new_task["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert new_task["status"] == "SUCCEEDED"
+        assert client.get(
+            f"/api/reviews/materials/12/segment-tasks/{first['taskId']}",
+            headers=headers,
+        ).json()["data"]["progress"]["stageCode"] == "review.segment.superseded"
+    finally:
+        service.release_first.set()
         app.dependency_overrides.clear()

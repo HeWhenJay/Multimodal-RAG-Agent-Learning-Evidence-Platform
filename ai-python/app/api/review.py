@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
-from threading import Lock
+from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Any, TypeVar
 from uuid import uuid4
 
@@ -95,6 +96,7 @@ _review_segment_executor = ThreadPoolExecutor(
 _review_segment_jobs_lock = Lock()
 _review_segment_jobs: dict[str, "_ReviewSegmentJob"] = {}
 _latest_review_segment_jobs: dict[tuple[str, int], str] = {}
+_REVIEW_SEGMENT_HEARTBEAT_SECONDS = 15.0
 
 
 @dataclass
@@ -473,7 +475,9 @@ def start_review_segment_task(
         existing = _find_active_review_segment_job(user_id, material_id, payload)
         if existing is not None:
             return Result.success(_review_segment_task_response(existing))
-        job = _create_review_segment_job(user_id, material_id, payload)
+        # forceRestart 只控制本次替代动作，不参与后续同请求幂等比较。
+        stored_payload = payload.model_copy(update={"forceRestart": False})
+        job = _create_review_segment_job(user_id, material_id, stored_payload)
     _review_segment_executor.submit(_run_review_segment_job, service, job)
     return Result.success(_review_segment_task_response(job))
 
@@ -1010,6 +1014,8 @@ def _find_active_review_segment_job(
     payload: ReviewSegmentGenerationRequest,
 ) -> _ReviewSegmentJob | None:
     """复用同一资料、同一分段选择和提示词的运行任务。"""
+    if payload.forceRestart:
+        return None
     task_id = _latest_review_segment_jobs.get((user_id, material_id))
     job = _review_segment_jobs.get(task_id) if task_id else None
     return (
@@ -1068,6 +1074,7 @@ def _set_review_segment_progress(
     stage_label: str,
     message: str,
     percent: int,
+    metadata: dict[str, object] | None = None,
 ) -> None:
     """更新分段任务当前阶段，并保留最近 12 条展示事件。"""
     now = datetime.now(timezone.utc)
@@ -1079,10 +1086,57 @@ def _set_review_segment_progress(
         "percent": max(0, min(100, int(percent))),
         "createdAt": now,
     }
+    allowed_metadata = {
+        "currentStep",
+        "totalSteps",
+        "attempt",
+        "maxAttempts",
+        "currentSegmentId",
+        "currentSegmentIndex",
+        "totalSegments",
+        "completedSegments",
+        "detail",
+        "elapsedSeconds",
+        "heartbeatAt",
+    }
+    event.update(
+        {
+            key: value
+            for key, value in (metadata or {}).items()
+            if key in allowed_metadata and value is not None
+        }
+    )
     job.status = status
     job.progress = {**event, "events": [*job.events, event][-12:]}
     job.events = job.progress["events"]
     job.updated_at = now
+
+
+def _touch_review_segment_heartbeat(job: _ReviewSegmentJob, started_at: float) -> None:
+    """只刷新任务心跳，不用重复事件淹没真实的模型阶段时间线。"""
+    now = datetime.now(timezone.utc)
+    job.progress = {
+        **job.progress,
+        "elapsedSeconds": max(0, int(monotonic() - started_at)),
+        "heartbeatAt": now,
+        "events": job.events,
+    }
+    job.updated_at = now
+
+
+def _run_review_segment_heartbeat(
+    job: _ReviewSegmentJob,
+    stop_event: Event,
+    started_at: float,
+) -> None:
+    """长模型调用期间持续证明后台线程仍存活，终态或任务被替代时自动退出。"""
+    while not stop_event.wait(_REVIEW_SEGMENT_HEARTBEAT_SECONDS):
+        with _review_segment_jobs_lock:
+            if job.status not in {"QUEUED", "RUNNING"}:
+                return
+            if _latest_review_segment_jobs.get((job.user_id, job.material_id)) != job.task_id:
+                return
+            _touch_review_segment_heartbeat(job, started_at)
 
 
 def _review_segment_task_response(job: _ReviewSegmentJob) -> ReviewSegmentGenerationTask:
@@ -1103,6 +1157,8 @@ def _review_segment_task_response(job: _ReviewSegmentJob) -> ReviewSegmentGenera
 
 def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> None:
     """后台逐段生成候选，单段质量失败由结果对象承载。"""
+    started_at = monotonic()
+    heartbeat_stop = Event()
     with _review_segment_jobs_lock:
         if job.task_id not in _review_segment_jobs:
             return
@@ -1113,12 +1169,24 @@ def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> N
             stage_label="读取分段原文",
             message="正在校验资料版本和用户选择的 evidence 分段",
             percent=5,
+            metadata={
+                "completedSegments": 0,
+                "totalSegments": len(job.payload.segmentIds),
+                "elapsedSeconds": 0,
+                "heartbeatAt": datetime.now(timezone.utc),
+            },
         )
+    Thread(
+        target=_run_review_segment_heartbeat,
+        args=(job, heartbeat_stop, started_at),
+        name=f"review-segment-heartbeat-{job.task_id[-6:]}",
+        daemon=True,
+    ).start()
 
     def on_progress(event: dict[str, object]) -> None:
         """把服务层逐段进度同步到可轮询任务。"""
         with _review_segment_jobs_lock:
-            if job.task_id not in _review_segment_jobs or job.status == "FAILED":
+            if job.task_id not in _review_segment_jobs or job.status not in {"QUEUED", "RUNNING"}:
                 return
             _set_review_segment_progress(
                 job,
@@ -1127,6 +1195,11 @@ def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> N
                 stage_label=str(event.get("stageLabel") or "生成分段候选"),
                 message=str(event.get("message") or "正在生成所选分段"),
                 percent=int(event.get("percent") or 10),
+                metadata={
+                    **event,
+                    "elapsedSeconds": max(0, int(monotonic() - started_at)),
+                    "heartbeatAt": datetime.now(timezone.utc),
+                },
             )
 
     try:
@@ -1153,6 +1226,8 @@ def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> N
             )
     except BusinessError as exc:
         with _review_segment_jobs_lock:
+            if _latest_review_segment_jobs.get((job.user_id, job.material_id)) != job.task_id:
+                return
             job.error = exc.message
             _set_review_segment_progress(
                 job,
@@ -1165,6 +1240,8 @@ def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> N
     except Exception as exc:  # noqa: BLE001 - 后台任务必须收敛为可查询失败状态。
         logger.exception("交互式分段生成任务失败: material_id=%s", job.material_id)
         with _review_segment_jobs_lock:
+            if _latest_review_segment_jobs.get((job.user_id, job.material_id)) != job.task_id:
+                return
             job.error = f"分段生成失败：{exc.__class__.__name__}"
             _set_review_segment_progress(
                 job,
@@ -1174,6 +1251,8 @@ def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> N
                 message=job.error,
                 percent=100,
             )
+    finally:
+        heartbeat_stop.set()
 
 
 def _invalidate_review_segment_job(user_id: str, material_id: int) -> None:

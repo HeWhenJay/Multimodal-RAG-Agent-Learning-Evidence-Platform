@@ -171,6 +171,7 @@ export interface ReviewSegmentGenerationPayload {
   segmentIds: string[];
   prompts: Record<string, string>;
   mode: 'STANDARD' | 'RELAXED';
+  forceRestart?: boolean;
 }
 
 export interface ReviewSegmentResult {
@@ -190,13 +191,37 @@ export interface ReviewSegmentGenerationResult {
   segments: ReviewSegmentResult[];
 }
 
+export interface ReviewSegmentProgressEvent {
+  stageCode: string;
+  stageLabel: string;
+  message: string;
+  status: string;
+  percent: number;
+  currentStep?: number | null;
+  totalSteps?: number | null;
+  attempt?: number | null;
+  maxAttempts?: number | null;
+  currentSegmentId?: string | null;
+  currentSegmentIndex?: number | null;
+  totalSegments?: number | null;
+  completedSegments?: number | null;
+  detail?: string | null;
+  elapsedSeconds?: number | null;
+  heartbeatAt?: string | null;
+  createdAt?: string | null;
+}
+
+export interface ReviewSegmentTaskProgress extends ReviewSegmentProgressEvent {
+  events: ReviewSegmentProgressEvent[];
+}
+
 export interface ReviewSegmentGenerationTask {
   taskId: string;
   materialId: number;
   mode: 'STANDARD' | 'RELAXED';
   segmentIds: string[];
   status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
-  progress: ReviewRewriteTaskProgress;
+  progress: ReviewSegmentTaskProgress;
   result?: ReviewSegmentGenerationResult | null;
   error?: string | null;
   createdAt: string;

@@ -117,6 +117,7 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("review", "llm", "cockpit", "retry-base-delay-ms"): "REVIEW_COCKPIT_RETRY_BASE_DELAY_MS",
     ("review", "llm", "cockpit", "retry-max-delay-ms"): "REVIEW_COCKPIT_RETRY_MAX_DELAY_MS",
     ("review", "llm", "cockpit", "keepalive-seconds"): "REVIEW_COCKPIT_KEEPALIVE_SECONDS",
+    ("review", "segment", "timeout-seconds"): "REVIEW_SEGMENT_TIMEOUT_SECONDS",
     ("review", "langextract", "enabled"): "REVIEW_LANGEXTRACT_ENABLED",
     ("review", "langextract", "extraction-passes"): "REVIEW_LANGEXTRACT_EXTRACTION_PASSES",
     ("review", "langextract", "max-char-buffer"): "REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER",

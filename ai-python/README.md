@@ -48,12 +48,13 @@ dashscope:
 - `DEEPSEEK_API_KEY`：可选的复习降级密钥；Cockpit 按长等待方案完成 Terra 重试后仍失败时才直连 DeepSeek
 - `REVIEW_COCKPIT_REQUEST_RETRIES`：项目在 DeepSeek 降级前重新请求 Cockpit 的次数，默认 `1`
 - `REVIEW_EXTRACTION_TIMEOUT_SECONDS`：单次 Cockpit 客户端等待窗口，默认 `615` 秒
+- `REVIEW_SEGMENT_TIMEOUT_SECONDS`：交互式生成单个分段的总预算，默认 `1800` 秒；失联段超时后不会阻塞整轮
 - `REVIEW_GENERATION_MAX_ATTEMPTS`：Actor 卡片质量尝试上限，默认 `8`，安全范围 `1-20`
 - `REVIEW_GENERATION_MAX_MERGE_ROUNDS`：多卡 Observer → Merge Repair 合并轮次上限，默认 `4`，安全范围 `1-12`；与 Actor 尝试独立计数
 - `RAG_DOUYIN_MCP_ENABLED`：抖音 MCP 语音转写路线开关，默认 `true`
 - `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS`：抖音转写任务轮询间隔，默认 `5`
 - `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS`：抖音单次转写最大等待时间，默认 `900`
-- `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料同一 pass 的 LangExtract I/O 并发，默认 `16`（2n）、硬上限 `64`
+- `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料 LangExtract 本地切分与定位聚合并发，默认及硬上限均为 `9`（n+1）
 - `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 

@@ -65,8 +65,15 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
   const [starting, setStarting] = useState(false);
   const [merging, setMerging] = useState(false);
   const [error, setError] = useState('');
+  const [clockNow, setClockNow] = useState(() => Date.now());
   const handledTaskIdsRef = useRef(new Set<string>());
   const busy = starting || task?.status === 'QUEUED' || task?.status === 'RUNNING';
+
+  useEffect(() => {
+    if (!busy) return undefined;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   // 将某轮结果并入已有草稿；未选中的旧分段不会被新任务清空。
   function absorbTaskResult(nextTask: ReviewSegmentGenerationTask) {
@@ -220,15 +227,16 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
 
   if (!target) return null;
 
-  async function generateSegments(segmentIds = selectedIds) {
-    if (!workspace || !segmentIds.length || busy || merging) return;
+  async function generateSegments(segmentIds = selectedIds, forceRestart = false) {
+    if (!workspace || !segmentIds.length || (busy && !forceRestart) || merging) return;
     setStarting(true);
     setError('');
     try {
       const nextTask = await startReviewSegmentTask(target!.materialId, {
         segmentIds,
         prompts: Object.fromEntries(segmentIds.map((segmentId) => [segmentId, prompts[segmentId] || DEFAULT_SEGMENT_PROMPT])),
-        mode
+        mode,
+        forceRestart
       });
       setTask(nextTask);
       if (nextTask.status === 'SUCCEEDED') absorbTaskResult(nextTask);
@@ -317,7 +325,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
             <div className="review-segment-toolbar-actions"><button className="outline-action small" type="button" onClick={selectUnfinishedSegments} disabled={busy || merging}><Check size={14} />选择未生成分段</button><button className="primary-action" type="button" onClick={() => void generateSegments()} disabled={!selectedIds.length || busy || merging}>{busy ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}{busy ? '后台生成中' : `生成已选 ${selectedIds.length} 段`}</button></div>
           </div>
 
-          {task?.progress ? <div className={`missing-knowledge-task-status is-${task.status.toLowerCase()}`} role="status" aria-live="polite"><div className="missing-knowledge-task-heading"><span className="missing-knowledge-task-icon">{task.status === 'FAILED' ? <CircleAlert size={16} /> : task.status === 'SUCCEEDED' ? <Check size={16} /> : <Loader2 className="spin" size={16} />}</span><div><strong>{task.progress.stageLabel}</strong><span>{task.progress.message}</span></div><b>{task.progress.percent}%</b></div><div className="missing-knowledge-task-progress"><i style={{ width: `${task.progress.percent}%` }} /></div></div> : null}
+          {task?.progress ? <SegmentTaskProgressPanel task={task} now={clockNow} restarting={starting} onRestart={() => void generateSegments(task.segmentIds, true)} /> : null}
 
           <div className="review-segment-layout">
             <section className="review-segment-source-column" aria-labelledby="review-segment-source-title">
@@ -326,8 +334,9 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
                 {workspace.segments.map((segment) => {
                   const result = results[segment.segmentId];
                   const hasDraft = Boolean(drafts[segment.segmentId]?.length);
+                  const isGenerating = busy && task?.progress.currentSegmentId === segment.segmentId;
                   return <article className={`review-segment-source${selected[segment.segmentId] ? ' is-selected' : ''}`} key={segment.segmentId}>
-                    <div className="review-segment-source-head"><label><input type="checkbox" checked={Boolean(selected[segment.segmentId])} onChange={(event) => setSelected((previous) => ({ ...previous, [segment.segmentId]: event.target.checked }))} disabled={busy || merging} /><span><strong>第 {segment.segmentIndex} 段</strong><small>{segment.title}</small></span></label><span className={`review-segment-state ${result?.status === 'FAILED' ? 'is-failed' : hasDraft ? 'is-ready' : ''}`}>{result?.status === 'FAILED' ? '生成失败' : hasDraft ? `${drafts[segment.segmentId].length} 张候选` : '未生成'}</span></div>
+                    <div className="review-segment-source-head"><label><input type="checkbox" checked={Boolean(selected[segment.segmentId])} onChange={(event) => setSelected((previous) => ({ ...previous, [segment.segmentId]: event.target.checked }))} disabled={busy || merging} /><span><strong>第 {segment.segmentIndex} 段</strong><small>{segment.title}</small></span></label><span className={`review-segment-state ${isGenerating ? 'is-running' : result?.status === 'FAILED' ? 'is-failed' : hasDraft ? 'is-ready' : ''}`}>{isGenerating ? task?.progress.stageLabel.replace(/^原文第 \d+ 段 · /, '') || '生成中' : result?.status === 'FAILED' ? '生成失败' : hasDraft ? `${drafts[segment.segmentId].length} 张候选` : '未生成'}</span></div>
                     <div className="review-segment-source-meta"><span>{segment.evidenceCount} 条 evidence</span><span>{segment.characterCount.toLocaleString('zh-CN')} 字</span><span>ID {segment.segmentId.slice(-8)}</span></div>
                     <details className="review-segment-raw"><summary>查看本段原始内容<ChevronRight size={14} /></summary><pre>{segment.rawContent}</pre></details>
                     <label className="review-segment-prompt"><span>本段补充提示词</span><textarea value={prompts[segment.segmentId] || ''} maxLength={2000} rows={4} onChange={(event) => setPrompts((previous) => ({ ...previous, [segment.segmentId]: event.target.value }))} disabled={busy || merging} /><small>建议补充追问方向、必须覆盖的术语或希望保留的原始问句。</small></label>
@@ -364,6 +373,44 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
       </section>
     </div>
   );
+}
+
+function SegmentTaskProgressPanel({ task, now, restarting, onRestart }: { task: ReviewSegmentGenerationTask; now: number; restarting: boolean; onRestart: () => void }) {
+  const progress = task.progress;
+  const heartbeatTime = progress.heartbeatAt || task.updatedAt || progress.createdAt;
+  const heartbeatAge = heartbeatTime ? Math.max(0, Math.floor((now - new Date(heartbeatTime).getTime()) / 1000)) : null;
+  const elapsedSeconds = progress.elapsedSeconds ?? (task.createdAt ? Math.max(0, Math.floor((now - new Date(task.createdAt).getTime()) / 1000)) : null);
+  const heartbeatLost = ['QUEUED', 'RUNNING'].includes(task.status) && heartbeatAge !== null && heartbeatAge >= 60;
+  const events = [...(progress.events || [])].slice(-6).reverse();
+  const currentSegment = progress.currentSegmentIndex && progress.totalSegments
+    ? `原文第 ${progress.currentSegmentIndex} 段 · 本轮共 ${progress.totalSegments} 段`
+    : '正在准备所选分段';
+  const attempt = progress.attempt && progress.maxAttempts ? `模型第 ${progress.attempt}/${progress.maxAttempts} 轮` : null;
+  return <div className={`missing-knowledge-task-status is-${task.status.toLowerCase()}${heartbeatLost ? ' is-stale' : ''}`} role="status" aria-live="polite">
+    <div className="missing-knowledge-task-heading">
+      <span className="missing-knowledge-task-icon">{task.status === 'FAILED' ? <CircleAlert size={16} /> : task.status === 'SUCCEEDED' ? <Check size={16} /> : <Loader2 className="spin" size={16} />}</span>
+      <div><strong>{progress.stageLabel}</strong><span>{progress.message}</span></div><b>{progress.percent}%</b>
+    </div>
+    <div className="missing-knowledge-task-progress"><i style={{ width: `${progress.percent}%` }} /></div>
+    <div className="review-segment-task-meta"><span>{currentSegment}</span>{progress.completedSegments != null && progress.totalSegments ? <span>已完成 {progress.completedSegments}/{progress.totalSegments} 段</span> : null}{attempt ? <span>{attempt}</span> : null}<span>已运行 {formatElapsed(elapsedSeconds)}</span>{heartbeatAge !== null ? <span>最近心跳 {heartbeatAge < 5 ? '刚刚' : `${heartbeatAge} 秒前`}</span> : null}</div>
+    {heartbeatLost ? <div className="review-segment-task-warning"><CircleAlert size={14} /><span>超过 1 分钟没有收到后台心跳，任务可能正在等待模型超时或进程异常；你可以继续等待单段超时，也可以立即替代这条旧任务。</span><button className="outline-action small" type="button" onClick={onRestart} disabled={restarting}>{restarting ? <Loader2 className="spin" size={13} /> : <RotateCcw size={13} />}{restarting ? '正在创建新任务' : '放弃旧任务并重新生成原选择'}</button></div> : null}
+    {progress.detail ? <p className="review-segment-task-detail">{progress.detail}</p> : null}
+    {events.length ? <details className="review-segment-task-events"><summary>查看最近阶段（{events.length}）</summary><ol>{events.map((event, index) => <li key={`${event.stageCode}-${event.createdAt || index}-${index}`}><strong>{event.stageLabel}</strong><span>{event.message}{event.attempt && event.maxAttempts ? ` · 第 ${event.attempt}/${event.maxAttempts} 轮` : ''}{event.createdAt ? ` · ${formatTaskTime(event.createdAt)}` : ''}</span>{event.detail ? <small>{event.detail}</small> : null}</li>)}</ol></details> : null}
+  </div>;
+}
+
+function formatElapsed(seconds: number | null) {
+  if (seconds === null || !Number.isFinite(seconds)) return '计算中';
+  const safe = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safe / 60);
+  const remainder = safe % 60;
+  return minutes ? `${minutes} 分 ${String(remainder).padStart(2, '0')} 秒` : `${remainder} 秒`;
+}
+
+function formatTaskTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function defaultPrompt(initialPrompt?: string) {

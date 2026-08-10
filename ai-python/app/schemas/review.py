@@ -182,6 +182,7 @@ class ReviewSegmentGenerationRequest(BaseModel):
     segmentIds: list[str] = Field(..., min_length=1, max_length=100)
     prompts: dict[str, str] = Field(default_factory=dict)
     mode: Literal["STANDARD", "RELAXED"] = "RELAXED"
+    forceRestart: bool = False
 
     @field_validator("segmentIds")
     @classmethod
@@ -222,6 +223,34 @@ class ReviewSegmentGenerationResult(BaseModel):
     materialId: int = Field(..., ge=1)
     sourceVersion: int = Field(..., ge=0)
     segments: list[ReviewSegmentResult] = Field(default_factory=list)
+
+
+class ReviewSegmentProgressEvent(BaseModel):
+    """交互式分段任务的一条可观测事件，包含段位置和模型内部阶段。"""
+
+    stageCode: str
+    stageLabel: str
+    message: str
+    status: str = "RUNNING"
+    percent: int = Field(default=0, ge=0, le=100)
+    currentStep: int | None = Field(default=None, ge=0)
+    totalSteps: int | None = Field(default=None, ge=1)
+    attempt: int | None = Field(default=None, ge=0)
+    maxAttempts: int | None = Field(default=None, ge=1)
+    currentSegmentId: str | None = None
+    currentSegmentIndex: int | None = Field(default=None, ge=1)
+    totalSegments: int | None = Field(default=None, ge=1)
+    completedSegments: int | None = Field(default=None, ge=0)
+    detail: str | None = None
+    elapsedSeconds: int | None = Field(default=None, ge=0)
+    heartbeatAt: datetime | None = None
+    createdAt: datetime | None = None
+
+
+class ReviewSegmentTaskProgress(ReviewSegmentProgressEvent):
+    """交互式分段任务当前阶段、后台心跳和最近事件时间线。"""
+
+    events: list[ReviewSegmentProgressEvent] = Field(default_factory=list, max_length=12)
 
 
 class ReviewMaterialRewritePreview(BaseModel):
@@ -298,7 +327,7 @@ class ReviewSegmentGenerationTask(BaseModel):
     mode: Literal["STANDARD", "RELAXED"]
     segmentIds: list[str] = Field(default_factory=list)
     status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
-    progress: ReviewRewriteTaskProgress
+    progress: ReviewSegmentTaskProgress
     result: ReviewSegmentGenerationResult | None = None
     error: str | None = None
     createdAt: datetime

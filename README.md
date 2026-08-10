@@ -473,9 +473,10 @@ Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允�
 | `REVIEW_LLM_API_KEY` | 复习摘要、知识单元发现和卡片生成使用的本机中转密钥；不继承通用 RAG 模型配置 |
 | `DEEPSEEK_API_KEY` | 可选的复习降级密钥；本机中转连接、超时或 OpenAI API 错误时才直连 DeepSeek |
 | `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | 单次 Cockpit 复习模型等待窗口，默认 `615` 秒，覆盖两次流打开、空闲窗口和余量 |
+| `REVIEW_SEGMENT_TIMEOUT_SECONDS` | 交互式复习单个分段的总执行预算，默认 `1800` 秒；超时只结束该段等待 |
 | `REVIEW_COCKPIT_REQUEST_RETRIES` | Terra 在降级 DeepSeek 前重新请求 Cockpit 的次数，默认 `1` |
 | `REVIEW_COCKPIT_RETRY_BASE_DELAY_MS` | Cockpit 首次重试退避，默认 `300` 毫秒；最大值由 `REVIEW_COCKPIT_RETRY_MAX_DELAY_MS=1500` 限制 |
-| `REVIEW_LANGEXTRACT_MAX_WORKERS` | 单份资料 LangExtract 同一 pass 的 I/O worker，默认 `8`、硬上限 `10` |
+| `REVIEW_LANGEXTRACT_MAX_WORKERS` | 单份资料 LangExtract 本地切分与定位聚合 worker，默认及硬上限均为 `9`（n+1） |
 | `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | 单份资料 LangExtract 总请求预算，默认 `32` |
 | `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮卡片生成模型调用上限，默认 `8`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
 | `REVIEW_GENERATION_MAX_MERGE_ROUNDS` | 多卡 Observer → Merge Repair 合并轮次上限，默认 `4`，安全范围 `1-12`；与 Actor 质量尝试独立计数 |

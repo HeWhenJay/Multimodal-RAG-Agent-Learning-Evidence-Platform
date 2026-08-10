@@ -78,11 +78,13 @@ review:
       retry-base-delay-ms: ${REVIEW_COCKPIT_RETRY_BASE_DELAY_MS:300}
       retry-max-delay-ms: ${REVIEW_COCKPIT_RETRY_MAX_DELAY_MS:1500}
       keepalive-seconds: ${REVIEW_COCKPIT_KEEPALIVE_SECONDS:15}
+  segment:
+    timeout-seconds: ${REVIEW_SEGMENT_TIMEOUT_SECONDS:1800}
   langextract:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
     max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
-    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:16}
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:9}
     max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
     timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:615}
 

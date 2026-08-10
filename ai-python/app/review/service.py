@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
 import logging
+import os
+from threading import Lock
+from time import monotonic
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -90,6 +93,15 @@ _review_segment_extract_executor = ThreadPoolExecutor(
     max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
     thread_name_prefix="review-segment",
 )
+
+
+def configured_review_segment_timeout_seconds() -> float:
+    """读取单个交互式分段的总执行预算，避免异常模型请求永久占用整轮任务。"""
+    try:
+        configured = float(os.getenv("REVIEW_SEGMENT_TIMEOUT_SECONDS", "1800"))
+    except (TypeError, ValueError):
+        configured = 1800.0
+    return max(0.05, configured)
 
 
 def report_progress(
@@ -915,6 +927,82 @@ class ReviewService:
         if normalized_mode not in {"STANDARD", "RELAXED"}:
             normalized_mode = "RELAXED"
         total = len(segment_ids)
+        segment_timeout_seconds = configured_review_segment_timeout_seconds()
+        segment_progress_lock = Lock()
+        local_progress = {segment_id: 0 for segment_id in segment_ids}
+        selected_positions = {
+            segment_id: position for position, segment_id in enumerate(segment_ids, start=1)
+        }
+        completed_segment_ids: set[str] = set()
+
+        def emit_segment_progress(segment_id: str, event: dict[str, object]) -> None:
+            """把单段模型进度聚合为整轮单调进度，并保留模型轮次等诊断字段。"""
+            if progress_callback is None:
+                return
+            segment_model, _segment = segment_map[segment_id]
+            try:
+                reported_percent = int(event.get("percent") or 0)
+            except (TypeError, ValueError):
+                reported_percent = 0
+            with segment_progress_lock:
+                local_progress[segment_id] = max(
+                    local_progress[segment_id],
+                    max(0, min(100, reported_percent)),
+                )
+                completed_count = len(completed_segment_ids)
+                # 5% 留给资料校验，95% 以后留给任务收尾；取所有段平均值可避免并行回调导致进度倒退。
+                overall_percent = min(
+                    94,
+                    5 + round(sum(local_progress.values()) / max(1, total) * 0.89),
+                )
+            stage_label = str(event.get("stageLabel") or "生成候选")
+            message = str(event.get("message") or "正在生成本段复习卡片")
+            selected_position = selected_positions[segment_id]
+            try:
+                progress_callback(
+                    {
+                        **event,
+                        "stageCode": str(event.get("stageCode") or "review.segment.generate"),
+                        "stageLabel": f"原文第 {segment_model.segmentIndex} 段 · {stage_label}",
+                        "message": f"本轮第 {selected_position}/{total} 个（原文第 {segment_model.segmentIndex} 段）：{message}",
+                        "percent": overall_percent,
+                        "currentSegmentId": segment_id,
+                        "currentSegmentIndex": segment_model.segmentIndex,
+                        "totalSegments": total,
+                        "completedSegments": completed_count,
+                    }
+                )
+            except Exception:  # noqa: BLE001 - 页面轮询断开不能影响模型生成。
+                logger.debug("分段进度回调已断开: material_id=%s segment_id=%s", material.id, segment_id)
+
+        def mark_segment_finished(segment_id: str, result: ReviewSegmentResult) -> None:
+            """记录单段终态并立即上报，供并行任务继续计算整体百分比。"""
+            with segment_progress_lock:
+                completed_segment_ids.add(segment_id)
+                local_progress[segment_id] = 100
+                completed_count = len(completed_segment_ids)
+                overall_percent = min(94, 5 + round(sum(local_progress.values()) / max(1, total) * 0.89))
+            if progress_callback:
+                try:
+                    progress_callback(
+                        {
+                            "stageCode": "review.segment.completed" if result.status == "SUCCEEDED" else "review.segment.failed",
+                            "stageLabel": f"第 {result.segmentIndex} 段{'已完成' if result.status == 'SUCCEEDED' else '未通过'}",
+                            "message": (
+                                f"已完成 {completed_count}/{total} 个所选分段，本段生成 {len(result.cards)} 张候选卡片"
+                                if result.status == "SUCCEEDED"
+                                else f"已完成 {completed_count}/{total} 个所选分段，本段可调整提示词后单独重试"
+                            ),
+                            "percent": overall_percent,
+                            "currentSegmentId": segment_id,
+                            "currentSegmentIndex": result.segmentIndex,
+                            "totalSegments": total,
+                            "completedSegments": completed_count,
+                            "detail": (result.error or "本段已通过 evidence 质量门禁"),
+                        }
+                    )
+                except Exception:  # noqa: BLE001 - 页面轮询断开不能影响任务收敛。
+                    logger.debug("分段终态进度回调已断开: material_id=%s segment_id=%s", material.id, segment_id)
 
         def generate_one(segment_id: str) -> ReviewSegmentResult:
             """在线程池中独立生成一段，异常只影响当前段。"""
@@ -931,6 +1019,7 @@ class ReviewService:
                     segment,
                     user_feedback=prompt or "请模拟真实面试官提问，完整保留本段独立知识点。",
                     generation_mode=normalized_mode,
+                    progress_callback=lambda event: emit_segment_progress(segment_id, event),
                 )
                 if not result.knowledge_points:
                     raise ReviewExtractionError("本段没有生成通过 evidence 门禁的卡片")
@@ -966,33 +1055,57 @@ class ReviewService:
                 )
 
         results: list[ReviewSegmentResult] = []
-        completed = 0
         worker_count = min(total, configured_io_workers("LLM_IO_MAX_WORKERS"))
-        futures = {
-            _review_segment_extract_executor.submit(generate_one, segment_id): segment_id
-            for segment_id in segment_ids[:worker_count]
-        }
+        futures: dict[object, tuple[str, float]] = {}
+
+        def submit_segment(segment_id: str) -> None:
+            """提交一段并记录独立截止时间，排队时间也计入用户可感知预算。"""
+            future = _review_segment_extract_executor.submit(generate_one, segment_id)
+            futures[future] = (segment_id, monotonic())
+
+        for segment_id in segment_ids[:worker_count]:
+            submit_segment(segment_id)
         # 选择数量受请求 schema 限制，但仍以稳定的共享池为上限，避免多资料同时生成时嵌套线程爆炸。
         pending_ids = segment_ids[worker_count:]
         while futures:
-            for future in as_completed(futures):
-                results.append(future.result())
-                completed += 1
-                if progress_callback:
-                    segment_result = results[-1]
-                    progress_callback(
-                        {
-                            "stageCode": "review.segment.generate",
-                            "stageLabel": f"完成第 {segment_result.segmentIndex} 段",
-                            "message": f"第 {completed}/{total} 个所选分段已完成，可继续处理其他分段",
-                            "percent": min(94, int(completed / total * 90)),
-                        }
+            next_deadline = min(
+                started_at + segment_timeout_seconds
+                for _segment_id, started_at in futures.values()
+            )
+            wait_timeout = max(0.0, min(0.25, next_deadline - monotonic()))
+            done, _not_done = wait(
+                tuple(futures),
+                timeout=wait_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            now = monotonic()
+            expired = {
+                future
+                for future, (_segment_id, started_at) in futures.items()
+                if future not in done and now - started_at >= segment_timeout_seconds
+            }
+            for future in [*done, *expired]:
+                item = futures.pop(future, None)
+                if item is None:
+                    continue
+                segment_id, _started_at = item
+                segment_model, _segment = segment_map[segment_id]
+                if future in expired:
+                    future.cancel()
+                    segment_result = ReviewSegmentResult(
+                        segmentId=segment_id,
+                        segmentIndex=segment_model.segmentIndex,
+                        title=segment_model.title,
+                        status="FAILED",
+                        qualityFeedback=["本段超过执行时间预算，已停止等待；可稍后单独重试本段"],
+                        error=f"本段生成超过 {int(segment_timeout_seconds)} 秒，已从本轮任务中释放",
                     )
+                else:
+                    segment_result = future.result()
+                results.append(segment_result)
+                mark_segment_finished(segment_id, segment_result)
                 if pending_ids:
-                    next_id = pending_ids.pop(0)
-                    futures[_review_segment_extract_executor.submit(generate_one, next_id)] = next_id
-                futures.pop(future, None)
-                break
+                    submit_segment(pending_ids.pop(0))
         results.sort(key=lambda item: item.segmentIndex)
         return ReviewSegmentGenerationResult(
             materialId=material.id,

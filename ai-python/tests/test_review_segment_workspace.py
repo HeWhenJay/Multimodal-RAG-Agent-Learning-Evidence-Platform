@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+import time
 
 import pytest
 
@@ -58,9 +59,20 @@ class SegmentExtractor:
         *,
         user_feedback: str | None = None,
         generation_mode: str = "STANDARD",
+        progress_callback=None,
         **_kwargs,
     ) -> ExtractionResult:
         self.calls.append((evidences[0].evidenceId, user_feedback or "", generation_mode, len(evidences)))
+        if progress_callback:
+            progress_callback({
+                "stageCode": "review.actor",
+                "stageLabel": "模型生成",
+                "message": "正在生成第 2/8 版复习卡片",
+                "percent": 40,
+                "attempt": 2,
+                "maxAttempts": 8,
+                "detail": "正在修复面试问题表达",
+            })
         if evidences[0].evidenceId == "e-24":
             raise ReviewExtractionError("第二段未通过 evidence 门禁", diagnostics=["缺少布隆过滤器误判率证据"])
         source = evidences[0]
@@ -219,7 +231,40 @@ def test_selected_segments_use_independent_prompts_and_keep_partial_failure() ->
     assert [item.status for item in result.segments] == ["SUCCEEDED", "FAILED"]
     assert result.segments[0].cards[0].evidenceIds == ["e-0"]
     assert result.segments[1].qualityFeedback == ["缺少布隆过滤器误判率证据"]
-    assert events[-1]["percent"] == 90
+    assert events[-1]["percent"] == 94
+    model_event = next(item for item in events if item["stageCode"] == "review.actor")
+    assert int(model_event["percent"]) > 5
+    assert model_event["attempt"] == 2
+    assert model_event["maxAttempts"] == 8
+    assert model_event["currentSegmentId"] in {item.segmentId for item in workspace.segments}
+
+
+def test_segment_timeout_returns_failed_result_without_blocking_whole_round(monkeypatch) -> None:
+    """单段模型失联超过预算后必须收敛为可重试失败，不能让整轮永久等待。"""
+    class SlowSegmentExtractor(SegmentExtractor):
+        """模拟超过单段预算后才返回的同步模型调用。"""
+
+        def extract(self, *args, **kwargs):
+            time.sleep(0.15)
+            return super().extract(*args, **kwargs)
+
+    monkeypatch.setenv("REVIEW_SEGMENT_TIMEOUT_SECONDS", "0.05")
+    transaction = SegmentTransaction()
+    service = service_with(transaction, SlowSegmentExtractor())
+    workspace = service.get_segment_workspace(31, "7")
+    started_at = time.monotonic()
+
+    result = service.generate_selected_segments(
+        31,
+        "7",
+        [workspace.segments[0].segmentId],
+        {},
+        mode="RELAXED",
+    )
+
+    assert time.monotonic() - started_at < 0.14
+    assert result.segments[0].status == "FAILED"
+    assert "超过执行时间预算" in result.segments[0].qualityFeedback[0]
 
 
 def test_merge_segment_candidates_supports_first_generation_and_rejects_unsupported_answer() -> None:
