@@ -298,6 +298,13 @@ def test_worker_cron_config_env_mapping_is_effective():
                 "staging-cleanup": {"enabled": False, "fixed-delay-seconds": 600},
                 "rag-task": {"enabled": True, "poll-interval-seconds": 0.2, "concurrency": 4},
                 "review-sync": {"max-workers": 2},
+                "review-task": {
+                    "enabled": True,
+                    "poll-seconds": 3,
+                    "batch-size": 12,
+                    "concurrency": 16,
+                    "stale-seconds": 900,
+                },
             }
         }
     )
@@ -317,6 +324,11 @@ def test_worker_cron_config_env_mapping_is_effective():
     assert env_defaults["RAG_TASK_WORKER_POLL_SECONDS"] == "0.2"
     assert env_defaults["RAG_TASK_WORKER_CONCURRENCY"] == "4"
     assert env_defaults["RAG_REVIEW_SYNC_WORKERS"] == "2"
+    assert env_defaults["REVIEW_TASK_WORKER_ENABLED"] == "true"
+    assert env_defaults["REVIEW_TASK_WORKER_POLL_SECONDS"] == "3"
+    assert env_defaults["REVIEW_TASK_WORKER_BATCH_SIZE"] == "12"
+    assert env_defaults["REVIEW_TASK_WORKER_CONCURRENCY"] == "16"
+    assert env_defaults["REVIEW_TASK_WORKER_STALE_SECONDS"] == "900"
 
 
 def test_kafka_worker_consumer_config_env_mapping_is_effective():
@@ -414,14 +426,32 @@ def test_run_entry_starts_and_stops_cron_subprocess(monkeypatch):
         def stop(self):
             calls.append("cron-stop")
 
+    class FakeReviewTaskProcess:
+        def stop(self):
+            calls.append("review-task-stop")
+
     # 启动监督测试只验证进程顺序，迁移 I/O 由 database_migrations 的专门测试覆盖。
     monkeypatch.setattr(
         "app.core.database_migrations.apply_python_schema_migrations",
         lambda: calls.append("migrations") or [],
     )
     monkeypatch.setattr("app.workers.supervisor.start_cron_process", lambda config_args: calls.append(config_args) or FakeCronProcess())
+    monkeypatch.setattr(
+        "app.workers.supervisor.start_worker_process",
+        lambda module, config_args: calls.append((module, config_args)) or FakeReviewTaskProcess(),
+    )
+    monkeypatch.setattr("app.core.runtime_config.kafka_enabled", lambda _args: False)
+    monkeypatch.setattr("app.core.runtime_config.agent_worker_enabled", lambda _args: False)
+    monkeypatch.setattr("app.core.runtime_config.rag_task_worker_enabled", lambda _args: False)
     monkeypatch.setattr("app.core.runtime_config.uvicorn.run", lambda *args, **kwargs: calls.append("uvicorn"))
 
     main(["--with-cron", "--config", "config/worker-test.yml"])
 
-    assert calls == ["migrations", ["--config", "config/worker-test.yml"], "uvicorn", "cron-stop"]
+    assert calls == [
+        "migrations",
+        ["--config", "config/worker-test.yml"],
+        ("app.workers.review_task_worker", ["--config", "config/worker-test.yml"]),
+        "uvicorn",
+        "review-task-stop",
+        "cron-stop",
+    ]

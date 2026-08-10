@@ -150,6 +150,13 @@ class ReviewTransaction(Protocol):
 
     def list_sync_candidates(self, user_id: str, limit: int) -> list[MaterialSourceRecord]: ...
 
+    def claim_review_generation_candidates(
+        self,
+        *,
+        batch_size: int,
+        stale_seconds: int,
+    ) -> list[MaterialSourceRecord]: ...
+
     def find_material(self, material_id: int, user_id: str) -> MaterialSourceRecord | None: ...
 
     def find_material_by_id(self, material_id: int) -> MaterialSourceRecord | None: ...
@@ -381,6 +388,78 @@ class DatabaseReviewTransaction:
             (user_id, limit),
         )
         return [self._to_material(row) for row in self._cursor.fetchall()]
+
+    def claim_review_generation_candidates(
+        self,
+        *,
+        batch_size: int,
+        stale_seconds: int,
+    ) -> list[MaterialSourceRecord]:
+        """原子领取排队或超时的复习任务，服务重启后可继续生成。"""
+        safe_batch_size = max(1, int(batch_size))
+        safe_stale_seconds = max(1, int(stale_seconds))
+        event = {
+            "stageCode": "review.recovery.claimed",
+            "stageLabel": "恢复生成",
+            "message": "检测到复习任务中断，已由 durable worker 重新领取",
+            "status": "RUNNING",
+            "currentStep": 1,
+            "totalSteps": 4,
+            "percent": 2,
+            "attempt": 0,
+        }
+        claimed: list[MaterialSourceRecord] = []
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.*, rm.generation_progress AS review_generation_progress
+                FROM {schema}.learning_material lm
+                JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = lm.id AND rm.user_id = lm.user_id
+                WHERE lm.status IN ('READY', 'PARTIAL')
+                  AND rm.status = 'GENERATING'
+                  AND (
+                      COALESCE(rm.generation_progress ->> 'stageCode', '') = 'review.queued'
+                      OR rm.updated_at <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.learning_review_material_exclusion excluded_material
+                      WHERE excluded_material.material_id = lm.id
+                        AND excluded_material.user_id = lm.user_id
+                  )
+                ORDER BY rm.updated_at ASC, lm.id ASC
+                LIMIT %s
+                FOR UPDATE OF rm SKIP LOCKED
+                """
+            ),
+            (safe_stale_seconds, safe_batch_size),
+        )
+        rows = self._cursor.fetchall()
+        for row in rows:
+            progress = merge_generation_progress(row.get("review_generation_progress"), event)
+            self._cursor.execute(
+                self._statement(
+                    """
+                    UPDATE {schema}.learning_review_material
+                    SET reason = %s,
+                        generation_progress = %s::jsonb,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE material_id = %s
+                      AND user_id = %s
+                      AND status = 'GENERATING'
+                    """
+                ),
+                (
+                    event["message"],
+                    json.dumps(progress, ensure_ascii=False, separators=(",", ":")),
+                    row["id"],
+                    row["user_id"],
+                ),
+            )
+            if self._cursor.rowcount > 0:
+                claimed.append(self._to_material(row))
+        return claimed
 
     def find_material(self, material_id: int, user_id: str) -> MaterialSourceRecord | None:
         """按资料 ID 和当前用户联合查询，避免生成接口越权。"""

@@ -26,17 +26,17 @@ npm run dev
 - 数据库：PostgreSQL + pgvector，默认 `127.0.0.1:5433`
 - 原始文件：本地目录或阿里 OSS；Kafka 仅在需要高吞吐索引时启用。
 
-`ai-python/run.py` 是后端唯一启动入口。默认会监督 FastAPI、Agent worker、RAG durable worker 和已启用的 cron；Kafka 配置为开启时才会额外启动 Kafka worker。旧文档中的 Java 架构仅作为迁移历史，不是当前代码、启动或联调依据。
+`ai-python/run.py` 是后端唯一启动入口。默认会监督 FastAPI、Agent worker、RAG durable worker、复习生成恢复 worker 和已启用的 cron；Kafka 配置为开启时才会额外启动 Kafka worker。旧文档中的 Java 架构仅作为迁移历史，不是当前代码、启动或联调依据。
 
 ## 项目能力
 
 - 多模态资料入库：文本、PDF、Office 文档、图片、字幕与视频；PDF 优先 MinerU，失败时走本地降级解析。
 - 可追溯 RAG：结构化解析、递归切块、文档/章节摘要、元数据隔离、BM25 与 pgvector 向量召回、Multi-Query、RRF/RAG-Fusion、重排和 evidence 引用。
-- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，结构化问题或候选较多时最多生成 32 张。
+- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，卡片数量不设固定上限，只合并重复事实并保留 evidence 门禁。
 - 复习质量闭环：独立 LangGraph 按 Planner → LangExtract Curator → Actor → Observer → Repair 运行；Curator 候选精确回指 evidence 并只执行一次，质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`。
 - 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
 - Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
-- 耐久任务：资料索引、查询任务、Agent 任务都先写入 PostgreSQL，再由 worker 以租约领取；进程重启后可恢复，不依赖 Web 请求进程存活。
+- 耐久任务：资料索引、查询任务、Agent 任务和复习生成请求都先写入 PostgreSQL，再由 worker 原子领取；进程重启后可恢复，不依赖 Web 请求进程存活。
 - Agent 工作台：支持在未分类或指定文件夹创建空白 `DRAFT` 会话、在同一 `taskId/threadId` 上多轮续聊、历史消息分页、LangGraph PAE/ReAct、受控工具、记忆、审批、撤销、事件投影与 SSE。
 - 长会话上下文：使用 `tiktoken` 做本地预算，未摘要原文超过 Token 阈值后才生成滚动摘要；PostgreSQL 保存消息与摘要事实，Redis 只缓存可重建的 L2 运行态快照。
 - Prompt 与模型观测：Agent、RAG、复习、简历、OCR 和 ASR Prompt 集中在 `ai-python/prompts/`；Agent Qwen 调用保留 provider usage，支持审计输入 Token、输出 Token 和总 Token。
@@ -207,7 +207,7 @@ RAG 检索设计采用 Multi-Query 扩展召回范围，查询变体先通过一
 
 ## 复习生成、文件夹与 FSRS 闭环
 
-RAG 索引进入 `READY` 或 `PARTIAL` 后，LOCAL worker 与 Kafka worker 都会按 `materialId + indexRequestVersion + extractorVersion` 幂等触发复习生成；前端上传完成轮询也会按 `materialId` 兜底触发同一服务。系统先做确定性的 evidence 清洗和学习内容过滤，只有通过过滤的资料才交给独立复习 LangGraph，面向用户的摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成。
+RAG 索引进入 `READY` 或 `PARTIAL` 后，LOCAL worker 与 Kafka worker 都会按 `materialId + indexRequestVersion` 幂等触发复习生成；前端上传完成轮询也会按 `materialId` 兜底触发同一服务。生成请求先持久化为 `review.queued`，独立复习恢复 worker 默认以 16 个 I/O 线程领取排队任务，并恢复超过 20 分钟未更新的 `GENERATING` 任务。系统先做确定性的 evidence 清洗和学习内容过滤，只有通过过滤的资料才交给独立复习 LangGraph，面向用户的摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成。
 
 ### Terra PAE/ReAct 生成质量闭环
 

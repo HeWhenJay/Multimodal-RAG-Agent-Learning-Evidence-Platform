@@ -89,6 +89,12 @@ workers:
     concurrency: ${RAG_TASK_WORKER_CONCURRENCY:9}
   review-sync:
     max-workers: ${RAG_REVIEW_SYNC_WORKERS:16}
+  review-task:
+    enabled: ${REVIEW_TASK_WORKER_ENABLED:true}
+    poll-seconds: ${REVIEW_TASK_WORKER_POLL_SECONDS:2}
+    batch-size: ${REVIEW_TASK_WORKER_BATCH_SIZE:16}
+    concurrency: ${REVIEW_TASK_WORKER_CONCURRENCY:16}
+    stale-seconds: ${REVIEW_TASK_WORKER_STALE_SECONDS:1200}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}

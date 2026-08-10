@@ -175,6 +175,13 @@ workers:
   review-sync:
     # RAG 终态回写后异步生成复习卡片；模型等待属于 I/O，默认使用 2n=16。
     max-workers: ${RAG_REVIEW_SYNC_WORKERS:16}
+  review-task:
+    # 领取服务重启后遗留的 GENERATING/queued 复习任务，模型等待属于 I/O。
+    enabled: ${REVIEW_TASK_WORKER_ENABLED:true}
+    poll-seconds: ${REVIEW_TASK_WORKER_POLL_SECONDS:2}
+    batch-size: ${REVIEW_TASK_WORKER_BATCH_SIZE:16}
+    concurrency: ${REVIEW_TASK_WORKER_CONCURRENCY:16}
+    stale-seconds: ${REVIEW_TASK_WORKER_STALE_SECONDS:1200}
 
 auth:
   database-url: ${AUTH_DATABASE_URL:}

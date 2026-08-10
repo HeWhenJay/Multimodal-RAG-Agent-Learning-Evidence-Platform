@@ -188,6 +188,11 @@ CONFIG_ENV_MAPPING: dict[tuple[str, ...], str] = {
     ("workers", "rag-task", "query-task-ttl-seconds"): "RAG_QUERY_TASK_TTL_SECONDS",
     ("workers", "rag-task", "local-index-enabled"): "RAG_LOCAL_INDEX_WORKER_ENABLED",
     ("workers", "review-sync", "max-workers"): "RAG_REVIEW_SYNC_WORKERS",
+    ("workers", "review-task", "enabled"): "REVIEW_TASK_WORKER_ENABLED",
+    ("workers", "review-task", "poll-seconds"): "REVIEW_TASK_WORKER_POLL_SECONDS",
+    ("workers", "review-task", "batch-size"): "REVIEW_TASK_WORKER_BATCH_SIZE",
+    ("workers", "review-task", "concurrency"): "REVIEW_TASK_WORKER_CONCURRENCY",
+    ("workers", "review-task", "stale-seconds"): "REVIEW_TASK_WORKER_STALE_SECONDS",
     ("dashscope", "api-key"): "DASHSCOPE_API_KEY",
     ("mineru", "command"): "MINERU_COMMAND",
     ("mineru", "token"): "MINERU_TOKEN",
@@ -573,6 +578,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         rag_task_process = start_worker_process("app.workers.rag_task_worker", worker_config_args(args))
         if rag_task_process is not None:
             managed_processes.append(rag_task_process)
+    if review_task_worker_enabled():
+        from app.workers.supervisor import start_worker_process
+
+        review_task_process = start_worker_process("app.workers.review_task_worker", worker_config_args(args))
+        if review_task_process is not None:
+            managed_processes.append(review_task_process)
     try:
         uvicorn.run(
             "app.main:app",
@@ -641,6 +652,11 @@ def rag_task_worker_enabled(args: argparse.Namespace) -> bool:
     if args.without_rag_worker:
         return False
     return read_bool_env("RAG_TASK_WORKER_ENABLED", False)
+
+
+def review_task_worker_enabled() -> bool:
+    """判断是否启动复习生成耐久恢复 worker。"""
+    return read_bool_env("REVIEW_TASK_WORKER_ENABLED", True)
 
 
 if __name__ == "__main__":

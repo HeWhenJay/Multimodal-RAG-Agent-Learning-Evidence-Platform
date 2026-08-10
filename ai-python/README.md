@@ -37,6 +37,8 @@ dashscope:
 - `RAG_OUTBOX_PUBLISH_CONCURRENCY`：Outbox Kafka/数据库 I/O 并发，默认 `16`（2n）；不同 topic/key 并行，同一 topic/key 按事件 ID 保序
 - `RAG_TASK_WORKER_CONCURRENCY`：查询与 local 索引耐久任务并发，CPU/内存阶段默认 `9`（n+1）
 - `RAG_REVIEW_SYNC_WORKERS`：入库后自动复习生成线程数，模型等待属于 I/O，默认 `16`（2n）；不会阻塞 RAG promote 终态回写
+- `REVIEW_TASK_WORKER_CONCURRENCY`：复习生成耐久恢复并发，默认 `16`（2n）；从 PostgreSQL 原子领取排队任务和超过租约的 `GENERATING` 任务
+- `REVIEW_TASK_WORKER_STALE_SECONDS`：复习任务中断恢复阈值，默认 `1200` 秒；生成阶段持续更新进度时不会被重复领取
 - `AGENT_WORKER_CONCURRENCY`：不同 Agent 持久任务并发，模型与数据库等待属于 I/O，默认 `16`（2n）；同一任务仍由任务锁串行
 - `REVIEW_LLM_API_KEY`：复习摘要、知识单元发现和卡片生成使用的本机中转密钥；缺失时返回可诊断失败，不生成本地伪内容
 - `DEEPSEEK_API_KEY`：可选的复习降级密钥；Cockpit 按长等待方案完成 Terra 重试后仍失败时才直连 DeepSeek
@@ -134,13 +136,13 @@ python run.py
 
 ### Python cron 与耐久 worker
 
-`run.py` 在 API 进程外监督耐久 worker。默认配置会启动 Agent 和 RAG 任务 worker；启用 Kafka 后会同时启动 Outbox cron 与 Kafka 状态消费 worker。所有长任务都从 PostgreSQL 中领取和回写，Web 进程重启不会丢失任务。
+`run.py` 在 API 进程外监督耐久 worker。默认配置会启动 Agent、RAG 任务 worker 和复习生成恢复 worker；启用 Kafka 后会同时启动 Outbox cron 与 Kafka 状态消费 worker。复习恢复 worker 每 2 秒从 PostgreSQL 原子领取 `review.queued` 或超过 20 分钟未更新的 `GENERATING` 资料，默认最多并发处理 16 份。Web 进程重启后，已持久化的复习任务会继续生成；旧活动卡片只在新候选成功发布后替换。
 
 `RAG_VIDEO_PARALLEL_WORKERS=9` 只表示单条视频内部的媒体分段解析线程数，视频解码和解析属于 CPU/内存阶段。
-完整 Kafka 本地配置下，`start.ps1` 会启动 FastAPI、cron、Kafka、Agent 和 RAG durable worker；Kafka 索引默认可并发处理 9 份不同资料。
+完整 Kafka 本地配置下，`start.ps1` 会启动 FastAPI、cron、Kafka、Agent、RAG durable worker 和复习恢复 worker；Kafka 索引默认可并发处理 9 份不同资料。
 
 ```powershell
-# 默认启动 FastAPI、Agent worker 和 RAG 任务 worker。
+# 默认启动 FastAPI、Agent worker、RAG 任务 worker和复习恢复 worker。
 .\ai-python\start.ps1
 
 # 使用 Kafka 索引链路时再显式启用 broker worker。
@@ -157,7 +159,7 @@ $env:AI_KAFKA_WORKER_ENABLED='true'
 - `app/core/`：启动配置读取、YAML 映射和 Uvicorn 启动参数。
 - `app/schemas/`：与 React 契约保持一致的 Pydantic 请求/响应模型。
 - `app/review/`：资料级复习卡片提炼、FSRS 排程、分组队列、答案揭示和生成并发保护。
-- `app/workers/`：Kafka 消费、Outbox 发布、RAG/Agent 耐久任务和独立 cron 调度。
+- `app/workers/`：Kafka 消费、Outbox 发布、RAG/Agent/复习生成耐久任务和独立 cron 调度。
 - `agents/gateway/`：受控本地工具、RAG 和记忆调用网关。
 - `agents/llm/`：Agent 规划、执行和回答使用的模型客户端。
 - `agents/orchestration/`：统一 PAE/ReAct 状态图及只读、规划辅助函数。

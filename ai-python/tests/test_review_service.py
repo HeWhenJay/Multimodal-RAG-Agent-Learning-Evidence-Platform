@@ -427,7 +427,7 @@ def test_review_model_failure_is_persisted_and_deactivates_old_cards() -> None:
     assert result.summary is None
     assert result.reason == "gpt-5.6-terra 生成的卡片未通过质量门禁"
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v12"
+    assert transaction.saved["extractor"] == "failed:review-card-v13"
     assert transaction.saved["cards"] == []
     assert transaction.saved["generation_progress_event"]["stageCode"] == "review.failed"
 
@@ -455,7 +455,7 @@ def test_unexpected_extractor_failure_is_persisted_instead_of_remaining_pending(
     assert result.reason == "复习生成遇到未预期错误（RuntimeError），请稍后重新生成"
     assert "不应直接暴露" not in result.reason
     assert transaction.saved is not None
-    assert transaction.saved["extractor"] == "failed:review-card-v12"
+    assert transaction.saved["extractor"] == "failed:review-card-v13"
     assert transaction.saved["quality_feedback"] == [result.reason]
 
 
