@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.result import BusinessError
 from app.review.fsrs_scheduler import FsrsReviewScheduler, as_utc
-from app.review.card_rewriter import CardRewriter
+from app.review.card_rewriter import (
+    CardRewriter,
+    infer_material_rewrite_card_count,
+)
 from app.review.generation_graph import ReviewManualReviewRequired
 from app.review.generation_guard import ReviewGenerationGuard
 from app.review.knowledge_extractor import (
@@ -155,8 +158,9 @@ class ReviewService:
         material_id: int,
         user_id: str,
         user_feedback: str | None = None,
+        generation_mode: str = "STANDARD",
     ) -> ReviewMaterial:
-        """携带可选人工说明，显式重新生成当前用户的一条资料。"""
+        """携带门禁模式和可选人工说明，显式重新生成当前用户的一条资料。"""
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
             excluded = transaction.is_material_excluded(material_id, user_id)
@@ -164,7 +168,13 @@ class ReviewService:
             raise BusinessError("学习资料不存在")
         if excluded:
             raise BusinessError("该资料已从复习中心移除")
-        result = self._generate(material, user_id, force=True, user_feedback=user_feedback)
+        result = self._generate(
+            material,
+            user_id,
+            force=True,
+            user_feedback=user_feedback,
+            generation_mode=generation_mode,
+        )
         if result is None:
             with self.repository.transaction() as transaction:
                 if transaction.is_material_excluded(material_id, user_id):
@@ -172,7 +182,12 @@ class ReviewService:
             raise BusinessError("该资料的复习卡片正在生成，请稍后刷新")
         return result
 
-    def prepare_material_generation(self, material_id: int, user_id: str) -> ReviewMaterial:
+    def prepare_material_generation(
+        self,
+        material_id: int,
+        user_id: str,
+        generation_mode: str = "STANDARD",
+    ) -> ReviewMaterial:
         """先持久化后台生成状态，避免人工触发请求同步等待模型返回。"""
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
@@ -191,7 +206,7 @@ class ReviewService:
             {
                 "stageCode": "review.queued",
                 "stageLabel": "后台排队",
-                "message": "已收到人工说明，生成请求已转入后台队列",
+                "message": f"已选择{generation_mode_label(generation_mode)}，生成请求已转入后台队列",
                 "status": "RUNNING",
                 "currentStep": 1,
                 "totalSteps": 4,
@@ -204,6 +219,34 @@ class ReviewService:
         if queued is None:
             raise BusinessError("复习生成任务入队失败，请稍后重试")
         return material_response(queued)
+
+    def keep_current_generation(self, material_id: int, user_id: str) -> ReviewMaterial:
+        """用户确认保留当前活动卡片，跳过本轮模型重新生成。"""
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material(material_id, user_id)
+            excluded = transaction.is_material_excluded(material_id, user_id)
+        if material is None:
+            raise BusinessError("学习资料不存在")
+        if excluded:
+            raise BusinessError("该资料已从复习中心移除")
+        event = terminal_generation_progress_event(
+            "GENERATED",
+            "用户选择保留当前可用卡片",
+            0,
+            at=as_utc(self.now_provider()),
+        )
+        event.update(
+            {
+                "stageCode": "review.keep_current",
+                "stageLabel": "保留当前版本",
+                "message": "已保留当前可用卡片，本次没有调用模型",
+            }
+        )
+        with self.repository.transaction() as transaction:
+            record = transaction.keep_current_generation(material, event)
+        if record is None:
+            raise BusinessError("当前没有可保留的复习卡片，请选择重新生成方式")
+        return material_response(record)
 
     def generate_indexed_material(self, material_id: int) -> ReviewMaterial | None:
         """在 RAG worker 确认索引终态后，按资料真实归属幂等生成复习卡片。"""
@@ -718,7 +761,7 @@ class ReviewService:
         payload: ReviewMaterialRewriteRequest,
         user_id: str,
     ) -> ReviewMaterialRewritePreview:
-        """读取资料全部活动卡片并生成一张综合卡片候选，不修改数据库。"""
+        """读取资料全部活动卡片并生成指定数量的候选，不修改数据库。"""
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
             if material is None:
@@ -730,6 +773,16 @@ class ReviewService:
             review_record = transaction.find_review_material(material_id, user_id)
         if not cards:
             raise BusinessError("该资料暂无可合并的活动卡片")
+        target_card_count = infer_material_rewrite_card_count(
+            payload.instruction,
+            payload.targetCardCount,
+            base_card_count=len(payload.baseCards) or 1,
+        )
+        base_cards = list(payload.baseCards)
+        if base_cards and target_card_count <= len(base_cards):
+            raise BusinessError(
+                f"已要求保留 {len(base_cards)} 张本次候选；新增卡片时目标总数必须大于 {len(base_cards)}"
+            )
         try:
             candidate = self.card_rewriter.rewrite_material(
                 LearningMaterialContext(
@@ -742,9 +795,36 @@ class ReviewService:
                 evidences,
                 instruction=payload.instruction,
                 mode=payload.mode,
+                target_card_count=target_card_count,
+                base_cards=[
+                    {
+                        "question": item.content.question,
+                        "answer": item.content.answer,
+                        "hint": item.content.hint,
+                        "evidenceIds": item.evidenceIds,
+                    }
+                    for item in base_cards
+                ],
             )
         except ReviewExtractionError as exc:
             raise BusinessError(str(exc)) from exc
+        generated_snapshots = [
+            ReviewMaterialCardSnapshot(
+                cardId=None,
+                content=ReviewCardContent(question=item.question, answer=item.answer, hint=item.hint),
+                evidenceRefs=list(item.evidence_refs),
+                evidenceIds=[evidence.evidenceId for evidence in item.evidence_refs],
+            )
+            for item in candidate.cards
+        ]
+        proposed_cards = generated_snapshots
+        if base_cards:
+            # 前端把上一轮候选作为 baseCards 传回；服务端只采用模型返回的末尾新增卡，硬保证基础候选不被改写。
+            additional_count = target_card_count - len(base_cards)
+            proposed_cards = [
+                item.model_copy(update={"cardId": None})
+                for item in base_cards
+            ] + generated_snapshots[-additional_count:]
         return ReviewMaterialRewritePreview(
             materialId=material.id,
             title=material.title,
@@ -755,17 +835,11 @@ class ReviewService:
             ),
             originalCardIds=[card.id for card in cards],
             originalCards=[material_card_snapshot(card) for card in cards],
-            proposedCards=[
-                ReviewMaterialCardSnapshot(
-                    cardId=None,
-                    content=ReviewCardContent(question=candidate.question, answer=candidate.answer, hint=candidate.hint),
-                    evidenceRefs=list(candidate.evidence_refs),
-                    evidenceIds=[item.evidenceId for item in candidate.evidence_refs],
-                )
-            ],
+            proposedCards=proposed_cards,
+            targetCardCount=len(proposed_cards),
             originalSummary=(review_record.summary if review_record and review_record.summary else material.document_summary),
             proposedSummary=candidate.summary or (review_record.summary if review_record and review_record.summary else material.document_summary),
-            mergeNote=candidate.merge_note or f"已将 {len(cards)} 张原卡片合并为 1 张综合卡片",
+            mergeNote=candidate.merge_note or f"已将 {len(cards)} 张原卡片重组为 {len(proposed_cards)} 张候选卡片",
             mode=payload.mode,
             modelName=candidate.model_name,
         )
@@ -777,8 +851,8 @@ class ReviewService:
         user_id: str,
     ) -> ReviewMaterialRewriteApplyResult:
         """校验预览版本后，在一个事务中替换资料的全部活动卡片。"""
-        if len(payload.proposedCards) != 1:
-            raise BusinessError("资料级合并必须最终确认恰好 1 张卡片")
+        if len(payload.proposedCards) < 1:
+            raise BusinessError("资料级改写最终至少需要确认 1 张卡片")
         now = as_utc(self.now_provider())
         with self.repository.transaction() as transaction:
             material = transaction.find_material(material_id, user_id)
@@ -796,36 +870,39 @@ class ReviewService:
             current_summary = current_review_record.summary if current_review_record else material.document_summary
             if material_cards_fingerprint(current_cards, current_summary) != payload.originalFingerprint:
                 raise BusinessError("资料卡片内容已被其他操作修改，请重新生成对比预览")
-            candidate = payload.proposedCards[0]
-            evidence_refs: list[Evidence] = []
-            if candidate.evidenceIds is not None:
-                evidence_by_id = {item.evidenceId: item for item in transaction.list_evidences(material)}
-                unknown_ids = [item for item in candidate.evidenceIds if item not in evidence_by_id]
-                if unknown_ids:
-                    raise BusinessError("综合卡片引用的原文证据不存在")
-                evidence_refs = [evidence_by_id[item] for item in candidate.evidenceIds]
-            if candidate.rewriteMode == "STRICT_SOURCE":
-                if not evidence_refs or not answer_is_grounded(candidate.answer, tuple(evidence_refs)):
-                    raise BusinessError("严格依赖原文的综合卡片未通过 evidence 忠实度校验")
-            evidence_refs_json = json.dumps(
-                [item.model_dump(mode="json") for item in evidence_refs],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            draft = ReviewCardDraft(
-                # 资料级确认属于用户编辑内容，后续索引同步不得把它当作普通 AI 卡片停用。
-                source_key=f"custom:material-merge:{material.id}:{uuid4().hex[:20]}",
-                question=candidate.question,
-                answer=candidate.answer,
-                hint=candidate.hint,
-                evidence_refs_json=evidence_refs_json,
-                fsrs_card_json=FsrsReviewScheduler().new_card_json(now),
-                due_at=now,
-            )
+            evidence_by_id = {item.evidenceId: item for item in transaction.list_evidences(material)}
+            drafts: list[ReviewCardDraft] = []
+            for candidate in payload.proposedCards:
+                evidence_refs: list[Evidence] = []
+                if candidate.evidenceIds is not None:
+                    unknown_ids = [item for item in candidate.evidenceIds if item not in evidence_by_id]
+                    if unknown_ids:
+                        raise BusinessError("候选卡片引用的原文证据不存在")
+                    evidence_refs = [evidence_by_id[item] for item in candidate.evidenceIds]
+                if candidate.rewriteMode == "STRICT_SOURCE":
+                    if not evidence_refs or not answer_is_grounded(candidate.answer, tuple(evidence_refs)):
+                        raise BusinessError("严格依赖原文的候选卡片未通过 evidence 忠实度校验")
+                evidence_refs_json = json.dumps(
+                    [item.model_dump(mode="json") for item in evidence_refs],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                drafts.append(
+                    ReviewCardDraft(
+                        # 资料级确认属于用户编辑内容，后续索引同步不得把它当作普通 AI 卡片停用。
+                        source_key=f"custom:material-rewrite:{material.id}:{uuid4().hex[:20]}",
+                        question=candidate.question,
+                        answer=candidate.answer,
+                        hint=candidate.hint,
+                        evidence_refs_json=evidence_refs_json,
+                        fsrs_card_json=FsrsReviewScheduler().new_card_json(now),
+                        due_at=now,
+                    )
+                )
             replaced = transaction.replace_active_cards_for_material(
                 material,
                 payload.originalCardIds,
-                [draft],
+                drafts,
                 summary=payload.proposedSummary,
             )
             if replaced is None:
@@ -994,6 +1071,7 @@ class ReviewService:
         *,
         force: bool,
         user_feedback: str | None = None,
+        generation_mode: str = "STANDARD",
     ) -> ReviewMaterial | None:
         """读取 evidence 后运行复习生成图，再用资料级短事务更新结果。"""
         if material.user_id != user_id:
@@ -1064,6 +1142,7 @@ class ReviewService:
                         context,
                         evidences,
                         user_feedback=user_feedback,
+                        generation_mode=generation_mode,
                         progress_callback=lambda event: self._record_generation_progress(material, event),
                     )
                 else:
@@ -1087,7 +1166,7 @@ class ReviewService:
                     quality_feedback=list(exc.quality_feedback),
                 )
             except ReviewExtractionError as exc:
-                # 失败结果会停用旧卡片，避免继续展示本地降级或旧 Prompt 的坏内容。
+                # 失败只保存诊断，Repository 会保留上一个已经发布的可用版本。
                 return self._save_generation(
                     material,
                     is_learning_content=None,
@@ -1379,6 +1458,14 @@ def terminal_generation_progress_event(
         "attempt": max(0, int(attempts)),
         "createdAt": at.isoformat(),
     }
+
+
+def generation_mode_label(value: str) -> str:
+    """把生成模式转换为用户可理解的中文阶段说明。"""
+    return {
+        "RELAXED": "宽松门禁重新生成",
+        "SEGMENTED": "分段生成并合并",
+    }.get(str(value or "").upper(), "标准门禁重新生成")
 
 
 def folder_response(record: ReviewFolderRecord) -> ReviewFolder:

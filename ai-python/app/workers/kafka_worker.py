@@ -11,6 +11,7 @@ import hashlib
 import threading
 from typing import Any, Callable
 
+from app.core.io_concurrency import configured_cpu_workers, configured_io_workers
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.repositories.rag_job import RagJobRepository
 from app.review.service import ReviewService
@@ -34,14 +35,32 @@ class MessageHandlingOutcome:
 
 @dataclass
 class InFlightMessage:
-    """同一 topic-partition 上唯一在途的 Kafka 消息。"""
+    """在线程池执行且尚未形成 offset 决策的 Kafka 消息。"""
 
     message: Any
     future: Future[MessageHandlingOutcome]
+    ordering_key: tuple[str, bytes | str]
+
+
+@dataclass
+class QueuedMessage:
+    """等待执行槽或同资料前序消息完成的 Kafka 消息。"""
+
+    message: Any
+    ordering_key: tuple[str, bytes | str]
+    ordering_reserved: bool = False
+
+
+@dataclass
+class PartitionCommitState:
+    """记录单个 partition 已完成但尚未连续提交的 offset。"""
+
+    next_offset: int
+    completed: dict[int, Any]
 
 
 class KafkaMessageDispatcher:
-    """让 poll 线程持续心跳，并按分区串行提交已完成消息的 offset。"""
+    """让单分区内不同资料并发执行，并只提交连续完成的 offset 水位。"""
 
     def __init__(
         self,
@@ -68,27 +87,38 @@ class KafkaMessageDispatcher:
             max_workers=self.worker_count + self.control_worker_count,
             thread_name_prefix="rag-kafka-handler",
         )
-        self.in_flight: dict[tuple[str, int], InFlightMessage] = {}
-        self.pending: dict[tuple[str, int], Any] = {}
-        self.retry_waiting: dict[tuple[str, int], tuple[Any, float]] = {}
+        self.in_flight: dict[tuple[str, int, int], InFlightMessage] = {}
+        self.pending: dict[tuple[str, int, int], QueuedMessage] = {}
+        self.retry_waiting: dict[tuple[str, int, int], tuple[QueuedMessage, float]] = {}
+        self.active_ordering_keys: set[tuple[str, bytes | str]] = set()
+        self.partition_commits: dict[tuple[str, int], PartitionCommitState] = {}
+        self.paused_partitions: set[tuple[str, int]] = set()
         self.fatal_error: KafkaWorkerConnectionError | None = None
 
     def accept(self, message: Any) -> None:
-        """暂停消息所属分区；只有真正空闲的执行槽才启动 handler。"""
-        key = message_partition_key(message)
-        if key in self.in_flight or key in self.pending or key in self.retry_waiting:
-            raise KafkaWorkerConnectionError(f"Kafka 分区出现多条并发在途消息：{key[0]}-{key[1]}")
-        self.consumer.pause([self._topic_partition(message)])
-        if self._can_submit(message):
-            self._submit(key, message)
+        """按 message key 保序提交；同一 partition 的不同资料可占用多个 handler。"""
+        identity = message_identity(message)
+        if identity in self.in_flight or identity in self.pending or identity in self.retry_waiting:
+            raise KafkaWorkerConnectionError(
+                f"Kafka 消息重复进入调度器：{identity[0]}-{identity[1]}-{identity[2]}"
+            )
+        partition_key = message_partition_key(message)
+        self.partition_commits.setdefault(
+            partition_key,
+            PartitionCommitState(next_offset=int(message.offset()), completed={}),
+        )
+        queued = QueuedMessage(message=message, ordering_key=message_ordering_key(message))
+        if self._can_submit(queued):
+            self._submit(identity, queued)
         else:
-            self.pending[key] = message
+            self.pending[identity] = queued
+            self._pause_partition(message)
 
     def advance(self) -> None:
-        """在 poll 线程收割后台结果，成功后同步提交并恢复对应分区。"""
-        completed = [key for key, item in self.in_flight.items() if item.future.done()]
-        for key in completed:
-            item = self.in_flight.pop(key)
+        """收割后台结果；允许乱序完成，但只按 partition 连续水位提交。"""
+        completed = [identity for identity, item in self.in_flight.items() if item.future.done()]
+        for identity in completed:
+            item = self.in_flight.pop(identity)
             try:
                 outcome = item.future.result()
             except KafkaWorkerConnectionError as exc:
@@ -99,20 +129,25 @@ class KafkaMessageDispatcher:
                 continue
             if outcome.action == "RETRY":
                 delay = min(self.retry_max_delay_seconds, max(0.1, outcome.retry_delay_seconds))
-                self.retry_waiting[key] = (item.message, time.monotonic() + delay)
+                self.retry_waiting[identity] = (
+                    QueuedMessage(
+                        message=item.message,
+                        ordering_key=item.ordering_key,
+                        ordering_reserved=True,
+                    ),
+                    time.monotonic() + delay,
+                )
                 continue
-            try:
-                self.consumer.commit(message=item.message, asynchronous=False)
-                self.consumer.resume([self._topic_partition(item.message)])
-            except Exception as exc:
-                self.fatal_error = KafkaWorkerConnectionError(str(exc))
+            self.active_ordering_keys.discard(item.ordering_key)
+            self._mark_completed(item.message)
 
         now = time.monotonic()
-        for key, (message, ready_at) in list(self.retry_waiting.items()):
+        for identity, (queued, ready_at) in list(self.retry_waiting.items()):
             if ready_at <= now:
-                self.retry_waiting.pop(key, None)
-                self.pending[key] = message
+                self.retry_waiting.pop(identity, None)
+                self.pending[identity] = queued
         self._fill_available_slots()
+        self._resume_ready_partitions()
 
     def discard_not_started(self) -> None:
         """停止或连接故障时丢弃未执行消息，保留未提交 offset 交给下一实例。"""
@@ -132,19 +167,26 @@ class KafkaMessageDispatcher:
             return
         while self.pending:
             candidate = next(
-                ((key, message) for key, message in self.pending.items() if self._can_submit(message)),
+                (
+                    (identity, queued)
+                    for identity, queued in self.pending.items()
+                    if self._can_submit(queued)
+                ),
                 None,
             )
             if candidate is None:
                 return
-            key, _message = candidate
-            message = self.pending.pop(key)
-            self._submit(key, message)
+            identity, _queued = candidate
+            queued = self.pending.pop(identity)
+            self._submit(identity, queued)
 
-    def _can_submit(self, message: Any) -> bool:
+    def _can_submit(self, queued: QueuedMessage) -> bool:
         """长任务使用独立上限，始终为状态与终态消息保留控制容量。"""
         if len(self.in_flight) >= self.worker_count + self.control_worker_count:
             return False
+        if queued.ordering_key in self.active_ordering_keys and not queued.ordering_reserved:
+            return False
+        message = queued.message
         if message.topic() not in self.long_task_topics:
             return True
         active_long_tasks = sum(
@@ -154,17 +196,67 @@ class KafkaMessageDispatcher:
         )
         return active_long_tasks < self.worker_count
 
-    def _submit(self, key: tuple[str, int], message: Any) -> None:
+    def _submit(self, identity: tuple[str, int, int], queued: QueuedMessage) -> None:
+        message = queued.message
         handler = self.handlers.get(message.topic())
         if handler is None:
             raise KafkaWorkerConnectionError(f"Kafka topic 缺少 handler：{message.topic()}")
+        self.active_ordering_keys.add(queued.ordering_key)
         future = self.executor.submit(
             process_consumer_message,
             handler,
             message,
             self.dead_letter_producer,
         )
-        self.in_flight[key] = InFlightMessage(message=message, future=future)
+        self.in_flight[identity] = InFlightMessage(
+            message=message,
+            future=future,
+            ordering_key=queued.ordering_key,
+        )
+
+    def _mark_completed(self, message: Any) -> None:
+        """登记完成 offset，并把同分区连续完成区间一次提交到最高水位。"""
+        partition_key = message_partition_key(message)
+        state = self.partition_commits.setdefault(
+            partition_key,
+            PartitionCommitState(next_offset=int(message.offset()), completed={}),
+        )
+        state.completed[int(message.offset())] = message
+        highest_contiguous: Any | None = None
+        while state.next_offset in state.completed:
+            highest_contiguous = state.completed.pop(state.next_offset)
+            state.next_offset += 1
+        if highest_contiguous is None:
+            return
+        try:
+            self.consumer.commit(message=highest_contiguous, asynchronous=False)
+        except Exception as exc:
+            self.fatal_error = KafkaWorkerConnectionError(str(exc))
+
+    def _pause_partition(self, message: Any) -> None:
+        """仅在出现本地排队时暂停分区，避免 poll 无界拉取消息。"""
+        partition_key = message_partition_key(message)
+        if partition_key in self.paused_partitions:
+            return
+        self.consumer.pause([self._topic_partition(message)])
+        self.paused_partitions.add(partition_key)
+
+    def _resume_ready_partitions(self) -> None:
+        """待执行队列清空后恢复对应分区，继续接收可并发的其它资料。"""
+        pending_partitions = {
+            message_partition_key(queued.message)
+            for queued in self.pending.values()
+        }
+        for partition_key in list(self.paused_partitions):
+            if partition_key in pending_partitions:
+                continue
+            topic, partition = partition_key
+            try:
+                self.consumer.resume([self.topic_partition_type(topic, partition)])
+            except Exception as exc:
+                self.fatal_error = KafkaWorkerConnectionError(str(exc))
+                return
+            self.paused_partitions.discard(partition_key)
 
     def _topic_partition(self, message: Any) -> Any:
         return self.topic_partition_type(message.topic(), message.partition())
@@ -320,26 +412,37 @@ def process_consumer_message(
 
 
 def message_partition_key(message: Any) -> tuple[str, int]:
-    """以 topic-partition 限制单分区只有一条在途消息，保持 Kafka 顺序语义。"""
+    """返回 offset 提交和暂停恢复使用的 topic-partition 标识。"""
     return str(message.topic()), int(message.partition())
 
 
+def message_identity(message: Any) -> tuple[str, int, int]:
+    """用 topic、partition 和 offset 唯一标识一次 Kafka 投递。"""
+    topic, partition = message_partition_key(message)
+    return topic, partition, int(message.offset())
+
+
+def message_ordering_key(message: Any) -> tuple[str, bytes | str]:
+    """相同 topic 与业务 key 严格串行；缺少 key 时仅约束当前 offset。"""
+    key_reader = getattr(message, "key", None)
+    raw_key = key_reader() if callable(key_reader) else None
+    if isinstance(raw_key, bytes) and raw_key:
+        normalized: bytes | str = raw_key
+    elif raw_key is not None and str(raw_key):
+        normalized = str(raw_key)
+    else:
+        normalized = f"__offset__:{message.partition()}:{message.offset()}"
+    return str(message.topic()), normalized
+
+
 def kafka_handler_concurrency() -> int:
-    """限制 Kafka 索引长任务线程数，防止视频解析耗尽 CPU、内存和下载带宽。"""
-    try:
-        value = int(os.getenv("RAG_KAFKA_HANDLER_CONCURRENCY", "4"))
-    except ValueError:
-        return 4
-    return min(32, max(1, value))
+    """读取 Kafka 视频/文档解析长任务线程数，CPU/内存阶段默认 n+1=9。"""
+    return configured_cpu_workers("RAG_KAFKA_HANDLER_CONCURRENCY")
 
 
 def kafka_control_concurrency() -> int:
-    """为 progress/result/promote/DLQ 保留独立线程，避免长任务占满后自阻塞。"""
-    try:
-        value = int(os.getenv("RAG_KAFKA_CONTROL_CONCURRENCY", "1"))
-    except ValueError:
-        return 1
-    return min(8, max(1, value))
+    """为 progress/result/promote/DLQ 保留 I/O 线程，默认按 2n=16。"""
+    return configured_io_workers("RAG_KAFKA_CONTROL_CONCURRENCY")
 
 
 def reconnect_initial_seconds() -> float:

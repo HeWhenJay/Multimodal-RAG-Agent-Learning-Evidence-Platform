@@ -9,7 +9,7 @@ from typing import Any
 REVIEW_CARD_PROMPT_VERSION = "review-card-v12"
 REVIEW_MISSING_KNOWLEDGE_PROMPT_VERSION = "review-missing-knowledge-v1"
 REVIEW_CARD_REWRITE_PROMPT_VERSION = "review-card-rewrite-v1"
-REVIEW_MATERIAL_REWRITE_PROMPT_VERSION = "review-material-rewrite-v1"
+REVIEW_MATERIAL_REWRITE_PROMPT_VERSION = "review-material-rewrite-v2"
 
 
 def review_card_system_prompt() -> str:
@@ -44,7 +44,7 @@ def review_card_system_prompt() -> str:
         "hint 必须提供一个具体回忆方向，不得直接泄露完整答案，也不得使用‘先回忆本节内容’等占位文案。"
         "卡片应支持主动回忆，不能要求用户重新阅读全文或观看完整视频。"
         "必须丢弃时间码、字幕范围、页码编号、片头片尾水印、重复字幕、寒暄、口头填充词、求赞关注和无事实转场。"
-        "如果清洗后没有值得复习的重点，返回空 cards；宁可少生成，也不能为了数量编造问题。"
+        "如果清洗后没有值得复习的重点，返回空 cards；每个独立且有 evidence 支撑的知识点都可以生成卡片，不能因为数量而抽样或遗漏。"
         "以下只是质量格式示例，不是可用于回答当前资料的知识：错误问题‘那什么意思呢？’应改为带明确主题的问题；"
         "错误卡面‘就必须先搞定 MVCC 具体是如何实现的’是转场陈述，不能发布；正确卡面既可以是"
         "‘MVCC 如何实现’，也可以是‘说明 MVCC 的实现机制’；错误问题‘父段摘要：这些是什么意思？’"
@@ -62,7 +62,8 @@ def review_card_user_prompt(
     source_questions: list[dict[str, str]] | None = None,
     required_source_questions: list[dict[str, str]] | None = None,
     curated_knowledge_units: list[dict[str, Any]] | None = None,
-    max_cards: int = 8,
+    max_cards: int | None = None,
+    generation_mode: str = "STANDARD",
     attempt: int = 1,
     quality_feedback: list[str] | None = None,
     user_feedback: str | None = None,
@@ -72,19 +73,19 @@ def review_card_user_prompt(
     rag_index_summary = summary if summary.strip() else ""
     structured_question_count = len(required_source_questions or [])
     curator_unit_count = len(curated_knowledge_units or [])
-    bounded_max_cards = max(1, min(32, max_cards))
+    normalized_mode = str(generation_mode or "STANDARD").strip().upper()
     if curator_unit_count:
         card_count_instruction = (
-            f"LangExtract 已定位 {curator_unit_count} 个候选知识单元；最多 {bounded_max_cards} 张，"
-            "同一主题的紧密事实可合并到一张卡，但 knowledgeUnitIds 必须完整覆盖全部候选"
+            f"LangExtract 已定位 {curator_unit_count} 个候选知识单元；不设固定卡片数量上限，"
+            "每个通过 evidence 门禁的独立知识点都应保留；同一主题的重复事实可以合并，knowledgeUnitIds 必须覆盖输入候选"
         )
     elif structured_question_count > 8:
         card_count_instruction = (
             f"检测到 {structured_question_count} 个资料原始问句；逐项保留其中有明确答案且通过质量门禁的问题，"
-            f"不得合并或抽样，最多 {bounded_max_cards} 张"
+            "不得合并不同知识点、不得抽样，不设固定卡片数量上限"
         )
     else:
-        card_count_instruction = "最多 8 张；通常 3-8 张，重点不足时允许少于 3 张；宁缺毋滥"
+        card_count_instruction = "不设固定卡片数量上限；按资料中独立、通过 evidence 校验的知识点生成，重点不足时可以返回 0 张"
     payload = {
         "任务": "完成 DeepSeek 复习总结和重点复习卡片生成，并逐条修复质量门禁反馈",
         "当前尝试轮次": max(1, int(attempt)),
@@ -95,10 +96,11 @@ def review_card_user_prompt(
         "资料类型": document_type,
         "RAG索引摘要说明": "可能只是截断的开头内容，仅作辅助证据；学习资料仍必须重新生成 summary",
         "RAG索引摘要": rag_index_summary[:2000] if rag_index_summary else None,
-        "原始问句候选": (source_questions or [])[:64],
-        "必须逐项覆盖的问题清单": (required_source_questions or [])[:32],
+        "门禁档位": normalized_mode,
+        "原始问句候选": (source_questions or []),
+        "必须逐项覆盖的问题清单": (required_source_questions or []),
         "必须逐项覆盖的问题数": structured_question_count,
-        "LangExtract候选知识单元": (curated_knowledge_units or [])[:32],
+        "LangExtract候选知识单元": (curated_knowledge_units or []),
         "必须覆盖的LangExtract候选数": curator_unit_count,
         "选题优先级": [
             "资料中明确提出、且在 evidence 中有答案的重点原始问题；清理口头语并补全主题",
@@ -134,7 +136,7 @@ def review_card_user_prompt(
                 }
             ],
         },
-        "evidence": evidences[:64],
+        "evidence": evidences,
     }
     return (
         "严格处理以下 JSON 输入。先在内部核对原始问句是否真的是资料重点、最终问题是否自包含、引用 evidence 是否足以回答，"
@@ -190,7 +192,7 @@ def review_missing_knowledge_user_prompt(
                 }
             ],
         },
-        "数量要求": "单轮最多 8 张；以真实遗漏数为准，允许返回 0 张",
+        "数量要求": "不设固定卡片数量上限；以真实遗漏数为准，允许返回 0 张",
     }
     return (
         "严格处理以下 JSON。先在内部核对用户所指主题、原文支撑和现有卡片重复情况，再输出唯一 JSON 对象。"
@@ -257,20 +259,26 @@ def review_card_rewrite_user_prompt(
     )
 
 
-def review_material_rewrite_system_prompt(mode: str) -> str:
-    """返回资料级卡片合并 Prompt，要求模型只输出一个综合卡片。"""
+def review_material_rewrite_system_prompt(mode: str, target_card_count: int = 1) -> str:
+    """返回资料级改写 Prompt，要求模型严格返回目标数量的独立卡片。"""
     mode_instruction = {
         "STRICT_SOURCE": "所有事实只能来自输入 evidence，答案每个主要论断都必须能被引用片段直接支持。",
         "SOURCE_FIRST": "以输入 evidence 和既有卡片为主，允许去重、重组和少量解释，但不能改变原意。",
         "SOURCE_REFERENCE": "以既有卡片和 evidence 为参考完成结构重写，可以补充克制的常识说明，但不得伪造来源。",
     }.get(mode, "以输入 evidence 和既有卡片为主完成重组。")
+    resolved_count = max(1, int(target_card_count))
     return (
         "你是学迹智配的资料级复习卡片主编。当前资料已经有多张复习卡片，"
-        "你的任务是把它们合并为恰好一张覆盖完整主题的综合卡片，不得输出多张候选。"
+        f"你的任务是把它们重组为恰好 {resolved_count} 张彼此独立、可以分别复习的候选卡片。"
+        "当用户要求保留已有生成内容并新增卡片时，必须把新增主题拆成独立卡片，"
+        "不能把新增主题压回第一张卡片，也不能因为原系统存在旧表而放弃新增卡片。"
         f"来源约束：{mode_instruction}"
         "必须保留既有卡片中的核心知识点，删除重复表达并建立清晰层次；question 要自包含，"
         "answer 直接回答问题，hint 只给回忆方向。summary 需要概括整份资料。"
-        "只输出唯一 JSON 对象，JSON 外不要解释。"
+        "如果用户提到旧项目表不可修改、inbox 或 outbox，应将其作为独立的架构说明卡片："
+        "inbox 用于接收和暂存待处理消息，记录幂等键、状态、重试和死信；"
+        "outbox 用于在本地事务内记录待发布事件，由发布器可靠投递并在成功后标记完成。"
+        f"只输出唯一 JSON 对象，cards 数组长度必须恰好为 {resolved_count}，JSON 外不要解释。"
     )
 
 
@@ -281,31 +289,43 @@ def review_material_rewrite_user_prompt(
     material_title: str,
     document_type: str,
     summary: str | None,
+    target_card_count: int = 1,
+    base_cards: list[dict[str, Any]] | None = None,
     cards: list[dict[str, Any]],
     evidences: list[dict[str, Any]],
 ) -> str:
-    """构造资料级合并输入并约束 evidenceId 只能来自当前资料。"""
+    """构造资料级改写输入并约束卡片数量和 evidenceId 只能来自当前资料。"""
+    resolved_count = max(1, int(target_card_count))
     payload = {
-        "任务": "将当前资料已有复习卡片合并为一张综合卡片，并重写资料摘要",
+        "任务": f"将当前资料已有复习卡片重组为恰好 {resolved_count} 张独立卡片，并重写资料摘要",
         "Prompt版本": REVIEW_MATERIAL_REWRITE_PROMPT_VERSION,
         "来源约束档位": mode,
         "用户改写想法": instruction,
+        "目标卡片总数": resolved_count,
         "资料标题": material_title,
         "资料类型": document_type,
         "原资料摘要": summary,
-        "现有卡片": cards[:100],
+        "必须原样保留的本轮候选": (base_cards or []),
+        "现有卡片": cards,
         "候选原文": evidences[:64],
         "输出结构": {
             "summary": "1-5000 字，概括整份资料核心脉络",
-            "question": "1-500 字，覆盖全部卡片主题且可独立理解",
-            "answer": "1-5000 字，合并全部核心知识点，优先使用安全 Markdown",
-            "hint": "可为空；不超过 1000 字，只给回忆方向",
-            "evidenceIds": "只填写输入中的真实 evidenceId，最多 4 个",
+            "cards": [
+                {
+                    "question": "1-500 字，单一主题且可独立理解",
+                    "answer": "1-5000 字，回答该卡片主题，优先使用安全 Markdown",
+                    "hint": "可为空；不超过 1000 字，只给回忆方向",
+                    "evidenceIds": "只填写输入中的真实 evidenceId，最多 4 个",
+                }
+            ],
             "mergeNote": "一句话说明合并保留了哪些核心内容",
         },
     }
     return (
         "先在内部比较全部原卡片、用户想法与来源约束，再输出唯一 JSON 对象。"
-        "不得拆成多张卡片，不得输出输入中不存在的 evidenceId：\n"
+        f"cards 必须恰好包含 {resolved_count} 个对象；每个对象只负责一个可独立回忆的主题。"
+        "如果输入包含‘必须原样保留的本轮候选’，这些候选由服务端固定为结果前缀；"
+        "后续新增卡片不得重复其问题和答案，应只覆盖用户要求的新主题。"
+        "不得把新增主题合并回已有主题，不得输出输入中不存在的 evidenceId：\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )

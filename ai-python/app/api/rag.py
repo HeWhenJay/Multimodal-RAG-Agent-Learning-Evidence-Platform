@@ -6,6 +6,7 @@
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from app.core.io_concurrency import configured_io_workers
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.observability.process_logger import RagProcessLogger, logged_rag_method, process_event, use_process_logger
@@ -57,7 +58,10 @@ router = APIRouter(prefix="/internal/rag", tags=["RAG"])
 loader = MineruDocumentLoader()
 parser_router = DocumentParserRouter(loader)
 store = create_rag_store()
-query_task_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rag-query-task")
+query_task_executor = ThreadPoolExecutor(
+    max_workers=configured_io_workers("RAG_QUERY_TASK_MAX_WORKERS"),
+    thread_name_prefix="rag-query-task",
+)
 query_tasks: dict[str, dict] = {}
 query_tasks_lock = Lock()
 QUERY_TASK_TTL = timedelta(minutes=30)

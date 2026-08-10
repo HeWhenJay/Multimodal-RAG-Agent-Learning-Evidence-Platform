@@ -31,6 +31,13 @@ dashscope:
 - `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
 - `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
 - `RAG_LLM_MODEL`：默认 `qwen-plus`
+- `LLM_IO_MAX_WORKERS`：所有在线 LLM、embedding、rerank、OCR 和 ASR 请求共用的进程级 I/O 线程池，默认 `16`、硬上限 `64`
+- `RAG_KAFKA_HANDLER_CONCURRENCY`：Kafka 视频/文档索引长任务并发，CPU/内存阶段默认 `9`（n+1）；同一 partition 内按资料 key 并发
+- `RAG_KAFKA_CONTROL_CONCURRENCY`：progress/result/promote/DLQ 控制消息 I/O 并发，默认 `16`（2n）
+- `RAG_OUTBOX_PUBLISH_CONCURRENCY`：Outbox Kafka/数据库 I/O 并发，默认 `16`（2n）；不同 topic/key 并行，同一 topic/key 按事件 ID 保序
+- `RAG_TASK_WORKER_CONCURRENCY`：查询与 local 索引耐久任务并发，CPU/内存阶段默认 `9`（n+1）
+- `RAG_REVIEW_SYNC_WORKERS`：入库后自动复习生成线程数，模型等待属于 I/O，默认 `16`（2n）；不会阻塞 RAG promote 终态回写
+- `AGENT_WORKER_CONCURRENCY`：不同 Agent 持久任务并发，模型与数据库等待属于 I/O，默认 `16`（2n）；同一任务仍由任务锁串行
 - `REVIEW_LLM_API_KEY`：复习摘要、知识单元发现和卡片生成使用的本机中转密钥；缺失时返回可诊断失败，不生成本地伪内容
 - `DEEPSEEK_API_KEY`：可选的复习降级密钥；Cockpit 按长等待方案完成 Terra 重试后仍失败时才直连 DeepSeek
 - `REVIEW_COCKPIT_REQUEST_RETRIES`：项目在 DeepSeek 降级前重新请求 Cockpit 的次数，默认 `1`
@@ -38,7 +45,7 @@ dashscope:
 - `RAG_DOUYIN_MCP_ENABLED`：抖音 MCP 语音转写路线开关，默认 `true`
 - `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS`：抖音转写任务轮询间隔，默认 `5`
 - `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS`：抖音单次转写最大等待时间，默认 `900`
-- `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料同一 pass 的 LangExtract I/O 并发，默认 `8`、硬上限 `10`
+- `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料同一 pass 的 LangExtract I/O 并发，默认 `16`（2n）、硬上限 `64`
 - `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 
@@ -128,6 +135,9 @@ python run.py
 ### Python cron 与耐久 worker
 
 `run.py` 在 API 进程外监督耐久 worker。默认配置会启动 Agent 和 RAG 任务 worker；启用 Kafka 后会同时启动 Outbox cron 与 Kafka 状态消费 worker。所有长任务都从 PostgreSQL 中领取和回写，Web 进程重启不会丢失任务。
+
+`RAG_VIDEO_PARALLEL_WORKERS=9` 只表示单条视频内部的媒体分段解析线程数，视频解码和解析属于 CPU/内存阶段。
+完整 Kafka 本地配置下，`start.ps1` 会启动 FastAPI、cron、Kafka、Agent 和 RAG durable worker；Kafka 索引默认可并发处理 9 份不同资料。
 
 ```powershell
 # 默认启动 FastAPI、Agent worker 和 RAG 任务 worker。
@@ -231,6 +241,6 @@ $env:BAILIAN_OCR_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 - `BAILIAN_OCR_RETRY_DELAY_SECONDS`：默认 `2`，每次 OCR 失败后等待再重试的秒数。
 - `RAG_VIDEO_OCR_BATCH_MAX_SIZE`：默认 `4`，关键帧 OCR 微批最多收集 4 帧；仍是一帧一个兼容接口请求，不依赖未声明的多图 API。
 - `RAG_VIDEO_OCR_BATCH_WAIT_MS`：默认 `800`，首帧到达后未满批时的最大等待窗口；满批或输入关闭立即派发。
-- `RAG_VIDEO_OCR_MAX_IN_FLIGHT`：默认 `2`，单个媒体分段最多同时执行的远程 OCR 请求。配合默认 2 个媒体 Worker，最多为 4 个并发请求。
+- `RAG_VIDEO_OCR_MAX_IN_FLIGHT`：默认 `16`，单个媒体分段最多同时执行的远程 OCR 请求，属于 I/O 密集阶段。
 
 `qwen3.5-ocr` 的官方文档未声明单请求多图上限，且 Batch API 支持列表未列出该模型，因此本项目不把多帧拼入一个请求。详细限制和运行契约见 `docs/api/rag.md`。

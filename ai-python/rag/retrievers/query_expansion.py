@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.io_concurrency import run_llm_io
 from rag.generation.bailian_llm import DEFAULT_CHAT_BASE_URL, DEFAULT_CHAT_MODEL, extract_message_content
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import logged_rag_method, process_event
@@ -150,8 +151,11 @@ class BailianQueryExpansionClient:
             recoverable=True,
             fallback_message=f"使用 {self.model} 模型完成 Multi-Query 查询变体生成失败，已降级到本地查询改写继续处理",
         ):
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+            def request_completion():
+                with httpx.Client(timeout=self.timeout_seconds) as client:
+                    return client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+
+            response = run_llm_io(request_completion)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         content = extract_message_content(response.json()).strip()

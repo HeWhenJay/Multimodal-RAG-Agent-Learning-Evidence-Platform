@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from app.repositories.rag_job import RagJobRepository
 from app.schemas.kafka import KafkaEnvelope
+from app.workers.review_sync_dispatcher import ReviewSyncDispatcher
 
 
 logger = logging.getLogger(__name__)
@@ -33,9 +34,12 @@ class RagKafkaStateWriter:
         repository: RagKafkaStateRepository | None = None,
         *,
         review_sync: Callable[[int], Any] | None = None,
+        review_dispatcher: ReviewSyncDispatcher | None = None,
     ) -> None:
         self.repository = repository or RagJobRepository()
-        self.review_sync = review_sync
+        self.review_dispatcher = review_dispatcher or (
+            ReviewSyncDispatcher(review_sync) if review_sync is not None else None
+        )
 
     def handle_progress(self, envelope: KafkaEnvelope) -> bool:
         """消费并去重用户可见的索引进度。"""
@@ -46,18 +50,18 @@ class RagKafkaStateWriter:
         return self.repository.consume_index_result(envelope)
 
     def handle_promote_result(self, envelope: KafkaEnvelope) -> bool:
-        """消费 promote 终态，并在成功后幂等衔接资料复习生成。"""
+        """先消费 promote 终态，再异步衔接资料复习生成。"""
         persisted = self.repository.consume_promote_result(envelope)
         payload = envelope.payload or {}
-        if self.review_sync is not None and str(payload.get("status") or "") == "SUCCEEDED":
+        if self.review_dispatcher is not None and str(payload.get("status") or "") == "SUCCEEDED":
             try:
                 material_id = int(payload.get("materialId"))
-                self.review_sync(material_id)
+                self.review_dispatcher.submit(material_id)
             except (TypeError, ValueError):
                 logger.warning("RAG 提升成功事件缺少合法 materialId，已跳过复习生成")
             except Exception:
-                # 复习是索引后的派生能力，失败不能回滚或阻断已经可检索的资料。
-                logger.exception("RAG 入库后自动生成复习卡片失败，materialId=%s", payload.get("materialId"))
+                # 调度失败也不能回滚或阻断已经可检索的资料。
+                logger.exception("RAG 入库后复习生成任务提交失败，materialId=%s", payload.get("materialId"))
         return persisted
 
     def handle_dlq(self, envelope: KafkaEnvelope) -> bool:

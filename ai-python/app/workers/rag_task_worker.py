@@ -13,6 +13,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from app.core.io_concurrency import configured_cpu_workers
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.repositories.rag_job import RagIndexJobRecord, RagJobRepository
 from app.repositories.rag_task import DurableQueryTask, RagQueryTaskRepositoryProtocol, build_query_task_repository
@@ -106,7 +107,7 @@ class RagDurableTaskWorker:
     def run_once(self) -> dict[str, int]:
         """执行一轮抢占任务；同类任务由固定 Worker 池并发执行。"""
         summary = {"queryClaimed": 0, "queryCompleted": 0, "queryFailed": 0, "indexClaimed": 0, "indexCompleted": 0, "indexFailed": 0}
-        batch_size = positive_int("RAG_TASK_WORKER_BATCH_SIZE", 4)
+        batch_size = positive_int("RAG_TASK_WORKER_BATCH_SIZE", 9)
         lease_seconds = positive_int("RAG_TASK_WORKER_LEASE_SECONDS", 120)
         worker_count = task_worker_concurrency()
         claim_size = min(batch_size, worker_count)
@@ -275,8 +276,8 @@ def local_index_enabled() -> bool:
 
 
 def task_worker_concurrency() -> int:
-    """读取耐久任务 Worker 并发数，默认 2，避免当前本机内存压力下过度抢占。"""
-    return min(8, positive_int("RAG_TASK_WORKER_CONCURRENCY", 2))
+    """读取查询/索引耐久任务线程数，索引解析阶段按 CPU/内存 n+1=9。"""
+    return configured_cpu_workers("RAG_TASK_WORKER_CONCURRENCY")
 
 
 def parse_not_before(value: object) -> datetime:

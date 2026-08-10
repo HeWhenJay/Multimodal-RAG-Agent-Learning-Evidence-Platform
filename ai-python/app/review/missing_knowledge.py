@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any
 
+from app.core.io_concurrency import run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.knowledge_extractor import (
     KnowledgePoint,
@@ -46,7 +47,8 @@ from prompts.review import (
 
 logger = logging.getLogger(__name__)
 MISSING_KNOWLEDGE_EVIDENCE_LIMIT = 48
-MISSING_KNOWLEDGE_CARD_LIMIT = 8
+# 兼容旧配置名；补漏结果按 evidence 门禁逐卡处理，不再按数量截断。
+MISSING_KNOWLEDGE_CARD_LIMIT: int | None = None
 
 
 @dataclass(frozen=True)
@@ -173,7 +175,7 @@ class MissingKnowledgeExtractor:
 
         try:
             response = call_cockpit_with_retry(
-                lambda: client.chat.completions.create(**request),
+                lambda: run_llm_io(lambda: client.chat.completions.create(**request)),
                 operation=f"{self.primary_endpoint.display_name} 补漏",
                 logger=logger,
             )
@@ -196,7 +198,7 @@ class MissingKnowledgeExtractor:
             )
             fallback_request = dict(request)
             fallback_request["model"] = fallback.model
-            response = fallback_client.chat.completions.create(**fallback_request)
+            response = run_llm_io(lambda: fallback_client.chat.completions.create(**fallback_request))
             self.active_model_name = fallback.display_name
             return response
 
@@ -215,8 +217,8 @@ class MissingKnowledgeExtractor:
         existing_questions = [item.question for item in existing_cards]
         accepted_questions = list(existing_questions)
         accepted: list[KnowledgePoint] = []
-        skipped = max(0, len(raw_cards) - MISSING_KNOWLEDGE_CARD_LIMIT)
-        for raw in raw_cards[:MISSING_KNOWLEDGE_CARD_LIMIT]:
+        skipped = 0
+        for raw in raw_cards:
             if not isinstance(raw, dict):
                 skipped += 1
                 continue

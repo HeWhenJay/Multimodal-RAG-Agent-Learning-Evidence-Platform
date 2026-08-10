@@ -12,15 +12,18 @@ export function MarkdownText({ content, className = '', rewriteHref }: MarkdownT
   return <div className={`markdown-text ${className}`.trim()}>{blocks}</div>;
 }
 
-// 将 Markdown 行拆成标题、段落、列表、引用和代码块。
+type MarkdownListMarker = { indent: number; ordered: boolean; number?: number; content: string };
+type MarkdownListItem = { content: string; children: MarkdownListBlock[] };
+type MarkdownListBlock = { ordered: boolean; start?: number; items: MarkdownListItem[] };
+
+// 将 Markdown 行拆成标题、段落、列表、引用和代码块；列表项目允许使用空行和缩进续写。
 function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, contextText?: string) => string) {
   const lines = normalizeGeneratedMarkdown(content).split('\n');
   const blocks: ReactNode[] = [];
   let paragraphLines: string[] = [];
-  let listItems: string[] = [];
-  let orderedList = false;
   let inCodeBlock = false;
   let codeLines: string[] = [];
+  let lineIndex = 0;
 
   function flushParagraph() {
     if (!paragraphLines.length) return;
@@ -29,93 +32,163 @@ function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, cont
     paragraphLines = [];
   }
 
-  function flushList() {
-    if (!listItems.length) return;
-    const Tag = orderedList ? 'ol' : 'ul';
-    blocks.push(
-      <Tag key={`list-${blocks.length}`}>
-        {listItems.map((item, index) => <li key={`${index}-${item}`}>{renderInlineMarkdown(item, item, rewriteHref)}</li>)}
-      </Tag>
-    );
-    listItems = [];
-    orderedList = false;
-  }
-
-  lines.forEach((line) => {
+  while (lineIndex < lines.length) {
+    const line = lines[lineIndex];
     const trimmed = line.trim();
     if (trimmed.startsWith('```')) {
       if (inCodeBlock) {
         blocks.push(<pre key={`code-${blocks.length}`}><code>{codeLines.join('\n')}</code></pre>);
         codeLines = [];
         inCodeBlock = false;
-        return;
+      } else {
+        flushParagraph();
+        inCodeBlock = true;
+        codeLines = [];
       }
-      flushParagraph();
-      flushList();
-      inCodeBlock = true;
-      codeLines = [];
-      return;
+      lineIndex += 1;
+      continue;
     }
 
     if (inCodeBlock) {
       codeLines.push(line);
-      return;
+      lineIndex += 1;
+      continue;
     }
 
     if (!trimmed) {
       flushParagraph();
-      flushList();
-      return;
+      lineIndex += 1;
+      continue;
     }
 
     const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
     if (heading) {
       flushParagraph();
-      flushList();
       const level = Math.min(heading[1].length + 3, 6);
       blocks.push(renderHeading(level, heading[2], `heading-${blocks.length}`, rewriteHref));
-      return;
+      lineIndex += 1;
+      continue;
     }
 
-    const ordered = /^\d+[.)]\s+(.+)$/.exec(trimmed);
-    const unordered = /^[-*+]\s+(.+)$/.exec(trimmed);
-    if (ordered || unordered) {
+    const listMarker = parseMarkdownListMarker(line);
+    if (listMarker) {
       flushParagraph();
-      const isOrdered = Boolean(ordered);
-      if (listItems.length && orderedList !== isOrdered) {
-        flushList();
-      }
-      orderedList = isOrdered;
-      listItems.push((ordered || unordered)?.[1] || trimmed);
-      return;
+      const parsedList = parseMarkdownList(lines, lineIndex, listMarker.indent);
+      blocks.push(renderMarkdownList(parsedList.block, `list-${blocks.length}`, rewriteHref));
+      lineIndex = parsedList.nextIndex;
+      continue;
     }
 
     const quote = /^>\s?(.+)$/.exec(trimmed);
     if (quote) {
       flushParagraph();
-      flushList();
       blocks.push(<blockquote key={`quote-${blocks.length}`}>{renderInlineMarkdown(quote[1], quote[1], rewriteHref)}</blockquote>);
-      return;
+      lineIndex += 1;
+      continue;
     }
 
     paragraphLines.push(trimmed);
-  });
+    lineIndex += 1;
+  }
 
   if (inCodeBlock) {
     blocks.push(<pre key={`code-${blocks.length}`}><code>{codeLines.join('\n')}</code></pre>);
   }
   flushParagraph();
-  flushList();
 
   return blocks.length ? blocks : [<p key="empty">暂无内容</p>];
+}
+
+// 读取列表标记并保留缩进，用于区分同级列表与嵌套列表。
+function parseMarkdownListMarker(line: string): MarkdownListMarker | null {
+  const ordered = /^(\s*)(\d+)[.)]\s+(.+)$/.exec(line);
+  if (ordered) {
+    return {
+      indent: normalizeMarkdownIndent(ordered[1]),
+      ordered: true,
+      number: Number(ordered[2]),
+      content: ordered[3]
+    };
+  }
+  const unordered = /^(\s*)[-*+]\s+(.+)$/.exec(line);
+  if (unordered) {
+    return { indent: normalizeMarkdownIndent(unordered[1]), ordered: false, content: unordered[2] };
+  }
+  return null;
+}
+
+// 递归读取一个列表，保留空行分隔的同级项目和缩进产生的子列表。
+function parseMarkdownList(lines: string[], startIndex: number, baseIndent: number): { block: MarkdownListBlock; nextIndex: number } {
+  const first = parseMarkdownListMarker(lines[startIndex]);
+  const ordered = first?.ordered ?? false;
+  const items: MarkdownListItem[] = [];
+  let lineIndex = startIndex;
+
+  while (lineIndex < lines.length) {
+    const marker = parseMarkdownListMarker(lines[lineIndex]);
+    if (!marker || marker.indent !== baseIndent || marker.ordered !== ordered) break;
+    const item: MarkdownListItem = { content: marker.content, children: [] };
+    items.push(item);
+    lineIndex += 1;
+
+    while (lineIndex < lines.length) {
+      const currentLine = lines[lineIndex];
+      const trimmed = currentLine.trim();
+      if (!trimmed) {
+        lineIndex += 1;
+        continue;
+      }
+
+      const nestedMarker = parseMarkdownListMarker(currentLine);
+      if (nestedMarker) {
+        if (nestedMarker.indent <= baseIndent) break;
+        const nested = parseMarkdownList(lines, lineIndex, nestedMarker.indent);
+        item.children.push(nested.block);
+        lineIndex = nested.nextIndex;
+        continue;
+      }
+
+      if (normalizeMarkdownIndent(currentLine.match(/^\s*/)?.[0] || '') > baseIndent) {
+        item.content = `${item.content} ${trimmed}`;
+        lineIndex += 1;
+        continue;
+      }
+      break;
+    }
+  }
+
+  return {
+    block: { ordered, start: ordered && first?.number && first.number !== 1 ? first.number : undefined, items },
+    nextIndex: lineIndex
+  };
+}
+
+// 把解析后的列表渲染为语义化 ol/ul，嵌套列表自然形成层次结构。
+function renderMarkdownList(block: MarkdownListBlock, key: string, rewriteHref?: (href: string, contextText?: string) => string): ReactNode {
+  const Tag = block.ordered ? 'ol' : 'ul';
+  return (
+    <Tag key={key} start={block.ordered ? block.start : undefined}>
+      {block.items.map((item, index) => (
+        <li key={`${key}-item-${index}`}>
+          {renderInlineMarkdown(item.content, item.content, rewriteHref)}
+          {item.children.map((child, childIndex) => renderMarkdownList(child, `${key}-child-${index}-${childIndex}`, rewriteHref))}
+        </li>
+      ))}
+    </Tag>
+  );
+}
+
+// 把 Tab 缩进按四个空格处理，保证生成内容使用空格或 Tab 都能正确嵌套。
+function normalizeMarkdownIndent(indent: string) {
+  return indent.replace(/\t/g, '    ').length;
 }
 
 // 模型有时把列表压成一行，这里只做保守换行，避免影响普通句子。
 function normalizeGeneratedMarkdown(content: string) {
   return content
     .replace(/\r\n/g, '\n')
-    .replace(/([。；;:：])\s+(\d+[.)]\s+\*\*)/g, '$1\n$2')
-    .replace(/\s+(-\s+❗\s*)/g, '\n$1');
+    .replace(/([。；;:：])[ \t]+(\d+[.)])[ \t]+/g, '$1\n$2 ')
+    .replace(/[ \t]+(-\s+❗\s*)/g, '\n$1');
 }
 
 // 显式选择 HTML 标题标签，避免动态 JSX 标签被全局 Three 类型误判。

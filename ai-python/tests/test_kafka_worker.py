@@ -233,7 +233,8 @@ def test_kafka_poll_continues_while_handler_runs_and_commits_after_completion(mo
     assert consumer is not None
     assert consumer.polled_while_handler_running is True
     assert consumer.committed_after_done is True
-    assert consumer.paused and consumer.resumed
+    assert consumer.paused == []
+    assert consumer.resumed == []
     assert handler_thread_ids and handler_thread_ids[0] != poll_thread_id
 
 
@@ -300,6 +301,95 @@ def test_kafka_dispatcher_reserves_capacity_for_control_messages() -> None:
         assert control_started.wait(0.5)
     finally:
         release_index.set()
+        while dispatcher.has_active_handlers:
+            dispatcher.advance()
+            time.sleep(0.001)
+        dispatcher.close()
+
+
+def test_kafka_dispatcher_runs_distinct_keys_concurrently_on_one_partition() -> None:
+    """单分区不应把不同资料串行化；offset 仍只能提交到连续完成水位。"""
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    commits: list[int] = []
+
+    class Message:
+        def __init__(self, offset: int, canonical: str) -> None:
+            self._offset = offset
+            self._canonical = canonical
+
+        def topic(self):
+            return "rag.material.index.request.v1"
+
+        def partition(self):
+            return 0
+
+        def offset(self):
+            return self._offset
+
+        def key(self):
+            return self._canonical.encode("utf-8")
+
+        def value(self):
+            payload = base_index_payload()
+            payload["canonicalDocumentId"] = self._canonical
+            payload["stagingDocumentId"] = f"{self._canonical}__job-job-1"
+            return envelope("RAG_INDEX_REQUESTED", payload).model_dump_json().encode("utf-8")
+
+    class Consumer:
+        def pause(self, _partitions):
+            return None
+
+        def resume(self, _partitions):
+            return None
+
+        def commit(self, *, message, asynchronous):
+            assert asynchronous is False
+            commits.append(message.offset())
+
+    class TopicPartition:
+        def __init__(self, topic, partition):
+            self.topic = topic
+            self.partition = partition
+
+    def handler(event):
+        if event.partitionKey == "material-a":
+            first_started.set()
+            release_first.wait(1.0)
+            return
+        second_started.set()
+
+    dispatcher = KafkaMessageDispatcher(
+        consumer=Consumer(),
+        handlers={"rag.material.index.request.v1": handler},
+        topic_partition_type=TopicPartition,
+        dead_letter_producer=FakeProducer(),
+        worker_count=2,
+        control_worker_count=1,
+        retry_max_delay_seconds=1.0,
+    )
+    try:
+        dispatcher.accept(Message(10, "material-a"))
+        dispatcher.accept(Message(11, "material-b"))
+        assert first_started.wait(0.5)
+        assert second_started.wait(0.5)
+
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and len(dispatcher.in_flight) == 2:
+            dispatcher.advance()
+            time.sleep(0.001)
+        assert commits == []
+
+        release_first.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and dispatcher.has_active_handlers:
+            dispatcher.advance()
+            time.sleep(0.001)
+        dispatcher.advance()
+        assert commits == [11]
+    finally:
+        release_first.set()
         while dispatcher.has_active_handlers:
             dispatcher.advance()
             time.sleep(0.001)

@@ -1,14 +1,15 @@
-"""按照用户想法生成单张复习卡片的无副作用改写预览。"""
+"""按照用户想法生成一张或多张复习卡片的无副作用改写预览。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
 import logging
+import re
 import time
 from typing import Any
 
-from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.core.io_concurrency import configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.knowledge_extractor import (
     LearningMaterialContext,
@@ -51,15 +52,22 @@ class CardRewriteCandidate:
 
 
 @dataclass(frozen=True)
-class MaterialRewriteCandidate:
-    """一份尚未写入数据库的资料级综合卡片候选。"""
+class MaterialRewriteCardCandidate:
+    """资料级改写中的一张尚未写入数据库的候选卡片。"""
 
-    summary: str | None
     question: str
     answer: str
     hint: str | None
-    merge_note: str | None
     evidence_refs: tuple[Evidence, ...]
+
+
+@dataclass(frozen=True)
+class MaterialRewriteCandidate:
+    """一份尚未写入数据库的资料级候选卡片集合。"""
+
+    summary: str | None
+    cards: tuple[MaterialRewriteCardCandidate, ...]
+    merge_note: str | None
     model_name: str
 
 
@@ -102,8 +110,10 @@ class CardRewriter:
         *,
         instruction: str,
         mode: str,
+        target_card_count: int | None = None,
+        base_cards: list[dict[str, Any]] | None = None,
     ) -> MaterialRewriteCandidate:
-        """把资料现有卡片合并为一张候选，整个过程不写数据库。"""
+        """按目标数量生成资料级候选，整个过程不写数据库。"""
         self._refresh_llm_config()
         if mode not in REWRITE_MODES:
             raise ReviewExtractionError("不支持的资料改写档位")
@@ -114,8 +124,85 @@ class CardRewriter:
         selected = select_material_rewrite_evidences(cards, evidences, instruction)
         if mode == "STRICT_SOURCE" and not selected:
             raise ReviewExtractionError("当前资料没有可用于严格改写的原文证据")
-        payload = self._generate_material_payload(material, cards, selected, instruction, mode)
-        return self.validate_material_payload(cards, selected, payload, mode)
+        resolved_count = infer_material_rewrite_card_count(instruction, target_card_count)
+        payload = self._generate_material_payload(
+            material,
+            cards,
+            selected,
+            instruction,
+            mode,
+            target_card_count=resolved_count,
+            base_cards=base_cards,
+        )
+        try:
+            return self.validate_material_payload(cards, selected, payload, mode, target_card_count=resolved_count)
+        except ReviewExtractionError as initial_error:
+            # 模型偶尔会把数组压扁成一个对象；用更强的修复提示再请求一次，避免把用户明确要求的新增卡片静默丢失。
+            if resolved_count <= 1:
+                raise
+            repair_instruction = (
+                f"{instruction}\n系统强制要求：最终必须返回恰好 {resolved_count} 张彼此独立的 cards，"
+                "不得把新增主题合并回第一张卡片。"
+            )
+            try:
+                repaired = self._generate_material_payload(
+                    material,
+                    cards,
+                    selected,
+                    repair_instruction,
+                    mode,
+                    target_card_count=resolved_count,
+                    base_cards=base_cards,
+                )
+                return self.validate_material_payload(
+                    cards,
+                    selected,
+                    repaired,
+                    mode,
+                    target_card_count=resolved_count,
+                )
+            except ReviewExtractionError:
+                # 若模型仍返回单卡对象，退化为逐卡生成：第一张保留原主题，后续卡片专门承载新增主题。
+                # 这样不会把用户明确要求的第二张卡片静默丢弃，也不会在服务层编造答案。
+                generated_cards: list[MaterialRewriteCardCandidate] = []
+                summary: str | None = None
+                model_name = self.active_model_name
+                for index in range(resolved_count):
+                    role_instruction = (
+                        f"{instruction}\n这是第 {index + 1}/{resolved_count} 张独立卡片。"
+                        + (
+                            "请保留现有资料的主要生成内容，作为基础复习卡片。"
+                            if index == 0
+                            else "请只承载用户要求新增的独立主题，尤其是 Inbox/Outbox 时说明其职责、事务边界、可靠投递和重试；不要与第一张合并。"
+                        )
+                    )
+                    single_payload = self._generate_material_payload(
+                        material,
+                        cards,
+                        selected,
+                        role_instruction,
+                        mode,
+                        target_card_count=1,
+                        base_cards=base_cards,
+                    )
+                    single = self.validate_material_payload(
+                        cards,
+                        selected,
+                        single_payload,
+                        mode,
+                        target_card_count=1,
+                    )
+                    generated_cards.extend(single.cards)
+                    summary = summary or single.summary
+                    model_name = single.model_name
+                if len(generated_cards) != resolved_count:
+                    raise initial_error
+                return MaterialRewriteCandidate(
+                    summary=summary,
+                    cards=tuple(generated_cards),
+                    merge_note=f"已按用户要求拆分为 {resolved_count} 张独立卡片",
+                    model_name=model_name,
+                )
 
     def _refresh_llm_config(self) -> None:
         """刷新主中转与 DeepSeek 降级配置，支持服务启动后补充环境变量。"""
@@ -203,8 +290,11 @@ class CardRewriter:
         evidences: list[Evidence],
         instruction: str,
         mode: str,
+        *,
+        target_card_count: int,
+        base_cards: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """请求资料级严格 JSON，解析失败时沿用短程传输重试。"""
+        """请求指定数量的资料级严格 JSON，解析失败时沿用短程传输重试。"""
         from openai import OpenAI
 
         prompt = review_material_rewrite_user_prompt(
@@ -213,6 +303,8 @@ class CardRewriter:
             material_title=material.title,
             document_type=material.document_type,
             summary=material.summary,
+            target_card_count=target_card_count,
+            base_cards=base_cards or [],
             cards=[
                 {"cardId": card.id, "question": card.question, "answer": card.answer, "hint": card.hint}
                 for card in cards
@@ -234,7 +326,10 @@ class CardRewriter:
                 request: dict[str, Any] = {
                     "model": self.model,
                     "messages": [
-                        {"role": "system", "content": review_material_rewrite_system_prompt(mode)},
+                        {
+                            "role": "system",
+                            "content": review_material_rewrite_system_prompt(mode, target_card_count),
+                        },
                         {"role": "user", "content": prompt},
                     ],
                     "reasoning_effort": self.reasoning_effort,
@@ -269,7 +364,7 @@ class CardRewriter:
                     "review.llm",
                     configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
                 ):
-                    return client.chat.completions.create(**request)
+                    return run_llm_io(lambda: client.chat.completions.create(**request))
 
             response = call_cockpit_with_retry(
                 request_primary,
@@ -299,7 +394,7 @@ class CardRewriter:
                 "review.llm",
                 configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
             ):
-                response = fallback_client.chat.completions.create(**fallback_request)
+                response = run_llm_io(lambda: fallback_client.chat.completions.create(**fallback_request))
             self.active_model_name = fallback.display_name
             return response
 
@@ -343,35 +438,79 @@ class CardRewriter:
         evidences: list[Evidence],
         payload: dict[str, Any],
         mode: str,
+        *,
+        target_card_count: int = 1,
     ) -> MaterialRewriteCandidate:
-        """校验资料级候选只包含一张完整卡片和真实 evidence。"""
+        """校验资料级候选数量、正文和真实 evidence。"""
         summary = normalize_markdown_text(payload.get("summary"), 5000)
-        question = compact_text(payload.get("question"), 500)
-        answer = normalize_markdown_text(payload.get("answer"), 5000)
-        hint = normalize_markdown_text(payload.get("hint"), 1000)
         merge_note = compact_text(payload.get("mergeNote"), 500)
-        if not question or not answer:
-            raise ReviewExtractionError(f"{self.active_model_name} 未返回完整的资料综合卡片")
+        raw_cards = payload.get("cards")
+        # 兼容旧模型在目标数量为 1 时仍返回 question/answer 顶层对象。
+        if not isinstance(raw_cards, list) and target_card_count == 1:
+            raw_cards = [payload]
+        if not isinstance(raw_cards, list) or len(raw_cards) != target_card_count:
+            raise ReviewExtractionError(
+                f"{self.active_model_name} 未按要求返回恰好 {target_card_count} 张资料改写卡片"
+            )
         evidence_by_id = {item.evidenceId: item for item in evidences}
-        raw_ids = payload.get("evidenceIds")
-        requested_ids = raw_ids if isinstance(raw_ids, list) else []
-        evidence_ids = list(dict.fromkeys(str(item) for item in requested_ids if str(item) in evidence_by_id))[:4]
-        if not evidence_ids:
-            for card in cards:
-                for evidence_id in existing_card_evidence_ids(card):
-                    if evidence_id in evidence_by_id and evidence_id not in evidence_ids:
-                        evidence_ids.append(evidence_id)
+        candidates: list[MaterialRewriteCardCandidate] = []
+        for raw_card in raw_cards:
+            if not isinstance(raw_card, dict):
+                raise ReviewExtractionError(f"{self.active_model_name} 返回了无效的资料改写卡片")
+            question = compact_text(raw_card.get("question"), 500)
+            answer = normalize_markdown_text(raw_card.get("answer"), 5000)
+            hint = normalize_markdown_text(raw_card.get("hint"), 1000)
+            if not question or not answer:
+                raise ReviewExtractionError(f"{self.active_model_name} 未返回完整的资料改写卡片")
+            raw_ids = raw_card.get("evidenceIds")
+            requested_ids = raw_ids if isinstance(raw_ids, list) else []
+            evidence_ids = list(
+                dict.fromkeys(str(item) for item in requested_ids if str(item) in evidence_by_id)
+            )[:4]
+            if not evidence_ids:
+                for card in cards:
+                    for evidence_id in existing_card_evidence_ids(card):
+                        if evidence_id in evidence_by_id and evidence_id not in evidence_ids:
+                            evidence_ids.append(evidence_id)
+                        if len(evidence_ids) >= 4:
+                            break
                     if len(evidence_ids) >= 4:
                         break
-                if len(evidence_ids) >= 4:
-                    break
-        refs = tuple(evidence_by_id[item] for item in evidence_ids)
-        if mode == "STRICT_SOURCE":
-            if not refs:
-                raise ReviewExtractionError("严格依赖原文的资料改写结果必须引用真实 evidence")
-            if not answer_is_grounded(answer, refs):
-                raise ReviewExtractionError("严格依赖原文的资料改写结果未通过 evidence 忠实度校验")
-        return MaterialRewriteCandidate(summary, question, answer, hint, merge_note, refs, self.active_model_name)
+            refs = tuple(evidence_by_id[item] for item in evidence_ids)
+            if mode == "STRICT_SOURCE":
+                if not refs:
+                    raise ReviewExtractionError("严格依赖原文的资料改写结果必须引用真实 evidence")
+                if not answer_is_grounded(answer, refs):
+                    raise ReviewExtractionError("严格依赖原文的资料改写结果未通过 evidence 忠实度校验")
+            candidates.append(MaterialRewriteCardCandidate(question, answer, hint, refs))
+        return MaterialRewriteCandidate(summary, tuple(candidates), merge_note, self.active_model_name)
+
+
+def infer_material_rewrite_card_count(
+    instruction: str,
+    explicit_count: int | None = None,
+    *,
+    base_card_count: int = 1,
+) -> int:
+    """从显式参数或中文自然语言推断资料级候选卡片总数。"""
+    if explicit_count is not None:
+        return max(1, int(explicit_count))
+    text = compact_text(instruction, 2000) or ""
+    numerals = {"一": 1, "两": 2, "俩": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
+    total_match = re.search(
+        r"(?:总共\s*(?:应该\s*)?(?:返回|生成|输出)?|(?:返回|输出|应该返回|必须返回))\s*"
+        r"(\d+|[一两俩二三四五六七八])\s*(?:张|个)?\s*卡片",
+        text,
+    )
+    if total_match:
+        token = total_match.group(1)
+        return max(1, int(token) if token.isdigit() else numerals[token])
+    add_match = re.search(r"(?:新增|新添|再加|补充|添加)\s*(\d+|[一两俩二三四五六七八])\s*(?:张|个)?\s*卡片", text)
+    if add_match:
+        token = add_match.group(1)
+        added = int(token) if token.isdigit() else numerals[token]
+        return max(1, max(1, base_card_count) + added)
+    return 1
 
 
 def select_rewrite_evidences(

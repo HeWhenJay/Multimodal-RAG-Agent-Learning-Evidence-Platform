@@ -8,8 +8,15 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.result import BusinessError
-from app.review.card_rewriter import CardRewriter, CardRewriteCandidate, MaterialRewriteCandidate
+from app.review.card_rewriter import (
+    CardRewriter,
+    CardRewriteCandidate,
+    MaterialRewriteCandidate,
+    MaterialRewriteCardCandidate,
+    infer_material_rewrite_card_count,
+)
 from app.review.fsrs_scheduler import FsrsReviewScheduler
+from app.review.knowledge_extractor import LearningMaterialContext
 from app.review.repository import MaterialSourceRecord, ReviewCardRecord, ReviewMaterialRecord, ReviewSettingsRecord
 from app.review.service import ReviewService
 from app.schemas.rag import Evidence
@@ -22,6 +29,50 @@ from app.schemas.review import (
 
 
 NOW = datetime(2026, 8, 7, 2, 0, tzinfo=timezone.utc)
+
+
+def test_material_rewrite_card_count_understands_add_and_total_phrases() -> None:
+    """自然语言中的新增数量和总数量必须转换为稳定候选数。"""
+    assert infer_material_rewrite_card_count("保留这次生成的内容，新添一张卡片") == 2
+    assert infer_material_rewrite_card_count("你总共应该返回俩张卡片") == 2
+    assert infer_material_rewrite_card_count("合并为一张综合卡片") == 1
+    assert infer_material_rewrite_card_count("返回两张卡片", explicit_count=3) == 3
+    assert infer_material_rewrite_card_count("再新增一张卡片", base_card_count=2) == 3
+
+
+def test_material_rewriter_falls_back_to_per_card_generation_when_model_keeps_returning_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """模型两次忽略多卡数组时，服务应逐卡调用并最终返回目标数量。"""
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
+    rewriter = CardRewriter(provider="deepseek")
+    transaction = MaterialEditingTransaction()
+    calls: list[int] = []
+
+    def fake_generate(*_args, target_card_count: int, **_kwargs):
+        calls.append(target_card_count)
+        if target_card_count == 2:
+            return {"question": "仍然只有一张", "answer": "错误输出"}
+        index = calls.count(1)
+        return {
+            "summary": "测试摘要",
+            "cards": [{
+                "question": f"独立卡片 {index}",
+                "answer": f"独立答案 {index}",
+                "evidenceIds": ["material-12-1"],
+            }],
+        }
+
+    monkeypatch.setattr(rewriter, "_generate_material_payload", fake_generate)
+    candidate = rewriter.rewrite_material(
+        LearningMaterialContext(12, "Kafka 高可用", "pdf", "测试摘要"),
+        transaction.cards,
+        transaction.evidences,
+        instruction="保留这次生成的内容，新添一张卡片",
+        mode="SOURCE_FIRST",
+        target_card_count=2,
+    )
+
+    assert calls == [2, 2, 1, 1]
+    assert [item.question for item in candidate.cards] == ["独立卡片 1", "独立卡片 2"]
 
 
 def evidence(evidence_id: str = "material-12-1") -> Evidence:
@@ -134,17 +185,29 @@ class StubCardRewriter:
             model_name="测试模型",
         )
 
-    def rewrite_material(self, material, cards, evidences, *, instruction: str, mode: str):
-        """返回一张覆盖全部现有卡片的资料级候选。"""
-        assert instruction == "合并为一张"
+    def rewrite_material(self, material, cards, evidences, *, instruction: str, mode: str, target_card_count: int | None = None, base_cards=None):
+        """按请求数量返回资料级候选，覆盖全部现有卡片。"""
+        assert instruction in {"合并为一张", "保留这次生成的内容 新添一张卡片，说明 inbox 和 outbox"}
         assert mode == "SOURCE_FIRST"
-        return MaterialRewriteCandidate(
-            summary="Kafka 高性能由顺序写、页缓存和零拷贝共同支撑。",
+        if instruction.startswith("保留这次"):
+            assert base_cards and base_cards[0]["question"] == "Kafka 如何实现高性能？"
+        candidates = [MaterialRewriteCardCandidate(
             question="Kafka 如何实现高性能？",
             answer="- **顺序写**降低磁盘寻址开销\n- **页缓存**批量落盘\n- **零拷贝**减少上下文切换",
             hint="回忆写入、缓存和传输三个层次",
-            merge_note=f"已合并 {len(cards)} 张卡片",
             evidence_refs=(evidences[0],),
+        )]
+        if target_card_count == 2:
+            candidates.append(MaterialRewriteCardCandidate(
+                question="旧项目表不可修改时，Inbox 和 Outbox 如何协作？",
+                answer="Inbox 接收并暂存待处理消息，Outbox 在业务事务内记录待发布事件；发布器提交后可靠投递并按幂等键去重。",
+                hint="回忆接收、事务记录、发布和重试",
+                evidence_refs=(evidences[0],),
+            ))
+        return MaterialRewriteCandidate(
+            summary="Kafka 高性能由顺序写、页缓存和零拷贝共同支撑。",
+            cards=tuple(candidates),
+            merge_note=f"已合并 {len(cards)} 张卡片",
             model_name="测试模型",
         )
 
@@ -195,23 +258,25 @@ class MaterialEditingTransaction(CardEditingTransaction):
         if sorted(original_card_ids) != sorted(card.id for card in self.cards):
             return None
         self.replace_called = True
-        draft = cards[0]
-        inserted = replace(
-            self.card,
-            id=90,
-            question=draft.question,
-            answer=draft.answer,
-            hint=draft.hint,
-            evidence_refs_json=draft.evidence_refs_json,
-            fsrs_card_json=draft.fsrs_card_json,
-            due_at=draft.due_at,
-            review_count=0,
-            lapse_count=0,
-            source_key=draft.source_key,
-        )
-        self.cards = [inserted]
-        self.review_material = replace(self.review_material, card_count=1, summary=summary)
-        return [inserted]
+        inserted_cards = [
+            replace(
+                self.card,
+                id=90 + index,
+                question=draft.question,
+                answer=draft.answer,
+                hint=draft.hint,
+                evidence_refs_json=draft.evidence_refs_json,
+                fsrs_card_json=draft.fsrs_card_json,
+                due_at=draft.due_at,
+                review_count=0,
+                lapse_count=0,
+                source_key=draft.source_key,
+            )
+            for index, draft in enumerate(cards)
+        ]
+        self.cards = inserted_cards
+        self.review_material = replace(self.review_material, card_count=len(inserted_cards), summary=summary)
+        return inserted_cards
 
 
 def test_card_library_includes_reviewed_cards_with_full_markdown_content() -> None:
@@ -313,6 +378,54 @@ def test_material_rewrite_preview_merges_cards_without_writing() -> None:
     assert preview.proposedCards[0].content.question == "Kafka 如何实现高性能？"
     assert len(preview.originalFingerprint) == 64
     assert transaction.replace_called is False
+
+
+def test_material_rewrite_infers_two_cards_for_preserve_and_add_instruction() -> None:
+    """保留已有生成内容并新增一张时，预览和确认都必须保留两张候选。"""
+    transaction = MaterialEditingTransaction()
+    service = ReviewService(
+        repository=CardEditingRepository(transaction),
+        card_rewriter=StubCardRewriter(),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+    initial = service.preview_material_rewrite(
+        12,
+        ReviewMaterialRewriteRequest(instruction="合并为一张", mode="SOURCE_FIRST"),
+        "7",
+    )
+    request = ReviewMaterialRewriteRequest(
+        instruction="保留这次生成的内容 新添一张卡片，说明 inbox 和 outbox",
+        mode="SOURCE_FIRST",
+        baseCards=initial.proposedCards,
+    )
+
+    preview = service.preview_material_rewrite(12, request, "7")
+
+    assert preview.targetCardCount == 2
+    assert len(preview.proposedCards) == 2
+    assert preview.proposedCards[0].content == initial.proposedCards[0].content
+    assert "Inbox" in preview.proposedCards[1].content.question
+    result = service.apply_material_rewrite(
+        12,
+        ReviewMaterialRewriteApplyRequest(
+            sourceVersion=preview.sourceVersion,
+            originalFingerprint=preview.originalFingerprint,
+            originalCardIds=preview.originalCardIds,
+            proposedSummary=preview.proposedSummary,
+            proposedCards=[
+                ReviewCardUpdateRequest(
+                    **item.content.model_dump(),
+                    rewriteMode=preview.mode,
+                    evidenceIds=item.evidenceIds,
+                )
+                for item in preview.proposedCards
+            ],
+        ),
+        "7",
+    )
+
+    assert len(result.cards) == 2
+    assert result.material.cardCount == 2
 
 
 def test_material_rewrite_apply_rejects_stale_content_fingerprint() -> None:

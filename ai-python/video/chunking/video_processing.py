@@ -1907,9 +1907,9 @@ def ocr_batch_wait_ms() -> int:
 
 
 def ocr_max_in_flight() -> int:
-    """限制每个媒体分段的同时 OCR 请求，默认 2 个以适配双 Worker 机器。"""
+    """限制每个媒体分段的 OCR 外部 I/O 请求，默认按 2n=16。"""
 
-    return bounded_positive_int("RAG_VIDEO_OCR_MAX_IN_FLIGHT", default=2, maximum=8)
+    return bounded_positive_int("RAG_VIDEO_OCR_MAX_IN_FLIGHT", default=16, maximum=64)
 
 
 def video_asr_batch_max_size() -> int:
@@ -1925,9 +1925,9 @@ def video_asr_batch_wait_ms() -> int:
 
 
 def video_asr_max_in_flight() -> int:
-    """限制同一视频内并发 ASR 请求数，默认 2 个以控制本机与远端负载。"""
+    """限制同一视频内 ASR 外部 I/O 请求数，默认按 2n=16。"""
 
-    return bounded_positive_int("RAG_ASR_MAX_IN_FLIGHT", default=2, maximum=4)
+    return bounded_positive_int("RAG_ASR_MAX_IN_FLIGHT", default=16, maximum=64)
 
 
 def video_asr_rpm_limit() -> int:

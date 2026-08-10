@@ -535,7 +535,7 @@ def test_card_rewrite_task_runs_in_background_and_restores_comparison() -> None:
         reused = client.post(
             "/api/reviews/cards/81/rewrite-tasks",
             headers=headers,
-            json={"instruction": "不应重复调用", "mode": "SOURCE_REFERENCE"},
+            json={"instruction": "改成列表", "mode": "SOURCE_FIRST"},
         )
         assert reused.json()["data"]["taskId"] == task["taskId"]
         service.rewrite_release.set()

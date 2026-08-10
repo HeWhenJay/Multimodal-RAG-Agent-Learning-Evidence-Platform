@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
-from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.core.io_concurrency import configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.generation_graph import (
     ProgressCallback,
@@ -62,12 +62,9 @@ ANSWER_CLAIM_CONNECTOR_PATTERN = (
     r"(?:使用|采用|通过|依赖|负责|保证|支持|实现|解决|导致|需要|可以|能够|会|将|必须|应当)|"
     r"并(?:使用|采用|通过|依赖|负责|保证|支持|实现|解决|导致|需要|可以|能够|会|将)"
 )
+# 兼容旧版调度计划的参考值。它只用于进度展示和旧调用方，不再截断实际卡片输出。
 STANDARD_REVIEW_CARD_LIMIT = 8
-MAX_STRUCTURED_REVIEW_CARD_LIMIT = 32
 STANDARD_EVIDENCE_LIMIT = 16
-STRUCTURED_EVIDENCE_LIMIT = 48
-CURATED_EVIDENCE_LIMIT = 64
-SOURCE_QUESTION_LIMIT = 64
 REVIEW_RESPONSE_PARSE_ATTEMPTS = 3
 SPEECH_QUESTION_MARKER_PATTERN = re.compile(
     r"(?:嗯|啊|呃|哎|就是|可能|然后|还有|这时候|他会问|面试官|"
@@ -150,6 +147,7 @@ class KnowledgePointExtractor:
         evidences: list[Evidence],
         *,
         user_feedback: str | None = None,
+        generation_mode: str = "STANDARD",
         progress_callback: ProgressCallback | None = None,
     ) -> ExtractionResult:
         """只根据 evidence 运行多轮复习模型生成图，失败时不发布降级内容。"""
@@ -174,8 +172,19 @@ class KnowledgePointExtractor:
             raise ReviewExtractionError(f"复习内容只允许使用 {self.model} 生成")
         if not self.api_key:
             raise ReviewExtractionError("未配置 REVIEW_LLM_API_KEY，无法生成复习内容")
+        mode = normalize_generation_mode(generation_mode)
+        if mode == "SEGMENTED":
+            return self._extract_segmented(
+                material,
+                cleaned,
+                category=category,
+                reason=reason,
+                user_feedback=user_feedback,
+                progress_callback=progress_callback,
+            )
         try:
-            source_questions = extract_source_question_candidates(cleaned, limit=SOURCE_QUESTION_LIMIT)
+            # 原始问题全部参与完整性检查，不设置候选数量截断。
+            source_questions = extract_source_question_candidates(cleaned)
             required_questions = required_structured_source_questions(source_questions)
             langextract_enabled = self._langextract_is_enabled()
             emit_progress(
@@ -205,6 +214,7 @@ class KnowledgePointExtractor:
                     attempt=attempt,
                     quality_feedback=feedback,
                     user_feedback=user_feedback,
+                    generation_mode=mode,
                     previous_candidate=previous_candidate,
                     progress_callback=progress_callback,
                 ),
@@ -214,14 +224,17 @@ class KnowledgePointExtractor:
                     payload,
                     source_questions=source_questions,
                     curator_context=curator_context,
+                    generation_mode=mode,
                 ),
                 plan={
                     "materialId": material.material_id,
                     "title": material.title,
                     "sourceQuestionCount": len(source_questions),
                     "structuredQuestionCount": len(required_questions),
-                    "maxCards": review_card_limit(source_questions),
+                    # 仅保留结构化问题计数，卡片输出不设置 maxCards 业务上限。
+                    "maxCards": None,
                     "hasUserFeedback": bool((user_feedback or "").strip()),
+                    "generationMode": mode,
                     "langExtractEnabled": langextract_enabled,
                     "llmModel": self.model,
                 },
@@ -255,6 +268,104 @@ class KnowledgePointExtractor:
             return self._langextract_enabled_override
         return read_bool_environment("REVIEW_LANGEXTRACT_ENABLED", True)
 
+    def _extract_segmented(
+        self,
+        material: LearningMaterialContext,
+        evidences: list[Evidence],
+        *,
+        category: str | None,
+        reason: str,
+        user_feedback: str | None,
+        progress_callback: ProgressCallback | None,
+    ) -> ExtractionResult:
+        """按连续 evidence 分段生成，成功段经确定性 reducer 去重合并。"""
+        segments = split_review_evidence_segments(evidences)
+        emit_progress(
+            progress_callback,
+            stageCode="review.segmented",
+            stageLabel="分段生成",
+            message=f"资料已拆分为 {len(segments)} 段，将逐段生成并合并全部合格卡片",
+            status="RUNNING",
+            currentStep=1,
+            totalSteps=max(1, len(segments) + 1),
+            percent=5,
+            attempt=0,
+            maxAttempts=None,
+        )
+        merged_points: list[KnowledgePoint] = []
+        summaries: list[str] = []
+        diagnostics: list[str] = []
+        attempts = 0
+        for index, segment in enumerate(segments, start=1):
+            def segment_progress(event: dict[str, Any], *, segment_index: int = index) -> None:
+                """在原节点进度前增加分段位置，便于页面识别当前处理范围。"""
+                if progress_callback is None:
+                    return
+                enriched = dict(event)
+                enriched["message"] = f"分段 {segment_index}/{len(segments)}：{event.get('message') or '正在生成'}"
+                detail = str(event.get("detail") or "").strip()
+                enriched["detail"] = f"segment={segment_index}/{len(segments)}" + (f"；{detail}" if detail else "")
+                progress_callback(enriched)
+
+            segment_feedback = "；".join(
+                item
+                for item in (
+                    (user_feedback or "").strip(),
+                    f"当前只处理资料第 {index}/{len(segments)} 段，完整保留本段独立知识点，不设置卡片数量上限",
+                )
+                if item
+            )
+            try:
+                result = self.extract(
+                    material,
+                    segment,
+                    user_feedback=segment_feedback,
+                    generation_mode="RELAXED",
+                    progress_callback=segment_progress,
+                )
+            except ReviewManualReviewRequired as exc:
+                attempts += exc.attempts
+                diagnostics.extend(f"分段 {index}/{len(segments)}：{item}" for item in exc.quality_feedback)
+                continue
+            except ReviewExtractionError as exc:
+                diagnostics.extend(f"分段 {index}/{len(segments)}：{item}" for item in exc.diagnostics)
+                continue
+            attempts += result.generation_attempts
+            diagnostics.extend(f"分段 {index}/{len(segments)}：{item}" for item in result.quality_feedback)
+            if result.summary:
+                summaries.append(result.summary)
+            if result.is_learning_content:
+                merged_points.extend(result.knowledge_points)
+        unique_points = deduplicate_segmented_points(merged_points)
+        if not unique_points:
+            raise ReviewManualReviewRequired(
+                "分段生成后仍没有可发布的复习卡片",
+                attempts=attempts,
+                quality_feedback=unique_feedback(diagnostics) or ["所有分段都未通过 evidence 质量门禁"],
+            )
+        emit_progress(
+            progress_callback,
+            stageCode="review.segmented.merge",
+            stageLabel="合并分段结果",
+            message=f"已合并 {len(segments)} 段结果，保留 {len(unique_points)} 张去重后的合格卡片",
+            status="COMPLETED",
+            currentStep=max(1, len(segments) + 1),
+            totalSteps=max(1, len(segments) + 1),
+            percent=94,
+            attempt=attempts,
+            maxAttempts=None,
+        )
+        return ExtractionResult(
+            True,
+            category,
+            reason,
+            tuple(unique_points),
+            f"model:{REVIEW_CARD_PROMPT_VERSION}:segmented",
+            merge_segment_summaries(summaries),
+            generation_attempts=attempts,
+            quality_feedback=tuple(unique_feedback(diagnostics)),
+        )
+
     def _refresh_llm_config(self) -> None:
         """刷新复习模型连接配置，支持启动后注入本机中转密钥。"""
         self.timeout_seconds = cockpit_retry_policy().request_timeout_seconds
@@ -286,7 +397,7 @@ class KnowledgePointExtractor:
                 "REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER", 8000, minimum=1000, maximum=20000
             ),
             max_workers=bounded_int_environment(
-                "REVIEW_LANGEXTRACT_MAX_WORKERS", 8, minimum=1, maximum=10
+                "REVIEW_LANGEXTRACT_MAX_WORKERS", 16, minimum=1, maximum=64
             ),
             max_model_requests=bounded_int_environment(
                 "REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS", 32, minimum=1, maximum=64
@@ -328,6 +439,7 @@ class KnowledgePointExtractor:
         attempt: int = 1,
         quality_feedback: list[str] | None = None,
         user_feedback: str | None = None,
+        generation_mode: str = "STANDARD",
         previous_candidate: dict[str, Any] | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
@@ -345,7 +457,8 @@ class KnowledgePointExtractor:
             evidences,
             source_questions,
             prioritized_evidence_ids=prioritized_evidence_ids,
-            limit=CURATED_EVIDENCE_LIMIT if curated_knowledge_units else None,
+            # 提炼卡片数量不设上限；有结构化问题或 Curator 候选时完整保留其 evidence。
+            limit=None,
         )
         evidence_payload = [
             {
@@ -363,7 +476,8 @@ class KnowledgePointExtractor:
             source_questions=source_questions,
             required_source_questions=required_structured_source_questions(source_questions),
             curated_knowledge_units=curated_knowledge_units,
-            max_cards=review_card_limit(source_questions, len(curated_knowledge_units)),
+            max_cards=None,
+            generation_mode=generation_mode,
             attempt=attempt,
             quality_feedback=quality_feedback,
             user_feedback=user_feedback,
@@ -436,7 +550,7 @@ class KnowledgePointExtractor:
                     "review.llm",
                     configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
                 ):
-                    return client.chat.completions.create(**request)
+                    return run_llm_io(lambda: client.chat.completions.create(**request))
 
             def report_cockpit_retry(
                 error: Exception,
@@ -506,7 +620,7 @@ class KnowledgePointExtractor:
                 "review.llm",
                 configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
             ):
-                response = fallback_client.chat.completions.create(**fallback_request)
+                response = run_llm_io(lambda: fallback_client.chat.completions.create(**fallback_request))
             self.active_model_name = fallback.display_name
             return response
 
@@ -518,6 +632,7 @@ class KnowledgePointExtractor:
         *,
         source_questions: list[dict[str, str]] | None = None,
         curator_context: dict[str, Any] | None = None,
+        generation_mode: str = "STANDARD",
     ) -> ExtractionResult:
         """逐卡收集可修复诊断，只发布全部通过门禁且结构覆盖完整的结果。"""
         summary = normalize_generated_summary(payload.get("summary"))
@@ -602,7 +717,11 @@ class KnowledgePointExtractor:
                         f"{label} 的 LangExtract 候选与 evidenceIds 不一致：{'、'.join(mismatched_unit_ids[:6])}"
                     )
                     continue
-            if is_noise_fragment(answer) or not answer_is_grounded(answer, refs):
+            if is_noise_fragment(answer) or not answer_is_grounded(
+                answer,
+                refs,
+                relaxed=normalize_generation_mode(generation_mode) == "RELAXED",
+            ):
                 diagnostics.append(f"{label} 的 answer 含噪声或未通过逐论断 evidence 忠实度校验")
                 continue
             question = compact_text(raw.get("question"), 180)
@@ -654,6 +773,7 @@ class KnowledgePointExtractor:
         minimum_structured_count = minimum_structured_question_coverage(
             question_candidates,
             len(expected_structured),
+            generation_mode=generation_mode,
         )
         if missing_structured:
             if minimum_structured_count < len(expected_structured) and covered_structured_count >= minimum_structured_count:
@@ -675,14 +795,19 @@ class KnowledgePointExtractor:
                     f"缺少：{'；'.join(missing_structured[:12])}"
                 )
         missing_curated_ids = [unit_id for unit_id in curated_by_id if unit_id not in covered_curated_units]
+        minimum_curated_count = minimum_curated_knowledge_coverage(
+            len(curated_by_id), generation_mode=generation_mode
+        )
         if missing_curated_ids:
             missing_curated = [
                 f"{unit_id} {compact_text(curated_by_id[unit_id].get('topic'), 40) or compact_text(curated_by_id[unit_id].get('text'), 60) or ''}"
                 for unit_id in missing_curated_ids[:16]
             ]
+            covered_curated_count = len(curated_by_id) - len(missing_curated_ids)
+            threshold_label = "宽松门禁" if normalize_generation_mode(generation_mode) == "RELAXED" else "标准门禁"
             diagnostics.append(
-                "LangExtract 候选知识覆盖不足："
-                f"应覆盖 {len(curated_by_id)} 个，已覆盖 {len(curated_by_id) - len(missing_curated_ids)} 个；"
+                f"LangExtract 候选知识覆盖不足（{threshold_label}最低线 {minimum_curated_count}/{len(curated_by_id)}）："
+                f"应覆盖 {len(curated_by_id)} 个，已覆盖 {covered_curated_count} 个；"
                 f"缺少：{'；'.join(missing_curated)}"
             )
         if not points:
@@ -697,7 +822,7 @@ class KnowledgePointExtractor:
             f"{self.active_model_name} 生成的卡片未完整覆盖资料已有的问题清单",
                 diagnostics=diagnostics[:80],
             )
-        if missing_curated_ids:
+        if len(curated_by_id) - len(missing_curated_ids) < minimum_curated_count:
             raise ReviewExtractionError(
             f"{self.active_model_name} 生成的卡片未完整覆盖 LangExtract 候选知识单元",
                 diagnostics=diagnostics[:80],
@@ -713,7 +838,8 @@ class KnowledgePointExtractor:
             True,
             None,
             f"{self.active_model_name} 已生成复习内容",
-            tuple(points[: review_card_limit(question_candidates, len(curated_by_id))]),
+            # 通过逐卡 evidence 门禁的结果全部发布，不再按历史 8/32 张规则截断。
+            tuple(points),
             f"model:{REVIEW_CARD_PROMPT_VERSION}",
             summary,
             quality_feedback=tuple(diagnostics[:80]),
@@ -729,7 +855,7 @@ def valid_curated_knowledge_units(context: dict[str, Any] | None) -> list[dict[s
         return []
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for raw in raw_units[:MAX_STRUCTURED_REVIEW_CARD_LIMIT]:
+    for raw in raw_units:
         if not isinstance(raw, dict):
             continue
         unit_id = compact_text(raw.get("knowledgeUnitId"), 40)
@@ -755,6 +881,81 @@ def valid_curated_knowledge_units(context: dict[str, Any] | None) -> list[dict[s
             }
         )
     return result
+
+
+def normalize_generation_mode(value: str | None) -> str:
+    """规范资料生成门禁档位，未知值安全回退标准模式。"""
+    normalized = str(value or "STANDARD").strip().upper()
+    return normalized if normalized in {"STANDARD", "RELAXED", "SEGMENTED"} else "STANDARD"
+
+
+def minimum_curated_knowledge_coverage(
+    expected_count: int,
+    *,
+    generation_mode: str = "STANDARD",
+) -> int:
+    """计算 LangExtract 候选最低覆盖数，不影响最终卡片数量。"""
+    if expected_count <= 0:
+        return 0
+    mode = normalize_generation_mode(generation_mode)
+    ratio = 0.40 if mode == "RELAXED" else 0.60
+    return min(expected_count, max(1, ceil(expected_count * ratio)))
+
+
+def split_review_evidence_segments(
+    evidences: list[Evidence],
+    *,
+    max_evidence_per_segment: int = 24,
+    max_characters_per_segment: int = 12000,
+) -> list[list[Evidence]]:
+    """按 evidence 原始顺序切成有界上下文段，段数随资料增长而增长。"""
+    ordered = sorted(evidences, key=evidence_position)
+    if not ordered:
+        return []
+    segments: list[list[Evidence]] = []
+    current: list[Evidence] = []
+    current_chars = 0
+    for item in ordered:
+        item_chars = len(item.snippet or "")
+        reaches_count = len(current) >= max(1, max_evidence_per_segment)
+        reaches_chars = current and current_chars + item_chars > max(1000, max_characters_per_segment)
+        if current and (reaches_count or reaches_chars):
+            segments.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+    if current:
+        segments.append(current)
+    return segments
+
+
+def deduplicate_segmented_points(points: list[KnowledgePoint]) -> list[KnowledgePoint]:
+    """跨分段按稳定问题键和来源键去重，保留首次通过门禁的完整卡片。"""
+    result: list[KnowledgePoint] = []
+    seen: set[str] = set()
+    for point in points:
+        key = normalized_sentence(point.question) or point.source_key
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(point)
+    return result
+
+
+def merge_segment_summaries(summaries: list[str]) -> str | None:
+    """合并各段模型摘要并去重，不在本地编造资料事实。"""
+    unique: list[str] = []
+    seen: set[str] = set()
+    for summary in summaries:
+        normalized = normalize_generated_summary(summary)
+        key = normalized_sentence(normalized or "")
+        if normalized and key and key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    if not unique:
+        return None
+    return compact_text(" ".join(unique), 500)
 
 
 def read_bool_environment(name: str, default: bool) -> bool:
@@ -933,7 +1134,7 @@ def select_review_prompt_evidences(
     required_questions = required_structured_source_questions(source_questions)
     prioritized_ids = {str(item) for item in (prioritized_evidence_ids or set()) if str(item)}
     if not required_questions and not prioritized_ids:
-        return select_representative_evidences(evidences, limit=STANDARD_EVIDENCE_LIMIT)
+        return sorted(evidences, key=evidence_position)
 
     ordered = sorted(evidences, key=evidence_position)
     preferred_ids = {
@@ -945,8 +1146,8 @@ def select_review_prompt_evidences(
         if evidence.evidenceId in preferred_ids:
             expanded_ids.add(ordered[index + 1].evidenceId)
 
-    resolved_limit = limit or (CURATED_EVIDENCE_LIMIT if prioritized_ids else STRUCTURED_EVIDENCE_LIMIT)
-    resolved_limit = max(1, min(CURATED_EVIDENCE_LIMIT, int(resolved_limit)))
+    # limit 仅供未来调用方控制请求体预算；默认完整发送，不能成为卡片数量的隐式上限。
+    resolved_limit = len(ordered) if limit is None else max(1, int(limit))
     preferred = [item for item in ordered if item.evidenceId in expanded_ids]
     selected = preferred[:resolved_limit]
     selected_ids = {item.evidenceId for item in selected}
@@ -1014,7 +1215,7 @@ def evidence_position(item: Evidence) -> int:
 def extract_source_question_candidates(
     evidences: list[Evidence],
     *,
-    limit: int = SOURCE_QUESTION_LIMIT,
+    limit: int | None = None,
 ) -> list[dict[str, str]]:
     """提取带 evidence 归属的原始问句，供模型选择和服务端校验。"""
     result: list[dict[str, str]] = []
@@ -1031,7 +1232,7 @@ def extract_source_question_candidates(
                 continue
             seen.add(key)
             result.append({"evidenceId": evidence.evidenceId, "question": question})
-            if len(result) >= max(1, limit):
+            if limit is not None and len(result) >= max(1, int(limit)):
                 return result
     return result
 
@@ -1067,21 +1268,18 @@ def extract_source_questions(evidence: Evidence) -> list[str]:
         key = normalized_sentence(section)
         if key not in seen:
             result.append(section)
-    return result[:32]
+    return result
 
 
 def review_card_limit(
     source_questions: list[dict[str, str]],
     curator_knowledge_unit_count: int = 0,
 ) -> int:
-    """结构化问题或 Curator 候选存在时动态放宽，最高仍限制为 32 张。"""
+    """返回旧调度器所需的建议数量；此值不是发布上限。"""
     required_questions = required_structured_source_questions(source_questions)
     if not required_questions and curator_knowledge_unit_count <= 0:
         return STANDARD_REVIEW_CARD_LIMIT
-    return min(
-        MAX_STRUCTURED_REVIEW_CARD_LIMIT,
-        max(STANDARD_REVIEW_CARD_LIMIT, len(required_questions), curator_knowledge_unit_count),
-    )
+    return max(STANDARD_REVIEW_CARD_LIMIT, len(required_questions), curator_knowledge_unit_count)
 
 
 def structured_source_questions(source_questions: list[dict[str, str]]) -> list[tuple[str, str]]:
@@ -1097,7 +1295,7 @@ def structured_source_questions(source_questions: list[dict[str, str]]) -> list[
         result.append((key, question))
     if len(result) <= STANDARD_REVIEW_CARD_LIMIT:
         return []
-    return result[:MAX_STRUCTURED_REVIEW_CARD_LIMIT]
+    return result
 
 
 def required_structured_source_questions(
@@ -1116,8 +1314,6 @@ def required_structured_source_questions(
             continue
         seen.add(key)
         result.append(item)
-        if len(result) >= MAX_STRUCTURED_REVIEW_CARD_LIMIT:
-            break
     return result
 
 
@@ -1158,8 +1354,10 @@ def canonical_source_question_key(value: str | None) -> str:
 def minimum_structured_question_coverage(
     source_questions: list[dict[str, str]],
     expected_count: int,
+    *,
+    generation_mode: str | None = None,
 ) -> int:
-    """为口语化 ASR 资料提供有限容错，干净的结构化资料仍要求百分之百覆盖。"""
+    """按资料口语程度和门禁档位计算结构化原始问题最低覆盖数。"""
     if expected_count <= 0:
         return 0
     speech_markers = sum(
@@ -1167,10 +1365,16 @@ def minimum_structured_question_coverage(
         for item in source_questions
     )
     is_speech_material = speech_markers >= 3 and speech_markers / max(1, len(source_questions)) >= 0.08
+    if generation_mode is None:
+        # 旧测试和外部调用方未传档位时保留历史严格行为。
+        return expected_count if not is_speech_material else min(expected_count, max(1, ceil(expected_count * 0.75)))
+    mode = normalize_generation_mode(generation_mode)
+    # 新流程对干净结构化资料保留 85% 覆盖线，对口语资料使用更低的容错线。
     if not is_speech_material:
-        return expected_count
-    # 口语重复已先归并；剩余问题仍需至少覆盖 75%，且不能低于普通卡片上限。
-    return max(STANDARD_REVIEW_CARD_LIMIT, ceil(expected_count * 0.75))
+        ratio = 0.45 if mode == "RELAXED" else 0.85
+    else:
+        ratio = 0.45 if mode == "RELAXED" else 0.65
+    return min(expected_count, max(1, ceil(expected_count * ratio)))
 
 
 def is_structured_source_question(value: str | None) -> bool:
@@ -1408,8 +1612,13 @@ def is_high_quality_review_hint(value: str) -> bool:
     )
 
 
-def answer_is_grounded(answer: str, evidence_refs: tuple[Evidence, ...]) -> bool:
-    """逐论断核验答案事实，防止正确摘录后夹带资料外结论。"""
+def answer_is_grounded(
+    answer: str,
+    evidence_refs: tuple[Evidence, ...],
+    *,
+    relaxed: bool = False,
+) -> bool:
+    """逐论断核验答案事实；宽松档降低重合阈值但仍要求每条事实有原文依据。"""
     answer_key = normalized_sentence(answer)
     source_key = normalized_sentence(" ".join(reference.snippet for reference in evidence_refs))
     if not answer_key or not source_key or contains_review_artifact(answer):
@@ -1417,7 +1626,7 @@ def answer_is_grounded(answer: str, evidence_refs: tuple[Evidence, ...]) -> bool
     if answer_key in source_key:
         return True
     claims = [normalized_sentence(claim) for claim in split_answer_claims(answer)]
-    return bool(claims) and all(text_is_grounded(claim, source_key) for claim in claims)
+    return bool(claims) and all(text_is_grounded(claim, source_key, relaxed=relaxed) for claim in claims)
 
 
 def split_answer_claims(answer: str) -> list[str]:
@@ -1443,7 +1652,7 @@ def split_answer_claims(answer: str) -> list[str]:
     return claims
 
 
-def text_is_grounded(text_key: str, source_key: str) -> bool:
+def text_is_grounded(text_key: str, source_key: str, *, relaxed: bool = False) -> bool:
     """要求单个答案事实与引用正文存在连续片段及足够的字符 n-gram 覆盖。"""
     if text_key in source_key:
         return True
@@ -1455,7 +1664,9 @@ def text_is_grounded(text_key: str, source_key: str) -> bool:
     if not grams:
         return False
     coverage = sum(gram in source_key for gram in grams) / len(grams)
-    return coverage >= 0.12 and longest_common_substring_length(text_key, source_key) >= min(6, len(text_key))
+    minimum_coverage = 0.08 if relaxed else 0.12
+    minimum_common = 4 if relaxed else 6
+    return coverage >= minimum_coverage and longest_common_substring_length(text_key, source_key) >= min(minimum_common, len(text_key))
 
 
 def longest_common_substring_length(left: str, right: str) -> int:

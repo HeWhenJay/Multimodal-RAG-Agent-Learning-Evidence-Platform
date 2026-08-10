@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.io_concurrency import run_llm_io
 
 DEFAULT_AGENT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -66,8 +67,11 @@ class AgentQwenClient:
             "response_format": {"type": "json_object"},
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+        def request_completion():
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                return client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+
+        response = run_llm_io(request_completion)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:300]}")
         data = response.json()

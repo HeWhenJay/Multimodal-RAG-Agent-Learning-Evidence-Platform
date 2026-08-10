@@ -240,7 +240,7 @@ def planner_progress_node(
         maxAttempts=int(state.get("max_attempts") or 1),
         detail=(
             f"识别到 {int(plan.get('structuredQuestionCount') or 0)} 个原始问题，"
-            f"本轮最多生成 {int(plan.get('maxCards') or 0)} 张卡片"
+            "所有通过 evidence 门禁的独立知识点均可生成卡片，不设数量上限"
         ),
     )
     return result
@@ -523,7 +523,8 @@ def curator_node(state: ReviewGenerationState, curator: Curator) -> ReviewGenera
     plan["langExtractStatus"] = context.get("status")
     plan["curatorKnowledgeUnitCount"] = unit_count
     if unit_count > 0:
-        plan["maxCards"] = min(32, max(int(plan.get("maxCards") or 0), unit_count))
+        # 仅记录候选数量供进度展示，不把候选数转换成卡片截断上限。
+        plan["curatorKnowledgeUnitCount"] = unit_count
     return {"plan": plan, "curator_context": context, "status": "GENERATING"}
 
 

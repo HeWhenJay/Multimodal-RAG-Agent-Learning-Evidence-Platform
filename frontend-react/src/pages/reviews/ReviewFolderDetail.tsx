@@ -174,7 +174,7 @@ export function ReviewFolderDetail() {
       const visibleMaterials = filterVisibleFolderCards(refreshed.materials, reviewedCardIdsRef.current);
       setDetail({ ...refreshed, materials: visibleMaterials });
       materialsRef.current = visibleMaterials;
-      setGradeMessage(`“${result.material.title}”已将原卡片合并为 1 张综合卡片`);
+      setGradeMessage(`“${result.material.title}”已将原卡片重组为 ${result.cards.length} 张新卡片`);
       window.dispatchEvent(new Event(REVIEW_CONTENT_UPDATED_EVENT));
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : '资料改写已应用，但文件夹刷新失败');

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.io_concurrency import run_llm_io
 from app.schemas.rag import Evidence
 from rag.core.source_references import evidence_source_label
 from rag.observability.model_logging import log_model_call
@@ -137,8 +138,11 @@ class BailianChatClient:
             recoverable=True,
             fallback_message=f"使用 {self.model} 模型完成基于 evidence 生成回答事件失败，已降级到本地证据摘要继续处理",
         ):
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+            def request_completion():
+                with httpx.Client(timeout=self.timeout_seconds) as client:
+                    return client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+
+            response = run_llm_io(request_completion)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()

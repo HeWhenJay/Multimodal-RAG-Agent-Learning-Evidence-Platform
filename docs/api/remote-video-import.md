@@ -166,8 +166,8 @@ MCP 的 `structuredContent` 和 TextContent JSON 两种响应均可解析。限�
 | `RAG_REMOTE_VIDEO_MAX_BYTES` | `536870912` | Bilibili 临时视频最大字节数 |
 | `RAG_REMOTE_VIDEO_MAX_DURATION_SECONDS` | `14400` | Bilibili 最大时长 |
 | `RAG_REMOTE_VIDEO_TASK_TIMEOUT_SECONDS` | `18000` | Bilibili 下载和后处理总墙钟时限 |
-| `RAG_KAFKA_HANDLER_CONCURRENCY` | `4` | Kafka 索引长任务并发上限 |
-| `RAG_TASK_WORKER_CONCURRENCY` | `2` | 本地耐久 worker 并发槽位 |
+| `RAG_KAFKA_HANDLER_CONCURRENCY` | `9` | Kafka CPU/内存密集索引长任务并发上限；单分区内不同资料 key 也可并发 |
+| `RAG_TASK_WORKER_CONCURRENCY` | `9` | 本地 CPU/内存密集耐久 worker 并发槽位 |
 | `RAG_INDEX_EXECUTION_LEASE_SECONDS` | `180` | 索引执行租约时长 |
 
 本地 PowerShell 示例：

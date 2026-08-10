@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import threading
+import time
 
 from app.workers.outbox_publisher import RagOutboxEvent, RagOutboxPublisher, backoff_seconds, publish_timeout_seconds
 
@@ -42,12 +44,50 @@ class FailingProducer(RecordingProducer):
         raise RuntimeError("KafkaError{SECRET_BODY_SHOULD_NOT_LEAK}")
 
 
-def sample_event(*, event_id: int = 1, attempt: int = 0) -> RagOutboxEvent:
+class ParallelProbeProducer(RecordingProducer):
+    """用同步屏障确认不同消息键确实进入独立 I/O worker。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.barrier = threading.Barrier(2)
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def send_serialized(self, topic, key, payload_json, *, flush_seconds):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            self.barrier.wait(timeout=2)
+            with self.lock:
+                self.sent.append((topic, key, payload_json, flush_seconds))
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+class OrderProbeProducer(RecordingProducer):
+    """延迟首条消息，确认相同 topic/key 不会被后续事件越过。"""
+
+    def send_serialized(self, topic, key, payload_json, *, flush_seconds):
+        if payload_json == "event-1":
+            time.sleep(0.05)
+        self.sent.append((topic, key, payload_json, flush_seconds))
+
+
+def sample_event(
+    *,
+    event_id: int = 1,
+    attempt: int = 0,
+    message_key: str = "material-1",
+    payload_json: str = '{"schemaVersion":"1.0","payload":{"text":"原始正文"}}',
+) -> RagOutboxEvent:
     return RagOutboxEvent(
         id=event_id,
         topic="rag.material.index.request.v1",
-        message_key="material-1",
-        payload_json='{"schemaVersion":"1.0","payload":{"text":"原始正文"}}',
+        message_key=message_key,
+        payload_json=payload_json,
         attempt=attempt,
     )
 
@@ -100,6 +140,45 @@ def test_outbox_publisher_releases_failed_event_with_redacted_summary(monkeypatc
     assert "SECRET_BODY_SHOULD_NOT_LEAK" not in summary
     assert next_attempt_at >= before
     assert backoff_seconds(4) == 8
+
+
+def test_outbox_publisher_publishes_different_keys_concurrently(monkeypatch):
+    """不同 Kafka key 属于独立 I/O，单轮内应并行等待投递确认。"""
+    monkeypatch.setenv("RAG_OUTBOX_PUBLISH_CONCURRENCY", "16")
+    repository = FakeOutboxRepository(
+        [
+            sample_event(event_id=1, message_key="material-1", payload_json="event-1"),
+            sample_event(event_id=2, message_key="material-2", payload_json="event-2"),
+        ]
+    )
+    producer = ParallelProbeProducer()
+    publisher = RagOutboxPublisher(repository=repository, producer=producer, publisher_id="publisher-1")
+
+    result = publisher.publish_due_events()
+
+    assert result == type(result)(claimed=2, published=2, failed=0)
+    assert producer.max_active == 2
+    assert sorted(repository.published) == [1, 2]
+
+
+def test_outbox_publisher_keeps_same_key_in_event_id_order(monkeypatch):
+    """同一 topic/key 即使启用 16 路线程池，也必须按事件 ID 串行发布。"""
+    monkeypatch.setenv("RAG_OUTBOX_PUBLISH_CONCURRENCY", "16")
+    repository = FakeOutboxRepository(
+        [
+            sample_event(event_id=3, payload_json="event-3"),
+            sample_event(event_id=1, payload_json="event-1"),
+            sample_event(event_id=2, payload_json="event-2"),
+        ]
+    )
+    producer = OrderProbeProducer()
+    publisher = RagOutboxPublisher(repository=repository, producer=producer, publisher_id="publisher-1")
+
+    result = publisher.publish_due_events()
+
+    assert result == type(result)(claimed=3, published=3, failed=0)
+    assert [payload for _, _, payload, _ in producer.sent] == ["event-1", "event-2", "event-3"]
+    assert repository.published == [1, 2, 3]
 
 
 def test_outbox_backoff_is_capped_but_never_disables_retries(monkeypatch):

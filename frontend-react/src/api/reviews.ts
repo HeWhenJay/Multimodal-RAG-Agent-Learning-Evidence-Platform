@@ -71,6 +71,8 @@ export interface ReviewMaterialCardSnapshot {
 export interface ReviewMaterialRewritePayload {
   instruction: string;
   mode: ReviewCardRewriteMode;
+  targetCardCount?: number | null;
+  baseCards?: ReviewMaterialCardSnapshot[];
 }
 
 export interface ReviewMaterialRewritePreview {
@@ -81,6 +83,7 @@ export interface ReviewMaterialRewritePreview {
   originalCardIds: number[];
   originalCards: ReviewMaterialCardSnapshot[];
   proposedCards: ReviewMaterialCardSnapshot[];
+  targetCardCount: number;
   originalSummary?: string | null;
   proposedSummary?: string | null;
   mergeNote?: string | null;
@@ -119,6 +122,7 @@ export interface ReviewMaterialRewriteTask {
   materialId: number;
   instruction: string;
   mode: ReviewCardRewriteMode;
+  targetCardCount: number;
   status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
   progress: ReviewRewriteTaskProgress;
   result?: ReviewMaterialRewritePreview | null;
@@ -264,6 +268,15 @@ export interface ReviewMaterial {
   syncedIndexRequestVersion?: number | null;
   updatedAt?: string | null;
   errorMessage?: string | null;
+}
+
+export type ReviewGenerationAction = 'REGENERATE' | 'KEEP_CURRENT';
+export type ReviewGenerationMode = 'STANDARD' | 'RELAXED' | 'SEGMENTED';
+
+export interface ReviewGenerationOptions {
+  action?: ReviewGenerationAction;
+  mode?: ReviewGenerationMode;
+  userFeedback?: string;
 }
 
 export interface ReviewFolder {
@@ -554,11 +567,20 @@ export function assignReviewMaterialsToFolder(
 }
 
 // 对单条学习资料重新分类并生成关键知识点卡片。
-export function generateReviewMaterial(materialId: number, userFeedback?: string): Promise<ReviewMaterial> {
-  const feedback = userFeedback?.trim();
+export function generateReviewMaterial(
+  materialId: number,
+  options: ReviewGenerationOptions = {},
+): Promise<ReviewMaterial> {
+  const feedback = options.userFeedback?.trim();
+  const body = {
+    action: options.action || 'REGENERATE',
+    mode: options.mode || 'STANDARD',
+    ...(feedback ? { userFeedback: feedback } : {})
+  };
   return request<ReviewMaterial>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/generate`, {
     method: 'POST',
-    ...(feedback ? { headers: jsonHeaders, body: JSON.stringify({ userFeedback: feedback }) } : {})
+    headers: jsonHeaders,
+    body: JSON.stringify(body)
   });
 }
 

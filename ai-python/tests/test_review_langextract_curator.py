@@ -188,11 +188,11 @@ def test_langextract_proxy_retries_with_deepseek_after_primary_connection_failur
 
 
 def test_langextract_curator_uses_same_model_timeout_as_baseline() -> None:
-    """线上默认使用 8 个 I/O worker，单请求超时仍与当前生成器保持一致。"""
+    """线上默认使用 16 个 I/O worker，单请求超时仍与当前生成器保持一致。"""
     from app.review.langextract_curator import LangExtractKnowledgeCurator
 
     assert LangExtractKnowledgeCurator(api_key="test-key").timeout_seconds == 615.0
-    assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 8
+    assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 16
 
 
 def test_langextract_passes_eight_workers_to_official_thread_pool() -> None:

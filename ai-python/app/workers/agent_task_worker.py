@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import Any
 from agents.gateway.local_gateway import LocalAgentGateway
 from agents.orchestration.pae_react_graph import resume_unified_agent, start_unified_agent
 from app.agent_runtime.service import AgentRuntimeService
+from app.core.io_concurrency import configured_io_workers
 from app.core.runtime_config import load_runtime_config, parse_args
 from app.schemas.agent import AgentTaskResumeRequest, AgentTaskStartRequest
 
@@ -25,23 +27,26 @@ logger = logging.getLogger(__name__)
 
 
 class AgentTaskWorker:
-    """单进程顺序领取任务，保证图事件按同一任务顺序落库。"""
+    """单进程并发执行不同 Agent 任务，同一任务仍由数据库锁保证事件顺序。"""
 
     def __init__(self, service: AgentRuntimeService | None = None) -> None:
         self._service = service or AgentRuntimeService()
 
     def process_available_tasks(self, limit: int | None = None) -> int:
         """处理当前批次可运行任务并返回实际尝试数。"""
-        processed = 0
+        tasks: list[dict[str, Any]] = []
         seen: set[str] = set()
         for task in self._service.list_runnable_task_records(limit):
             task_id = text(task.get("id"))
             if not task_id or task_id in seen:
                 continue
             seen.add(task_id)
-            if self.process_task(task):
-                processed += 1
-        return processed
+            tasks.append(task)
+        if not tasks:
+            return 0
+        worker_count = min(len(tasks), agent_worker_concurrency())
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="agent-durable-worker") as pool:
+            return sum(bool(result) for result in pool.map(self.process_task, tasks))
 
     def process_task(self, task: dict[str, Any]) -> bool:
         """执行初始任务或根据最近审批恢复同一持久任务。"""
@@ -130,7 +135,12 @@ def run_forever(worker: AgentTaskWorker, *, sleep: Any = time.sleep) -> None:
 
 def worker_batch_size() -> int:
     """读取每轮任务上限，避免启动时一次处理无限历史恢复任务。"""
-    return bounded_int(os.getenv("AGENT_WORKER_BATCH_SIZE"), default=4, lower=1, upper=32)
+    return bounded_int(os.getenv("AGENT_WORKER_BATCH_SIZE"), default=16, lower=1, upper=64)
+
+
+def agent_worker_concurrency() -> int:
+    """读取不同 Agent 任务的并发数，模型与数据库等待阶段默认按 2n=16。"""
+    return configured_io_workers("AGENT_WORKER_CONCURRENCY")
 
 
 def worker_poll_seconds() -> float:

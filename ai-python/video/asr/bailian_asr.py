@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from app.core.io_concurrency import run_llm_io
 from rag.observability.model_logging import log_model_call
 from prompts.media import DEFAULT_ASR_PROMPT
 
@@ -179,6 +180,15 @@ class BailianAsrClient:
         file_url: str,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        """把异步 ASR 的提交、轮询和下载整体放入模型 I/O 线程池。"""
+        return run_llm_io(lambda: self._call_filetrans_direct(file_url, progress_callback))
+
+    def _call_filetrans_direct(
+        self,
+        file_url: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        """在线程池 worker 中执行百炼异步转写协议。"""
         try:
             import httpx
         except ImportError as exc:
@@ -326,9 +336,12 @@ class BailianAsrClient:
             fallback_message=f"使用 {self.model} 模型完成视频音频同步 ASR 转写事件失败，已降级到字幕、关键帧 OCR 或视频元数据继续处理",
         ):
             try:
-                with httpx.Client(timeout=self.timeout_seconds) as client:
-                    self._sync_limiter.acquire()
-                    response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+                def request_completion():
+                    with httpx.Client(timeout=self.timeout_seconds) as client:
+                        self._sync_limiter.acquire()
+                        return client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+
+                response = run_llm_io(request_completion)
             finally:
                 cleanup_audio_reference()
         if response.status_code >= 400:

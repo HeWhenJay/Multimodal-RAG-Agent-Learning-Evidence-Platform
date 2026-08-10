@@ -8,7 +8,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter
 from rag.generation.bailian_llm import generate_grounded_answer
 from rag.chunkers.chunking import RecursiveChunker
 from rag.core.models import Chunk, utc_now_iso
@@ -80,12 +80,8 @@ PARSER_MAX_LENGTH = 80
 
 
 def index_chunk_workers() -> int:
-    """读取后端 RAG chunk Worker 数，限制在避免本机内存过载的安全范围。"""
-    try:
-        configured = int(os.getenv("RAG_INDEX_CHUNK_WORKERS", "2"))
-    except ValueError:
-        configured = 2
-    return max(1, min(configured, 8))
+    """读取递归切块和本地 token 统计 Worker 数，CPU/内存阶段默认 n+1=9。"""
+    return configured_cpu_workers("RAG_INDEX_CHUNK_WORKERS")
 
 
 def normalize_table_prefix(value: str | None) -> str:

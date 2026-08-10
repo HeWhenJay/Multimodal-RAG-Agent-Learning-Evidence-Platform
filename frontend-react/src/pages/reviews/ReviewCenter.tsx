@@ -64,6 +64,8 @@ import {
   type ReviewFolder,
   type ReviewGradeResult,
   type ReviewGenerationProgressEvent,
+  type ReviewGenerationAction,
+  type ReviewGenerationMode,
   type ReviewMaterial,
   type ReviewMissingKnowledgeResult,
   type ReviewMissingKnowledgeTask,
@@ -159,6 +161,8 @@ export function ReviewCenter() {
   const [reviewFeedbackText, setReviewFeedbackText] = useState('');
   const [reviewFeedbackError, setReviewFeedbackError] = useState('');
   const [reviewFeedbackBusy, setReviewFeedbackBusy] = useState(false);
+  const [reviewFeedbackAction, setReviewFeedbackAction] = useState<ReviewGenerationAction>('REGENERATE');
+  const [reviewFeedbackMode, setReviewFeedbackMode] = useState<ReviewGenerationMode>('STANDARD');
   const [missingKnowledgeTarget, setMissingKnowledgeTarget] = useState<MissingKnowledgeTarget | null>(null);
   const [missingKnowledgeTasks, setMissingKnowledgeTasks] = useState<Record<number, ReviewMissingKnowledgeTask>>({});
   const [manualCardTarget, setManualCardTarget] = useState<ManualCardTarget | null>(null);
@@ -814,10 +818,14 @@ export function ReviewCenter() {
     }
   }
 
-  async function regenerateMaterial(material: ReviewMaterial, userFeedback?: string) {
+  async function regenerateMaterial(
+    material: ReviewMaterial,
+    options: { action?: ReviewGenerationAction; mode?: ReviewGenerationMode; userFeedback?: string } = {},
+  ) {
     const materialId = resolveMaterialId(material);
     if (materialId == null || busyMaterialId !== null) return;
-    if (!userFeedback && material.cardCount > 0) {
+    const needsContext = material.status === 'FAILED' || material.status === 'NEEDS_REVIEW' || material.needsManualReview;
+    if (!options.userFeedback && !needsContext && material.cardCount > 0) {
       setMaterialRewriteTarget({
         materialId,
         title: material.title,
@@ -826,18 +834,19 @@ export function ReviewCenter() {
       });
       return;
     }
-    const needsContext = material.status === 'FAILED' || material.status === 'NEEDS_REVIEW' || material.needsManualReview;
-    if (!userFeedback && needsContext) {
+    if (!options.userFeedback && !options.action && needsContext) {
       reviewFeedbackDismissedMaterialIdRef.current = null;
       setReviewFeedbackTarget(material);
       setReviewFeedbackText('');
       setReviewFeedbackError('');
+      setReviewFeedbackAction('REGENERATE');
+      setReviewFeedbackMode('STANDARD');
       return;
     }
     setBusyMaterialId(materialId);
     setError('');
     try {
-      const result = await generateReviewMaterial(materialId, userFeedback);
+      const result = await generateReviewMaterial(materialId, options);
       if (result.status === 'GENERATING') {
         setReviewFeedbackTarget(null);
         setSyncMessage(`“${material.title}”已转入后台生成，请稍后查看进度`);
@@ -873,7 +882,7 @@ export function ReviewCenter() {
       ? { ...group, cards: replacementCards, dueCardCount: replacementCards.length }
       : group));
     setMaterialRewriteTarget(null);
-    setSyncMessage(`“${result.material.title}”已将原卡片合并为 1 张综合卡片`);
+    setSyncMessage(`“${result.material.title}”已将原卡片重组为 ${result.cards.length} 张新卡片`);
     window.dispatchEvent(new Event(REVIEW_CONTENT_UPDATED_EVENT));
     await loadData();
   }
@@ -884,13 +893,17 @@ export function ReviewCenter() {
     const target = reviewFeedbackTarget;
     if (!target || reviewFeedbackBusy) return;
     const feedback = reviewFeedbackText.trim();
-    if (!feedback) {
+    if (reviewFeedbackAction === 'REGENERATE' && reviewFeedbackMode === 'STANDARD' && !feedback) {
       setReviewFeedbackError('请先补充本节重点、问题范围或需要保留的原始问句');
       return;
     }
     setReviewFeedbackBusy(true);
     try {
-      await regenerateMaterial(target, feedback);
+      await regenerateMaterial(target, {
+        action: reviewFeedbackAction,
+        mode: reviewFeedbackMode,
+        userFeedback: feedback || undefined
+      });
       setReviewFeedbackText('');
       setReviewFeedbackError('');
     } finally {
@@ -1174,7 +1187,19 @@ export function ReviewCenter() {
       <ReviewDeletionDialog target={deleteTarget} deleting={deletingKey !== null} onConfirm={() => void confirmDeletion()} onClose={() => { if (deletingKey === null) setDeleteTarget(null); }} />
       <ReviewFolderEditorDialog target={folderEditorTarget} name={folderEditorName} busy={folderBusy} onNameChange={setFolderEditorName} onSubmit={saveFolder} onClose={() => { if (!folderBusy) setFolderEditorTarget(null); }} />
       <ReviewFolderDeleteDialog folder={folderDeleteTarget} busy={folderBusy} onConfirm={() => void confirmFolderDeletion()} onClose={() => { if (!folderBusy) setFolderDeleteTarget(null); }} />
-      <ReviewGenerationFeedbackDialog target={reviewFeedbackTarget} feedback={reviewFeedbackText} error={reviewFeedbackError} busy={reviewFeedbackBusy || busyMaterialId !== null} onFeedbackChange={(value) => { setReviewFeedbackText(value); if (value.trim()) setReviewFeedbackError(''); }} onSubmit={submitReviewFeedback} onClose={closeReviewFeedbackDialog} />
+      <ReviewGenerationFeedbackDialog
+        target={reviewFeedbackTarget}
+        feedback={reviewFeedbackText}
+        error={reviewFeedbackError}
+        busy={reviewFeedbackBusy || busyMaterialId !== null}
+        action={reviewFeedbackAction}
+        mode={reviewFeedbackMode}
+        onActionChange={(value) => { setReviewFeedbackAction(value); setReviewFeedbackError(''); }}
+        onModeChange={(value) => { setReviewFeedbackMode(value); setReviewFeedbackError(''); }}
+        onFeedbackChange={(value) => { setReviewFeedbackText(value); if (value.trim()) setReviewFeedbackError(''); }}
+        onSubmit={submitReviewFeedback}
+        onClose={closeReviewFeedbackDialog}
+      />
       <ReviewMissingKnowledgeDialog target={missingKnowledgeTarget} onClose={() => setMissingKnowledgeTarget(null)} onTaskChanged={(task) => { if (!task) return; setMissingKnowledgeTasks((previous) => ({ ...previous, [task.materialId]: task })); }} onCardsAdded={async (result: ReviewMissingKnowledgeResult) => { const previousCount = materials.find((material) => resolveMaterialId(material) === result.materialId)?.cardCount || 0; setFolderMessage(`已追加 ${result.addedCount} 张遗漏知识点卡片`); await refreshAfterCardAppend(result.materialId, previousCount, result.cards); }} />
       <ReviewManualCardDialog target={manualCardTarget} onClose={() => setManualCardTarget(null)} onCreated={async (card) => { const previousCount = materials.find((material) => resolveMaterialId(material) === card.materialId)?.cardCount || 0; setFolderMessage('已创建 1 张手动复习卡片'); await refreshAfterCardAppend(card.materialId, previousCount, [card]); }} />
       <ReviewCardEditDialog target={cardEditTarget} onClose={() => setCardEditTarget(null)} onSaved={applyUpdatedCard} />
@@ -1285,6 +1310,10 @@ function ReviewGenerationFeedbackDialog({
   feedback,
   error,
   busy,
+  action,
+  mode,
+  onActionChange,
+  onModeChange,
   onFeedbackChange,
   onSubmit,
   onClose
@@ -1293,6 +1322,10 @@ function ReviewGenerationFeedbackDialog({
   feedback: string;
   error: string;
   busy: boolean;
+  action: ReviewGenerationAction;
+  mode: ReviewGenerationMode;
+  onActionChange: (value: ReviewGenerationAction) => void;
+  onModeChange: (value: ReviewGenerationMode) => void;
   onFeedbackChange: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
   onClose: () => void;
@@ -1316,14 +1349,16 @@ function ReviewGenerationFeedbackDialog({
       <form className="review-generation-dialog" role="dialog" aria-modal="true" aria-labelledby="review-generation-title" onSubmit={onSubmit}>
         <div className="review-generation-dialog-icon"><AlertTriangle size={20} /></div>
         <div className="review-generation-dialog-copy">
-          <h3 id="review-generation-title">需要人工补充后再生成</h3>
+          <h3 id="review-generation-title">选择资料处理方式</h3>
           <p className="review-generation-title" title={target.title}>{target.title}</p>
-          <p>自动修复会把下面的质量反馈交给下一轮 DeepSeek。你可以指出本节真正的重点、问题范围或需要保留的原始问句。</p>
+          <p>本次质量门禁未通过。你可以保留当前卡片，或选择新的生成策略；失败时旧版本不会被停用。</p>
           {diagnostics.length ? <div className="review-generation-feedback"><strong>最近质量反馈</strong><ul>{diagnostics.slice(-8).map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></div> : null}
-          <label><span>补充说明（必填）</span><textarea ref={inputRef} value={feedback} maxLength={2000} aria-invalid={Boolean(error)} aria-describedby={error ? 'review-generation-feedback-error' : undefined} onChange={(event) => onFeedbackChange(event.target.value)} placeholder="例如：本节只讲 Kafka delete 与 compact 两类清理策略，请逐条保留视频中的原始问题。" disabled={busy} />{error ? <small id="review-generation-feedback-error" className="review-generation-validation" role="alert">{error}</small> : null}</label>
+          {target.cardCount > 0 ? <fieldset className="review-generation-choice"><legend>处理动作</legend><label><input type="radio" name="review-generation-action" checked={action === 'KEEP_CURRENT'} onChange={() => onActionChange('KEEP_CURRENT')} disabled={busy} />保留当前卡片</label><label><input type="radio" name="review-generation-action" checked={action === 'REGENERATE'} onChange={() => onActionChange('REGENERATE')} disabled={busy} />重新生成</label></fieldset> : null}
+          {action === 'REGENERATE' ? <fieldset className="review-generation-choice"><legend>生成模式</legend><label><input type="radio" name="review-generation-mode" checked={mode === 'STANDARD'} onChange={() => onModeChange('STANDARD')} disabled={busy} />标准门禁<span>补充提示词后重试，质量要求最高</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'RELAXED'} onChange={() => onModeChange('RELAXED')} disabled={busy} />宽松门禁<span>保留真实 evidence，降低覆盖比例门槛</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'SEGMENTED'} onChange={() => onModeChange('SEGMENTED')} disabled={busy} />分段生成并合并<span>按资料段生成，合并全部通过门禁的卡片</span></label></fieldset> : null}
+          {action === 'REGENERATE' ? <label><span>补充说明{mode === 'STANDARD' ? '（标准模式必填）' : '（可选）'}</span><textarea ref={inputRef} value={feedback} maxLength={2000} aria-invalid={Boolean(error)} aria-describedby={error ? 'review-generation-feedback-error' : undefined} onChange={(event) => onFeedbackChange(event.target.value)} placeholder="例如：本节只讲 Kafka delete 与 compact 两类清理策略，请逐条保留视频中的原始问题。" disabled={busy} />{error ? <small id="review-generation-feedback-error" className="review-generation-validation" role="alert">{error}</small> : null}</label> : null}
           {busy ? <p className="review-generation-running-note">正在后台生成，可以关闭窗口，稍后查看资料状态。</p> : null}
         </div>
-        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose}>稍后处理</button><button className="primary-action" type="submit" disabled={busy || !feedback.trim()}>{busy ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}{busy ? '修复生成中' : '带说明重新生成'}</button></div>
+        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose}>稍后处理</button><button className="primary-action" type="submit" disabled={busy || (action === 'REGENERATE' && mode === 'STANDARD' && !feedback.trim())}>{busy ? <Loader2 className="spin" size={16} /> : action === 'KEEP_CURRENT' ? <Check size={16} /> : <RefreshCw size={16} />}{busy ? '处理中' : action === 'KEEP_CURRENT' ? '保留当前卡片' : '开始生成'}</button></div>
       </form>
     </div>
   );

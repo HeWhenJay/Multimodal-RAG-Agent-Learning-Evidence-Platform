@@ -133,10 +133,12 @@ class ReviewMaterialCardSnapshot(BaseModel):
 
 
 class ReviewMaterialRewriteRequest(BaseModel):
-    """请求把资料当前卡片重新组织为新的资料级卡片集合。"""
+    """请求把资料当前卡片重新组织为指定数量的新卡片集合。"""
 
     instruction: str = Field(..., min_length=1, max_length=2000)
     mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"] = "SOURCE_FIRST"
+    targetCardCount: int | None = Field(default=None, ge=1)
+    baseCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list)
 
     @field_validator("instruction")
     @classmethod
@@ -155,9 +157,10 @@ class ReviewMaterialRewritePreview(BaseModel):
     title: str
     sourceVersion: int = Field(ge=0)
     originalFingerprint: str = Field(..., min_length=16, max_length=128)
-    originalCardIds: list[int] = Field(default_factory=list, max_length=100)
-    originalCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list, max_length=100)
-    proposedCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list, min_length=1, max_length=8)
+    originalCardIds: list[int] = Field(default_factory=list)
+    originalCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list)
+    proposedCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list, min_length=1)
+    targetCardCount: int = Field(default=1, ge=1)
     originalSummary: str | None = None
     proposedSummary: str | None = None
     mergeNote: str | None = None
@@ -204,6 +207,7 @@ class ReviewMaterialRewriteTask(BaseModel):
     materialId: int = Field(ge=1)
     instruction: str
     mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    targetCardCount: int = Field(default=1, ge=1)
     status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
     progress: ReviewRewriteTaskProgress
     result: ReviewMaterialRewritePreview | None = None
@@ -217,8 +221,8 @@ class ReviewMaterialRewriteApplyRequest(BaseModel):
 
     sourceVersion: int = Field(ge=0)
     originalFingerprint: str = Field(..., min_length=16, max_length=128)
-    originalCardIds: list[int] = Field(..., min_length=1, max_length=100)
-    proposedCards: list[ReviewCardUpdateRequest] = Field(..., min_length=1, max_length=8)
+    originalCardIds: list[int] = Field(..., min_length=1)
+    proposedCards: list[ReviewCardUpdateRequest] = Field(..., min_length=1)
     proposedSummary: str | None = Field(default=None, max_length=5000)
 
     @field_validator("originalCardIds")
@@ -291,8 +295,10 @@ class ReviewGroupOrderResult(BaseModel):
 
 
 class ReviewGenerationRequest(BaseModel):
-    """用户在人工修复阶段提供的可选生成说明。"""
+    """用户在人工修复阶段选择的处理动作、门禁模式和可选说明。"""
 
+    action: Literal["REGENERATE", "KEEP_CURRENT"] = "REGENERATE"
+    mode: Literal["STANDARD", "RELAXED", "SEGMENTED"] = "STANDARD"
     userFeedback: str | None = Field(default=None, max_length=2000)
 
     @field_validator("userFeedback")

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.core.io_concurrency import run_llm_io
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import process_event
 from prompts.vision import DEFAULT_OCR_PROMPT
@@ -243,6 +244,11 @@ class BailianOcrClient:
         }
 
     def _post(self, payload: dict[str, Any], headers: dict[str, str]) -> Any:
+        """在线 OCR 请求统一交给专用 LLM I/O 线程池。"""
+        return run_llm_io(lambda: self._post_direct(payload, headers))
+
+    def _post_direct(self, payload: dict[str, Any], headers: dict[str, str]) -> Any:
+        """在线程池 worker 中执行实际 OCR HTTP 请求。"""
         url = f"{self.base_url}/chat/completions"
         if self._http_client is not None:
             return self._http_client.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)

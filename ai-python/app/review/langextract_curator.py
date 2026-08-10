@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.core.io_concurrency import configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.knowledge_extractor import (
     ReviewLlmEndpoint,
@@ -26,7 +26,6 @@ from app.schemas.rag import Evidence
 
 logger = logging.getLogger(__name__)
 LANGEXTRACT_CURATOR_VERSION = "langextract-curator-v1"
-MAX_PRODUCTION_CURATOR_UNITS = 32
 
 
 @dataclass(frozen=True)
@@ -142,7 +141,7 @@ class _CompletionsAuditProxy:
         try:
             def request_primary() -> Any:
                 with process_io_limiter.slot("review.langextract", self._max_in_flight):
-                    return self._delegate.create(**kwargs)
+                    return run_llm_io(lambda: self._delegate.create(**kwargs))
 
             response = call_cockpit_with_retry(
                 request_primary,
@@ -156,7 +155,7 @@ class _CompletionsAuditProxy:
             fallback_kwargs = dict(kwargs)
             fallback_kwargs["model"] = self._fallback_model
             with process_io_limiter.slot("review.langextract", self._max_in_flight):
-                response = self._fallback_delegate.create(**fallback_kwargs)
+                response = run_llm_io(lambda: self._fallback_delegate.create(**fallback_kwargs))
             if self._on_fallback is not None:
                 self._on_fallback()
             kwargs = fallback_kwargs
@@ -253,7 +252,7 @@ class LangExtractKnowledgeCurator:
         resolved_workers = max_workers if max_workers is not None else configured_io_workers(
             "REVIEW_LANGEXTRACT_MAX_WORKERS"
         )
-        self.max_workers = max(1, min(10, int(resolved_workers)))
+        self.max_workers = max(1, min(64, int(resolved_workers)))
         self.max_model_requests = max(1, min(64, int(max_model_requests)))
         resolved_timeout = (
             cockpit_retry_policy().request_timeout_seconds
@@ -495,9 +494,9 @@ def deduplicate_curator_candidates(
 def build_production_curator_context(
     result: LangExtractCuratorResult,
     *,
-    limit: int = MAX_PRODUCTION_CURATOR_UNITS,
+    limit: int | None = None,
 ) -> dict[str, Any]:
-    """把严格定位候选整理为线上生成图可消费的主题多样化知识单元。"""
+    """把全部严格定位候选整理为线上生成图可消费的主题多样化知识单元。"""
     selected = select_production_curator_candidates(list(result.candidates), limit=limit)
     knowledge_units = [
         {
@@ -505,7 +504,7 @@ def build_production_curator_context(
             "text": candidate.text,
             "topic": candidate.topic,
             "knowledgeType": candidate.knowledge_type,
-            # 卡片发布契约最多允许两个 evidenceId，候选上下文保持相同边界。
+            # 单张卡片最多引用两个 evidenceId，候选数量本身不设上限。
             "evidenceIds": list(candidate.evidence_ids[:2]),
         }
         for index, candidate in enumerate(selected, start=1)
@@ -527,10 +526,10 @@ def build_production_curator_context(
 def select_production_curator_candidates(
     candidates: list[CuratorCandidate],
     *,
-    limit: int = MAX_PRODUCTION_CURATOR_UNITS,
+    limit: int | None = None,
 ) -> list[CuratorCandidate]:
-    """先消除近重复，再按 topic 轮询，避免长资料前半段独占候选预算。"""
-    bounded_limit = max(1, min(MAX_PRODUCTION_CURATOR_UNITS, int(limit)))
+    """先消除近重复，再按 topic 轮询；默认保留全部候选，不设业务数量上限。"""
+    bounded_limit = None if limit is None else max(1, int(limit))
     unique: list[CuratorCandidate] = []
     for candidate in sorted(candidates, key=lambda item: (item.char_start, item.char_end)):
         if any(curator_candidates_are_near_duplicates(candidate, accepted) for accepted in unique):
@@ -551,7 +550,7 @@ def select_production_curator_candidates(
 
     selected: list[CuratorCandidate] = []
     offset = 0
-    while len(selected) < bounded_limit:
+    while bounded_limit is None or len(selected) < bounded_limit:
         appended = False
         for group_key in group_order:
             group = groups[group_key]
@@ -559,7 +558,7 @@ def select_production_curator_candidates(
                 continue
             selected.append(group[offset])
             appended = True
-            if len(selected) >= bounded_limit:
+            if bounded_limit is not None and len(selected) >= bounded_limit:
                 break
         if not appended:
             break

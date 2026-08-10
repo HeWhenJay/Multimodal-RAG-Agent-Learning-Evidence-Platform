@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.io_concurrency import run_llm_io
 from app.schemas.rag import Evidence
 from rag.observability.model_logging import log_model_call
 from rag.observability.process_logger import logged_rag_method, process_event
@@ -228,8 +229,11 @@ class BailianRerankClient:
             recoverable=True,
             fallback_message=f"使用 {self.model} 模型完成候选 evidence 重排事件失败，已降级到本地关键词重排继续处理",
         ):
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(url, headers=headers, json=payload)
+            def request_rerank():
+                with httpx.Client(timeout=self.timeout_seconds) as client:
+                    return client.post(url, headers=headers, json=payload)
+
+            response = run_llm_io(request_rerank)
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
         data = response.json()

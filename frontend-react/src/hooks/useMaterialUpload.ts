@@ -6,7 +6,8 @@ import type { LearningMaterial } from '../api/types';
 export const MATERIAL_FILE_ACCEPT = '.pdf,.doc,.docx,.ppt,.pptx,.md,.markdown,.xls,.xlsx,.txt,.srt,.vtt,.png,.jpg,.jpeg,.webp,.mp4,.mov,.m4v,.webm,.mkv,.avi';
 export const MATERIAL_UPLOADED_EVENT = 'learning-evidence:material-uploaded';
 const VIDEO_CHUNK_SIZE = 20 * 1024 * 1024;
-const VIDEO_CHUNK_UPLOAD_CONCURRENCY = readPositiveIntEnv('VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY', 2);
+// 视频分片上传属于网络 I/O，默认按 2n=16；服务端仍通过任务租约和队列保护资源。
+const VIDEO_CHUNK_UPLOAD_CONCURRENCY = readPositiveIntEnv('VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY', 16);
 const PROGRESS_POLL_INTERVAL_MS = 2000;
 const CHUNK_UPLOAD_RETRY_LIMIT = 3;
 const CHUNK_UPLOAD_SESSION_PREFIX = 'learning-evidence:chunk-upload:';

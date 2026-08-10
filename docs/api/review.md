@@ -1,6 +1,82 @@
 # 学习复习与提醒接口文档
 
-更新日期：2026-08-08
+更新日期：2026-08-10
+
+## 质量门禁分级与人工决策（2026-08-10）
+
+### 变更摘要
+
+复习生成不再把“所有结构化问句和所有 LangExtract 候选 100% 覆盖”作为唯一发布条件。单卡片仍必须
+引用真实 evidence、拒绝噪声和资料外事实；资料级完整性改为可解释的分级门禁。当自动修复耗尽后，
+用户可以保留当前可用卡片、补充提示词按标准门禁重试、使用宽松门禁重试，或把资料分段生成后合并。
+
+生成失败或进入 `NEEDS_REVIEW` 时，不再停用上一次已发布的 AI 卡片，也不重置其 FSRS 状态、到期时间、
+评分次数和遗忘次数。新候选只有完整通过所选模式门禁后才原子替换旧 AI 卡片。首次生成没有旧卡片时，
+“保留当前卡片”不可用，用户仍可选择另外三种重新生成方式。
+
+### 接口
+
+`POST /api/reviews/materials/{materialId}/generate`
+
+- 鉴权：`Authorization: Bearer <token>`，资料归属只从当前登录用户推导。
+- 默认请求体可以省略，兼容原有标准后台生成。
+- `REGENERATE` 立即返回 `GENERATING`，真实模型任务在线程池继续运行；前端沿用资料列表轮询
+  `generationProgress`、`qualityFeedback` 和终态。
+- `KEEP_CURRENT` 不调用模型；存在当前活动卡片时立即返回 `GENERATED`，否则返回中文业务失败信封。
+
+请求体：
+
+```json
+{
+  "action": "REGENERATE",
+  "mode": "RELAXED",
+  "userFeedback": "缓存穿透与布隆过滤器分别成卡，忽略重复口语问句"
+}
+```
+
+| 字段 | 可选值 | 说明 |
+| --- | --- | --- |
+| `action` | `REGENERATE`、`KEEP_CURRENT` | 默认 `REGENERATE`；保留当前卡片时不进入后台模型任务 |
+| `mode` | `STANDARD`、`RELAXED`、`SEGMENTED` | 默认 `STANDARD`；`KEEP_CURRENT` 时忽略 |
+| `userFeedback` | 0-2000 字 | 用户补充的重点、问题范围或原始问句，不作为事实来源 |
+
+成功信封保持 `Result<ReviewMaterial>`：
+
+```json
+{
+  "code": 1,
+  "msg": "success",
+  "data": {
+    "materialId": 42,
+    "status": "GENERATING",
+    "cardCount": 13,
+    "needsManualReview": false
+  }
+}
+```
+
+`cardCount` 在 `GENERATING`、`FAILED` 或 `NEEDS_REVIEW` 阶段可以保留上一个已发布版本的活动卡片数。
+这表示旧版仍可复习，不表示新候选已发布。
+
+### 三档生成策略
+
+| 模式 | 资料级覆盖门禁 | 单卡片 evidence 门禁 | 适用场景 |
+| --- | --- | --- | --- |
+| `STANDARD` | 口语结构化问题至少 65%，干净结构化资料至少 85%，LangExtract 候选至少 60% | 逐论断字符覆盖与连续原文片段使用原严格阈值 | 默认生成，兼顾完整性与稳定性 |
+| `RELAXED` | 结构化问题至少 45%，LangExtract 候选至少 40% | 仍要求真实 evidence、无噪声、每个论断与原文存在可核对重合；只适度降低字符阈值 | 已有较多合格卡但被完整性门禁卡住 |
+| `SEGMENTED` | 按连续 evidence/章节自动分段，每段使用宽松门禁，成功段按稳定来源键和规范化问题去重合并 | 每段独立校验；失败段不能污染成功段 | 长视频、知识点较多、单次模型难以覆盖完整资料 |
+
+以上比例是最低发布线，不是卡片数量目标。缺失候选仍写入 `qualityFeedback` 供用户审计。任何模式都不能
+接受不存在的 evidenceId、空答案、时间码/OCR 水印、无上下文问题或完全没有原文支撑的答案。
+
+### 失败与保留规则
+
+- 模型不可用、返回非法结构、所有分段都失败或没有任何合格卡片时，状态仍为 `FAILED`/`NEEDS_REVIEW`。
+- 失败只更新诊断、尝试次数和进度终态；已有活动卡片保持原样，新生成候选不部分覆盖数据库。
+- `KEEP_CURRENT` 只确认继续使用当前活动卡片；没有活动卡片时返回
+  `当前没有可保留的复习卡片，请选择重新生成方式`。
+- 宽松和分段模式仍是后台任务，重复点击同一资料继续受进程内任务去重和资料级生成锁保护。
+- Java 无需新增 AI 逻辑；React 只扩展请求类型和人工决策弹窗。
 
 ## 变更摘要
 
@@ -22,7 +98,7 @@
 
 今日资料标题上的拖拽手柄同时支持文件夹投放。用户把整份文档拖到文件夹卡片并松手后，前端调用既有批量归档接口，只改变该文档的文件夹归属；拖拽经过今日队列造成的临时排序会恢复，不额外写入资料优先级。主页面资料归档区支持逐份勾选和“全选未归档资料”，选择目标文件夹后一次批量进入；触屏与键盘用户无需使用拖拽也能完成批量归档。主页面和文件夹详情的文档排序均在松手位置显示虚影，松手后一次提交完整顺序，失败时恢复原顺序。
 
-结构化视频不再受普通资料“最多 8 张”的固定截断影响。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，同时由 LangExtract 从陈述式讲解中发现定义、机制、流程、因果、对比和实践结论。当结构化问题或严格定位候选超过 8 个时，单份资料动态放宽到最多 32 张；同主题连续细节可合并，但不得遗漏候选知识 ID。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
+结构化视频和普通学习资料均不设置卡片数量上限。提炼前先从整份清洗后 evidence 中提取讲者、课件或字幕已经明确列出的原始问题，同时由 LangExtract 从陈述式讲解中发现定义、机制、流程、因果、对比和实践结论。每个独立且通过 evidence 门禁的知识点都可以生成卡片；仅合并重复事实，不因数量抽样或截断候选。服务端继续逐卡执行问题完整性、答案忠实度和 evidence 引用门禁，不用数量目标放宽质量要求。
 
 新增卡片级和资料组级删除。卡片删除会立即停用卡片并保留稳定来源键排除记录，后续同步或重新生成不得恢复同一卡片；资料组删除会停用该资料的全部复习卡片并写入资料排除记录，后续自动同步、索引完成回调和手动生成都必须跳过。资料组删除只影响复习中心，不删除用户上传的原始文件、RAG 文档、切块或 evidence；既有 FSRS 评分日志继续保留，避免删除后篡改“今日已完成”等历史统计。
 
@@ -46,10 +122,10 @@
 - `dueCount` 表示全部到期卡片积压，`todayReviewedCount` 表示当天已经开始复习的资料数，`actionableDueCount` 表示扣除资料额度后仍可进入队列的资料数；同一资料已开始复习时，即使额度用尽也会继续展示该资料剩余到期卡片。顶部徽标和浏览器通知只使用后者。
 - 资料同步按 `learning_material.index_request_version` 与提炼器版本幂等。资料重建索引或 Prompt 升级后，按资料分批刷新模型摘要、知识点正文和 evidence；同一稳定来源键的卡片继续保留既有 FSRS 学习状态。
 - 资料先执行确定性的本地前置过滤，只判断是否属于学习资料并分配内部类别；纯时间码、字幕水印、口头语、会议纪要、日志、歌词等杂项直接写入 `SKIPPED`，不调用 `gpt-5.6-terra`。通过过滤后，独立的复习 PAE/ReAct LangGraph 执行“规划—LangExtract Curator—生成—质量观察—修复”循环。Curator 对完整 evidence 只运行一次，Repair 复用候选，不重复执行长文抽取。图的 `recursion_limit` 固定为 `999`，卡片 `gpt-5.6-terra` 真实调用默认最多 `8` 次，可通过 `REVIEW_GENERATION_MAX_ATTEMPTS` 调整；递归上限不能被解释为 999 次模型请求。
-- `REVIEW_LLM_API_KEY` 缺失等不可执行错误写入 `FAILED`。`DEEPSEEK_API_KEY` 或 `REVIEW_LLM_FALLBACK_API_KEY` 仅用于主中转失败后的 DeepSeek 降级，不能代替主密钥。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，停用该资料当前活跃卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，必须由用户携带补充说明再次生成。
+- `REVIEW_LLM_API_KEY` 缺失等不可执行错误写入 `FAILED`。`DEEPSEEK_API_KEY` 或 `REVIEW_LLM_FALLBACK_API_KEY` 仅用于主中转失败后的 DeepSeek 降级，不能代替主密钥。模型输出未通过问题完整性、结构化问题覆盖与 evidence 门禁时，观察节点必须形成逐项中文诊断并送入下一轮 Prompt；尝试耗尽或 LangGraph 递归异常后写入 `NEEDS_REVIEW`，保留该资料当前活动卡片，并持久化 `generationAttempts` 与 `qualityFeedback`。`NEEDS_REVIEW` 不参加后台自动重试，用户可在决策弹窗中保留旧版、输入提示词重试、降低门禁或选择分段合并。
 - `FAILED` 和 `NEEDS_REVIEW` 资料的 `reason` 是可诊断字段，前端资料分组会直接展示失败或人工处理原因。服务启动日志也会提示密钥缺失，但不会阻止其他 RAG 接口启动。Windows 本地开发中，若长时间运行的 PyCharm 没有继承新设置的用户环境变量，服务会只读当前用户的 `HKCU\Environment` 并把 `REVIEW_LLM_API_KEY`、`DEEPSEEK_API_KEY` 等实际已配置密钥注入当前进程，随后由 `run.py` 启动的 API 与 worker 统一继承；不会读取其他账户、不会把密钥写入配置文件或日志。
 - 复习生成期间，`ReviewMaterial.generationProgress` 持久化当前阶段和最近 12 条事件。阶段包括 evidence 整理、Planner 规划、LangExtract 知识发现、`gpt-5.6-terra` 生成、Observer 质量校验、Repair 自动修复、卡片保存和人工处理；Curator 会公开原始候选、精确定位候选、最终选择数与模型请求数。`percent`、`currentStep/totalSteps`、`attempt/maxAttempts` 与 `detail` 可直接驱动前端进度条和流程时间线。服务重启后仍可读取最后阶段快照，超过 20 分钟未更新的 `GENERATING` 资料允许下一轮同步恢复。
-- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前资料提炼卡片版本为 `review-card-v12`，单卡片改写 Prompt 为 `review-card-rewrite-v1`，资料级合并改写 Prompt 为 `review-material-rewrite-v1`。v12 在 v11 的问题清洗、可选问号、`sourceQuestion` 审计和增量 Repair 基础上，要求答案尽量使用安全 Markdown；资料提炼仍引入最多 32 个 LangExtract `knowledgeUnitId`，模型必须为卡片回传覆盖 ID，服务端校验候选 evidence 与卡片 evidence 至少有一项重合，并拒绝未完整覆盖的结果。`gpt-5.6-terra` 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
+- 复习功能的所有 LLM Prompt 统一放在 `ai-python/prompts/`，当前资料提炼卡片版本为 `review-card-v12`，单卡片改写 Prompt 为 `review-card-rewrite-v1`，资料级改写 Prompt 为 `review-material-rewrite-v2`。资料级改写的 `targetCardCount` 只要求为正整数，不设固定上限；模型必须返回与目标数量一致的 `cards` 数组。v12 在 v11 的问题清洗、可选问号、`sourceQuestion` 审计和增量 Repair 基础上，要求答案尽量使用安全 Markdown；资料提炼会把全部 LangExtract `knowledgeUnitId` 传入模型，模型必须为卡片回传覆盖 ID，服务端校验候选 evidence 与卡片 evidence 至少有一项重合，并拒绝未完整覆盖的结果。`gpt-5.6-terra` 空响应或非法 JSON 在当前质量轮内最多短程重试 3 次，不消耗 LangGraph 质量修复轮次。逐论断答案仍必须由所引用 evidence 支撑，业务模块不得生成或改写面向用户的摘要、问题、答案与提示。
 - 所有复习 LLM 调用主路径统一使用本机 OpenAI-compatible Cockpit 中转 `http://localhost:58966/v1` 的 `gpt-5.6-terra`，显式开启 `thinking.type=enabled`，思考强度固定为 `reasoning_effort=max`。主密钥读取 `REVIEW_LLM_API_KEY`。项目客户端按 Cockpit“长等待方案”给内部账号与平台轮换留出完整窗口：流打开窗口 180 秒、空闲窗口 240 秒、启动重试 1 次、请求重试 1 次、退避 300-1500 毫秒；因此默认客户端等待窗口为 615 秒。连接失败、超时、429、5xx、Cockpit 账号授权失效导致的 401/403 会先向 Cockpit 重试一次，只有两次 Cockpit 请求都失败后才允许直连 DeepSeek `deepseek-v4-flash`。400、404、422 等确定性请求错误不在 Cockpit 重试，避免错误请求形成重试风暴。进度、摘要和失败原因必须区分“Cockpit 重试”与“DeepSeek 降级”。不得继承通用 `RAG_LLM_MODEL`、`DASHSCOPE_API_KEY` 或其他代理配置。
 - 视频、面经和讲解类资料在送模前先从原始 transcript evidence 抽取原始问句候选，父段摘要与 OCR 转场不得进入候选。模型必须优先选择资料中已经明确提出、且由后续原文回答的重点问题，并在输出中回传 `sourceQuestion` 作为来源审计；最终 `question` 由本次实际调用模型输出为去除口头语、指代完整、可脱离上下文独立理解的问句。只有没有合适原问句时才允许根据重点事实生成新问题，且不得生成脱离资料表述的泛化问题。
 - 发布前质量门禁必须逐卡拒绝：`父段摘要：`、时间码或 OCR 水印；“那是什么意思”“这些是什么”等无上下文指代；陈述句、转场句和未完成问句；“本节关键知识点是什么”等泛化占位题；答案为空、答案与问题明显错位、引用不存在或答案缺少 evidence 支撑。学习资料还必须包含一份非空模型摘要和至少一张通过门禁的卡片，否则整次结果为 `FAILED`。
@@ -78,16 +154,19 @@ Cockpit 重试参数默认与本机“长等待方案”保持一致：
 
 线上默认并发与预算：
 
+本项目并发基准固定为 `n=8`：模型、LangExtract、embedding、rerank、OCR、ASR 和数据库等待等 I/O 阶段默认 `2n=16`；视频解码、递归切块和本地计算等 CPU/内存阶段默认 `n+1=9`。环境变量仍可按实际配额下调。
+
 | 环节 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `REVIEW_LANGEXTRACT_MAX_WORKERS` | `8` | 同一 pass 内并发处理文本块，硬上限 10 |
+| `LLM_IO_MAX_WORKERS` | `16` | Agent、RAG、复习、简历、OCR/ASR 等在线模型请求共用的专用 I/O 线程池，硬上限 64 |
+| `REVIEW_LANGEXTRACT_MAX_WORKERS` | `16` | 同一 pass 内并发处理文本块；模型等待属于 I/O，硬上限 64 |
 | `REVIEW_LANGEXTRACT_EXTRACTION_PASSES` | `2` | 两轮串行执行，提高召回；不会跨 pass 并发 |
 | `REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER` | `8000` | 单个文本块字符预算 |
 | `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | `32` | 单份资料 LangExtract 请求总预算 |
 | `REVIEW_LANGEXTRACT_TIMEOUT_SECONDS` | `120` | 单个 LangExtract 请求超时 |
-| `REVIEW_DEEPSEEK_MAX_IN_FLIGHT` | `8` | 卡片生成请求的进程级并发闸门 |
+| `REVIEW_DEEPSEEK_MAX_IN_FLIGHT` | `16` | 卡片生成请求的进程级 I/O 并发闸门 |
 
-LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待当前实际模型 HTTP；项目在客户端代理外再增加进程级共享闸门，保证多份资料同时生成时不会把“每份 8 个 worker”相乘成无界请求数。配置超过 10 时回退或限制在安全范围，降低配置不当造成的限流和内存压力。
+LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待当前实际模型 HTTP；项目在客户端代理外再增加进程级共享闸门，默认按 2n=16 控制 I/O 并发，避免多份资料叠加后形成无界请求数。配置超过 64 时回退或限制在安全范围，降低配置不当造成的限流和内存压力。
 
 密钥只从用户环境变量 `DEEPSEEK_API_KEY` 读取。默认优先使用当前进程环境；Windows 进程环境缺失时，再只读当前用户的 `HKCU\Environment`，并缓存到当前进程供受监督 worker 继承。Linux、容器和服务器环境仍只使用标准进程环境。复习生成不会读取 `SUBAI_BASE_URL`、`SU_BAI_API_KEY`、`DASHSCOPE_API_KEY` 或通用 RAG 模型配置，也不存在本地内容降级。Windows 用户级配置示例：
 
@@ -114,7 +193,7 @@ LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待当前实际�
 | POST | `/api/reviews/materials/{materialId}/rewrite-tasks` | 创建资料级后台合并/重新生成任务，立即返回任务编号 |
 | GET | `/api/reviews/materials/{materialId}/rewrite-tasks/latest` | 获取当前资料最近一次合并/重新生成任务 |
 | GET | `/api/reviews/materials/{materialId}/rewrite-tasks/{taskId}` | 查询资料级改写任务的阶段、进度和对比结果 |
-| POST | `/api/reviews/materials/{materialId}/rewrite-apply` | 携带预览版本和用户确认后的 1 张候选，事务内替换旧卡片 |
+| POST | `/api/reviews/materials/{materialId}/rewrite-apply` | 携带预览版本和用户确认后的任意数量候选，事务内替换旧卡片 |
 | POST | `/api/reviews/materials/{materialId}/cards` | 创建一张用户手动复习卡片，不依赖 AI 补漏 |
 | POST | `/api/reviews/materials/{materialId}/missing-knowledge` | 兼容旧客户端：同步查找并追加遗漏知识点 |
 | POST | `/api/reviews/materials/{materialId}/missing-knowledge/tasks` | 创建后台补漏任务，立即返回任务编号 |
@@ -212,12 +291,19 @@ Content-Type: application/json
 Authorization: Bearer <token>
 
 {
-  "instruction": "将当前 4 张 Kafka 卡片合并成 1 张综合卡片，保留全部核心机制",
-  "mode": "SOURCE_FIRST"
+  "instruction": "保留这次生成的内容，新添一张卡片，说明旧项目表不可修改时如何维护 inbox 和 outbox",
+  "mode": "SOURCE_FIRST",
+  "targetCardCount": 2
 }
 ```
 
-关闭弹窗不会取消任务；重新打开时通过 `GET /api/reviews/materials/12/rewrite-tasks/latest` 恢复，再查询具体任务。完成后的 `result` 包含原卡片、综合候选、资料版本和正文指纹，数据库仍保持不变。用户确认后才调用 `rewrite-apply`；因此后台生成、关闭弹窗和恢复查看均不会绕过前后对比与并发覆盖校验。同一用户、同一资料的运行任务会被复用。任务也采用进程内状态，Python API 重启后需重新提交。
+关闭弹窗不会取消任务；重新打开时通过 `GET /api/reviews/materials/12/rewrite-tasks/latest` 恢复，再查询具体任务。`targetCardCount` 可指定任意正整数；不传时服务端会识别“新增一张/返回两张”等中文要求，自动推断总数为 2。用户在已有预览上点击“重新生成候选”时，前端会把当前编辑后的候选作为 `baseCards` 一并提交；服务端将这些基础候选原样固定为结果前缀，只采用模型生成的末尾新增卡，硬保证“保留这次生成的内容”不会被模型重新改写。完成后的 `result.proposedCards` 数量必须等于目标数量；数据库仍保持不变。用户确认后才调用 `rewrite-apply`，应用接口在一个事务内停用旧活动卡片并插入全部确认后的候选，不设固定数量上限。同一用户、同一资料的运行任务会被复用。任务也采用进程内状态，Python API 重启后需重新提交。
+
+当旧项目表属于只读遗留表时，不应直接修改它：
+
+- `Inbox` 表接收外部消息或待处理候选，保存幂等键、原始 payload、处理状态、重试次数和错误信息，供消费者安全重放。
+- `Outbox` 表与本地业务事务一起记录待发布事件；事务提交后由发布器投递到 Kafka/任务队列，成功标记 `PUBLISHED`，失败按退避策略重试。它解决“数据库已写入但消息没有发出去”的双写问题。
+- 复习卡片场景可把 AI 候选先写入 Inbox，用户确认后在事务中写入新卡片并写 Outbox 事件；旧表只读，旧卡片通过排除记录或新表视图隐藏，不需要回写遗留表。
 
 ```http
 POST /api/reviews/materials/12/rewrite-preview
@@ -230,7 +316,7 @@ Authorization: Bearer <token>
 }
 ```
 
-预览响应包含 `originalCards`、恰好 1 张 `proposedCards`、`originalSummary`、`proposedSummary`、`sourceVersion` 和 `originalFingerprint`，不会改变数据库。用户可以编辑候选内容后提交：
+预览响应包含 `originalCards`、目标数量的 `proposedCards`、`targetCardCount`、`originalSummary`、`proposedSummary`、`sourceVersion` 和 `originalFingerprint`，不会改变数据库。用户可以逐张编辑候选内容后提交：
 
 ```http
 POST /api/reviews/materials/12/rewrite-apply
@@ -248,6 +334,12 @@ Authorization: Bearer <token>
     "hint": "回忆分区、顺序写、页缓存和零拷贝",
     "rewriteMode": "SOURCE_FIRST",
     "evidenceIds": ["chunk-1", "chunk-2"]
+  }, {
+    "question": "旧项目表不可修改时，Inbox 和 Outbox 如何协作？",
+    "answer": "Inbox 负责接收和暂存待处理消息；Outbox 在事务内记录待发布事件，由发布器可靠投递并按幂等键去重。",
+    "hint": "回忆接收、事务记录、发布和重试",
+    "rewriteMode": "SOURCE_FIRST",
+    "evidenceIds": ["chunk-3"]
   }]
 }
 ```

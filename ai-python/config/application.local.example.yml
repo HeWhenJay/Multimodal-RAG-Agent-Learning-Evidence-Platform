@@ -6,6 +6,10 @@ server:
   port: ${AI_SERVICE_PORT:8090}
   reload: ${AI_SERVICE_RELOAD:true}
 
+llm:
+  # I/O 密集型在线模型调用的进程级线程数，本机可按账号配额和网络容量调整。
+  io-max-workers: ${LLM_IO_MAX_WORKERS:16}
+
 storage:
   # 本地开发默认写 uploads/rag；生产切换为 oss 并补齐下方环境变量。
   provider: ${EVIDENCE_STORAGE_PROVIDER:local}
@@ -20,9 +24,15 @@ storage:
 
 rag:
   embedding:
-    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:8}
+    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:16}
   retrieval:
-    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:8}
+    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:16}
+  index:
+    chunk-workers: ${RAG_INDEX_CHUNK_WORKERS:9}
+  kafka:
+    worker:
+      handler-concurrency: ${RAG_KAFKA_HANDLER_CONCURRENCY:9}
+      control-concurrency: ${RAG_KAFKA_CONTROL_CONCURRENCY:16}
   # 可按本机数据分布覆盖融合和无百炼时的本地重排权重。
   fusion:
     strategy: ${RAG_FUSION_STRATEGY:weighted_rrf}
@@ -51,7 +61,7 @@ review:
       base-url: ${REVIEW_LLM_FALLBACK_BASE_URL:https://api.deepseek.com}
       api-key: ${REVIEW_LLM_FALLBACK_API_KEY:}
     timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:615}
-    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:8}
+    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:16}
     cockpit:
       retry-enabled: ${REVIEW_COCKPIT_RETRY_ENABLED:true}
       stream-open-timeout-seconds: ${REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS:180}
@@ -65,9 +75,20 @@ review:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
     max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
-    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:8}
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:16}
     max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
     timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:615}
+
+workers:
+  outbox:
+    publish-concurrency: ${RAG_OUTBOX_PUBLISH_CONCURRENCY:16}
+  agent:
+    batch-size: ${AGENT_WORKER_BATCH_SIZE:16}
+    concurrency: ${AGENT_WORKER_CONCURRENCY:16}
+  rag-task:
+    concurrency: ${RAG_TASK_WORKER_CONCURRENCY:9}
+  review-sync:
+    max-workers: ${RAG_REVIEW_SYNC_WORKERS:16}
 
 dashscope:
   api-key: ${DASHSCOPE_API_KEY:}
@@ -91,6 +112,7 @@ remote-video:
     max-wait-seconds: ${RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS:900}
 
 video:
+  parallel-workers: ${RAG_VIDEO_PARALLEL_WORKERS:9}
   # 未加入 PATH 时可填完整路径，例如 C:\ffmpeg\bin\ffmpeg.exe。
   ffmpeg-command: ${FFMPEG_COMMAND:}
   ffprobe-command: ${FFPROBE_COMMAND:}

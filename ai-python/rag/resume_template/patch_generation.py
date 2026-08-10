@@ -7,6 +7,7 @@ from typing import Any
 from openai import OpenAI
 from pydantic import ValidationError
 
+from app.core.io_concurrency import run_llm_io
 from app.schemas.resume_template import (
     ResumeContentPatch,
     ResumePatchEvidence,
@@ -143,24 +144,26 @@ def choose_provider(provider: str) -> str:
 def generate_with_openai_structured_outputs(request: ResumePatchGenerationRequest, schema: dict[str, Any]) -> list[ResumeContentPatch]:
     """调用 OpenAI Structured Outputs，强制模型返回 JSON Schema 补丁。"""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_RESUME_PATCH_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
-        temperature=0.2,
-        messages=[
-            {
-                "role": "system",
-                "content": resume_patch_system_prompt(strict=True),
+    response = run_llm_io(
+        lambda: client.chat.completions.create(
+            model=os.getenv("OPENAI_RESUME_PATCH_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": resume_patch_system_prompt(strict=True),
+                },
+                {"role": "user", "content": build_generation_prompt(request)},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": SCHEMA_NAME,
+                    "schema": schema,
+                    "strict": True,
+                },
             },
-            {"role": "user", "content": build_generation_prompt(request)},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": SCHEMA_NAME,
-                "schema": schema,
-                "strict": True,
-            },
-        },
+        )
     )
     content = response.choices[0].message.content or "{}"
     return parse_patch_payload(content)
@@ -172,14 +175,16 @@ def generate_with_dashscope_json_mode(request: ResumePatchGenerationRequest) -> 
         api_key=os.getenv("DASHSCOPE_API_KEY"),
         base_url=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     )
-    response = client.chat.completions.create(
-        model=os.getenv("DASHSCOPE_RESUME_PATCH_MODEL", os.getenv("RAG_LLM_MODEL", "qwen-plus")),
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": resume_patch_system_prompt()},
-            {"role": "user", "content": build_generation_prompt(request)},
-        ],
-        response_format={"type": "json_object"},
+    response = run_llm_io(
+        lambda: client.chat.completions.create(
+            model=os.getenv("DASHSCOPE_RESUME_PATCH_MODEL", os.getenv("RAG_LLM_MODEL", "qwen-plus")),
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": resume_patch_system_prompt()},
+                {"role": "user", "content": build_generation_prompt(request)},
+            ],
+            response_format={"type": "json_object"},
+        )
     )
     content = response.choices[0].message.content or "{}"
     return parse_patch_payload(content)

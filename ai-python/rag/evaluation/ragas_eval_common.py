@@ -1043,7 +1043,7 @@ def load_ragas_eval_settings() -> RagasEvalSettings:
         timeout_seconds=_parse_positive_float("RAGAS_EVAL_TIMEOUT_SECONDS", "60"),
         max_retries=_parse_non_negative_int("RAGAS_EVAL_MAX_RETRIES", "2"),
         max_wait_seconds=_parse_positive_float("RAGAS_EVAL_MAX_WAIT_SECONDS", "10"),
-        max_workers=_parse_positive_int("RAGAS_EVAL_MAX_WORKERS", "2"),
+        max_workers=_parse_positive_int("RAGAS_EVAL_MAX_WORKERS", "16"),
         batch_size=_parse_optional_positive_int("RAGAS_EVAL_BATCH_SIZE"),
         temperature=_parse_temperature("RAGAS_EVAL_TEMPERATURE", "0"),
         max_tokens=_parse_optional_positive_int("RAGAS_EVAL_MAX_TOKENS"),

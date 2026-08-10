@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
@@ -8,6 +10,7 @@ import socket
 from typing import Any
 from uuid import uuid4
 
+from app.core.io_concurrency import configured_io_workers
 from rag.kafka.producer import KafkaJsonProducer
 
 
@@ -193,7 +196,7 @@ class RagOutboxPublisher:
         self.publisher_id = publisher_id or build_publisher_id()
 
     def publish_due_events(self) -> OutboxPublishResult:
-        """抢占一批到期事件，Kafka 确认成功后才写入 `PUBLISHED`。"""
+        """抢占到期事件并按消息键并行发布，Kafka 确认后才写入 `PUBLISHED`。"""
         now = datetime.now(timezone.utc)
         events = self.repository.claim_due_events(
             now=now,
@@ -201,9 +204,33 @@ class RagOutboxPublisher:
             publisher_id=self.publisher_id,
             lease_seconds=positive_int("RAG_OUTBOX_LEASE_SECONDS", 60),
         )
+        if not events:
+            return OutboxPublishResult(claimed=0, published=0, failed=0)
+
+        event_groups: dict[tuple[str, str], list[RagOutboxEvent]] = defaultdict(list)
+        for event in events:
+            event_groups[(event.topic, event.message_key)].append(event)
+
+        worker_count = min(
+            configured_io_workers("RAG_OUTBOX_PUBLISH_CONCURRENCY"),
+            len(event_groups),
+        )
         published = 0
         failed = 0
-        for event in events:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="rag-outbox-publish") as pool:
+            futures = [pool.submit(self._publish_event_group, group) for group in event_groups.values()]
+            for future in as_completed(futures):
+                group_published, group_failed = future.result()
+                published += group_published
+                failed += group_failed
+
+        return OutboxPublishResult(claimed=len(events), published=published, failed=failed)
+
+    def _publish_event_group(self, events: list[RagOutboxEvent]) -> tuple[int, int]:
+        """同一 topic/key 内按事件 ID 串行发布，避免并发破坏分区消息顺序。"""
+        published = 0
+        failed = 0
+        for event in sorted(events, key=lambda item: item.id):
             try:
                 self.producer.send_serialized(
                     event.topic,
@@ -226,7 +253,7 @@ class RagOutboxPublisher:
                     event.topic,
                     exc.__class__.__name__,
                 )
-        return OutboxPublishResult(claimed=len(events), published=published, failed=failed)
+        return published, failed
 
 
 def build_publisher_id() -> str:

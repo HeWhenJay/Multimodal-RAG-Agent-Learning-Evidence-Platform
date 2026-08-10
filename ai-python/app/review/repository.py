@@ -195,6 +195,12 @@ class ReviewTransaction(Protocol):
         event: dict[str, Any],
     ) -> ReviewMaterialRecord | None: ...
 
+    def keep_current_generation(
+        self,
+        material: MaterialSourceRecord,
+        event: dict[str, Any],
+    ) -> ReviewMaterialRecord | None: ...
+
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]: ...
 
     def list_review_folders(self, user_id: str, *, now: datetime) -> list[ReviewFolderRecord]: ...
@@ -834,7 +840,7 @@ class DatabaseReviewTransaction:
         self._cursor.execute(
             self._statement(
                 """
-                INSERT INTO {schema}.learning_review_material (
+                INSERT INTO {schema}.learning_review_material AS current_review (
                     material_id, user_id, index_request_version, is_learning_content,
                     category, summary, status, reason, extractor, card_count, generated_at
                     , generation_attempts, quality_feedback, generation_progress
@@ -843,9 +849,24 @@ class DatabaseReviewTransaction:
                 ON CONFLICT (material_id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     index_request_version = EXCLUDED.index_request_version,
-                    is_learning_content = EXCLUDED.is_learning_content,
-                    category = EXCLUDED.category,
-                    summary = EXCLUDED.summary,
+                    is_learning_content = CASE
+                        WHEN EXCLUDED.status IN ('FAILED', 'NEEDS_REVIEW')
+                             AND current_review.card_count > 0
+                        THEN current_review.is_learning_content
+                        ELSE EXCLUDED.is_learning_content
+                    END,
+                    category = CASE
+                        WHEN EXCLUDED.status IN ('FAILED', 'NEEDS_REVIEW')
+                             AND current_review.card_count > 0
+                        THEN current_review.category
+                        ELSE EXCLUDED.category
+                    END,
+                    summary = CASE
+                        WHEN EXCLUDED.status IN ('FAILED', 'NEEDS_REVIEW')
+                             AND current_review.card_count > 0
+                        THEN current_review.summary
+                        ELSE EXCLUDED.summary
+                    END,
                     status = EXCLUDED.status,
                     reason = EXCLUDED.reason,
                     extractor = EXCLUDED.extractor,
@@ -854,7 +875,7 @@ class DatabaseReviewTransaction:
                     generation_progress = EXCLUDED.generation_progress,
                     generated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE {schema}.learning_review_material.index_request_version <= EXCLUDED.index_request_version
+                WHERE current_review.index_request_version <= EXCLUDED.index_request_version
                 RETURNING id
                 """
             ),
@@ -881,65 +902,66 @@ class DatabaseReviewTransaction:
                 return current
             raise RuntimeError("保存复习资料分类时检测到索引版本冲突")
         review_material_id = int(inserted_row["id"])
-        self._cursor.execute(
-            self._statement(
-                """
-                SELECT source_key
-                FROM {schema}.learning_review_card_exclusion
-                WHERE material_id = %s AND user_id = %s
-                """
-            ),
-            (material.id, material.user_id),
-        )
-        excluded_source_keys = {str(row["source_key"]) for row in self._cursor.fetchall()}
-        self._cursor.execute(
-            self._statement(
-                """
-                UPDATE {schema}.learning_review_card
-                SET active = FALSE, updated_at = CURRENT_TIMESTAMP
-                WHERE material_id = %s AND user_id = %s
-                  AND source_key NOT LIKE 'manual:%%'
-                  AND source_key NOT LIKE 'custom:%%'
-                """
-            ),
-            (material.id, material.user_id),
-        )
-        for card in cards:
-            if card.source_key in excluded_source_keys:
-                continue
+        if status in {"GENERATED", "SKIPPED"}:
             self._cursor.execute(
                 self._statement(
                     """
-                    INSERT INTO {schema}.learning_review_card (
-                        review_material_id, material_id, user_id, source_key,
-                        question, answer, hint, evidence_refs, fsrs_card_json,
-                        due_at, retrievability, review_count, lapse_count, active
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 0, 0, 0, TRUE)
-                    ON CONFLICT (material_id, source_key) DO UPDATE SET
-                        review_material_id = EXCLUDED.review_material_id,
-                        user_id = EXCLUDED.user_id,
-                        question = EXCLUDED.question,
-                        answer = EXCLUDED.answer,
-                        hint = EXCLUDED.hint,
-                        evidence_refs = EXCLUDED.evidence_refs,
-                        active = TRUE,
-                        updated_at = CURRENT_TIMESTAMP
+                    SELECT source_key
+                    FROM {schema}.learning_review_card_exclusion
+                    WHERE material_id = %s AND user_id = %s
                     """
                 ),
-                (
-                    review_material_id,
-                    material.id,
-                    material.user_id,
-                    card.source_key,
-                    card.question,
-                    card.answer,
-                    card.hint,
-                    card.evidence_refs_json,
-                    card.fsrs_card_json,
-                    card.due_at,
-                ),
+                (material.id, material.user_id),
             )
+            excluded_source_keys = {str(row["source_key"]) for row in self._cursor.fetchall()}
+            self._cursor.execute(
+                self._statement(
+                    """
+                    UPDATE {schema}.learning_review_card
+                    SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+                    WHERE material_id = %s AND user_id = %s
+                      AND source_key NOT LIKE 'manual:%%'
+                      AND source_key NOT LIKE 'custom:%%'
+                    """
+                ),
+                (material.id, material.user_id),
+            )
+            for card in cards:
+                if card.source_key in excluded_source_keys:
+                    continue
+                self._cursor.execute(
+                    self._statement(
+                        """
+                        INSERT INTO {schema}.learning_review_card (
+                            review_material_id, material_id, user_id, source_key,
+                            question, answer, hint, evidence_refs, fsrs_card_json,
+                            due_at, retrievability, review_count, lapse_count, active
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 0, 0, 0, TRUE)
+                        ON CONFLICT (material_id, source_key) DO UPDATE SET
+                            review_material_id = EXCLUDED.review_material_id,
+                            user_id = EXCLUDED.user_id,
+                            question = EXCLUDED.question,
+                            answer = EXCLUDED.answer,
+                            hint = EXCLUDED.hint,
+                            evidence_refs = EXCLUDED.evidence_refs,
+                            active = TRUE,
+                            updated_at = CURRENT_TIMESTAMP
+                        """
+                    ),
+                    (
+                        review_material_id,
+                        material.id,
+                        material.user_id,
+                        card.source_key,
+                        card.question,
+                        card.answer,
+                        card.hint,
+                        card.evidence_refs_json,
+                        card.fsrs_card_json,
+                        card.due_at,
+                    ),
+                )
         self._cursor.execute(
             self._statement(
                 """
@@ -958,6 +980,66 @@ class DatabaseReviewTransaction:
         if record is None:
             raise RuntimeError("保存复习资料分类后无法读取结果")
         return record
+
+    def keep_current_generation(
+        self,
+        material: MaterialSourceRecord,
+        event: dict[str, Any],
+    ) -> ReviewMaterialRecord | None:
+        """确认继续使用当前活动卡片，不恢复历史已淘汰候选。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.index_request_version,
+                       rm.id AS review_material_id,
+                       rm.generation_progress
+                FROM {schema}.learning_material lm
+                JOIN {schema}.learning_review_material rm ON rm.material_id = lm.id
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm, rm
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        current = self._cursor.fetchone()
+        if current is None:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT COUNT(1) AS card_count
+                FROM {schema}.learning_review_card
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        card_count = int((self._cursor.fetchone() or {}).get("card_count") or 0)
+        if card_count <= 0:
+            return None
+        progress = merge_generation_progress(current.get("generation_progress"), event)
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material
+                SET index_request_version = %s,
+                    status = 'GENERATED',
+                    reason = '用户选择保留当前可用卡片',
+                    card_count = %s,
+                    generation_progress = %s::jsonb,
+                    generated_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """
+            ),
+            (
+                int(current.get("index_request_version") or material.index_request_version),
+                card_count,
+                json.dumps(progress, ensure_ascii=False, separators=(",", ":")),
+                int(current["review_material_id"]),
+            ),
+        )
+        return self._find_review_material(material.id, material.user_id)
 
     def list_review_materials(self, user_id: str, limit: int = 100) -> list[ReviewMaterialRecord]:
         """先读取未归档资料，再按资料 ID 批量读取复习状态，避免资料列表多表联查。"""

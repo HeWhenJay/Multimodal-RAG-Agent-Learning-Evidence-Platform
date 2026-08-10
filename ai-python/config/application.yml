@@ -6,6 +6,10 @@ server:
   port: ${AI_SERVICE_PORT:8090}
   reload: ${AI_SERVICE_RELOAD:true}
 
+llm:
+  # 所有在线模型 HTTP 请求共用专用 I/O 线程池，避免阻塞 API、Worker 或 Agent 编排线程。
+  io-max-workers: ${LLM_IO_MAX_WORKERS:16}
+
 rag:
   store:
     backend: ${RAG_STORE_BACKEND:pgvector}
@@ -21,10 +25,13 @@ rag:
     timeout-seconds: ${RAG_EMBEDDING_TIMEOUT_SECONDS:30}
     batch-max-size: ${RAG_EMBEDDING_BATCH_MAX_SIZE:10}
     batch-wait-ms: ${RAG_EMBEDDING_BATCH_WAIT_MS:1000}
-    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:8}
+    max-in-flight: ${RAG_EMBEDDING_MAX_IN_FLIGHT:16}
   retrieval:
-    # Multi-Query 的 pgvector 请求属于外部 I/O，本机 28 线程/16GB 内存默认使用 8 个有界 worker。
-    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:8}
+    # Multi-Query 的 pgvector 请求属于外部 I/O，默认按 2n=16 个有界 worker。
+    io-workers: ${RAG_RETRIEVAL_IO_WORKERS:16}
+  index:
+    # 递归切块与本地 token 统计属于 CPU/内存阶段，默认 n+1=9。
+    chunk-workers: ${RAG_INDEX_CHUNK_WORKERS:9}
   rerank:
     provider: ${RAG_RERANK_PROVIDER:auto}
     model: ${RAG_RERANK_MODEL:qwen3-rerank}
@@ -67,6 +74,10 @@ rag:
     worker:
       auto-offset-reset: ${RAG_KAFKA_AUTO_OFFSET_RESET:earliest}
       max-poll-interval-ms: ${RAG_KAFKA_MAX_POLL_INTERVAL_MS:21600000}
+      # 单分区内按资料 key 并发执行，CPU/内存密集索引默认 n+1=9 个长任务槽。
+      handler-concurrency: ${RAG_KAFKA_HANDLER_CONCURRENCY:9}
+      # 控制消息独立保留容量，属于网络/数据库 I/O，默认 2n=16。
+      control-concurrency: ${RAG_KAFKA_CONTROL_CONCURRENCY:16}
       reconnect-initial-seconds: ${RAG_KAFKA_RECONNECT_INITIAL_SECONDS:1}
       reconnect-max-seconds: ${RAG_KAFKA_RECONNECT_MAX_SECONDS:30}
     producer:
@@ -110,7 +121,7 @@ review:
       api-key: ${REVIEW_LLM_FALLBACK_API_KEY:}
     # 615 秒覆盖 Cockpit 两次 180 秒流打开、240 秒流空闲和 15 秒余量。
     timeout-seconds: ${REVIEW_EXTRACTION_TIMEOUT_SECONDS:615}
-    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:8}
+    max-in-flight: ${REVIEW_DEEPSEEK_MAX_IN_FLIGHT:16}
     cockpit:
       retry-enabled: ${REVIEW_COCKPIT_RETRY_ENABLED:true}
       stream-open-timeout-seconds: ${REVIEW_COCKPIT_STREAM_OPEN_TIMEOUT_SECONDS:180}
@@ -124,7 +135,7 @@ review:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
     max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
-    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:8}
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:16}
     max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
     timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:615}
 
@@ -136,6 +147,8 @@ workers:
   outbox:
     enabled: ${RAG_OUTBOX_PUBLISHER_ENABLED:true}
     batch-size: ${RAG_OUTBOX_BATCH_SIZE:50}
+    # Kafka/数据库等待属于 I/O；不同消息 key 默认按 2n=16 并发，同 key 保序。
+    publish-concurrency: ${RAG_OUTBOX_PUBLISH_CONCURRENCY:16}
     lease-seconds: ${RAG_OUTBOX_LEASE_SECONDS:60}
     publish-fixed-delay-ms: ${RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS:1000}
     max-attempts: ${RAG_OUTBOX_MAX_ATTEMPTS:8}
@@ -149,13 +162,19 @@ workers:
   agent:
     enabled: ${AI_AGENT_WORKER_ENABLED:true}
     poll-interval-seconds: ${AI_AGENT_WORKER_POLL_INTERVAL_SECONDS:0.5}
+    batch-size: ${AGENT_WORKER_BATCH_SIZE:16}
+    concurrency: ${AGENT_WORKER_CONCURRENCY:16}
   rag-task:
     enabled: ${RAG_TASK_WORKER_ENABLED:true}
     poll-interval-seconds: ${RAG_TASK_WORKER_POLL_SECONDS:1}
-    batch-size: ${RAG_TASK_WORKER_BATCH_SIZE:4}
+    batch-size: ${RAG_TASK_WORKER_BATCH_SIZE:9}
+    concurrency: ${RAG_TASK_WORKER_CONCURRENCY:9}
     lease-seconds: ${RAG_TASK_WORKER_LEASE_SECONDS:120}
     query-task-ttl-seconds: ${RAG_QUERY_TASK_TTL_SECONDS:1800}
     local-index-enabled: ${RAG_LOCAL_INDEX_WORKER_ENABLED:true}
+  review-sync:
+    # RAG 终态回写后异步生成复习卡片；模型等待属于 I/O，默认使用 2n=16。
+    max-workers: ${RAG_REVIEW_SYNC_WORKERS:16}
 
 auth:
   database-url: ${AUTH_DATABASE_URL:}
@@ -204,7 +223,7 @@ ocr:
     # 不使用未经官方确认的多图单请求，微批内仍是一帧一请求。
     batch-max-size: ${RAG_VIDEO_OCR_BATCH_MAX_SIZE:4}
     batch-wait-ms: ${RAG_VIDEO_OCR_BATCH_WAIT_MS:800}
-    max-in-flight: ${RAG_VIDEO_OCR_MAX_IN_FLIGHT:2}
+    max-in-flight: ${RAG_VIDEO_OCR_MAX_IN_FLIGHT:16}
 
 asr:
   provider: ${RAG_ASR_PROVIDER:auto}
@@ -223,8 +242,12 @@ asr:
   filetrans-poll-interval-seconds: ${RAG_ASR_FILETRANS_POLL_INTERVAL_SECONDS:2}
   batch-max-size: ${RAG_ASR_BATCH_MAX_SIZE:4}
   batch-wait-ms: ${RAG_ASR_BATCH_WAIT_MS:1000}
-  max-in-flight: ${RAG_ASR_MAX_IN_FLIGHT:2}
+  max-in-flight: ${RAG_ASR_MAX_IN_FLIGHT:16}
   rpm-limit: ${RAG_ASR_RPM_LIMIT:90}
+
+video:
+  # 视频解码、切片和分段解析属于 CPU/内存阶段，默认 n+1=9。
+  parallel-workers: ${RAG_VIDEO_PARALLEL_WORKERS:9}
 
 remote-video:
   douyin:

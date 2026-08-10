@@ -12,6 +12,7 @@ import threading
 import tempfile
 from typing import Any
 
+from app.core.io_concurrency import configured_cpu_workers
 from app.schemas.rag import DocumentBlock
 from rag.core.models import ParsedBlockDocument
 from rag.loaders.document_parsers import DocumentParserRouter, mark_video_evidence_quality
@@ -31,7 +32,7 @@ from video.chunking.video_processing import (
 
 
 DEFAULT_SEGMENT_TARGET_MIB = 20
-DEFAULT_WORKER_COUNT = 2
+DEFAULT_WORKER_COUNT = 9
 MIN_SEGMENT_SECONDS = 15
 MEANINGFUL_VIDEO_CHANNELS = {"subtitle", "frame_ocr"}
 PARSER_NAME_MAX_LENGTH = 80
@@ -540,9 +541,9 @@ def segment_target_bytes() -> int:
 
 
 def worker_count_from_env() -> int:
-    """读取后端片段 Worker 数量，默认 2 个 Worker 抢同一个队列。"""
+    """读取视频解码、分段解析线程数，CPU/内存阶段默认按 n+1=9。"""
 
-    return positive_int("RAG_VIDEO_PARALLEL_WORKERS", DEFAULT_WORKER_COUNT)
+    return configured_cpu_workers("RAG_VIDEO_PARALLEL_WORKERS")
 
 
 def segment_filename(filename: str, index: int) -> str:

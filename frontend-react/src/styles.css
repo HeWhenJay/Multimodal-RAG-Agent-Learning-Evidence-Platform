@@ -1249,6 +1249,32 @@ input:disabled {
   padding-left: 22px;
 }
 
+.markdown-text ol {
+  list-style-type: decimal;
+}
+
+.markdown-text ol ol {
+  list-style-type: lower-alpha;
+}
+
+.markdown-text ol ol ol {
+  list-style-type: lower-roman;
+}
+
+.markdown-text ul ul {
+  list-style-type: circle;
+}
+
+.markdown-text ul ul ul {
+  list-style-type: square;
+}
+
+.markdown-text li > ul,
+.markdown-text li > ol {
+  margin-top: 5px;
+  margin-bottom: 5px;
+}
+
 .markdown-text li {
   margin: 6px 0;
 }

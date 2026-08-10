@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +20,7 @@ from app.schemas.rag_control import RagQueryPublicRequest
 from app.services.rag_control_service import RagControlService
 from app.workers.rag_kafka_state import RagKafkaStateWriter
 from app.workers.rag_task_worker import RagDurableTaskWorker
+from app.workers.review_sync_dispatcher import ReviewSyncDispatcher
 
 
 class EmptyIndexRepository:
@@ -311,7 +314,16 @@ def test_index_result_builds_terminal_progress_without_cross_topic_ordering() ->
 def test_successful_promote_triggers_idempotent_review_generation() -> None:
     """资料真正可检索后应按 materialId 触发复习生成，重复消息仍交给业务幂等检查。"""
     material_ids: list[int] = []
-    writer = RagKafkaStateWriter(repository=StateRepository(), review_sync=material_ids.append)
+
+    class ImmediateDispatcher:
+        def submit(self, material_id: int) -> bool:
+            material_ids.append(material_id)
+            return True
+
+    writer = RagKafkaStateWriter(
+        repository=StateRepository(),
+        review_dispatcher=ImmediateDispatcher(),  # type: ignore[arg-type]
+    )
     promote = event("RAG_PROMOTE_RESULT").model_copy(
         update={"payload": {"jobId": "job-1", "materialId": 7, "requestVersion": 1, "status": "SUCCEEDED"}}
     )
@@ -323,13 +335,48 @@ def test_successful_promote_triggers_idempotent_review_generation() -> None:
 def test_failed_promote_does_not_trigger_review_generation() -> None:
     """RAG 提升失败时没有可用 canonical evidence，不能提前生成复习卡片。"""
     material_ids: list[int] = []
-    writer = RagKafkaStateWriter(repository=StateRepository(), review_sync=material_ids.append)
+
+    class ImmediateDispatcher:
+        def submit(self, material_id: int) -> bool:
+            material_ids.append(material_id)
+            return True
+
+    writer = RagKafkaStateWriter(
+        repository=StateRepository(),
+        review_dispatcher=ImmediateDispatcher(),  # type: ignore[arg-type]
+    )
     promote = event("RAG_PROMOTE_RESULT").model_copy(
         update={"payload": {"jobId": "job-1", "materialId": 7, "requestVersion": 1, "status": "FAILED"}}
     )
 
     assert writer.handle_promote_result(promote) is True
     assert material_ids == []
+
+
+def test_promote_result_does_not_wait_for_review_llm_generation() -> None:
+    """LangExtract/复习 LLM 必须在独立线程池执行，不能阻塞 Kafka promote offset。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_review(_material_id: int) -> None:
+        started.set()
+        release.wait(1.0)
+
+    dispatcher = ReviewSyncDispatcher(slow_review, max_workers=1)
+    writer = RagKafkaStateWriter(repository=StateRepository(), review_dispatcher=dispatcher)
+    promote = event("RAG_PROMOTE_RESULT").model_copy(
+        update={"payload": {"jobId": "job-1", "materialId": 7, "requestVersion": 1, "status": "SUCCEEDED"}}
+    )
+
+    begin = time.perf_counter()
+    try:
+        assert writer.handle_promote_result(promote) is True
+        elapsed = time.perf_counter() - begin
+        assert elapsed < 0.2
+        assert started.wait(0.5)
+    finally:
+        release.set()
+        dispatcher.close()
 
 
 def test_local_index_worker_consumes_durable_job_without_kafka(monkeypatch) -> None:

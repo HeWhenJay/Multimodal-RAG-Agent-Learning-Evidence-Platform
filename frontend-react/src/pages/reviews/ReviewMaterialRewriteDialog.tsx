@@ -39,7 +39,8 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
   const [mode, setMode] = useState<ReviewCardRewriteMode>('SOURCE_FIRST');
   const [instruction, setInstruction] = useState(DEFAULT_INSTRUCTION);
   const [preview, setPreview] = useState<ReviewMaterialRewritePreview | null>(null);
-  const [draft, setDraft] = useState<ReviewCardContent>({ question: '', answer: '', hint: '' });
+  const [drafts, setDrafts] = useState<ReviewCardContent[]>([]);
+  const [targetCardCount, setTargetCardCount] = useState<number | null>(null);
   const [draftSummary, setDraftSummary] = useState('');
   const [starting, setStarting] = useState(false);
   const [task, setTask] = useState<ReviewMaterialRewriteTask | null>(null);
@@ -53,7 +54,8 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
     setMode('SOURCE_FIRST');
     setInstruction(DEFAULT_INSTRUCTION);
     setPreview(null);
-    setDraft({ question: '', answer: '', hint: '' });
+    setDrafts([]);
+    setTargetCardCount(null);
     setDraftSummary(target.summary || '');
     setStarting(false);
     setTask(null);
@@ -66,7 +68,7 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
         setMode(latest.mode);
         if (latest.result) {
           setPreview(latest.result);
-          setDraft(latest.result.proposedCards[0]?.content || { question: '', answer: '', hint: '' });
+          setDrafts(latest.result.proposedCards.map((card) => card.content));
           setDraftSummary(latest.result.proposedSummary || latest.result.originalSummary || '');
         }
         if (latest.status === 'FAILED') setError(latest.error || '资料级改写预览生成失败');
@@ -97,7 +99,7 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
         setTask(nextTask);
         if (nextTask.status === 'SUCCEEDED' && nextTask.result) {
           setPreview(nextTask.result);
-          setDraft(nextTask.result.proposedCards[0]?.content || { question: '', answer: '', hint: '' });
+          setDrafts(nextTask.result.proposedCards.map((card) => card.content));
           setDraftSummary(nextTask.result.proposedSummary || nextTask.result.originalSummary || '');
         } else if (nextTask.status === 'FAILED') {
           setError(nextTask.error || '资料级改写预览生成失败');
@@ -128,13 +130,22 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
     setError('');
     setPreview(null);
     try {
-      const nextTask = await startReviewMaterialRewriteTask(activeTarget.materialId, { instruction: instruction.trim(), mode });
+      const nextTask = await startReviewMaterialRewriteTask(activeTarget.materialId, {
+        instruction: instruction.trim(),
+        mode,
+        targetCardCount,
+        baseCards: preview?.proposedCards.map((card, index) => ({
+          ...card,
+          cardId: null,
+          content: drafts[index] || card.content
+        })) || []
+      });
       setTask(nextTask);
       setInstruction(nextTask.instruction);
       setMode(nextTask.mode);
       if (nextTask.result) {
         setPreview(nextTask.result);
-        setDraft(nextTask.result.proposedCards[0]?.content || { question: '', answer: '', hint: '' });
+        setDrafts(nextTask.result.proposedCards.map((card) => card.content));
         setDraftSummary(nextTask.result.proposedSummary || nextTask.result.originalSummary || '');
       }
       if (nextTask.status === 'FAILED') setError(nextTask.error || '资料级改写预览生成失败');
@@ -146,23 +157,23 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
   }
 
   async function applyPreview() {
-    if (!preview || !draft.question.trim() || !draft.answer.trim() || applying) return;
+    if (!preview || applying || drafts.length !== preview.proposedCards.length) return;
+    if (drafts.some((draft) => !draft.question.trim() || !draft.answer.trim())) return;
     setApplying(true);
     setError('');
     try {
-      const sourceCandidate = preview.proposedCards[0];
       const result = await applyReviewMaterialRewrite(activeTarget.materialId, {
         sourceVersion: preview.sourceVersion,
         originalFingerprint: preview.originalFingerprint,
         originalCardIds: preview.originalCardIds,
         proposedSummary: draftSummary.trim() || null,
-        proposedCards: [{
+        proposedCards: drafts.map((draft, index) => ({
           question: draft.question.trim(),
           answer: draft.answer.trim(),
           hint: draft.hint?.trim() || null,
           rewriteMode: preview.mode,
-          evidenceIds: sourceCandidate?.evidenceIds || []
-        }]
+          evidenceIds: preview.proposedCards[index]?.evidenceIds || []
+        }))
       });
       await onApplied(result);
       onClose();
@@ -177,7 +188,7 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
     <div className="review-delete-overlay review-rewrite-overlay" role="dialog" aria-modal="true" aria-labelledby="review-material-rewrite-title" onMouseDown={(event) => { if (event.target === event.currentTarget && !applying) onClose(); }}>
       <section className="review-rewrite-dialog review-material-rewrite-dialog" aria-busy={busy}>
         <header className="review-card-editor-header">
-          <div><span className="review-card-editor-icon is-ai"><WandSparkles size={18} /></span><div><h3 id="review-material-rewrite-title">AI 重组整份资料</h3><p>当前 {target.cardCount} 张卡片会先合并为 1 张综合卡片，确认前不会覆盖原内容。</p></div></div>
+          <div><span className="review-card-editor-icon is-ai"><WandSparkles size={18} /></span><div><h3 id="review-material-rewrite-title">AI 重组整份资料</h3><p>当前 {target.cardCount} 张卡片会先重组为目标数量的独立候选，确认前不会覆盖原内容。</p></div></div>
           <button className="icon-button compact" type="button" onClick={onClose} disabled={applying} title={busy ? '关闭窗口并在后台继续' : '关闭资料改写'} aria-label={busy ? '关闭窗口并在后台继续' : '关闭资料改写'}><X size={18} /></button>
         </header>
         {error ? <div className="review-alert danger">{error}</div> : null}
@@ -186,6 +197,7 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
             {REWRITE_MODES.map((option) => <button key={option.value} type="button" role="radio" aria-checked={mode === option.value} className={mode === option.value ? 'is-active' : ''} onClick={() => { setMode(option.value); setPreview(null); }} disabled={busy || applying}><strong>{option.label}</strong><span>{option.detail}</span></button>)}
           </div>
           <label className="review-rewrite-instruction"><span>告诉 AI 你希望怎样修改</span><textarea value={instruction} maxLength={2000} rows={3} onChange={(event) => setInstruction(event.target.value)} disabled={busy || applying} /></label>
+          <label className="review-rewrite-card-count"><span>候选卡片数量</span><input type="number" min={1} step={1} value={targetCardCount ?? ''} placeholder="自动识别" onChange={(event) => { const value = event.target.value.trim(); setTargetCardCount(value ? Math.max(1, Number(value)) : null); }} disabled={busy || applying} /><small>留空自动识别；输入任意正整数，不设置卡片数量上限。</small></label>
           <button className="primary-action" type="submit" disabled={!instruction.trim() || busy || applying}>{busy ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}{busy ? '后台生成中' : preview ? '重新生成候选' : '生成资料级对比'}</button>
         </form>
         {task && progress ? (
@@ -204,10 +216,10 @@ export function ReviewMaterialRewriteDialog({ target, onClose, onApplied }: Revi
           <div className="review-rewrite-comparison review-material-comparison" aria-label="资料原卡片与综合卡片对比">
             <div className="review-material-original-column"><div className="review-comparison-column-title">修改前 · {preview.originalCards.length} 张卡片</div>{preview.originalCards.map((card, index) => <ComparisonCard key={card.cardId || index} label={`原卡片 ${index + 1}`} content={card.content} tone="original" />)}</div>
             <div className="review-rewrite-arrow" aria-hidden="true"><ArrowRight size={20} /></div>
-            <div className="review-rewrite-proposed-column"><div className="review-comparison-column-title">修改后 · 1 张综合卡片</div><ComparisonCard label="综合卡片" content={draft} tone="proposed" /><div className="review-rewrite-inline-editor"><label><span>新摘要（可选）</span><textarea value={draftSummary} maxLength={5000} rows={4} onChange={(event) => setDraftSummary(event.target.value)} disabled={applying} /></label><label><span>新问题</span><textarea value={draft.question} maxLength={500} rows={3} onChange={(event) => setDraft((previous) => ({ ...previous, question: event.target.value }))} disabled={applying} /></label><label><span>新答案（Markdown）</span><textarea value={draft.answer} maxLength={5000} rows={10} onChange={(event) => setDraft((previous) => ({ ...previous, answer: event.target.value }))} disabled={applying} /></label><label><span>新提示（可选）</span><textarea value={draft.hint || ''} maxLength={1000} rows={3} onChange={(event) => setDraft((previous) => ({ ...previous, hint: event.target.value }))} disabled={applying} /></label></div></div>
+            <div className="review-rewrite-proposed-column"><div className="review-comparison-column-title">修改后 · {drafts.length} 张候选卡片</div><div className="review-material-proposed-list">{drafts.map((draft, index) => <div className="review-material-proposed-item" key={`proposed-${index}`}><ComparisonCard label={`候选卡片 ${index + 1}`} content={draft} tone="proposed" /><div className="review-rewrite-inline-editor"><label><span>新问题</span><textarea value={draft.question} maxLength={500} rows={3} onChange={(event) => setDrafts((previous) => previous.map((item, itemIndex) => itemIndex === index ? { ...item, question: event.target.value } : item))} disabled={applying} /></label><label><span>新答案（Markdown）</span><textarea value={draft.answer} maxLength={5000} rows={8} onChange={(event) => setDrafts((previous) => previous.map((item, itemIndex) => itemIndex === index ? { ...item, answer: event.target.value } : item))} disabled={applying} /></label><label><span>新提示（可选）</span><textarea value={draft.hint || ''} maxLength={1000} rows={3} onChange={(event) => setDrafts((previous) => previous.map((item, itemIndex) => itemIndex === index ? { ...item, hint: event.target.value } : item))} disabled={applying} /></label></div></div>)}</div><div className="review-rewrite-inline-editor"><label><span>新摘要（可选）</span><textarea value={draftSummary} maxLength={5000} rows={4} onChange={(event) => setDraftSummary(event.target.value)} disabled={applying} /></label></div></div>
           </div>
           {preview.mergeNote ? <p className="review-material-merge-note"><Check size={14} />{preview.mergeNote}</p> : null}
-          <footer className="review-card-editor-footer review-rewrite-footer"><span><Check size={14} />由 {preview.modelName} 生成 · 原 {preview.originalCards.length} 张卡片将在确认后停用</span><div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={applying}><RotateCcw size={15} />回退并关闭</button><button className="primary-action" type="button" onClick={() => void applyPreview()} disabled={applying || !draft.question.trim() || !draft.answer.trim()}>{applying ? <Loader2 className="spin" size={16} /> : <Check size={16} />}{applying ? '覆盖中' : '确认覆盖为 1 张'}</button></div></footer>
+          <footer className="review-card-editor-footer review-rewrite-footer"><span><Check size={14} />由 {preview.modelName} 生成 · 原 {preview.originalCards.length} 张卡片将在确认后停用</span><div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose} disabled={applying}><RotateCcw size={15} />回退并关闭</button><button className="primary-action" type="button" onClick={() => void applyPreview()} disabled={applying || drafts.length !== preview.proposedCards.length || drafts.some((draft) => !draft.question.trim() || !draft.answer.trim())}>{applying ? <Loader2 className="spin" size={16} /> : <Check size={16} />}{applying ? '覆盖中' : `确认覆盖为 ${drafts.length} 张`}</button></div></footer>
         </> : null}
       </section>
     </div>

@@ -15,6 +15,13 @@ from run import (
 from app.workers.supervisor import build_worker_command
 
 
+def test_llm_io_thread_pool_config_env_mapping_is_effective():
+    """统一模型 I/O 线程数必须能从 YAML 映射为环境变量。"""
+    env_defaults = build_env_defaults({"llm": {"io-max-workers": 24}})
+
+    assert env_defaults["LLM_IO_MAX_WORKERS"] == "24"
+
+
 def test_fusion_and_local_rerank_config_env_mapping_is_effective():
     """校验融合与本地重排配置能从 YAML 映射为运行环境变量。"""
     env_defaults = build_env_defaults(
@@ -282,13 +289,15 @@ def test_worker_cron_config_env_mapping_is_effective():
                 "outbox": {
                     "enabled": True,
                     "batch-size": 20,
+                    "publish-concurrency": 16,
                     "lease-seconds": 45,
                     "publish-fixed-delay-ms": 750,
                     "max-attempts": 6,
                     "publish-timeout-ms": 2500,
                 },
                 "staging-cleanup": {"enabled": False, "fixed-delay-seconds": 600},
-                "rag-task": {"enabled": True, "poll-interval-seconds": 0.2},
+                "rag-task": {"enabled": True, "poll-interval-seconds": 0.2, "concurrency": 4},
+                "review-sync": {"max-workers": 2},
             }
         }
     )
@@ -297,6 +306,7 @@ def test_worker_cron_config_env_mapping_is_effective():
     assert env_defaults["AI_CRON_POLL_INTERVAL_SECONDS"] == "0.25"
     assert env_defaults["RAG_OUTBOX_PUBLISHER_ENABLED"] == "true"
     assert env_defaults["RAG_OUTBOX_BATCH_SIZE"] == "20"
+    assert env_defaults["RAG_OUTBOX_PUBLISH_CONCURRENCY"] == "16"
     assert env_defaults["RAG_OUTBOX_LEASE_SECONDS"] == "45"
     assert env_defaults["RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS"] == "750"
     assert env_defaults["RAG_OUTBOX_MAX_ATTEMPTS"] == "6"
@@ -305,6 +315,8 @@ def test_worker_cron_config_env_mapping_is_effective():
     assert env_defaults["RAG_STAGING_CLEANUP_FIXED_DELAY_SECONDS"] == "600"
     assert env_defaults["RAG_TASK_WORKER_ENABLED"] == "true"
     assert env_defaults["RAG_TASK_WORKER_POLL_SECONDS"] == "0.2"
+    assert env_defaults["RAG_TASK_WORKER_CONCURRENCY"] == "4"
+    assert env_defaults["RAG_REVIEW_SYNC_WORKERS"] == "2"
 
 
 def test_kafka_worker_consumer_config_env_mapping_is_effective():
@@ -316,6 +328,8 @@ def test_kafka_worker_consumer_config_env_mapping_is_effective():
                     "worker": {
                         "auto-offset-reset": "latest",
                         "max-poll-interval-ms": 1_800_000,
+                        "handler-concurrency": 6,
+                        "control-concurrency": 2,
                     }
                 }
             }
@@ -324,6 +338,8 @@ def test_kafka_worker_consumer_config_env_mapping_is_effective():
 
     assert env_defaults["RAG_KAFKA_AUTO_OFFSET_RESET"] == "latest"
     assert env_defaults["RAG_KAFKA_MAX_POLL_INTERVAL_MS"] == "1800000"
+    assert env_defaults["RAG_KAFKA_HANDLER_CONCURRENCY"] == "6"
+    assert env_defaults["RAG_KAFKA_CONTROL_CONCURRENCY"] == "2"
 
 
 def test_cron_cli_override_and_worker_config_forwarding(monkeypatch):

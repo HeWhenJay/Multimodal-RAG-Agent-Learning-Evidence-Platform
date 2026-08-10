@@ -53,7 +53,7 @@ from app.schemas.rag import (
     QueryRequest,
     QueryResponse,
 )
-from app.core.io_concurrency import configured_io_workers, process_io_limiter
+from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter, run_llm_io
 
 
 TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_+#.-]+")
@@ -67,12 +67,8 @@ DEFAULT_FUSION_DIAGNOSTIC_LIMIT = 20
 
 
 def index_chunk_workers() -> int:
-    """读取后端 RAG chunk Worker 数；默认 2，防止本机内存紧张时过度并发。"""
-    try:
-        configured = int(os.getenv("RAG_INDEX_CHUNK_WORKERS", "2"))
-    except ValueError:
-        configured = 2
-    return max(1, min(configured, 8))
+    """读取递归切块和本地 token 统计 Worker 数，CPU/内存阶段默认 n+1=9。"""
+    return configured_cpu_workers("RAG_INDEX_CHUNK_WORKERS")
 
 
 @dataclass(frozen=True)
@@ -1030,7 +1026,7 @@ def embedding_batch_config() -> EmbeddingBatchConfig:
     )
     wait_ms = read_bounded_int_env("RAG_EMBEDDING_BATCH_WAIT_MS", 1000, minimum=0, maximum=10000, warnings=warnings)
     max_in_flight = read_bounded_int_env(
-        "RAG_EMBEDDING_MAX_IN_FLIGHT", 8, minimum=1, maximum=10, warnings=warnings
+        "RAG_EMBEDDING_MAX_IN_FLIGHT", 16, minimum=1, maximum=64, warnings=warnings
     )
     for warning in warnings:
         process_event(
@@ -1143,8 +1139,11 @@ def dashscope_embed_texts(texts: list[str], *, model: str, dimensions: int) -> l
             "rag.embedding",
             configured_io_workers("RAG_EMBEDDING_MAX_IN_FLIGHT"),
         ):
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(f"{base_url}/embeddings", headers=headers, json=payload)
+            def request_embeddings():
+                with httpx.Client(timeout=timeout) as client:
+                    return client.post(f"{base_url}/embeddings", headers=headers, json=payload)
+
+            response = run_llm_io(request_embeddings)
     if response.status_code >= 400:
         raise RuntimeError(f"百炼 embedding 调用失败: HTTP {response.status_code} {response.text[:500]}")
     data = response.json()

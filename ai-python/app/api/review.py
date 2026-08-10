@@ -14,7 +14,9 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Query
 
 from app.core.current_user import CurrentUser
+from app.core.io_concurrency import configured_io_workers
 from app.core.result import BusinessError, Result
+from app.review.card_rewriter import infer_material_rewrite_card_count
 from app.review.generation_guard import ReviewGenerationGuard
 from app.review.service import ReviewService
 from app.schemas.review import (
@@ -62,20 +64,20 @@ router = APIRouter(prefix="/api/reviews", tags=["学习复习"])
 T = TypeVar("T")
 _generation_guard = ReviewGenerationGuard()
 _review_generation_executor = ThreadPoolExecutor(
-    max_workers=2,
+    max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
     thread_name_prefix="review-generation",
 )
 _review_generation_jobs_lock = Lock()
 _review_generation_jobs: set[tuple[str, int]] = set()
 _missing_knowledge_executor = ThreadPoolExecutor(
-    max_workers=2,
+    max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
     thread_name_prefix="review-missing-knowledge",
 )
 _missing_knowledge_jobs_lock = Lock()
 _missing_knowledge_jobs: dict[str, "_MissingKnowledgeJob"] = {}
 _latest_missing_knowledge_jobs: dict[tuple[str, int], str] = {}
 _review_rewrite_executor = ThreadPoolExecutor(
-    max_workers=2,
+    max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
     thread_name_prefix="review-rewrite",
 )
 _review_rewrite_jobs_lock = Lock()
@@ -110,6 +112,8 @@ class _ReviewRewriteJob:
     target_kind: str
     target_id: int
     payload: ReviewCardRewriteRequest | ReviewMaterialRewriteRequest
+    target_card_count: int = 1
+    base_cards: tuple[Any, ...] = ()
     status: str = "QUEUED"
     progress: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -287,14 +291,26 @@ def generate_review_material(
     payload: ReviewGenerationRequest | None = None,
     service: ReviewService = Depends(get_review_service),
 ) -> Result[ReviewMaterial]:
-    """对一条当前用户资料重新分类并生成关键知识点，可携带人工补充说明。"""
+    """按用户选择保留当前卡片，或用指定门禁模式重新生成。"""
     user_id = str(current_user.id)
     feedback = payload.userFeedback if payload else None
-    queued = execute(
-        "准备后台生成学习资料复习卡片",
-        lambda: service.prepare_material_generation(material_id, user_id),
-    )
-    _submit_review_generation(service, material_id, user_id, feedback)
+    action = payload.action if payload else "REGENERATE"
+    mode = payload.mode if payload else "STANDARD"
+    if action == "KEEP_CURRENT":
+        return Result.success(
+            execute(
+                "保留当前学习资料复习卡片",
+                lambda: service.keep_current_generation(material_id, user_id),
+            )
+        )
+    def prepare_generation() -> ReviewMaterial:
+        """兼容旧测试替身，同时把非标准门禁档位传递给服务层。"""
+        if mode == "STANDARD":
+            return service.prepare_material_generation(material_id, user_id)
+        return service.prepare_material_generation(material_id, user_id, generation_mode=mode)
+
+    queued = execute("准备后台生成学习资料复习卡片", prepare_generation)
+    _submit_review_generation(service, material_id, user_id, feedback, mode)
     return Result.success(
         queued
     )
@@ -332,7 +348,7 @@ def start_review_material_rewrite_task(
     """创建资料级后台合并改写任务，并立即返回任务状态。"""
     user_id = str(current_user.id)
     with _review_rewrite_jobs_lock:
-        existing = _find_active_review_rewrite_job(user_id, "MATERIAL", material_id)
+        existing = _find_active_review_rewrite_job(user_id, "MATERIAL", material_id, payload)
         if existing is not None:
             return Result.success(_material_rewrite_task_response(existing))
         job = _create_review_rewrite_job(user_id, "MATERIAL", material_id, payload)
@@ -574,7 +590,7 @@ def start_review_card_rewrite_task(
     """创建单卡片后台改写任务，并立即返回任务状态。"""
     user_id = str(current_user.id)
     with _review_rewrite_jobs_lock:
-        existing = _find_active_review_rewrite_job(user_id, "CARD", card_id)
+        existing = _find_active_review_rewrite_job(user_id, "CARD", card_id, payload)
         if existing is not None:
             return Result.success(_card_rewrite_task_response(existing))
         job = _create_review_rewrite_job(user_id, "CARD", card_id, payload)
@@ -689,11 +705,18 @@ def _find_active_review_rewrite_job(
     user_id: str,
     target_kind: str,
     target_id: int,
+    payload: ReviewCardRewriteRequest | ReviewMaterialRewriteRequest,
 ) -> _ReviewRewriteJob | None:
-    """复用同一用户与目标尚未结束的改写任务，避免重复调用模型。"""
+    """只复用请求内容完全相同的运行任务，避免新指令被旧任务吞掉。"""
     task_id = _latest_review_rewrite_jobs.get((user_id, target_kind, target_id))
     job = _review_rewrite_jobs.get(task_id) if task_id else None
-    return job if job and job.status in {"QUEUED", "RUNNING"} else None
+    return (
+        job
+        if job
+        and job.status in {"QUEUED", "RUNNING"}
+        and job.payload.model_dump(mode="json") == payload.model_dump(mode="json")
+        else None
+    )
 
 
 def _create_review_rewrite_job(
@@ -704,12 +727,39 @@ def _create_review_rewrite_job(
 ) -> _ReviewRewriteJob:
     """在持锁状态下登记改写任务及其初始排队进度。"""
     prefix = "card-rewrite" if target_kind == "CARD" else "material-rewrite"
+    key = (user_id, target_kind, target_id)
+    previous_task_id = _latest_review_rewrite_jobs.get(key)
+    previous = _review_rewrite_jobs.get(previous_task_id) if previous_task_id else None
+    if previous and previous.status in {"QUEUED", "RUNNING"}:
+        previous.error = "已提交新的改写要求，本任务结果不再使用"
+        _set_review_rewrite_progress(
+            previous,
+            status="FAILED",
+            stage_code=f"rewrite.{target_kind.lower()}.superseded",
+            stage_label="已由新任务替代",
+            message=previous.error,
+            percent=100,
+        )
     job = _ReviewRewriteJob(
         task_id=f"{prefix}-{uuid4().hex[:12]}",
         user_id=user_id,
         target_kind=target_kind,
         target_id=target_id,
         payload=payload,
+        target_card_count=(
+            infer_material_rewrite_card_count(
+                payload.instruction,
+                payload.targetCardCount,
+                base_card_count=len(payload.baseCards) or 1,
+            )
+            if target_kind == "MATERIAL" and isinstance(payload, ReviewMaterialRewriteRequest)
+            else 1
+        ),
+        base_cards=(
+            tuple(payload.baseCards)
+            if target_kind == "MATERIAL" and isinstance(payload, ReviewMaterialRewriteRequest)
+            else ()
+        ),
     )
     _set_review_rewrite_progress(
         job,
@@ -720,7 +770,7 @@ def _create_review_rewrite_job(
         percent=0,
     )
     _review_rewrite_jobs[job.task_id] = job
-    _latest_review_rewrite_jobs[(user_id, target_kind, target_id)] = job.task_id
+    _latest_review_rewrite_jobs[key] = job.task_id
     _trim_review_rewrite_jobs()
     return job
 
@@ -806,6 +856,7 @@ def _material_rewrite_task_response(job: _ReviewRewriteJob) -> ReviewMaterialRew
         materialId=job.target_id,
         instruction=job.payload.instruction,
         mode=job.payload.mode,
+        targetCardCount=job.target_card_count,
         status=job.status,  # type: ignore[arg-type]
         progress=job.progress,
         result=job.result if isinstance(job.result, ReviewMaterialRewritePreview) else None,
@@ -1057,6 +1108,7 @@ def _submit_review_generation(
     material_id: int,
     user_id: str,
     user_feedback: str | None,
+    generation_mode: str,
 ) -> None:
     """提交资料级后台任务，同一进程内避免重复排队。"""
     key = (user_id, material_id)
@@ -1070,6 +1122,7 @@ def _submit_review_generation(
         material_id,
         user_id,
         user_feedback,
+        generation_mode,
         key,
     )
 
@@ -1079,11 +1132,21 @@ def _run_review_generation(
     material_id: int,
     user_id: str,
     user_feedback: str | None,
+    generation_mode: str,
     key: tuple[str, int],
 ) -> None:
     """执行后台复习生成并把异常收敛到资料终态或日志。"""
     try:
-        service.generate_material(material_id, user_id, user_feedback)
+        if generation_mode == "STANDARD":
+            # 兼容尚未扩展 generation_mode 的旧服务替身和外部调用方。
+            service.generate_material(material_id, user_id, user_feedback)
+        else:
+            service.generate_material(
+                material_id,
+                user_id,
+                user_feedback,
+                generation_mode=generation_mode,
+            )
     except BusinessError as exc:
         # 另一实例可能已经持有资料锁，保留真实运行方的进度即可。
         logger.info("后台复习生成未取得资料锁，materialId=%s，原因：%s", material_id, exc)

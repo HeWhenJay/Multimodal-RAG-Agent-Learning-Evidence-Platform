@@ -2,6 +2,45 @@
 
 > 当前运行时只使用本文件中的 Python FastAPI 公开控制面和 Python durable worker。后文如出现 Java Source API、7080、callback 或旧 `/internal/rag/*`，均为迁移前历史契约，不得用于启动或联调。
 
+## Kafka 单分区并发与索引后 LLM 解耦（2026-08-09）
+
+### 并发基准（n=8，2026-08-10）
+
+- 非 CPU 密集型的网络、LLM、embedding、rerank、OCR、ASR、Kafka 控制和数据库等待阶段，默认并发为 `2n=16`。
+- CPU/内存密集型的视频解码、递归切块、本地 token/BM25 计算和索引任务，默认线程数为 `n+1=9`。
+- 环境变量仍可覆盖默认值，但实现会分别按 I/O 上限 `64`、CPU 上限 `9` 做保护；批大小、RPM、队列容量和数据库连接池不是线程并发数，不随该规则机械扩大。
+
+### 变更摘要
+
+- `ai-python/start.ps1` 仍只负责进入 `learning-evidence-rag` Conda 环境并启动 `run.py`；`run.py`
+  会按配置分别监督 FastAPI、cron、Kafka、Agent 和 RAG durable worker。`RAG_VIDEO_PARALLEL_WORKERS`
+  只表示一条视频内部的媒体片段解析线程数，不代表整个服务只启动两个 worker。
+- Kafka consumer 允许同一 topic-partition 内不同 `message.key()` 的资料任务并发执行，并按 partition
+  offset 连续完成水位提交。相同资料 key 仍严格串行，失败重放继续依赖 jobId、requestVersion、
+  `rag_consumed_event` 和 staging/promote 幂等围栏。
+- 因此即使本地 `rag.material.index.request.v1` 只有 1 个 partition，索引实际并发也可达到
+  `RAG_KAFKA_HANDLER_CONCURRENCY`；不再要求为获得本机并发而不可逆地扩容既有 topic 分区。
+- `RAG_PROMOTE_RESULT` 必须先完成 PostgreSQL 终态回写并提交 Kafka offset，再把自动复习生成投递到
+  独立的 `RAG_REVIEW_SYNC_WORKERS` 线程池。LangExtract、复习摘要和卡片 LLM 失败不能阻塞后续
+  progress/result/promote/DLQ，也不能让已完成索引的资料长期停留在 `PARSING`。
+- 在线 LLM、embedding、rerank、OCR 和 ASR 的同步 SDK 调用统一进入进程级 `LLM_IO_MAX_WORKERS`
+  I/O 线程池；调用方可以同步等待，也可以通过异步适配器等待，但不得在 FastAPI 事件循环或 Kafka
+  poll/control 线程中直接执行阻塞网络请求。
+- Agent durable worker 会并发执行最多 `AGENT_WORKER_CONCURRENCY=16` 个不同任务；同一 taskId 仍通过数据库
+  执行锁保持图事件、审批恢复与终态写入顺序。
+- Outbox cron 每轮把事件按 `(topic, message_key)` 分组，不同组按
+  `RAG_OUTBOX_PUBLISH_CONCURRENCY=16` 并行等待 Kafka 与 PostgreSQL，同组仍按事件 ID 顺序发送。
+
+### 异步状态与失败规则
+
+- RAG 索引终态仍以 `learning_material.status=READY/PARTIAL/FAILED` 和对应 `rag_index_job` 为准；
+  自动复习生成是索引后的派生任务，不属于 RAG 六阶段状态机。
+- 自动复习线程池已接收任务后，资料可以立即用于检索。复习生成失败只更新复习域状态并记录受控错误；
+  用户可在复习中心重新生成，不回滚 RAG 入库结果。
+- 同一资料的重复 promote result 由 Kafka/数据库幂等规则过滤；异步复习调度器还会按 materialId
+  去重进程内待执行任务，避免重复占用模型并发。
+- 本变更不修改 `/api/rag/*` 请求或 `Result<T>` 响应字段，前端无需调整 TypeScript 类型。
+
 ## Python 公开控制面（阶段 3）
 
 更新日期：2026-07-25
@@ -33,21 +72,21 @@
   受控对象，只在本机保留单片上传临时文件和小型会话元数据，不合并或持久化整视频；收齐并完成 OSS multipart
   后仅投递 1 条资料级索引任务。`local` 模式才使用受控本地分片目录合并。
   Kafka 或 local durable worker 抢到该资料级任务后，如果原文件是视频，会先用 FFmpeg 按约 20MiB
-  目标切成可解析媒体片段，再由后端 2 个 Worker 从共享队列抢占这些媒体片段并发解析，最后聚合
+  目标切成可解析媒体片段，再由后端 9 个 CPU/内存 Worker 从共享队列抢占这些媒体片段并发解析，最后聚合
   blocks 后对同一个 material 的 staging 索引执行一次 index_blocks。这表示并发发生在 Kafka
   到后端 worker 之后，而不是把前端上传分片分发给不同 Kafka worker。
-- 前端 20MiB 分片上传默认最多 2 个 in-flight，可用 VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY=1/2
+- 前端 20MiB 分片上传属于网络 I/O，默认最多 16 个 in-flight，可用 VITE_VIDEO_CHUNK_UPLOAD_CONCURRENCY 调低
   在同一线上链路中切换顺序上传与并发上传。后端按 userId/uploadId 加锁，持久化 OSS uploadId、已确认 part
   ETag 与完成资料 ID，支持重复片幂等返回，并避免并发最后几片重复 complete 或重复创建资料。
 - 视频并发切片由 RAG_VIDEO_PARALLEL_SEGMENTS_ENABLED=true 默认启用，RAG_VIDEO_PARALLEL_WORKERS
-  默认 2，RAG_VIDEO_PARALLEL_SEGMENT_TARGET_MIB 默认 20。若原视频同目录存在 .srt/.vtt 侧车字幕，
+  默认 9（CPU/内存阶段 n+1），RAG_VIDEO_PARALLEL_SEGMENT_TARGET_MIB 默认 20。若原视频同目录存在 .srt/.vtt 侧车字幕，
   local 存储会将字幕镜像到视频旁；OSS 存储会以同一对象 key 的 .srt/.vtt 保存，并在 Kafka worker
   下载视频时一并落到临时视频旁。随后 worker 会先把字幕按媒体片段写入临时片段旁边，确保每个片段
   仍走字幕优先解析。RAG_VIDEO_SIDECAR_SEARCH_DIRS 可配置本机受控字幕目录，供浏览器只上传 mp4
   的场景按同名文件补齐侧车字幕；若 FFmpeg/ffprobe 不可用、视频过小、切片失败、或切片解析只得到
   元数据 fallback，则自动回落原整视频解析路径。
-- RAG_INDEX_CHUNK_WORKERS 默认 2，用于解析完成后的递归切块 embedding 并发准备；RAG_TASK_WORKER_CONCURRENCY
-  默认 2，用于 Kafka 关闭时 local durable worker 对同轮 claim 的查询/索引任务并发执行。数据库写入、
+- RAG_INDEX_CHUNK_WORKERS 默认 9，用于解析完成后的递归切块和本地 token 统计；RAG_TASK_WORKER_CONCURRENCY
+  默认 9，用于 Kafka 关闭时 local durable worker 对同轮 claim 的查询/索引任务并发执行。数据库写入、
   staging promote 与状态回写仍在各任务内部保持原有幂等和事务边界。
 - RAG_KAFKA_MAX_POLL_INTERVAL_MS 默认 3600000，允许单条长视频索引在同一 consumer handler 中持续执行，
   避免超过 Kafka 默认 5 分钟 poll 间隔后被移出 consumer group。RAG_VIDEO_FRAME_OCR_ENABLED 默认 true；
@@ -58,9 +97,9 @@
   `6000 RPM / 30,000,000 TPM`，但官方没有公布多图单请求上限，且 OpenAI 兼容 Batch API 的
   支持列表未列出该模型。因此系统不拼接未经验证的多图请求，而是保持“一帧一请求”语义，通过
   `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800` 与
-  `RAG_VIDEO_OCR_MAX_IN_FLIGHT=2` 形成受控 OCR 微批：积累满 4 帧立即并发派发；未满时从首帧起最多
-  等待 800ms，输入关闭时立即刷出尾批。两个媒体 Worker 同时运行时最多 4 个 OCR 请求，低于官方
-  RPM 上限并避免长视频帧图占满本机内存。每张帧图仍独立重试、降级到本地 OCR，并保留原时间戳 evidence。
+  `RAG_VIDEO_OCR_MAX_IN_FLIGHT=16` 形成受控 OCR 微批：积累满 4 帧立即并发派发；未满时从首帧起最多
+  等待 800ms，输入关闭时立即刷出尾批。每个媒体分段最多 16 个 OCR I/O 请求，仍受进程级模型闸门和
+  远端 RPM 限制。每张帧图仍独立重试、降级到本地 OCR，并保留原时间戳 evidence。
   由于兼容接口以 Base64 传图，`BAILIAN_OCR_MAX_IMAGE_BYTES` 默认按官方 10MB 编码后字符串上限折算，
   过大的帧图在远程调用前跳过并走既有降级路径。
 - `POST /api/rag/query/tasks` 在同一事务内写入 `rag_query_history` 和 `rag_query_task`，返回
@@ -180,8 +219,9 @@ Python cron 不新增 HTTP 接口。`ai-python/run.py` 读取配置后会在独�
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `AI_CRON_ENABLED` | `true` | 是否由 `run.py` 监督 Python cron 进程；关闭时 API 单独运行。 |
-| `RAG_OUTBOX_PUBLISHER_ENABLED` | `false` | 是否启用 Python Outbox 发布任务；切流时必须与 Java 发布器互斥。 |
+| `RAG_OUTBOX_PUBLISHER_ENABLED` | `true` | 是否启用 Python Outbox 发布任务；切流时必须与 Java 发布器互斥。 |
 | `RAG_OUTBOX_BATCH_SIZE` | `50` | 每轮抢占的最大 Outbox 事件数。 |
+| `RAG_OUTBOX_PUBLISH_CONCURRENCY` | `16` | 不同 topic/key 的 Kafka 与数据库 I/O 并发；同一 topic/key 保持事件 ID 顺序。 |
 | `RAG_OUTBOX_LEASE_SECONDS` | `60` | `PUBLISHING` 租约时长；进程异常后过期事件可被其他实例接管。 |
 | `RAG_OUTBOX_PUBLISH_FIXED_DELAY_MS` | `1000` | 单轮结束到下一轮开始的固定等待时间。 |
 | `RAG_OUTBOX_MAX_ATTEMPTS` | `8` | 指数退避的最大指数，不限制事件最终重试次数。 |
@@ -1575,7 +1615,7 @@ mp4/mov/webm/mkv/avi
 | `RAG_ASR_FILETRANS_MAX_ATTEMPTS` | `2` | filetrans 异步任务提交/轮询失败后的最大尝试次数，超过后才降级到字幕、同步 ASR 或视频元数据 |
 | `RAG_ASR_BATCH_MAX_SIZE` | `4` | 一个 ASR 微批最多收集 4 个音频段；微批内仍保持一段音频一个远程请求 |
 | `RAG_ASR_BATCH_WAIT_MS` | `1000` | 首段入队后未满批的最长等待窗口；视频分段全部就绪后尾批立即刷出 |
-| `RAG_ASR_MAX_IN_FLIGHT` | `2` | 单个视频处理上下文中最多 2 个同时执行的 ASR 请求，允许两个后台 Worker 自行抢占任务 |
+| `RAG_ASR_MAX_IN_FLIGHT` | `16` | 单个视频处理上下文中最多 16 个 ASR I/O 请求，仍受 RPM 和进程级闸门限制 |
 | `RAG_ASR_RPM_LIMIT` | `90` | 进程内保守启动速率；实现上限定为 100 RPM，默认预留 10% 余量给账户级限流 |
 | `RAG_VIDEO_AUDIO_SEGMENT_SECONDS` | `300` | 本地或私有长视频同步 ASR 的音频分段时长 |
 | `RAG_ASR_AUDIO_BITRATE` | `64k` | FFmpeg 输出 MP3 的目标码率；采样率固定为 16kHz、单声道 |
@@ -1610,7 +1650,7 @@ mp4/mov/webm/mkv/avi
 | `RAG_QUERY_VIDEO_MAX_PER_TIME_WINDOW` | `1` | 同一视频同一时间窗内每类视频 evidence 默认保留数量 |
 | `RAG_VIDEO_OCR_BATCH_MAX_SIZE` | `4` | 一个 OCR 微批最多收集 4 帧；每帧仍独立调用一次 OCR 接口 |
 | `RAG_VIDEO_OCR_BATCH_WAIT_MS` | `800` | 首帧入队后未满批的最长等待窗口；输入关闭时立即刷出尾批 |
-| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `2` | 单个媒体分段最多 2 个同时 OCR 请求；队列有界以限制帧图内存 |
+| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `16` | 单个媒体分段最多 16 个 OCR I/O 请求；队列仍有界以限制帧图内存 |
 | `BAILIAN_OCR_MAX_ATTEMPTS` | `3` | 单张图片或视频关键帧调用百炼 OCR 的总尝试次数，建议生产按稳定性调到 `3-5` |
 | `BAILIAN_OCR_RETRY_DELAY_SECONDS` | `2` | OCR 单次失败后的重试等待秒数 |
 
@@ -2181,7 +2221,7 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 | `BAILIAN_OCR_RETRY_DELAY_SECONDS` | `2` | 每次 OCR 失败后的重试等待秒数，最后一次失败后不再等待 |
 | `RAG_VIDEO_OCR_BATCH_MAX_SIZE` | `4` | 视频关键帧微批容量；不改变每个请求只传一张图片的兼容接口 schema |
 | `RAG_VIDEO_OCR_BATCH_WAIT_MS` | `800` | 从首帧开始等待未满批的最大毫秒数 |
-| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `2` | 单个媒体分段的 OCR 并发请求数，配置值限定为 `1-8` |
+| `RAG_VIDEO_OCR_MAX_IN_FLIGHT` | `16` | 单个媒体分段的 OCR I/O 并发请求数，配置值限定为 `1-64` |
 
 请求 schema：
 
@@ -2269,10 +2309,10 @@ OSS 模式写入 `learning_material.original_file_path` 的优先级：
 
 | 环节 | 默认配置 | 实际派发语义 | 保护范围 |
 | --- | --- | --- | --- |
-| 视频 OCR | `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800`、`RAG_VIDEO_OCR_MAX_IN_FLIGHT=2` | 满 4 帧立即派发，未满从首帧最多等待 800ms；批内以最多 2 个线程并发执行单帧 OCR | 队列容量受批大小和并发数约束；每帧独立重试、降级和 evidence 时间戳 |
-| 视频 ASR | `RAG_ASR_BATCH_MAX_SIZE=4`、`RAG_ASR_BATCH_WAIT_MS=1000`、`RAG_ASR_MAX_IN_FLIGHT=2` | 满 4 段立即派发，尾批立即刷出；单个视频处理上下文内最多 2 个线程并发执行单段 ASR/filetrans | 单视频节流与进程共享限流器均按 `RAG_ASR_RPM_LIMIT=90` 限制启动速率 |
-| 切块 embedding | `RAG_EMBEDDING_BATCH_MAX_SIZE=10`、`RAG_EMBEDDING_BATCH_WAIT_MS=1000`、`RAG_EMBEDDING_MAX_IN_FLIGHT=8` | 已完成解析的切块按最多 10 条组成一个 `input` 数组，并发最多 8 个远程批次；响应按原始输入顺序复位 | 进程级共享闸门同样限制为 8；向量数量不完整即中止本次索引，避免错配 chunk |
-| Multi-Query pgvector | `RAG_RETRIEVAL_IO_WORKERS=8` | 一次批量生成全部查询变体向量，再以最多 8 个线程并发执行相互独立的 pgvector 查询；结果按原查询下标复位后进入 RRF/RAG-Fusion | 当前 Multi-Query 默认 5 条，因此通常实际使用 5 个 worker；数据库 I/O 有进程级共享闸门，BM25 与融合顺序保持确定性 |
+| 视频 OCR | `RAG_VIDEO_OCR_BATCH_MAX_SIZE=4`、`RAG_VIDEO_OCR_BATCH_WAIT_MS=800`、`RAG_VIDEO_OCR_MAX_IN_FLIGHT=16` | 满 4 帧立即派发，未满从首帧最多等待 800ms；批内以最多 16 个线程并发执行单帧 OCR | 队列容量受批大小和并发数约束；每帧独立重试、降级和 evidence 时间戳 |
+| 视频 ASR | `RAG_ASR_BATCH_MAX_SIZE=4`、`RAG_ASR_BATCH_WAIT_MS=1000`、`RAG_ASR_MAX_IN_FLIGHT=16` | 满 4 段立即派发，尾批立即刷出；单个视频处理上下文内最多 16 个线程并发执行单段 ASR/filetrans | 单视频节流与进程共享限流器均按 `RAG_ASR_RPM_LIMIT=90` 限制启动速率 |
+| 切块 embedding | `RAG_EMBEDDING_BATCH_MAX_SIZE=10`、`RAG_EMBEDDING_BATCH_WAIT_MS=1000`、`RAG_EMBEDDING_MAX_IN_FLIGHT=16` | 已完成解析的切块按最多 10 条组成一个 `input` 数组，并发最多 16 个远程批次；响应按原始输入顺序复位 | 进程级共享闸门同样限制为 16；向量数量不完整即中止本次索引，避免错配 chunk |
+| Multi-Query pgvector | `RAG_RETRIEVAL_IO_WORKERS=16` | 一次批量生成全部查询变体向量，再以最多 16 个线程并发执行相互独立的 pgvector 查询；结果按原查询下标复位后进入 RRF/RAG-Fusion | 当前 Multi-Query 默认 5 条，因此通常实际使用 5 个 worker；数据库 I/O 有进程级共享闸门，BM25 与融合顺序保持确定性 |
 
 OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多张图片或多个音频段拼进一个未经验证的
 模型请求。OCR 仍发送一张 Base64 图片，ASR/filetrans 仍发送一个音频文件 URL；这样保留每帧/每段
@@ -2281,7 +2321,7 @@ OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多�
 
 `RAG_EMBEDDING_BATCH_WAIT_MS` 预留给持续流式生产切块的调度诊断。当前一次 `index_blocks` 在切块集合
 已完整就绪后才进入向量化，因此不会为了等待更多文本额外阻塞 1000ms；实际分批由 10 条上限和
-`max-in-flight` 控制。Embedding 和 pgvector Multi-Query 都属于等待外部服务的 I/O 密集阶段，默认并发提升为 8，硬上限 10；非法值回退默认值，超过实现上限的并发或批量值会被限制在安全范围内。解析、视频解码、BM25 全量打分等 CPU/内存密集阶段不使用该 I/O 并发值。
+`max-in-flight` 控制。Embedding、OCR、ASR 和 pgvector Multi-Query 都属于等待外部服务的 I/O 密集阶段，默认按 2n=16，硬上限 64；非法值回退默认值，超过实现上限的并发或批量值会被限制在安全范围内。解析、视频解码、递归切块、BM25 全量打分等 CPU/内存密集阶段默认按 n+1=9，不使用 I/O 并发值。
 
 ### 模型限制、兼容性和可观测性
 
@@ -2290,7 +2330,7 @@ OCR 和 ASR 的“微批”仅用于受控积累与并发派发，不会把多�
 | `qwen3.5-ocr` | Base64 图片字符串上限为 10,000,000 字节；原图默认上限为 7,499,952 字节，避免 data URL 头和 Base64 膨胀越界 | 使用 OpenAI 兼容 `chat/completions` 单图 schema；不假设存在多图单请求能力 |
 | `qwen3-asr-flash` | ASR 启动速率实现上限为 100 RPM，默认保守设置为 90 RPM | 单音频段同步请求；超出同步音频大小限制时不提交，并继续可用降级链路 |
 | `qwen3-asr-flash-filetrans` | 一个异步任务对应一个可访问的 `http(s)` 文件 URL，等待轮数默认 `30`、间隔默认 `2s` | 采用百炼异步任务 API 并把句级 `begin_time/end_time` 转为 SRT；不兼容时不再把该模型错误地当成 Chat Completions ASR |
-| `text-embedding-v4` | 每个远程 `input` 批次最多 10 条文本，默认 1024 维 | 使用 OpenAI 兼容数组 `input`，结果强制按输入下标映射回 chunk；远程批次默认最大并发 8、硬上限 10 |
+| `text-embedding-v4` | 每个远程 `input` 批次最多 10 条文本，默认 1024 维 | 使用 OpenAI 兼容数组 `input`，结果强制按输入下标映射回 chunk；远程批次默认最大并发 16、硬上限 64 |
 
 账户、地域或模型版本的实时配额低于上述保护值时，以百炼返回的限流响应为准，应相应调低并发与 RPM；
 这些参数不是提高账户配额的手段。运行时可通过下列过程事件定位实际批次，而不需要读取敏感请求内容：
