@@ -203,7 +203,14 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
         }
       } catch (pollError) {
         if (!active) return;
-        setError(pollError instanceof Error ? pollError.message : '分段任务进度读取失败');
+        const message = pollError instanceof Error ? pollError.message : '分段任务进度读取失败';
+        if (/任务不存在|任务已过期|已过期/.test(message)) {
+          // API 进程重启后进程内任务表会清空；停止轮询并释放按钮，用户可重新选择分段生成。
+          setTask((previous) => previous ? { ...previous, status: 'FAILED', error: '后台服务已重启，旧分段任务已失效，请重新选择分段生成' } : previous);
+          setError('后台服务已重启，旧分段任务已失效，请重新选择分段生成');
+          return;
+        }
+        setError(message);
         timer = window.setTimeout(() => void poll(), 2000);
       }
     };
