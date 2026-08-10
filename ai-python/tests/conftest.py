@@ -13,5 +13,7 @@ os.environ.setdefault("RAG_VECTOR_DIMENSIONS", "1024")
 os.environ.setdefault("RAG_ANSWER_PROVIDER", "local")
 os.environ.setdefault("RAG_RERANK_PROVIDER", "local")
 os.environ["RAG_QUERY_EXPANSION_PROVIDER"] = "local"
+# 普通单测不调用 ASR/OCR 纠错模型，纠错模块测试会显式注入本地替身。
+os.environ.setdefault("RAG_TEXT_CORRECTION_ENABLED", "false")
 # 仅显式的 LangExtract 集成测试启用真实候选节点，避免普通单测访问远程复习模型。
 os.environ.setdefault("REVIEW_LANGEXTRACT_ENABLED", "false")

@@ -14,6 +14,11 @@ from typing import Any
 from xml.etree import ElementTree
 
 from video.ocr.bailian_ocr import BailianOcrClient, OcrResult
+from video.correction.recognition_text_correction import (
+    BailianRecognitionTextCorrector,
+    RecognitionTextCorrector,
+    correct_recognition_blocks,
+)
 from rag.loaders.mineru_loader import MineruDocumentLoader
 from rag.core.models import ParsedBlockDocument
 from rag.loaders.parse_quality import QualitySignals, evaluate_parse_quality, merge_quality
@@ -55,9 +60,11 @@ class DocumentParserRouter:
         self,
         mineru_loader: MineruDocumentLoader | None = None,
         ocr_client: BailianOcrClient | None = None,
+        text_corrector: RecognitionTextCorrector | None = None,
     ) -> None:
         self.mineru_loader = mineru_loader or MineruDocumentLoader()
         self.ocr_client = ocr_client or BailianOcrClient.from_env()
+        self.text_corrector = text_corrector or BailianRecognitionTextCorrector.from_env()
         self.summary_index = SummaryIndex()
 
     @logged_rag_method("parse.route", "parse_file", "解析受控文件路径")
@@ -238,6 +245,13 @@ class DocumentParserRouter:
             parser = "fallback-text"
             warnings = [f"native parser failed: {exc}"]
 
+        blocks, correction_warnings = correct_recognition_blocks(
+            blocks,
+            corrector=self.text_corrector,
+            progress_reporter=progress_reporter,
+        )
+        warnings.extend(correction_warnings)
+        parser = append_text_correction_parser(parser, blocks)
         result = self._finalize(document_id, blocks, parser, quality, warnings)
         process_event(
             stage="parse.completed",
@@ -306,7 +320,13 @@ class DocumentParserRouter:
             high_precision=False,
         )
         quality = mark_text_native_quality(quality)
-        result = self._finalize(document_id, blocks, parser or "manual-text", quality, [])
+        blocks, correction_warnings = correct_recognition_blocks(
+            blocks,
+            corrector=self.text_corrector,
+            progress_reporter=progress_reporter,
+        )
+        result_parser = append_text_correction_parser(parser or "manual-text", blocks)
+        result = self._finalize(document_id, blocks, result_parser, quality, correction_warnings)
         process_event(
             stage="parse.completed",
             action="parse_text_completed",
@@ -732,7 +752,6 @@ class DocumentParserRouter:
                 source_path=source_path,
                 parse_engine=artifacts.transcript_parser,
             )
-            blocks.extend(transcript_blocks)
         frame_blocks, dedup_stats = dedupe_video_frame_blocks(
             artifacts.frame_blocks,
             document_id,
@@ -743,6 +762,17 @@ class DocumentParserRouter:
                 "video.frame_ocr.dedup: "
                 f"已合并 {dedup_stats.get('dedupRemovedCount')} 个近重复关键帧 OCR evidence"
             )
+        recognized_blocks, correction_warnings = correct_recognition_blocks(
+            [*transcript_blocks, *frame_blocks],
+            corrector=self.text_corrector,
+            progress_reporter=progress_reporter,
+        )
+        transcript_block_count = len(transcript_blocks)
+        transcript_blocks = recognized_blocks[:transcript_block_count]
+        frame_blocks = recognized_blocks[transcript_block_count:]
+        warnings.extend(correction_warnings)
+        parser = append_text_correction_parser(parser, recognized_blocks)
+        blocks.extend(transcript_blocks)
         blocks.extend(frame_blocks)
         summary_frame_blocks = [block for block in frame_blocks if block.metadata.get("evidenceChannel") == "frame_ocr"]
         summary_blocks, summary_warnings = build_video_segment_summary_blocks(
@@ -802,7 +832,6 @@ class DocumentParserRouter:
                 source_path=source_reference,
                 parse_engine=artifacts.transcript_parser,
             )
-            blocks.extend(transcript_blocks)
         frame_blocks, dedup_stats = dedupe_video_frame_blocks(
             artifacts.frame_blocks,
             document_id,
@@ -813,6 +842,17 @@ class DocumentParserRouter:
                 "video.frame_ocr.dedup: "
                 f"已合并 {dedup_stats.get('dedupRemovedCount')} 个近重复关键帧 OCR evidence"
             )
+        recognized_blocks, correction_warnings = correct_recognition_blocks(
+            [*transcript_blocks, *frame_blocks],
+            corrector=self.text_corrector,
+            progress_reporter=progress_reporter,
+        )
+        transcript_block_count = len(transcript_blocks)
+        transcript_blocks = recognized_blocks[:transcript_block_count]
+        frame_blocks = recognized_blocks[transcript_block_count:]
+        warnings.extend(correction_warnings)
+        parser = append_text_correction_parser(parser, recognized_blocks)
+        blocks.extend(transcript_blocks)
         blocks.extend(frame_blocks)
         summary_frame_blocks = [block for block in frame_blocks if block.metadata.get("evidenceChannel") == "frame_ocr"]
         summary_blocks, summary_warnings = build_video_segment_summary_blocks(
@@ -2285,6 +2325,15 @@ def mark_supplemental_blocks(blocks: list[DocumentBlock]) -> list[DocumentBlock]
         metadata = {**block.metadata, "supplemental": True}
         result.append(block.model_copy(update={"metadata": metadata, "confidence": min(block.confidence, 0.78)}))
     return result
+
+
+def append_text_correction_parser(parser: str, blocks: list[DocumentBlock]) -> str:
+    """在至少一个识别块实际被纠正时标记资料级解析链路。"""
+    if "+text-correction" in parser:
+        return parser
+    if any(block.metadata.get("correctionApplied") is True for block in blocks):
+        return f"{parser}+text-correction"
+    return parser
 
 
 def normalize_blocks(document_id: str, blocks: list[DocumentBlock]) -> list[DocumentBlock]:

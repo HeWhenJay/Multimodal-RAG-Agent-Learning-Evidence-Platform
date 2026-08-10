@@ -64,6 +64,15 @@ rag:
     base-url: ${RAG_LLM_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
     timeout-seconds: ${RAG_LLM_TIMEOUT_SECONDS:45}
     temperature: ${RAG_LLM_TEMPERATURE:0.2}
+  text-correction:
+    # ASR/OCR 识别后、摘要与切块前执行；失败时保留原文继续索引。
+    enabled: ${RAG_TEXT_CORRECTION_ENABLED:auto}
+    model: ${RAG_TEXT_CORRECTION_MODEL:qwen-plus}
+    base-url: ${RAG_TEXT_CORRECTION_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    timeout-seconds: ${RAG_TEXT_CORRECTION_TIMEOUT_SECONDS:45}
+    batch-max-items: ${RAG_TEXT_CORRECTION_BATCH_MAX_ITEMS:32}
+    batch-max-chars: ${RAG_TEXT_CORRECTION_BATCH_MAX_CHARS:12000}
+    min-similarity: ${RAG_TEXT_CORRECTION_MIN_SIMILARITY:0.55}
   progress:
     console-enabled: ${RAG_CONSOLE_PROGRESS_ENABLED:true}
   process-log:

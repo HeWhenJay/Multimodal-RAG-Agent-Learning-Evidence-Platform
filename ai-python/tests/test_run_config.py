@@ -204,6 +204,33 @@ def test_model_dynamic_batch_config_env_mapping_is_effective():
     assert env_defaults["RAG_ASR_RPM_LIMIT"] == "90"
 
 
+def test_recognition_text_correction_config_env_mapping_is_effective():
+    """校验 ASR/OCR 纠错节点配置能从 YAML 映射为运行环境变量。"""
+    env_defaults = build_env_defaults(
+        {
+            "rag": {
+                "text-correction": {
+                    "enabled": "auto",
+                    "model": "qwen-plus",
+                    "base-url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "timeout-seconds": 45,
+                    "batch-max-items": 32,
+                    "batch-max-chars": 12000,
+                    "min-similarity": 0.55,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["RAG_TEXT_CORRECTION_ENABLED"] == "auto"
+    assert env_defaults["RAG_TEXT_CORRECTION_MODEL"] == "qwen-plus"
+    assert env_defaults["RAG_TEXT_CORRECTION_BASE_URL"].endswith("/compatible-mode/v1")
+    assert env_defaults["RAG_TEXT_CORRECTION_TIMEOUT_SECONDS"] == "45"
+    assert env_defaults["RAG_TEXT_CORRECTION_BATCH_MAX_ITEMS"] == "32"
+    assert env_defaults["RAG_TEXT_CORRECTION_BATCH_MAX_CHARS"] == "12000"
+    assert env_defaults["RAG_TEXT_CORRECTION_MIN_SIMILARITY"] == "0.55"
+
+
 def test_video_v6_config_env_mapping_is_effective():
     """校验 V6 视频 OCR 新配置能从 YAML 映射为运行环境变量。"""
     env_defaults = build_env_defaults(

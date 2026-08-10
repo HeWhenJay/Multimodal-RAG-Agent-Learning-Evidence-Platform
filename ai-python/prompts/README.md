@@ -7,6 +7,6 @@
 - `agent.py`：Planner、Executor、Repair、Acceptance、Answer Writer 及上下文压缩
 - `resume.py`：简历字段补丁生成
 - `vision.py`：图片 OCR
-- `media.py`：音频 ASR
+- `media.py`：音频 ASR 与 ASR/OCR 识别文本纠错
 
 Prompt 函数只接收已经完成长度限制和敏感字段过滤的动态输入。调用方负责模型选择、超时、重试和响应校验；修改模板时同步更新对应版本常量和测试。

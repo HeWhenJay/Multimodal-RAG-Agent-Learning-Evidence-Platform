@@ -46,6 +46,13 @@ rag:
   # 回答准入默认偏保守；只有评测集证明召回损失可接受时再下调。
   answer-guard:
     min-top-score-dashscope: ${RAG_ANSWER_MIN_TOP_SCORE_DASHSCOPE:0.55}
+  text-correction:
+    # auto 表示存在 DASHSCOPE_API_KEY 时启用；离线开发可显式设为 false。
+    enabled: ${RAG_TEXT_CORRECTION_ENABLED:auto}
+    model: ${RAG_TEXT_CORRECTION_MODEL:qwen-plus}
+    batch-max-items: ${RAG_TEXT_CORRECTION_BATCH_MAX_ITEMS:32}
+    batch-max-chars: ${RAG_TEXT_CORRECTION_BATCH_MAX_CHARS:12000}
+    min-similarity: ${RAG_TEXT_CORRECTION_MIN_SIMILARITY:0.55}
 
 review:
   llm:

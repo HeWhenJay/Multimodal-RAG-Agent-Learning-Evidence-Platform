@@ -27,6 +27,7 @@ STAGE_LABELS = {
     "parse.video.frame.candidates": "视频候选帧",
     "parse.video.slide_detect": "PPT 翻页检测",
     "parse.video.ocr": "关键帧 OCR",
+    "parse.text_correction": "ASR/OCR 错别字纠正",
     "parse.text": "解析文本",
     "parse.completed": "解析完成",
     "sanitize.blocks": "清洗文本",

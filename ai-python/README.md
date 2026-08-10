@@ -31,6 +31,10 @@ dashscope:
 - `RAG_EMBEDDING_MODEL`：默认 `text-embedding-v4`
 - `RAG_RERANK_MODEL`：默认 `qwen3-rerank`
 - `RAG_LLM_MODEL`：默认 `qwen-plus`
+- `RAG_TEXT_CORRECTION_ENABLED`：默认 `auto`，存在 `DASHSCOPE_API_KEY` 时在摘要、切块和索引前启用 ASR/OCR 错别字纠正；失败时保留原识别文本
+- `RAG_TEXT_CORRECTION_MODEL`：默认 `qwen-plus`，按批纠正口音同音字、OCR 形近字和明显断句错误
+- `RAG_TEXT_CORRECTION_BATCH_MAX_ITEMS` / `RAG_TEXT_CORRECTION_BATCH_MAX_CHARS`：默认 `32` / `12000`，限制单次纠错 Prompt 的识别块数和字符数
+- `RAG_TEXT_CORRECTION_MIN_SIMILARITY`：默认 `0.55`，差异过大的模型结果会被拒绝，避免纠错节点改写 evidence
 - `LLM_IO_MAX_WORKERS`：所有在线 LLM、embedding、rerank、OCR 和 ASR 请求共用的进程级 I/O 线程池，默认 `16`、硬上限 `64`
 - `RAG_KAFKA_HANDLER_CONCURRENCY`：Kafka 视频/文档索引长任务并发，CPU/内存阶段默认 `9`（n+1）；同一 partition 内按资料 key 并发
 - `RAG_KAFKA_CONTROL_CONCURRENCY`：progress/result/promote/DLQ 控制消息 I/O 并发，默认 `16`（2n）
@@ -51,7 +55,7 @@ dashscope:
 - `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 
-Agent、RAG、复习、简历、视觉 OCR 和音频 ASR Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
+Agent、RAG、复习、简历、视觉 OCR、音频 ASR 和识别文本纠错 Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
 
 抖音 URL 接入流程与 SocialDataX MCP 工具契约见 `docs/api/remote-video-import.md`。
 
