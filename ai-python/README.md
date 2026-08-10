@@ -48,6 +48,8 @@ dashscope:
 - `DEEPSEEK_API_KEY`：可选的复习降级密钥；Cockpit 按长等待方案完成 Terra 重试后仍失败时才直连 DeepSeek
 - `REVIEW_COCKPIT_REQUEST_RETRIES`：项目在 DeepSeek 降级前重新请求 Cockpit 的次数，默认 `1`
 - `REVIEW_EXTRACTION_TIMEOUT_SECONDS`：单次 Cockpit 客户端等待窗口，默认 `615` 秒
+- `REVIEW_GENERATION_MAX_ATTEMPTS`：Actor 卡片质量尝试上限，默认 `8`，安全范围 `1-20`
+- `REVIEW_GENERATION_MAX_MERGE_ROUNDS`：多卡 Observer → Merge Repair 合并轮次上限，默认 `4`，安全范围 `1-12`；与 Actor 尝试独立计数
 - `RAG_DOUYIN_MCP_ENABLED`：抖音 MCP 语音转写路线开关，默认 `true`
 - `RAG_DOUYIN_TRANSCRIPT_POLL_INTERVAL_SECONDS`：抖音转写任务轮询间隔，默认 `5`
 - `RAG_DOUYIN_TRANSCRIPT_MAX_WAIT_SECONDS`：抖音单次转写最大等待时间，默认 `900`
@@ -56,6 +58,8 @@ dashscope:
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
 
 Agent、RAG、复习、简历、视觉 OCR、音频 ASR 和识别文本纠错 Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
+
+复习生成图在 Actor 通过单卡门禁后会执行多卡片粒度复查。`multi_card_observer` 只返回结构化合并计划，`merge_repair` 只修改计划点名的卡片组，并在合并后重新进入单卡 Observer；合并结果必须保留 knowledge unit、原始问题覆盖、evidence 和答案论断并集。连续候选指纹无变化或合并轮次耗尽时安全进入 `NEEDS_REVIEW`，最后一次完整有效候选和旧活动卡片不被覆盖。
 
 抖音 URL 接入流程与 SocialDataX MCP 工具契约见 `docs/api/remote-video-import.md`。
 

@@ -32,8 +32,8 @@ npm run dev
 
 - 多模态资料入库：文本、PDF、Office 文档、图片、字幕与视频；PDF 优先 MinerU，失败时走本地降级解析。
 - 可追溯 RAG：结构化解析、递归切块、文档/章节摘要、元数据隔离、BM25 与 pgvector 向量召回、Multi-Query、RRF/RAG-Fusion、重排和 evidence 引用。
-- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，卡片数量不设固定上限，只合并重复事实并保留 evidence 门禁。
-- 复习质量闭环：独立 LangGraph 按 Planner → LangExtract Curator → Actor → Observer → Repair 运行；Curator 候选精确回指 evidence 并只执行一次，质量门禁反馈会进入下一轮 Prompt，自动修复耗尽后转为 `NEEDS_REVIEW`。
+- 间隔复习：以用户上传资料为 group，自动识别八股、面经、课程与技术讲解；LangExtract 从完整资料发现陈述式与问答式知识单元，卡片数量不设固定上限，按主动回忆边界合并重复事实并保留 evidence 门禁。
+- 复习质量闭环：独立 LangGraph 按 Planner → LangExtract Curator → Actor → 单卡 Observer → 多卡 Observer → 保存运行；多卡 Observer 只输出结构化合并计划，`merge_repair` 只改点名卡片组，再回到单卡 Observer 复查，最多默认 4 个合并轮次并用候选指纹检测无进展，安全失败转为 `NEEDS_REVIEW`。
 - 复习文件夹：文档可拖拽或批量移入文件夹；归档后从主页面隐藏，在文件夹内逐文档查看、揭示、评分，也可移出文件夹恢复主页面展示。
 - Prompt 与证据边界：复习 Prompt 集中在 `ai-python/prompts/review.py`；摘要、问题、答案和提示默认由 `gpt-5.6-terra` 基于当前 evidence 生成，本地只做过滤、结构校验和忠实度门禁，不生成内容降级结果。
 - 耐久任务：资料索引、查询任务、Agent 任务和复习生成请求都先写入 PostgreSQL，再由 worker 原子领取；进程重启后可恢复，不依赖 Web 请求进程存活。
@@ -55,7 +55,7 @@ flowchart TB
         API["FastAPI 公开控制面\nAuth / PageData / Logs\nRAG / Agent / Memory / SSE"]
         AGW["Agent durable worker\nLangGraph PAE/ReAct"]
         RAGW["RAG durable worker\n查询任务 + LOCAL 索引"]
-        REVIEW["复习领域服务\nLangExtract + Terra PAE/ReAct\nFSRS + 文件夹"]
+        REVIEW["复习领域服务\n单卡/多卡 Observer + merge repair\nFSRS + 文件夹"]
         CRON["cron\nOutbox / staging 清理"]
         KAFKAW["Kafka worker\n仅 Kafka 模式"]
         SUP --> API
@@ -221,11 +221,17 @@ flowchart TB
     CONFIG -->|"是"| QUESTIONS["提取原始问题清单\n准备完整 evidence"]
     QUESTIONS --> PLANNER["planner\n固定目标、覆盖范围和完成标准"]
     PLANNER --> CURATOR["LangExtract curator\n2 个串行 passes\n每轮最多 8 个文本块并发"]
-    CURATOR --> GROUND["原文精确定位 + evidenceId 映射\n近重复过滤 + topic 轮询\n最多 32 个 knowledgeUnitId"]
+    CURATOR --> GROUND["原文精确定位 + evidenceId 映射\n近重复过滤 + topic 轮询\nknowledgeUnitId 覆盖审计"]
     GROUND --> ACTOR["actor\ngpt-5.6-terra 生成唯一 JSON"]
-    ACTOR --> OBSERVER{"observer 质量门禁\n摘要、问题、hint、sourceQuestion\nknowledgeUnitId 完整覆盖\nevidenceId 与逐论断忠实度"}
-    OBSERVER -->|"通过"| GENERATED["GENERATED\n持久化卡片并继承或初始化 FSRS"]
+    ACTOR --> OBSERVER["observer\n单卡质量门禁\n问题、hint、sourceQuestion(s)\nevidenceId 与逐论断忠实度"]
+    OBSERVER -->|"通过"| MULTI["multi_card_observer\n只输出结构化合并计划\n不直接改卡"]
     OBSERVER -->|"拒绝"| REPAIR["repair\n整理逐项中文诊断并写入下一轮 Prompt"]
+    MULTI -->|"通过"| GENERATED["GENERATED\n持久化卡片并继承或初始化 FSRS"]
+    MULTI -->|"需要合并"| PLAN["merge plan\ncardIndexes / parentTopic / reason\ntargetQuestion / hintTopics\nknowledgeUnitIds、evidenceIds、claims 并集"]
+    PLAN --> MERGE["merge_repair\n只改点名合并组\n保留原问题覆盖与全部 evidence"]
+    MERGE --> OBSERVER
+    MULTI -->|"无进展、异常或轮次耗尽"| MERGE_MANUAL["human_review\nNEEDS_REVIEW\n保留最后有效候选与旧卡片"]
+    MERGE_MANUAL --> FEEDBACK
     REPAIR --> BUDGET{"模型尝试预算是否耗尽"}
     BUDGET -->|"否"| ACTOR
     BUDGET -->|"是"| MANUAL["human_review\nNEEDS_REVIEW"]
@@ -233,7 +239,7 @@ flowchart TB
     FEEDBACK --> PLANNER
 ```
 
-LangExtract Curator 在一轮图中只运行一次，Repair 会复用同一候选上下文；默认每轮最多 8 个并发复习模型请求、整个进程也限制为 8，避免多资料叠加后无界扩张。LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制卡片生成的真实模型预算，默认 8 次，安全范围为 1-20 次。尝试耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。
+LangExtract Curator 在一轮图中只运行一次，Actor 的质量 Repair 会复用同一候选上下文；多卡 Observer 只负责提出合并计划，Merge Repair 完成确定性并集校验后必须重新经过单卡 Observer。默认每轮最多 8 个并发复习模型请求、整个进程也限制为 8，避免多资料叠加后无界扩张。LangGraph 固定使用 `recursion_limit=999` 作为多节点循环的总步数兜底；它不代表会调用模型 999 次。`REVIEW_GENERATION_MAX_ATTEMPTS` 控制 Actor 卡片生成的真实模型预算，`REVIEW_GENERATION_MAX_MERGE_ROUNDS` 控制独立合并轮次，默认 4、范围为 1-12；两套预算相互独立。合并结果必须保留 knowledge unit、原始问题覆盖、evidence 和原答案论断并集，连续候选指纹无变化即安全停止。尝试或合并轮次耗尽后保存 `generationAttempts` 与 `qualityFeedback`，转入 `NEEDS_REVIEW` 并停止后台自动重试；用户补充说明后才开始新一轮图执行。
 
 ### 文件夹归档与文件夹内复习
 
@@ -472,6 +478,7 @@ Python 从 `ai-python/config/application.yml` 加载非敏感默认值，并允�
 | `REVIEW_LANGEXTRACT_MAX_WORKERS` | 单份资料 LangExtract 同一 pass 的 I/O worker，默认 `8`、硬上限 `10` |
 | `REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS` | 单份资料 LangExtract 总请求预算，默认 `32` |
 | `REVIEW_GENERATION_MAX_ATTEMPTS` | 每轮卡片生成模型调用上限，默认 `8`，安全范围 `1-20`；与图的 `recursion_limit=999` 相互独立 |
+| `REVIEW_GENERATION_MAX_MERGE_ROUNDS` | 多卡 Observer → Merge Repair 合并轮次上限，默认 `4`，安全范围 `1-12`；与 Actor 质量尝试独立计数 |
 | `RAG_EMBEDDING_MAX_IN_FLIGHT` | 百炼 embedding 远程批次并发，默认 `8`、硬上限 `10` |
 | `RAG_RETRIEVAL_IO_WORKERS` | Multi-Query pgvector I/O worker，默认 `8`、硬上限 `10` |
 | `RAG_VIDEO_PARALLEL_SEGMENT_TARGET_MIB` | 后端大视频媒体分片目标，默认 `20`；实际边界受关键帧影响 |
