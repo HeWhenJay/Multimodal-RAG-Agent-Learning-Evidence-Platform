@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
-from app.core.io_concurrency import configured_io_workers, process_io_limiter, run_llm_io
+from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.generation_graph import (
     ProgressCallback,
@@ -396,9 +396,7 @@ class KnowledgePointExtractor:
             max_char_buffer=bounded_int_environment(
                 "REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER", 8000, minimum=1000, maximum=20000
             ),
-            max_workers=bounded_int_environment(
-                "REVIEW_LANGEXTRACT_MAX_WORKERS", 16, minimum=1, maximum=64
-            ),
+            max_workers=configured_cpu_workers("REVIEW_LANGEXTRACT_MAX_WORKERS"),
             max_model_requests=bounded_int_environment(
                 "REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS", 32, minimum=1, maximum=64
             ),
@@ -1565,7 +1563,7 @@ def normalize_generated_summary(value: object) -> str | None:
 
 
 def is_high_quality_review_question(value: str) -> bool:
-    """接受完整疑问或主动回忆指令，问号仅作展示标点而非发布门禁。"""
+    """只接受可独立理解的面试官式问题，拒绝教材任务和转述式元话语。"""
     question = " ".join(str(value or "").split()).strip()
     normalized = normalized_sentence(question)
     if not 8 <= len(normalized) <= 180:
@@ -1580,6 +1578,10 @@ def is_high_quality_review_question(value: str) -> bool:
         question,
     ):
         return False
+    if re.match(r"^(?:请)?(?:说明|列出|概括|总结|梳理|阐述|指出|回忆)", question):
+        return False
+    if re.search(r"(?:如果)?面试官(?:要求|问|问到|提到).{0,80}(?:如何回答|怎么回答|你会怎么说)", question):
+        return False
     if re.search(
         r"(?:什么意思|这些是什么|那是什么|到底什么意思|本节(?:的)?(?:核心内容|关键知识点|主要内容)|"
         r"本段(?:的)?(?:核心内容|关键知识点|主要内容)|这段(?:主要)?讲了什么|需要掌握什么)",
@@ -1592,7 +1594,7 @@ def is_high_quality_review_question(value: str) -> bool:
         question,
     )
     recall_instruction = re.match(
-        r"^(?:请)?(?:说明|解释|概述|列出|比较|分析|描述|总结|梳理|阐述|指出|回忆)\s*",
+        r"^(?:请你?)?(?:解释|比较|分析|描述)\s*",
         question,
     )
     return bool(question_form or recall_instruction)

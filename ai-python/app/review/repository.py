@@ -180,6 +180,15 @@ class ReviewTransaction(Protocol):
         summary: str | None = None,
     ) -> list[ReviewCardRecord] | None: ...
 
+    def publish_segment_cards_for_material(
+        self,
+        material: MaterialSourceRecord,
+        original_card_ids: list[int],
+        cards: list[ReviewCardDraft],
+        *,
+        summary: str | None = None,
+    ) -> list[ReviewCardRecord] | None: ...
+
     def save_generation(
         self,
         material: MaterialSourceRecord,
@@ -661,6 +670,156 @@ class DatabaseReviewTransaction:
         )
         if not inserted_ids:
             return []
+        self._cursor.execute(
+            self._card_select(
+                "WHERE c.id = ANY(%s::BIGINT[]) AND c.user_id = %s AND lm.user_id = %s ORDER BY c.id ASC"
+            ),
+            (inserted_ids, material.user_id, material.user_id),
+        )
+        return [self._to_card(row) for row in self._cursor.fetchall()]
+
+    def publish_segment_cards_for_material(
+        self,
+        material: MaterialSourceRecord,
+        original_card_ids: list[int],
+        cards: list[ReviewCardDraft],
+        *,
+        summary: str | None = None,
+    ) -> list[ReviewCardRecord] | None:
+        """允许首次生成或替换旧卡片，并把用户确认的分段候选一次性发布。"""
+        if not cards:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT lm.index_request_version,
+                       rm.id AS review_material_id,
+                       rm.summary AS review_summary
+                FROM {schema}.learning_material lm
+                LEFT JOIN {schema}.learning_review_material rm
+                  ON rm.material_id = lm.id AND rm.user_id = lm.user_id
+                WHERE lm.id = %s AND lm.user_id = %s
+                FOR UPDATE OF lm
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        current = self._cursor.fetchone()
+        if current is None or int(current.get("index_request_version") or 0) != material.index_request_version:
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT id, source_key
+                FROM {schema}.learning_review_card
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                ORDER BY id ASC
+                FOR UPDATE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        old_rows = self._cursor.fetchall()
+        old_ids = [int(row["id"]) for row in old_rows]
+        if old_ids != sorted(set(original_card_ids)):
+            return None
+        self._cursor.execute(
+            self._statement(
+                """
+                INSERT INTO {schema}.learning_review_material (
+                    material_id, user_id, index_request_version, is_learning_content,
+                    category, summary, status, reason, extractor, card_count,
+                    generated_at, generation_attempts, quality_feedback, generation_progress
+                )
+                VALUES (%s, %s, %s, TRUE, '面试复习', %s, 'GENERATED',
+                        '用户已确认交互式分段生成结果', 'model:segment-workspace-v1', 0,
+                        CURRENT_TIMESTAMP, 0, '[]'::jsonb, '{}'::jsonb)
+                ON CONFLICT (material_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    index_request_version = EXCLUDED.index_request_version,
+                    is_learning_content = TRUE,
+                    category = COALESCE({schema}.learning_review_material.category, EXCLUDED.category),
+                    summary = COALESCE(EXCLUDED.summary, {schema}.learning_review_material.summary),
+                    status = 'GENERATED',
+                    reason = EXCLUDED.reason,
+                    extractor = EXCLUDED.extractor,
+                    generation_attempts = 0,
+                    quality_feedback = '[]'::jsonb,
+                    generation_progress = '{}'::jsonb,
+                    generated_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id
+                """
+            ),
+            (
+                material.id,
+                material.user_id,
+                material.index_request_version,
+                summary,
+            ),
+        )
+        review_material_id = int(self._cursor.fetchone()["id"])
+        for row in old_rows:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_card_exclusion (
+                        original_card_id, material_id, user_id, source_key
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                (int(row["id"]), material.id, material.user_id, str(row["source_key"])),
+            )
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_card
+                SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE material_id = %s AND user_id = %s AND active = TRUE
+                """
+            ),
+            (material.id, material.user_id),
+        )
+        inserted_ids: list[int] = []
+        for card in cards:
+            self._cursor.execute(
+                self._statement(
+                    """
+                    INSERT INTO {schema}.learning_review_card (
+                        review_material_id, material_id, user_id, source_key,
+                        question, answer, hint, evidence_refs, fsrs_card_json,
+                        due_at, retrievability, review_count, lapse_count, active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 0, 0, 0, TRUE)
+                    RETURNING id
+                    """
+                ),
+                (
+                    review_material_id,
+                    material.id,
+                    material.user_id,
+                    card.source_key,
+                    card.question,
+                    card.answer,
+                    card.hint,
+                    card.evidence_refs_json,
+                    card.fsrs_card_json,
+                    card.due_at,
+                ),
+            )
+            inserted_ids.append(int(self._cursor.fetchone()["id"]))
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_review_material
+                SET card_count = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND user_id = %s
+                """
+            ),
+            (len(inserted_ids), review_material_id, material.user_id),
+        )
         self._cursor.execute(
             self._card_select(
                 "WHERE c.id = ANY(%s::BIGINT[]) AND c.user_id = %s AND lm.user_id = %s ORDER BY c.id ASC"

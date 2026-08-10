@@ -2,6 +2,45 @@
 
 更新日期：2026-08-10
 
+## 交互式分段生成工作台（2026-08-10）
+
+现有 `SEGMENTED` 模式会在服务端把按原位置排序的 evidence 按“每段最多 24 条、最多约 12000 字”自动切段，随后逐段使用宽松门禁生成，最后自动按规范化问题和来源键去重合并。该模式只展示总体进度，用户看不到每段原文，也不能给单独一段补充说明或编辑中间候选。
+
+新增交互式分段工作台后，一键 `SEGMENTED` 快捷模式继续保留，同时增加以下人工流程：
+
+1. 用户打开资料的“分段工作台”，读取稳定的分段 ID、章节/时间范围、原始 evidence 内容和当前正式卡片版本。
+2. 用户勾选一个或多个分段，并为每段填写独立提示词；未勾选分段不会调用模型。
+3. 后台任务只生成本轮选中的分段。每段独立返回成功、失败、摘要、质量反馈和带真实 evidenceId 的候选卡片；一个分段失败不影响其他分段结果。
+4. 用户可以继续选择其他分段、修改提示词重新生成某段、编辑已生成问题/答案/提示，或取消某段参与最终合并。
+5. “合并为正式复习卡片”会携带资料索引版本、原活动卡片 ID/指纹和全部候选 evidenceId。服务端重新校验资料归属、并发版本和逐卡 evidence 忠实度后，在同一事务中替换正式卡片；合并前不会写入正式卡片或改变 FSRS 状态。
+
+同一轮选中的分段会进入进程级共享 I/O 线程池并发生成，默认最多 16 个；多份资料共用这一个池，避免每个任务各建线程导致并发膨胀。LangExtract 的本地切分、映射和聚合按 CPU/内存密集阶段限制为 n+1=9，实际模型网络请求仍受 16 个 I/O 并发槽约束。
+
+### 接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/reviews/materials/{materialId}/segments` | 返回当前用户资料的分段原文、evidence、原卡片版本与合并基线 |
+| `POST` | `/api/reviews/materials/{materialId}/segment-tasks` | 按用户选择的 `segmentIds` 和逐段 `prompts` 创建后台生成任务 |
+| `GET` | `/api/reviews/materials/{materialId}/segment-tasks/{taskId}` | 查询所选分段的生成进度、逐段结果和质量反馈 |
+| `GET` | `/api/reviews/materials/{materialId}/segment-tasks/latest` | 重新打开工作台时恢复最近一次后台任务 |
+| `POST` | `/api/reviews/materials/{materialId}/segments/merge` | 校验用户编辑后的候选并原子发布为正式复习卡片 |
+
+分段生成请求示例：
+
+```json
+{
+  "segmentIds": ["segment-a1", "segment-b2"],
+  "prompts": {
+    "segment-a1": "重点模拟面试官追问主从同步流程",
+    "segment-b2": "保留脑裂参数及其作用"
+  },
+  "mode": "RELAXED"
+}
+```
+
+公开响应继续使用 `Result<T>` 信封；用户身份只从 `Authorization` 对应的服务端上下文读取。分段 ID 必须属于当前资料当前索引版本，过期或跨资料 ID 返回中文业务失败。任务状态为 `QUEUED`、`RUNNING`、`SUCCEEDED` 或 `FAILED`。`SUCCEEDED` 表示任务编排完成，允许其中个别分段为 `FAILED`，前端应保留成功分段并允许用户重试失败段。
+
 ## 质量门禁分级与人工决策（2026-08-10）
 
 ### 变更摘要

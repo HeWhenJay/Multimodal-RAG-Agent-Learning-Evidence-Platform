@@ -22,6 +22,7 @@ import {
   GripVertical,
   LocateFixed,
   LibraryBig,
+  Layers3,
   Loader2,
   MessageCirclePlus,
   MoveRight,
@@ -84,6 +85,7 @@ import { useDragAutoScroll } from './useDragAutoScroll';
 import { ReviewCardEditDialog } from './ReviewCardEditDialog';
 import { ReviewCardRewriteDialog } from './ReviewCardRewriteDialog';
 import { ReviewMaterialRewriteDialog, type MaterialRewriteTarget } from './ReviewMaterialRewriteDialog';
+import { ReviewSegmentWorkspaceDialog, type ReviewSegmentWorkspaceTarget } from './ReviewSegmentWorkspaceDialog';
 
 type ReviewRating = 1 | 2 | 3 | 4;
 type DropPlacement = 'before' | 'after';
@@ -169,6 +171,7 @@ export function ReviewCenter() {
   const [cardEditTarget, setCardEditTarget] = useState<ReviewCard | null>(null);
   const [cardRewriteTarget, setCardRewriteTarget] = useState<ReviewCard | null>(null);
   const [materialRewriteTarget, setMaterialRewriteTarget] = useState<MaterialRewriteTarget | null>(null);
+  const [segmentWorkspaceTarget, setSegmentWorkspaceTarget] = useState<ReviewSegmentWorkspaceTarget | null>(null);
   const [cardActionLoadingId, setCardActionLoadingId] = useState<number | null>(null);
   const [locatedMaterialId, setLocatedMaterialId] = useState<number | null>(null);
   const locateTimerRef = useRef<number | null>(null);
@@ -893,6 +896,20 @@ export function ReviewCenter() {
     const target = reviewFeedbackTarget;
     if (!target || reviewFeedbackBusy) return;
     const feedback = reviewFeedbackText.trim();
+    if (reviewFeedbackAction === 'REGENERATE' && reviewFeedbackMode === 'SEGMENTED') {
+      const materialId = resolveMaterialId(target);
+      if (materialId == null) return;
+      setSegmentWorkspaceTarget({
+        materialId,
+        title: target.title,
+        cardCount: target.cardCount,
+        initialPrompt: feedback || undefined
+      });
+      setReviewFeedbackTarget(null);
+      setReviewFeedbackText('');
+      setReviewFeedbackError('');
+      return;
+    }
     if (reviewFeedbackAction === 'REGENERATE' && reviewFeedbackMode === 'STANDARD' && !feedback) {
       setReviewFeedbackError('请先补充本节重点、问题范围或需要保留的原始问句');
       return;
@@ -1177,7 +1194,7 @@ export function ReviewCenter() {
             {materials.length ? materials.map((material) => {
               const materialId = resolveMaterialId(material);
               const queueIndex = materialId == null ? -1 : pendingMaterialIdList.indexOf(materialId);
-              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} located={materialId != null && locatedMaterialId === materialId} busy={busyMaterialId === materialId} missingKnowledgeTask={materialId == null ? undefined : missingKnowledgeTasks[materialId]} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onCreateManual={() => { if (materialId != null) setManualCardTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
+              return <ReviewMaterialRow key={materialId ?? material.title} material={material} queuePosition={queueIndex >= 0 ? queueIndex + 1 : null} queueTotal={pendingMaterialIdList.length} selected={materialId != null && Boolean(selectedMaterialIds[materialId])} located={materialId != null && locatedMaterialId === materialId} busy={busyMaterialId === materialId} missingKnowledgeTask={materialId == null ? undefined : missingKnowledgeTasks[materialId]} deleting={materialId != null && deletingKey === `MATERIAL:${materialId}`} locked={orderBusy} onToggleSelected={() => { if (materialId != null) setSelectedMaterialIds((previous) => toggleSelected(previous, materialId)); }} onFindMissing={() => { if (materialId != null) setMissingKnowledgeTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onCreateManual={() => { if (materialId != null) setManualCardTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onOpenSegments={() => { if (materialId != null) setSegmentWorkspaceTarget({ materialId, title: material.title, cardCount: material.cardCount }); }} onRegenerate={() => void regenerateMaterial(material)} onDelete={() => { if (materialId != null) requestMaterialDeletion(materialId, material.title); }} />;
             }) : <p className="panel-empty">暂无未归档资料；文件夹中的内容请进入对应文件夹查看</p>}
           </div>
         </section>
@@ -1205,6 +1222,7 @@ export function ReviewCenter() {
       <ReviewCardEditDialog target={cardEditTarget} onClose={() => setCardEditTarget(null)} onSaved={applyUpdatedCard} />
       <ReviewCardRewriteDialog target={cardRewriteTarget} onClose={() => setCardRewriteTarget(null)} onSaved={applyUpdatedCard} />
       <ReviewMaterialRewriteDialog target={materialRewriteTarget} onClose={() => setMaterialRewriteTarget(null)} onApplied={applyMaterialRewrite} />
+      <ReviewSegmentWorkspaceDialog target={segmentWorkspaceTarget} onClose={() => setSegmentWorkspaceTarget(null)} onApplied={applyMaterialRewrite} />
     </div>
   );
 }
@@ -1354,11 +1372,11 @@ function ReviewGenerationFeedbackDialog({
           <p>本次质量门禁未通过。你可以保留当前卡片，或选择新的生成策略；失败时旧版本不会被停用。</p>
           {diagnostics.length ? <div className="review-generation-feedback"><strong>最近质量反馈</strong><ul>{diagnostics.slice(-8).map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></div> : null}
           {target.cardCount > 0 ? <fieldset className="review-generation-choice"><legend>处理动作</legend><label><input type="radio" name="review-generation-action" checked={action === 'KEEP_CURRENT'} onChange={() => onActionChange('KEEP_CURRENT')} disabled={busy} />保留当前卡片</label><label><input type="radio" name="review-generation-action" checked={action === 'REGENERATE'} onChange={() => onActionChange('REGENERATE')} disabled={busy} />重新生成</label></fieldset> : null}
-          {action === 'REGENERATE' ? <fieldset className="review-generation-choice"><legend>生成模式</legend><label><input type="radio" name="review-generation-mode" checked={mode === 'STANDARD'} onChange={() => onModeChange('STANDARD')} disabled={busy} />标准门禁<span>补充提示词后重试，质量要求最高</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'RELAXED'} onChange={() => onModeChange('RELAXED')} disabled={busy} />宽松门禁<span>保留真实 evidence，降低覆盖比例门槛</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'SEGMENTED'} onChange={() => onModeChange('SEGMENTED')} disabled={busy} />分段生成并合并<span>按资料段生成，合并全部通过门禁的卡片</span></label></fieldset> : null}
+          {action === 'REGENERATE' ? <fieldset className="review-generation-choice"><legend>生成模式</legend><label><input type="radio" name="review-generation-mode" checked={mode === 'STANDARD'} onChange={() => onModeChange('STANDARD')} disabled={busy} />标准门禁<span>补充提示词后重试，质量要求最高</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'RELAXED'} onChange={() => onModeChange('RELAXED')} disabled={busy} />宽松门禁<span>保留真实 evidence，降低覆盖比例门槛</span></label><label><input type="radio" name="review-generation-mode" checked={mode === 'SEGMENTED'} onChange={() => onModeChange('SEGMENTED')} disabled={busy} />交互式分段生成<span>先查看每段原文，再逐段补充提示词、生成、编辑和合并</span></label></fieldset> : null}
           {action === 'REGENERATE' ? <label><span>补充说明{mode === 'STANDARD' ? '（标准模式必填）' : '（可选）'}</span><textarea ref={inputRef} value={feedback} maxLength={2000} aria-invalid={Boolean(error)} aria-describedby={error ? 'review-generation-feedback-error' : undefined} onChange={(event) => onFeedbackChange(event.target.value)} placeholder="例如：本节只讲 Kafka delete 与 compact 两类清理策略，请逐条保留视频中的原始问题。" disabled={busy} />{error ? <small id="review-generation-feedback-error" className="review-generation-validation" role="alert">{error}</small> : null}</label> : null}
           {busy ? <p className="review-generation-running-note">正在后台生成，可以关闭窗口，稍后查看资料状态。</p> : null}
         </div>
-        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose}>稍后处理</button><button className="primary-action" type="submit" disabled={busy || (action === 'REGENERATE' && mode === 'STANDARD' && !feedback.trim())}>{busy ? <Loader2 className="spin" size={16} /> : action === 'KEEP_CURRENT' ? <Check size={16} /> : <RefreshCw size={16} />}{busy ? '处理中' : action === 'KEEP_CURRENT' ? '保留当前卡片' : '开始生成'}</button></div>
+        <div className="review-delete-actions"><button className="outline-action" type="button" onClick={onClose}>稍后处理</button><button className="primary-action" type="submit" disabled={busy || (action === 'REGENERATE' && mode === 'STANDARD' && !feedback.trim())}>{busy ? <Loader2 className="spin" size={16} /> : action === 'KEEP_CURRENT' ? <Check size={16} /> : mode === 'SEGMENTED' ? <Layers3 size={16} /> : <RefreshCw size={16} />}{busy ? '处理中' : action === 'KEEP_CURRENT' ? '保留当前卡片' : mode === 'SEGMENTED' ? '打开分段工作台' : '开始生成'}</button></div>
       </form>
     </div>
   );
@@ -1659,7 +1677,7 @@ function EvidenceRow({ evidence }: { evidence: RagEvidence }) {
   );
 }
 
-function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, located, busy, missingKnowledgeTask, deleting, locked, onToggleSelected, onFindMissing, onCreateManual, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; located: boolean; busy: boolean; missingKnowledgeTask?: ReviewMissingKnowledgeTask; deleting: boolean; locked: boolean; onToggleSelected: () => void; onFindMissing: () => void; onCreateManual: () => void; onRegenerate: () => void; onDelete: () => void }) {
+function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, located, busy, missingKnowledgeTask, deleting, locked, onToggleSelected, onFindMissing, onCreateManual, onOpenSegments, onRegenerate, onDelete }: { material: ReviewMaterial; queuePosition: number | null; queueTotal: number; selected: boolean; located: boolean; busy: boolean; missingKnowledgeTask?: ReviewMissingKnowledgeTask; deleting: boolean; locked: boolean; onToggleSelected: () => void; onFindMissing: () => void; onCreateManual: () => void; onOpenSegments: () => void; onRegenerate: () => void; onDelete: () => void }) {
   const summary = materialSummary(material.summary, material.reason, material.status);
   const manualReview = material.status === 'NEEDS_REVIEW' || material.needsManualReview;
   const materialRewrite = material.cardCount > 0;
@@ -1679,6 +1697,7 @@ function ReviewMaterialRow({ material, queuePosition, queueTotal, selected, loca
       <div className={`material-status ${statusClass(material.status)}`}>{formatGenerationStatus(material.status)}</div>
       <div className="material-row-actions">
         {material.status === 'GENERATED' ? <><button className={`icon-button tiny${missingKnowledgeBusy ? ' is-task-running' : ''}`} type="button" title={missingKnowledgeBusy ? '查看补漏进度' : '对话补充遗漏知识点'} aria-label={missingKnowledgeBusy ? `查看 ${material.title} 的补漏进度` : `为 ${material.title} 补充遗漏知识点`} onClick={onFindMissing} disabled={busy || deleting || locked}>{missingKnowledgeBusy ? <Loader2 className="spin" size={14} /> : <MessageCirclePlus size={14} />}</button><button className="icon-button tiny" type="button" title="创建手动复习卡片" aria-label={`为 ${material.title} 创建手动复习卡片`} onClick={onCreateManual} disabled={busy || deleting || locked}><PenLine size={14} /></button></> : null}
+        <button className="icon-button tiny" type="button" title="查看原文并选择分段生成" aria-label={`打开 ${material.title} 的交互式分段生成工作台`} onClick={onOpenSegments} disabled={busy || deleting || locked}><Layers3 size={14} /></button>
         <button className="icon-button tiny" type="button" title={materialRewrite ? 'AI 合并改写并对比' : manualReview ? '补充说明并重新生成' : '重新生成卡片'} aria-label={`${materialRewrite ? 'AI 合并改写并对比' : manualReview ? '补充说明并重新生成' : '重新生成'} ${material.title}`} onClick={onRegenerate} disabled={busy || deleting || locked}>{busy ? <Loader2 className="spin" size={14} /> : materialRewrite ? <Sparkles size={14} /> : manualReview ? <AlertTriangle size={14} /> : <RefreshCw size={14} />}</button>
         <button className="icon-button tiny danger" type="button" title="移出复习中心" aria-label={`将 ${material.title} 移出复习中心`} onClick={onDelete} disabled={busy || deleting || locked}>{deleting ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}</button>
       </div>

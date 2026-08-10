@@ -13,6 +13,7 @@ import {
   FolderOpen,
   FolderX,
   GripVertical,
+  Layers3,
   Loader2,
   MessageCirclePlus,
   PenLine,
@@ -33,6 +34,7 @@ import { useDragAutoScroll } from './useDragAutoScroll';
 import { ReviewCardEditDialog } from './ReviewCardEditDialog';
 import { ReviewCardRewriteDialog } from './ReviewCardRewriteDialog';
 import { ReviewMaterialRewriteDialog, type MaterialRewriteTarget } from './ReviewMaterialRewriteDialog';
+import { ReviewSegmentWorkspaceDialog, type ReviewSegmentWorkspaceTarget } from './ReviewSegmentWorkspaceDialog';
 
 type ReviewRating = 1 | 2 | 3 | 4;
 type DropPlacement = 'before' | 'after';
@@ -75,6 +77,7 @@ export function ReviewFolderDetail() {
   const [cardEditTarget, setCardEditTarget] = useState<ReviewCard | null>(null);
   const [cardRewriteTarget, setCardRewriteTarget] = useState<ReviewCard | null>(null);
   const [materialRewriteTarget, setMaterialRewriteTarget] = useState<MaterialRewriteTarget | null>(null);
+  const [segmentWorkspaceTarget, setSegmentWorkspaceTarget] = useState<ReviewSegmentWorkspaceTarget | null>(null);
   const [cardActionLoadingId, setCardActionLoadingId] = useState<number | null>(null);
   const materialsRef = useRef<ReviewFolderMaterial[]>([]);
   const reviewedCardIdsRef = useRef<Set<number>>(new Set());
@@ -474,6 +477,7 @@ export function ReviewFolderDetail() {
               </button>
               <div className="review-folder-document-actions">
                 {material.cardCount > 0 ? <button className="outline-action small review-ai-action" type="button" onClick={() => setMaterialRewriteTarget({ materialId: material.materialId, title: material.title, summary: material.summary, cardCount: material.cardCount })} disabled={movingMaterialId !== null || draggingMaterialId !== null || orderSaving}><Sparkles size={14} />AI 合并改写</button> : null}
+                <button className="outline-action small review-segment-action" type="button" onClick={() => setSegmentWorkspaceTarget({ materialId: material.materialId, title: material.title, cardCount: material.cardCount })} disabled={movingMaterialId !== null || draggingMaterialId !== null || orderSaving}><Layers3 size={14} />分段工作台</button>
                 <button className="outline-action small" type="button" onClick={() => setManualCardTarget({ materialId: material.materialId, title: material.title, cardCount: material.cardCount })} disabled={movingMaterialId !== null || draggingMaterialId !== null || orderSaving}><PenLine size={14} />手动建卡</button>
                 <button className="outline-action small" type="button" onClick={() => setMissingKnowledgeTarget({ materialId: material.materialId, title: material.title, cardCount: material.cardCount })} disabled={movingMaterialId !== null || draggingMaterialId !== null || orderSaving}>{missingKnowledgeTasks[material.materialId]?.status === 'QUEUED' || missingKnowledgeTasks[material.materialId]?.status === 'RUNNING' ? <Loader2 className="spin" size={14} /> : <MessageCirclePlus size={14} />}{missingKnowledgeTasks[material.materialId]?.status === 'QUEUED' || missingKnowledgeTasks[material.materialId]?.status === 'RUNNING' ? '查看进度' : '补充遗漏'}</button>
                 <button className="outline-action small review-folder-remove" type="button" onClick={() => void removeFromFolder(material.materialId, material.title)} disabled={movingMaterialId !== null || draggingMaterialId !== null || orderSaving}><FolderX size={14} />{movingMaterialId === material.materialId ? '移出中' : '移出文件夹'}</button>
@@ -513,6 +517,7 @@ export function ReviewFolderDetail() {
       <ReviewCardEditDialog target={cardEditTarget} onClose={() => setCardEditTarget(null)} onSaved={applyUpdatedCard} />
       <ReviewCardRewriteDialog target={cardRewriteTarget} onClose={() => setCardRewriteTarget(null)} onSaved={applyUpdatedCard} />
       <ReviewMaterialRewriteDialog target={materialRewriteTarget} onClose={() => setMaterialRewriteTarget(null)} onApplied={applyMaterialRewrite} />
+      <ReviewSegmentWorkspaceDialog target={segmentWorkspaceTarget} onClose={() => setSegmentWorkspaceTarget(null)} onApplied={applyMaterialRewrite} />
       <FolderCardDeletionDialog target={deleteTarget} deleting={deletingCardId !== null} onConfirm={() => void confirmCardDeletion()} onClose={() => { if (deletingCardId === null) setDeleteTarget(null); }} />
     </div>
   );

@@ -135,7 +135,8 @@ review:
     enabled: ${REVIEW_LANGEXTRACT_ENABLED:true}
     extraction-passes: ${REVIEW_LANGEXTRACT_EXTRACTION_PASSES:2}
     max-char-buffer: ${REVIEW_LANGEXTRACT_MAX_CHAR_BUFFER:8000}
-    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:16}
+    # LangExtract 含本地切分、映射和聚合，按 CPU/内存密集阶段限制为 n+1=9；模型网络请求仍走 I/O 池。
+    max-workers: ${REVIEW_LANGEXTRACT_MAX_WORKERS:9}
     max-model-requests: ${REVIEW_LANGEXTRACT_MAX_MODEL_REQUESTS:32}
     timeout-seconds: ${REVIEW_LANGEXTRACT_TIMEOUT_SECONDS:615}
 

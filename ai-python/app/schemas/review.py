@@ -150,6 +150,80 @@ class ReviewMaterialRewriteRequest(BaseModel):
         return normalized
 
 
+class ReviewEvidenceSegment(BaseModel):
+    """交互式分段工作台展示的一段原始 evidence。"""
+
+    segmentId: str = Field(..., min_length=8, max_length=80)
+    segmentIndex: int = Field(..., ge=1)
+    totalSegments: int = Field(..., ge=1)
+    title: str = Field(..., min_length=1, max_length=240)
+    characterCount: int = Field(default=0, ge=0)
+    evidenceCount: int = Field(default=0, ge=0)
+    rawContent: str = Field(..., min_length=1, max_length=30000)
+    evidenceRefs: list[Evidence] = Field(default_factory=list)
+
+
+class ReviewSegmentWorkspace(BaseModel):
+    """资料分段原文、并发合并基线和用户可选的生成单元。"""
+
+    materialId: int = Field(..., ge=1)
+    title: str
+    sourceVersion: int = Field(..., ge=0)
+    originalFingerprint: str = Field(..., min_length=16, max_length=128)
+    originalCardIds: list[int] = Field(default_factory=list)
+    originalCards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list)
+    originalSummary: str | None = None
+    segments: list[ReviewEvidenceSegment] = Field(default_factory=list)
+
+
+class ReviewSegmentGenerationRequest(BaseModel):
+    """按用户勾选的分段和逐段提示词创建生成任务。"""
+
+    segmentIds: list[str] = Field(..., min_length=1, max_length=100)
+    prompts: dict[str, str] = Field(default_factory=dict)
+    mode: Literal["STANDARD", "RELAXED"] = "RELAXED"
+
+    @field_validator("segmentIds")
+    @classmethod
+    def normalize_segment_ids(cls, value: list[str]) -> list[str]:
+        """去掉空白并拒绝重复分段，避免同一段在一次任务中重复调用模型。"""
+        normalized = list(dict.fromkeys(item.strip() for item in value if item and item.strip()))
+        if not normalized:
+            raise ValueError("至少选择一个资料分段")
+        return normalized
+
+    @field_validator("prompts")
+    @classmethod
+    def normalize_segment_prompts(cls, value: dict[str, str]) -> dict[str, str]:
+        """压缩逐段提示词并限制单段上下文说明长度。"""
+        return {
+            str(key).strip(): " ".join(str(prompt or "").split()).strip()[:2000]
+            for key, prompt in value.items()
+            if str(key).strip()
+        }
+
+
+class ReviewSegmentResult(BaseModel):
+    """一段生成完成后的候选卡片和可诊断结果。"""
+
+    segmentId: str
+    segmentIndex: int = Field(..., ge=1)
+    title: str
+    status: Literal["SUCCEEDED", "FAILED"]
+    summary: str | None = None
+    cards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list)
+    qualityFeedback: list[str] = Field(default_factory=list, max_length=80)
+    error: str | None = None
+
+
+class ReviewSegmentGenerationResult(BaseModel):
+    """本轮所选分段的独立结果集合，允许部分成功。"""
+
+    materialId: int = Field(..., ge=1)
+    sourceVersion: int = Field(..., ge=0)
+    segments: list[ReviewSegmentResult] = Field(default_factory=list)
+
+
 class ReviewMaterialRewritePreview(BaseModel):
     """资料级改写的无副作用前后对比结果。"""
 
@@ -214,6 +288,37 @@ class ReviewMaterialRewriteTask(BaseModel):
     error: str | None = None
     createdAt: datetime
     updatedAt: datetime
+
+
+class ReviewSegmentGenerationTask(BaseModel):
+    """可关闭工作台后继续查询的分段生成任务。"""
+
+    taskId: str = Field(min_length=1, max_length=80)
+    materialId: int = Field(..., ge=1)
+    mode: Literal["STANDARD", "RELAXED"]
+    segmentIds: list[str] = Field(default_factory=list)
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    progress: ReviewRewriteTaskProgress
+    result: ReviewSegmentGenerationResult | None = None
+    error: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
+
+
+class ReviewSegmentMergeRequest(BaseModel):
+    """携带工作台版本和用户编辑候选，原子发布分段复习卡片。"""
+
+    sourceVersion: int = Field(..., ge=0)
+    originalFingerprint: str = Field(..., min_length=16, max_length=128)
+    originalCardIds: list[int] = Field(default_factory=list)
+    proposedCards: list[ReviewCardUpdateRequest] = Field(..., min_length=1)
+    proposedSummary: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("originalCardIds")
+    @classmethod
+    def normalize_original_card_ids(cls, value: list[int]) -> list[int]:
+        """去重排序当前卡片基线，允许首次生成时为空。"""
+        return sorted(set(value))
 
 
 class ReviewMaterialRewriteApplyRequest(BaseModel):

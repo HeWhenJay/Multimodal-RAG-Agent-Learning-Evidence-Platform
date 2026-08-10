@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 
-REVIEW_CARD_PROMPT_VERSION = "review-card-v13"
+REVIEW_CARD_PROMPT_VERSION = "review-card-v14"
 REVIEW_MISSING_KNOWLEDGE_PROMPT_VERSION = "review-missing-knowledge-v2"
 REVIEW_CARD_REWRITE_PROMPT_VERSION = "review-card-rewrite-v2"
 REVIEW_MATERIAL_REWRITE_PROMPT_VERSION = "review-material-rewrite-v3"
@@ -32,8 +32,9 @@ def review_card_system_prompt() -> str:
         "不能确定时必须为 null，sourceQuestion 不参与卡面内容表达。最终 question 必须去掉口头语并补全上下文，"
         "必须模拟真实面试官向候选人发问，而不是教材标题、学习任务或自问自答。优先使用‘请你解释一下……？’、"
         "‘你会如何实现……？’、‘为什么……？’、‘如果……你会怎么处理？’、‘……和……有什么区别？’等自然口吻，"
-        "必要时可以把‘说明/比较/列出某主题’改写为‘面试官要求你说明/比较/列出……时，你会如何回答？’；"
-        "问题应尽量以问号结尾，不能只写名词短语或祈使句。"
+        "禁止直接以‘说明、列出、概括、总结、梳理、阐述、指出、回忆’开头写成教材任务，"
+        "也禁止‘面试官要求你……时，你会如何回答’‘如果面试官问……’等转述式元话语；必须直接向候选人提问。"
+        "问题应尽量以问号结尾，不能只写名词短语、祈使句或学习要求。"
         "只有没有合适原始问句时，才可围绕资料明确强调的核心定义、机制、流程、对比、因果或实践结论生成新问题，"
         "此时 sourceQuestion 必须为 null。不得把每一句讲解都机械改成问题，不得生成资料没有重点讨论的泛化题。"
         "question 禁止包含无法脱离上下文理解的这、那、它、这些、上述、前面等指代；禁止输出直接泄露答案的事实陈述、转场句、"
@@ -50,8 +51,8 @@ def review_card_system_prompt() -> str:
         "如果清洗后没有值得复习的重点，返回空 cards；每个独立且有 evidence 支撑的知识点都可以生成卡片，不能因为数量而抽样或遗漏。"
         "以下只是质量格式示例，不是可用于回答当前资料的知识：错误问题‘那什么意思呢？’应改为带明确主题的问题；"
         "错误卡面‘就必须先搞定 MVCC 具体是如何实现的’是转场陈述，不能发布；应改成面试官口吻的"
-        "‘请你解释一下 MVCC 的实现机制？’；错误问题‘MVCC 如何实现’应补成‘如果面试官问 MVCC 如何实现，"
-        "你会如何回答？’；错误问题‘父段摘要：这些是什么意思？’"
+        "‘请你解释一下 MVCC 的实现机制？’；错误问题‘MVCC 如何实现’应补成‘MVCC 通常是如何实现的？’；"
+        "错误问题‘父段摘要：这些是什么意思？’"
         "包含检索元数据和无上下文指代，必须丢弃。"
         "只输出约定的唯一 JSON 对象，不要在 JSON 外输出 Markdown、分析过程或解释；JSON 字符串内部允许使用 Markdown。"
     )

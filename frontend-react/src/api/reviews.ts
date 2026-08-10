@@ -145,6 +145,72 @@ export interface ReviewMaterialRewriteApplyResult {
   replacedCardIds: number[];
 }
 
+export interface ReviewEvidenceSegment {
+  segmentId: string;
+  segmentIndex: number;
+  totalSegments: number;
+  title: string;
+  characterCount: number;
+  evidenceCount: number;
+  rawContent: string;
+  evidenceRefs: RagEvidence[];
+}
+
+export interface ReviewSegmentWorkspace {
+  materialId: number;
+  title: string;
+  sourceVersion: number;
+  originalFingerprint: string;
+  originalCardIds: number[];
+  originalCards: ReviewMaterialCardSnapshot[];
+  originalSummary?: string | null;
+  segments: ReviewEvidenceSegment[];
+}
+
+export interface ReviewSegmentGenerationPayload {
+  segmentIds: string[];
+  prompts: Record<string, string>;
+  mode: 'STANDARD' | 'RELAXED';
+}
+
+export interface ReviewSegmentResult {
+  segmentId: string;
+  segmentIndex: number;
+  title: string;
+  status: 'SUCCEEDED' | 'FAILED';
+  summary?: string | null;
+  cards: ReviewMaterialCardSnapshot[];
+  qualityFeedback: string[];
+  error?: string | null;
+}
+
+export interface ReviewSegmentGenerationResult {
+  materialId: number;
+  sourceVersion: number;
+  segments: ReviewSegmentResult[];
+}
+
+export interface ReviewSegmentGenerationTask {
+  taskId: string;
+  materialId: number;
+  mode: 'STANDARD' | 'RELAXED';
+  segmentIds: string[];
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  progress: ReviewRewriteTaskProgress;
+  result?: ReviewSegmentGenerationResult | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewSegmentMergePayload {
+  sourceVersion: number;
+  originalFingerprint: string;
+  originalCardIds: number[];
+  proposedCards: ReviewCardUpdatePayload[];
+  proposedSummary?: string | null;
+}
+
 export interface ReviewOverview {
   dueCount: number;
   actionableDueCount: number;
@@ -499,6 +565,39 @@ export function fetchReviewMaterialRewriteTask(materialId: number, taskId: strin
 // 应用用户确认后的资料级候选，服务端会校验原卡片版本并原子替换。
 export function applyReviewMaterialRewrite(materialId: number, payload: ReviewMaterialRewriteApplyPayload): Promise<ReviewMaterialRewriteApplyResult> {
   return request<ReviewMaterialRewriteApplyResult>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/rewrite-apply`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 读取资料当前索引版本对应的原始分段，供用户先查看再决定生成范围。
+export function fetchReviewSegmentWorkspace(materialId: number): Promise<ReviewSegmentWorkspace> {
+  return request<ReviewSegmentWorkspace>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segments`);
+}
+
+// 只为用户勾选的分段创建后台任务，每段提示词互相独立。
+export function startReviewSegmentTask(materialId: number, payload: ReviewSegmentGenerationPayload): Promise<ReviewSegmentGenerationTask> {
+  return request<ReviewSegmentGenerationTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segment-tasks`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 重新打开工作台时恢复该资料最近一次后台分段任务。
+export function fetchLatestReviewSegmentTask(materialId: number): Promise<ReviewSegmentGenerationTask | null> {
+  return request<ReviewSegmentGenerationTask | null>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segment-tasks/latest`);
+}
+
+// 轮询指定分段任务，不阻塞页面上的原文浏览和候选编辑。
+export function fetchReviewSegmentTask(materialId: number, taskId: string): Promise<ReviewSegmentGenerationTask> {
+  return request<ReviewSegmentGenerationTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segment-tasks/${encodeURIComponent(taskId)}`);
+}
+
+// 将用户确认参与的候选一次性发布为正式复习卡片。
+export function mergeReviewSegments(materialId: number, payload: ReviewSegmentMergePayload): Promise<ReviewMaterialRewriteApplyResult> {
+  return request<ReviewMaterialRewriteApplyResult>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segments/merge`, {
     method: 'POST',
     headers: jsonHeaders,
     body: JSON.stringify(payload)

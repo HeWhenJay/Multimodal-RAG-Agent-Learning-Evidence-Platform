@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from app.core.io_concurrency import configured_io_workers, process_io_limiter, run_llm_io
+from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
 from app.review.knowledge_extractor import (
     ReviewLlmEndpoint,
@@ -249,10 +249,10 @@ class LangExtractKnowledgeCurator:
         )
         self.extraction_passes = max(1, min(5, int(extraction_passes)))
         self.max_char_buffer = max(1000, min(20000, int(max_char_buffer)))
-        resolved_workers = max_workers if max_workers is not None else configured_io_workers(
+        resolved_workers = max_workers if max_workers is not None else configured_cpu_workers(
             "REVIEW_LANGEXTRACT_MAX_WORKERS"
         )
-        self.max_workers = max(1, min(64, int(resolved_workers)))
+        self.max_workers = max(1, min(9, int(resolved_workers)))
         self.max_model_requests = max(1, min(64, int(max_model_requests)))
         resolved_timeout = (
             cockpit_retry_policy().request_timeout_seconds

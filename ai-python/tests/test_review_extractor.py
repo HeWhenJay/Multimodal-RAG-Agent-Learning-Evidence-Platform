@@ -165,7 +165,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v13"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v14"
     assert clients == [
         {
             "api_key": "test-key",
@@ -566,13 +566,14 @@ def test_quality_gate_rejects_contextless_or_non_recall_cards(question: str) -> 
     assert is_high_quality_review_question(question) is False
 
 
-def test_quality_gate_accepts_self_contained_core_questions() -> None:
-    """完整疑问句不再依赖结尾问号，主动回忆指令也可发布。"""
+def test_quality_gate_accepts_interviewer_questions_and_rejects_textbook_tasks() -> None:
+    """完整面试问题不依赖结尾问号，但教材任务式祈使句不能发布。"""
     assert is_high_quality_review_question("事务的隔离性如何由锁和 MVCC 共同保证？") is True
     assert is_high_quality_review_question("事务的隔离性如何由锁和 MVCC 共同保证") is True
     assert is_high_quality_review_question("MVCC 的隐藏字段、undo log 与 Read View 如何协作？") is True
     assert is_high_quality_review_question("RC 与 RR 隔离级别生成 Read View 的时机有什么区别？") is True
-    assert is_high_quality_review_question("说明 Kafka 页缓存提升读写性能的机制") is True
+    assert is_high_quality_review_question("说明 Kafka 页缓存提升读写性能的机制") is False
+    assert is_high_quality_review_question("Kafka 页缓存为什么能提升读写性能？") is True
     assert is_high_quality_review_question("Kafka 使用页缓存把磁盘访问变为内存访问。") is False
 
 

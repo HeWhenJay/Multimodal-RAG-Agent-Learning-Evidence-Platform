@@ -97,8 +97,8 @@ def test_missing_knowledge_validator_accepts_statement_based_course_point_and_de
     assert result.skipped_count == 1
 
 
-def test_missing_knowledge_validator_accepts_recall_instruction_without_question_mark() -> None:
-    """补漏卡面同样接受不带问号的主动回忆指令。"""
+def test_missing_knowledge_validator_accepts_direct_interviewer_question() -> None:
+    """补漏卡面应使用面试官直接提问，而不是教材式主动回忆指令。"""
     source = sample_evidence()
     result = MissingKnowledgeExtractor(provider="deepseek").validate_payload(
         LearningMaterialContext(12, "Kafka 高性能设计", "mp4"),
@@ -107,7 +107,7 @@ def test_missing_knowledge_validator_accepts_recall_instruction_without_question
             "assistantMessage": "找到了零拷贝相关讲解。",
             "cards": [
                 {
-                    "question": "说明 Kafka 零拷贝提升数据传输性能的机制",
+                    "question": "Kafka 零拷贝为什么能提升数据传输性能？",
                     "answer": source.snippet,
                     "hint": "从磁盘 IO、网络 IO 和数据复制次数回忆",
                     "evidenceIds": [source.evidenceId],
@@ -117,7 +117,7 @@ def test_missing_knowledge_validator_accepts_recall_instruction_without_question
         [],
     )
 
-    assert [point.question for point in result.knowledge_points] == ["说明 Kafka 零拷贝提升数据传输性能的机制"]
+    assert [point.question for point in result.knowledge_points] == ["Kafka 零拷贝为什么能提升数据传输性能？"]
 
 
 def test_missing_knowledge_falls_back_to_deepseek_after_primary_connection_failure(monkeypatch) -> None:

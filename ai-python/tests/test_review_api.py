@@ -31,7 +31,12 @@ from app.schemas.review import (
     ReviewMaterial,
     ReviewMaterialCardSnapshot,
     ReviewMaterialRewritePreview,
+    ReviewMaterialRewriteApplyResult,
     ReviewMissingKnowledgeResult,
+    ReviewSegmentGenerationResult,
+    ReviewSegmentResult,
+    ReviewSegmentWorkspace,
+    ReviewEvidenceSegment,
     ReviewMaterialFolderRequest,
     ReviewOverview,
     ReviewSettings,
@@ -58,6 +63,8 @@ class StubReviewService:
     def __init__(self) -> None:
         self.users: list[str] = []
         self.feedbacks: list[str | None] = []
+        self.segment_requests: list[tuple[int, list[str], dict[str, str], str, str]] = []
+        self.segment_merge_users: list[str] = []
         self.generation_event = Event()
 
     def remember(self, user_id: str) -> None:
@@ -339,6 +346,64 @@ class StubReviewService:
     def update_settings(self, payload: ReviewSettings, user_id: str) -> ReviewSettings:
         self.remember(user_id)
         return payload
+
+    def get_segment_workspace(self, material_id: int, user_id: str) -> ReviewSegmentWorkspace:
+        """返回两段固定原文，验证工作台路由的资料归属。"""
+        self.remember(user_id)
+        assert material_id == 12
+        return ReviewSegmentWorkspace(
+            materialId=material_id,
+            title="Kafka 高可用",
+            sourceVersion=7,
+            originalFingerprint="0123456789abcdef",
+            originalCardIds=[],
+            originalSummary="原摘要",
+            segments=[
+                ReviewEvidenceSegment(
+                    segmentId="segment-kafka-01",
+                    segmentIndex=1,
+                    totalSegments=2,
+                    title="ISR",
+                    characterCount=20,
+                    evidenceCount=1,
+                    rawContent="[e-1] ISR 原文",
+                ),
+                ReviewEvidenceSegment(
+                    segmentId="segment-kafka-02",
+                    segmentIndex=2,
+                    totalSegments=2,
+                    title="故障转移",
+                    characterCount=24,
+                    evidenceCount=1,
+                    rawContent="[e-2] 故障转移原文",
+                ),
+            ],
+        )
+
+    def generate_selected_segments(self, material_id: int, user_id: str, segment_ids, prompts, mode, progress_callback=None) -> ReviewSegmentGenerationResult:
+        """记录用户选择和提示词，并返回一成功一失败的部分结果。"""
+        self.remember(user_id)
+        self.segment_requests.append((material_id, list(segment_ids), dict(prompts), mode, user_id))
+        if progress_callback:
+            progress_callback({"stageCode": "review.segment.test", "stageLabel": "测试段完成", "message": "测试完成", "percent": 80})
+        return ReviewSegmentGenerationResult(
+            materialId=material_id,
+            sourceVersion=7,
+            segments=[
+                ReviewSegmentResult(segmentId=segment_ids[0], segmentIndex=1, title="ISR", status="SUCCEEDED", cards=[ReviewMaterialCardSnapshot(content=ReviewCardContent(question="ISR 面试官会怎么问？", answer="保持同步副本集合。"), evidenceIds=["e-1"])], summary="ISR 摘要"),
+                *([ReviewSegmentResult(segmentId=segment_ids[1], segmentIndex=2, title="故障转移", status="FAILED", qualityFeedback=["测试失败段"], error="测试失败")] if len(segment_ids) > 1 else []),
+            ],
+        )
+
+    def apply_segment_cards(self, material_id: int, payload, user_id: str) -> ReviewMaterialRewriteApplyResult:
+        """记录最终合并使用的认证用户，并返回原子发布结果。"""
+        self.remember(user_id)
+        self.segment_merge_users.append(user_id)
+        return ReviewMaterialRewriteApplyResult(
+            material=sample_material().model_copy(update={"cardCount": len(payload.proposedCards)}),
+            cards=[sample_card().model_copy(update={"question": item.question, "answer": item.answer, "hint": item.hint}) for item in payload.proposedCards],
+            replacedCardIds=payload.originalCardIds,
+        )
 
 
 def sample_card() -> ReviewCard:
@@ -722,5 +787,69 @@ def test_duplicate_group_order_ids_are_rejected_before_service_call() -> None:
         assert response.status_code == 200
         assert response.json() == {"code": 0, "msg": "请求参数不合法", "data": None}
         assert service.users == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_review_segment_workspace_task_and_merge_routes_are_resumable() -> None:
+    """交互式分段接口保持 Result 信封，任务完成后可恢复并原子合并。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    try:
+        workspace_response = client.get("/api/reviews/materials/12/segments", headers=headers)
+        assert workspace_response.status_code == 200
+        workspace = workspace_response.json()["data"]
+        assert workspace["segments"][0]["rawContent"].startswith("[e-1]")
+
+        created = client.post(
+            "/api/reviews/materials/12/segment-tasks",
+            headers=headers,
+            json={
+                "segmentIds": ["segment-kafka-01", "segment-kafka-02"],
+                "prompts": {"segment-kafka-01": "追问 ISR", "segment-kafka-02": "追问故障转移"},
+                "mode": "RELAXED",
+            },
+        )
+        assert created.status_code == 200
+        task = created.json()["data"]
+        assert task["status"] in {"QUEUED", "RUNNING", "SUCCEEDED"}
+
+        latest = None
+        for _ in range(100):
+            latest = client.get(
+                f"/api/reviews/materials/12/segment-tasks/{task['taskId']}",
+                headers=headers,
+            ).json()["data"]
+            if latest["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert latest["status"] == "SUCCEEDED"
+        assert [item["status"] for item in latest["result"]["segments"]] == ["SUCCEEDED", "FAILED"]
+        assert service.segment_requests[0][2] == {"segment-kafka-01": "追问 ISR", "segment-kafka-02": "追问故障转移"}
+
+        merged = client.post(
+            "/api/reviews/materials/12/segments/merge",
+            headers=headers,
+            json={
+                "sourceVersion": 7,
+                "originalFingerprint": "0123456789abcdef",
+                "originalCardIds": [],
+                "proposedSummary": "用户确认摘要",
+                "proposedCards": [{
+                    "question": "ISR 面试官会怎么问？",
+                    "answer": "保持同步副本集合。",
+                    "hint": "先说同步副本",
+                    "rewriteMode": "STRICT_SOURCE",
+                    "evidenceIds": ["e-1"],
+                }],
+            },
+        )
+        assert merged.status_code == 200
+        assert merged.json()["data"]["material"]["cardCount"] == 1
+        assert service.segment_merge_users == ["42"]
+        assert client.get("/api/reviews/materials/12/segment-tasks/latest", headers=headers).json()["data"] is None
     finally:
         app.dependency_overrides.clear()

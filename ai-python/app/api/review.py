@@ -33,6 +33,11 @@ from app.schemas.review import (
     ReviewMaterialRewritePreview,
     ReviewMaterialRewriteRequest,
     ReviewMaterialRewriteTask,
+    ReviewSegmentGenerationRequest,
+    ReviewSegmentGenerationResult,
+    ReviewSegmentGenerationTask,
+    ReviewSegmentMergeRequest,
+    ReviewSegmentWorkspace,
     ReviewDeletionResult,
     ReviewDueGroups,
     ReviewFolder,
@@ -83,6 +88,13 @@ _review_rewrite_executor = ThreadPoolExecutor(
 _review_rewrite_jobs_lock = Lock()
 _review_rewrite_jobs: dict[str, "_ReviewRewriteJob"] = {}
 _latest_review_rewrite_jobs: dict[tuple[str, str, int], str] = {}
+_review_segment_executor = ThreadPoolExecutor(
+    max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
+    thread_name_prefix="review-segment-generation",
+)
+_review_segment_jobs_lock = Lock()
+_review_segment_jobs: dict[str, "_ReviewSegmentJob"] = {}
+_latest_review_segment_jobs: dict[tuple[str, int], str] = {}
 
 
 @dataclass
@@ -118,6 +130,23 @@ class _ReviewRewriteJob:
     progress: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     result: ReviewCardRewritePreview | ReviewMaterialRewritePreview | None = None
+    error: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class _ReviewSegmentJob:
+    """保存交互式分段任务的选择、逐段提示词和后台结果。"""
+
+    task_id: str
+    user_id: str
+    material_id: int
+    payload: ReviewSegmentGenerationRequest
+    status: str = "QUEUED"
+    progress: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    result: ReviewSegmentGenerationResult | None = None
     error: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -408,6 +437,99 @@ def apply_review_material_rewrite(
     )
     _invalidate_review_rewrite_job(user_id, "MATERIAL", material_id)
     return Result.success(applied)
+
+
+@router.get(
+    "/materials/{material_id}/segments",
+    response_model=Result[ReviewSegmentWorkspace],
+)
+def get_review_segment_workspace(
+    material_id: int,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewSegmentWorkspace]:
+    """读取当前资料可选择的原始分段和正式卡片版本。"""
+    return Result.success(
+        execute(
+            "读取复习资料分段",
+            lambda: service.get_segment_workspace(material_id, str(current_user.id)),
+        )
+    )
+
+
+@router.post(
+    "/materials/{material_id}/segment-tasks",
+    response_model=Result[ReviewSegmentGenerationTask],
+)
+def start_review_segment_task(
+    material_id: int,
+    payload: ReviewSegmentGenerationRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewSegmentGenerationTask]:
+    """创建用户选中分段的后台生成任务。"""
+    user_id = str(current_user.id)
+    with _review_segment_jobs_lock:
+        existing = _find_active_review_segment_job(user_id, material_id, payload)
+        if existing is not None:
+            return Result.success(_review_segment_task_response(existing))
+        job = _create_review_segment_job(user_id, material_id, payload)
+    _review_segment_executor.submit(_run_review_segment_job, service, job)
+    return Result.success(_review_segment_task_response(job))
+
+
+@router.get(
+    "/materials/{material_id}/segment-tasks/latest",
+    response_model=Result[ReviewSegmentGenerationTask | None],
+)
+def latest_review_segment_task(
+    material_id: int,
+    current_user: CurrentUser,
+) -> Result[ReviewSegmentGenerationTask | None]:
+    """恢复当前资料最近一次交互式分段生成任务。"""
+    user_id = str(current_user.id)
+    with _review_segment_jobs_lock:
+        task_id = _latest_review_segment_jobs.get((user_id, material_id))
+        job = _review_segment_jobs.get(task_id) if task_id else None
+        return Result.success(_review_segment_task_response(job) if job else None)
+
+
+@router.get(
+    "/materials/{material_id}/segment-tasks/{task_id}",
+    response_model=Result[ReviewSegmentGenerationTask],
+)
+def get_review_segment_task(
+    material_id: int,
+    task_id: str,
+    current_user: CurrentUser,
+) -> Result[ReviewSegmentGenerationTask]:
+    """读取当前用户的一条交互式分段生成任务。"""
+    user_id = str(current_user.id)
+    with _review_segment_jobs_lock:
+        job = _review_segment_jobs.get(task_id)
+        if job is None or job.user_id != user_id or job.material_id != material_id:
+            raise BusinessError("分段生成任务不存在或已过期")
+        return Result.success(_review_segment_task_response(job))
+
+
+@router.post(
+    "/materials/{material_id}/segments/merge",
+    response_model=Result[ReviewMaterialRewriteApplyResult],
+)
+def merge_review_segments(
+    material_id: int,
+    payload: ReviewSegmentMergeRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewMaterialRewriteApplyResult]:
+    """校验用户编辑候选，并原子发布为当前资料的正式复习卡片。"""
+    user_id = str(current_user.id)
+    merged = execute(
+        "合并分段复习卡片",
+        lambda: service.apply_segment_cards(material_id, payload, user_id),
+    )
+    _invalidate_review_segment_job(user_id, material_id)
+    return Result.success(merged)
 
 
 @router.post(
@@ -880,6 +1002,200 @@ def _trim_review_rewrite_jobs() -> None:
         key = (job.user_id, job.target_kind, job.target_id)
         if _latest_review_rewrite_jobs.get(key) == job.task_id:
             _latest_review_rewrite_jobs.pop(key, None)
+
+
+def _find_active_review_segment_job(
+    user_id: str,
+    material_id: int,
+    payload: ReviewSegmentGenerationRequest,
+) -> _ReviewSegmentJob | None:
+    """复用同一资料、同一分段选择和提示词的运行任务。"""
+    task_id = _latest_review_segment_jobs.get((user_id, material_id))
+    job = _review_segment_jobs.get(task_id) if task_id else None
+    return (
+        job
+        if job
+        and job.status in {"QUEUED", "RUNNING"}
+        and job.payload.model_dump(mode="json") == payload.model_dump(mode="json")
+        else None
+    )
+
+
+def _create_review_segment_job(
+    user_id: str,
+    material_id: int,
+    payload: ReviewSegmentGenerationRequest,
+) -> _ReviewSegmentJob:
+    """登记一条交互式分段生成任务，并用新请求替代旧运行任务。"""
+    key = (user_id, material_id)
+    previous_task_id = _latest_review_segment_jobs.get(key)
+    previous = _review_segment_jobs.get(previous_task_id) if previous_task_id else None
+    if previous and previous.status in {"QUEUED", "RUNNING"}:
+        previous.error = "已提交新的分段选择，本任务结果不再使用"
+        _set_review_segment_progress(
+            previous,
+            status="FAILED",
+            stage_code="review.segment.superseded",
+            stage_label="已由新任务替代",
+            message=previous.error,
+            percent=100,
+        )
+    job = _ReviewSegmentJob(
+        task_id=f"segment-generation-{uuid4().hex[:12]}",
+        user_id=user_id,
+        material_id=material_id,
+        payload=payload,
+    )
+    _set_review_segment_progress(
+        job,
+        status="QUEUED",
+        stage_code="review.segment.queue",
+        stage_label="后台排队",
+        message=f"已选择 {len(payload.segmentIds)} 个分段，任务将在后台继续执行",
+        percent=0,
+    )
+    _review_segment_jobs[job.task_id] = job
+    _latest_review_segment_jobs[key] = job.task_id
+    _trim_review_segment_jobs()
+    return job
+
+
+def _set_review_segment_progress(
+    job: _ReviewSegmentJob,
+    *,
+    status: str,
+    stage_code: str,
+    stage_label: str,
+    message: str,
+    percent: int,
+) -> None:
+    """更新分段任务当前阶段，并保留最近 12 条展示事件。"""
+    now = datetime.now(timezone.utc)
+    event = {
+        "stageCode": stage_code,
+        "stageLabel": stage_label,
+        "message": message,
+        "status": "RUNNING" if status in {"QUEUED", "RUNNING"} else status,
+        "percent": max(0, min(100, int(percent))),
+        "createdAt": now,
+    }
+    job.status = status
+    job.progress = {**event, "events": [*job.events, event][-12:]}
+    job.events = job.progress["events"]
+    job.updated_at = now
+
+
+def _review_segment_task_response(job: _ReviewSegmentJob) -> ReviewSegmentGenerationTask:
+    """把进程内分段任务转换为公开响应。"""
+    return ReviewSegmentGenerationTask(
+        taskId=job.task_id,
+        materialId=job.material_id,
+        mode=job.payload.mode,
+        segmentIds=job.payload.segmentIds,
+        status=job.status,  # type: ignore[arg-type]
+        progress=job.progress,
+        result=job.result,
+        error=job.error,
+        createdAt=job.created_at,
+        updatedAt=job.updated_at,
+    )
+
+
+def _run_review_segment_job(service: ReviewService, job: _ReviewSegmentJob) -> None:
+    """后台逐段生成候选，单段质量失败由结果对象承载。"""
+    with _review_segment_jobs_lock:
+        if job.task_id not in _review_segment_jobs:
+            return
+        _set_review_segment_progress(
+            job,
+            status="RUNNING",
+            stage_code="review.segment.prepare",
+            stage_label="读取分段原文",
+            message="正在校验资料版本和用户选择的 evidence 分段",
+            percent=5,
+        )
+
+    def on_progress(event: dict[str, object]) -> None:
+        """把服务层逐段进度同步到可轮询任务。"""
+        with _review_segment_jobs_lock:
+            if job.task_id not in _review_segment_jobs or job.status == "FAILED":
+                return
+            _set_review_segment_progress(
+                job,
+                status="RUNNING",
+                stage_code=str(event.get("stageCode") or "review.segment.generate"),
+                stage_label=str(event.get("stageLabel") or "生成分段候选"),
+                message=str(event.get("message") or "正在生成所选分段"),
+                percent=int(event.get("percent") or 10),
+            )
+
+    try:
+        result = service.generate_selected_segments(
+            job.material_id,
+            job.user_id,
+            job.payload.segmentIds,
+            job.payload.prompts,
+            job.payload.mode,
+            on_progress,
+        )
+        with _review_segment_jobs_lock:
+            if _latest_review_segment_jobs.get((job.user_id, job.material_id)) != job.task_id:
+                return
+            job.result = result
+            success_count = sum(1 for item in result.segments if item.status == "SUCCEEDED")
+            _set_review_segment_progress(
+                job,
+                status="SUCCEEDED",
+                stage_code="review.segment.completed",
+                stage_label="所选分段已完成",
+                message=f"本轮 {success_count}/{len(result.segments)} 个分段生成成功，可继续选择其他分段或合并",
+                percent=100,
+            )
+    except BusinessError as exc:
+        with _review_segment_jobs_lock:
+            job.error = exc.message
+            _set_review_segment_progress(
+                job,
+                status="FAILED",
+                stage_code="review.segment.failed",
+                stage_label="分段生成失败",
+                message=exc.message,
+                percent=100,
+            )
+    except Exception as exc:  # noqa: BLE001 - 后台任务必须收敛为可查询失败状态。
+        logger.exception("交互式分段生成任务失败: material_id=%s", job.material_id)
+        with _review_segment_jobs_lock:
+            job.error = f"分段生成失败：{exc.__class__.__name__}"
+            _set_review_segment_progress(
+                job,
+                status="FAILED",
+                stage_code="review.segment.failed",
+                stage_label="分段生成失败",
+                message=job.error,
+                percent=100,
+            )
+
+
+def _invalidate_review_segment_job(user_id: str, material_id: int) -> None:
+    """正式合并后移除最近任务入口，避免旧候选再次被恢复。"""
+    with _review_segment_jobs_lock:
+        _latest_review_segment_jobs.pop((user_id, material_id), None)
+
+
+def _trim_review_segment_jobs() -> None:
+    """限制进程内分段任务历史，优先淘汰最旧终态任务。"""
+    overflow = len(_review_segment_jobs) - 256
+    if overflow <= 0:
+        return
+    removable = sorted(
+        (job for job in _review_segment_jobs.values() if job.status in {"SUCCEEDED", "FAILED"}),
+        key=lambda item: item.updated_at,
+    )
+    for job in removable[:overflow]:
+        _review_segment_jobs.pop(job.task_id, None)
+        key = (job.user_id, job.material_id)
+        if _latest_review_segment_jobs.get(key) == job.task_id:
+            _latest_review_segment_jobs.pop(key, None)
 
 
 def _run_review_rewrite_job(service: ReviewService, job: _ReviewRewriteJob) -> None:

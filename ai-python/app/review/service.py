@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
@@ -11,6 +12,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.result import BusinessError
+from app.core.io_concurrency import configured_io_workers
 from app.review.fsrs_scheduler import FsrsReviewScheduler, as_utc
 from app.review.card_rewriter import (
     CardRewriter,
@@ -23,6 +25,9 @@ from app.review.knowledge_extractor import (
     LearningMaterialContext,
     ReviewExtractionError,
     answer_is_grounded,
+    clean_review_evidences,
+    deduplicate_evidences,
+    split_review_evidence_segments,
 )
 from app.review.missing_knowledge import MissingKnowledgeExtractor
 from app.review.repository import (
@@ -50,6 +55,11 @@ from app.schemas.review import (
     ReviewMaterialRewriteApplyResult,
     ReviewMaterialRewritePreview,
     ReviewMaterialRewriteRequest,
+    ReviewEvidenceSegment,
+    ReviewSegmentGenerationResult,
+    ReviewSegmentMergeRequest,
+    ReviewSegmentResult,
+    ReviewSegmentWorkspace,
     ReviewBatchDeletionResult,
     ReviewCardGroup,
     ReviewDeletionResult,
@@ -76,6 +86,10 @@ from prompts.review import REVIEW_CARD_PROMPT_VERSION
 
 
 logger = logging.getLogger(__name__)
+_review_segment_extract_executor = ThreadPoolExecutor(
+    max_workers=configured_io_workers("LLM_IO_MAX_WORKERS"),
+    thread_name_prefix="review-segment",
+)
 
 
 def report_progress(
@@ -844,6 +858,167 @@ class ReviewService:
             modelName=candidate.model_name,
         )
 
+    def get_segment_workspace(self, material_id: int, user_id: str) -> ReviewSegmentWorkspace:
+        """读取当前资料的原始分段和正式卡片版本，供用户选择生成范围。"""
+        material, cards, evidences, review_record = self._load_segment_material(material_id, user_id)
+        segments = split_review_evidence_segments(clean_review_evidences(deduplicate_evidences(evidences)))
+        if not segments:
+            raise BusinessError("该资料暂无可用于分段生成的原始 evidence")
+        return ReviewSegmentWorkspace(
+            materialId=material.id,
+            title=material.title,
+            sourceVersion=material.index_request_version,
+            originalFingerprint=material_cards_fingerprint(
+                cards,
+                review_record.summary if review_record else material.document_summary,
+            ),
+            originalCardIds=[card.id for card in cards],
+            originalCards=[material_card_snapshot(card) for card in cards],
+            originalSummary=(
+                review_record.summary
+                if review_record and review_record.summary
+                else material.document_summary
+            ),
+            segments=[
+                build_review_segment(segment, index=index, total=len(segments), material_id=material.id, version=material.index_request_version)
+                for index, segment in enumerate(segments, start=1)
+            ],
+        )
+
+    def generate_selected_segments(
+        self,
+        material_id: int,
+        user_id: str,
+        segment_ids: list[str],
+        prompts: dict[str, str],
+        mode: str = "RELAXED",
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> ReviewSegmentGenerationResult:
+        """只生成用户勾选的分段，单段失败不影响其他段返回。"""
+        material, _cards, raw_evidences, _review_record = self._load_segment_material(material_id, user_id)
+        evidences = clean_review_evidences(deduplicate_evidences(raw_evidences))
+        segments = split_review_evidence_segments(evidences)
+        if not segments:
+            raise BusinessError("该资料暂无可用于分段生成的原始 evidence")
+        segment_models = [
+            build_review_segment(segment, index=index, total=len(segments), material_id=material.id, version=material.index_request_version)
+            for index, segment in enumerate(segments, start=1)
+        ]
+        segment_map = {
+            item.segmentId: (item, segment)
+            for item, segment in zip(segment_models, segments, strict=True)
+        }
+        unknown_ids = [item for item in segment_ids if item not in segment_map]
+        if unknown_ids:
+            raise BusinessError("所选资料分段已过期，请重新打开分段工作台")
+        normalized_mode = str(mode or "RELAXED").strip().upper()
+        if normalized_mode not in {"STANDARD", "RELAXED"}:
+            normalized_mode = "RELAXED"
+        total = len(segment_ids)
+
+        def generate_one(segment_id: str) -> ReviewSegmentResult:
+            """在线程池中独立生成一段，异常只影响当前段。"""
+            segment_model, segment = segment_map[segment_id]
+            prompt = " ".join(str(prompts.get(segment_id) or "").split()).strip()
+            try:
+                result = self.extractor.extract(
+                    LearningMaterialContext(
+                        material_id=material.id,
+                        title=material.title,
+                        document_type=material.document_type,
+                        summary=material.document_summary,
+                    ),
+                    segment,
+                    user_feedback=prompt or "请模拟真实面试官提问，完整保留本段独立知识点。",
+                    generation_mode=normalized_mode,
+                )
+                if not result.knowledge_points:
+                    raise ReviewExtractionError("本段没有生成通过 evidence 门禁的卡片")
+                return ReviewSegmentResult(
+                    segmentId=segment_id,
+                    segmentIndex=segment_model.segmentIndex,
+                    title=segment_model.title,
+                    status="SUCCEEDED",
+                    summary=result.summary,
+                    cards=[knowledge_point_snapshot(point) for point in result.knowledge_points],
+                    qualityFeedback=list(result.quality_feedback),
+                )
+            except (ReviewManualReviewRequired, ReviewExtractionError) as exc:
+                feedback = list(getattr(exc, "quality_feedback", ()) or getattr(exc, "diagnostics", ()) or [str(exc)])
+                return ReviewSegmentResult(
+                    segmentId=segment_id,
+                    segmentIndex=segment_model.segmentIndex,
+                    title=segment_model.title,
+                    status="FAILED",
+                    qualityFeedback=feedback[:80],
+                    error=str(exc),
+                )
+
+            except Exception as exc:  # noqa: BLE001 - 单段模型异常必须收敛为可重试结果。
+                logger.exception("交互式分段生成异常: material_id=%s segment_id=%s", material.id, segment_id)
+                return ReviewSegmentResult(
+                    segmentId=segment_id,
+                    segmentIndex=segment_model.segmentIndex,
+                    title=segment_model.title,
+                    status="FAILED",
+                    qualityFeedback=["本段模型调用出现异常，可调整提示词后重试"],
+                    error=f"本段生成失败：{exc.__class__.__name__}",
+                )
+
+        results: list[ReviewSegmentResult] = []
+        completed = 0
+        worker_count = min(total, configured_io_workers("LLM_IO_MAX_WORKERS"))
+        futures = {
+            _review_segment_extract_executor.submit(generate_one, segment_id): segment_id
+            for segment_id in segment_ids[:worker_count]
+        }
+        # 选择数量受请求 schema 限制，但仍以稳定的共享池为上限，避免多资料同时生成时嵌套线程爆炸。
+        pending_ids = segment_ids[worker_count:]
+        while futures:
+            for future in as_completed(futures):
+                results.append(future.result())
+                completed += 1
+                if progress_callback:
+                    segment_result = results[-1]
+                    progress_callback(
+                        {
+                            "stageCode": "review.segment.generate",
+                            "stageLabel": f"完成第 {segment_result.segmentIndex} 段",
+                            "message": f"第 {completed}/{total} 个所选分段已完成，可继续处理其他分段",
+                            "percent": min(94, int(completed / total * 90)),
+                        }
+                    )
+                if pending_ids:
+                    next_id = pending_ids.pop(0)
+                    futures[_review_segment_extract_executor.submit(generate_one, next_id)] = next_id
+                futures.pop(future, None)
+                break
+        results.sort(key=lambda item: item.segmentIndex)
+        return ReviewSegmentGenerationResult(
+            materialId=material.id,
+            sourceVersion=material.index_request_version,
+            segments=results,
+        )
+
+    def _load_segment_material(
+        self,
+        material_id: int,
+        user_id: str,
+    ) -> tuple[MaterialSourceRecord, list[ReviewCardRecord], list[Evidence], ReviewMaterialRecord | None]:
+        """在一次只读事务中读取分段、卡片和并发合并所需的资料基线。"""
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material(material_id, user_id)
+            if material is None:
+                raise BusinessError("学习资料不存在")
+            if transaction.is_material_excluded(material_id, user_id):
+                raise BusinessError("该资料已从复习中心移除")
+            return (
+                material,
+                transaction.list_active_cards_for_material(material_id, user_id),
+                transaction.list_evidences(material),
+                transaction.find_review_material(material_id, user_id),
+            )
+
     def apply_material_rewrite(
         self,
         material_id: int,
@@ -914,6 +1089,83 @@ class ReviewService:
         return ReviewMaterialRewriteApplyResult(
             material=material_response(record),
             cards=[card_response(card, FsrsReviewScheduler(settings.desired_retention), now, include_answer=True) for card in replaced],
+            replacedCardIds=list(payload.originalCardIds),
+        )
+
+    def apply_segment_cards(
+        self,
+        material_id: int,
+        payload: ReviewSegmentMergeRequest,
+        user_id: str,
+    ) -> ReviewMaterialRewriteApplyResult:
+        """重新校验用户编辑候选，并原子发布交互式分段结果。"""
+        now = as_utc(self.now_provider())
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material(material_id, user_id)
+            if material is None:
+                raise BusinessError("学习资料不存在")
+            if transaction.is_material_excluded(material_id, user_id):
+                raise BusinessError("该资料已从复习中心移除")
+            if material.index_request_version != payload.sourceVersion:
+                raise BusinessError("资料内容已更新，请重新打开分段工作台")
+            current_cards = transaction.list_active_cards_for_material(material_id, user_id)
+            current_ids = sorted(card.id for card in current_cards)
+            if current_ids != payload.originalCardIds:
+                raise BusinessError("资料卡片已被其他操作修改，请重新打开分段工作台")
+            current_review = transaction.find_review_material(material_id, user_id)
+            current_summary = current_review.summary if current_review else material.document_summary
+            if material_cards_fingerprint(current_cards, current_summary) != payload.originalFingerprint:
+                raise BusinessError("资料卡片内容已被其他操作修改，请重新打开分段工作台")
+            evidence_by_id = {item.evidenceId: item for item in transaction.list_evidences(material)}
+            drafts: list[ReviewCardDraft] = []
+            for candidate in payload.proposedCards:
+                evidence_ids = candidate.evidenceIds or []
+                if not evidence_ids:
+                    raise BusinessError("分段候选卡片必须保留真实 evidence 引用")
+                unknown_ids = [item for item in evidence_ids if item not in evidence_by_id]
+                if unknown_ids:
+                    raise BusinessError("分段候选卡片引用的原文证据不存在")
+                evidence_refs = tuple(evidence_by_id[item] for item in evidence_ids)
+                if not answer_is_grounded(candidate.answer, evidence_refs):
+                    raise BusinessError("编辑后的分段候选未通过 evidence 忠实度校验")
+                drafts.append(
+                    ReviewCardDraft(
+                        source_key=f"custom:segment-workspace:{material.id}:{uuid4().hex[:20]}",
+                        question=candidate.question,
+                        answer=candidate.answer,
+                        hint=candidate.hint,
+                        evidence_refs_json=json.dumps(
+                            [item.model_dump(mode="json") for item in evidence_refs],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        fsrs_card_json=FsrsReviewScheduler().new_card_json(now),
+                        due_at=now,
+                    )
+                )
+            published = transaction.publish_segment_cards_for_material(
+                material,
+                payload.originalCardIds,
+                drafts,
+                summary=payload.proposedSummary,
+            )
+            if published is None:
+                raise BusinessError("分段候选发布失败，请刷新后重试")
+            record = transaction.find_review_material(material_id, user_id)
+            settings = transaction.get_or_create_settings(user_id)
+        if record is None:
+            raise BusinessError("发布分段卡片后无法读取资料状态")
+        return ReviewMaterialRewriteApplyResult(
+            material=material_response(record),
+            cards=[
+                card_response(
+                    card,
+                    FsrsReviewScheduler(settings.desired_retention),
+                    now,
+                    include_answer=True,
+                )
+                for card in published
+            ],
             replacedCardIds=list(payload.originalCardIds),
         )
 
@@ -1382,6 +1634,59 @@ def material_cards_fingerprint(cards: list[ReviewCardRecord], summary: str | Non
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def build_review_segment(
+    evidences: list[Evidence],
+    *,
+    index: int,
+    total: int,
+    material_id: int,
+    version: int,
+) -> ReviewEvidenceSegment:
+    """把连续 evidence 转为稳定分段 ID、可读标题和原始内容预览。"""
+    evidence_ids = [item.evidenceId for item in evidences]
+    digest = hashlib.sha256(
+        f"{material_id}:{version}:{'|'.join(evidence_ids)}".encode("utf-8")
+    ).hexdigest()[:24]
+    locations: list[str] = []
+    for item in evidences:
+        location = item.sectionName or item.sectionTitle or item.startTime or ""
+        if location and location not in locations:
+            locations.append(location)
+    if locations:
+        title = "、".join(locations[:2])
+        if len(locations) > 2:
+            title += "等"
+    else:
+        title = f"第 {index} 段"
+    raw_parts = []
+    for item in evidences:
+        location = item.sectionName or item.sectionTitle or "原文片段"
+        if item.startTime:
+            location = f"{location}（{item.startTime}-{item.endTime or item.startTime}）"
+        raw_parts.append(f"[{item.evidenceId}] {location}\n{item.snippet}")
+    raw_content = "\n\n".join(raw_parts).strip()
+    return ReviewEvidenceSegment(
+        segmentId=f"segment-{digest}",
+        segmentIndex=index,
+        totalSegments=total,
+        title=title[:240],
+        characterCount=len(raw_content),
+        evidenceCount=len(evidences),
+        rawContent=raw_content[:30000],
+        evidenceRefs=evidences,
+    )
+
+
+def knowledge_point_snapshot(point: Any) -> ReviewMaterialCardSnapshot:
+    """把模型知识点候选转换为可编辑、仍携带 evidence 的工作台卡片。"""
+    return ReviewMaterialCardSnapshot(
+        cardId=None,
+        content=ReviewCardContent(question=point.question, answer=point.answer, hint=point.hint),
+        evidenceRefs=list(point.evidence_refs),
+        evidenceIds=[item.evidenceId for item in point.evidence_refs],
+    )
 
 
 def material_generation_is_current(record: ReviewMaterialRecord, index_request_version: int) -> bool:

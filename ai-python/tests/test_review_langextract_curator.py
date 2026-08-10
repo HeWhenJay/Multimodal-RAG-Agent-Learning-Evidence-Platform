@@ -187,12 +187,12 @@ def test_langextract_proxy_retries_with_deepseek_after_primary_connection_failur
     assert fallback_requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
-def test_langextract_curator_uses_same_model_timeout_as_baseline() -> None:
-    """线上默认使用 16 个 I/O worker，单请求超时仍与当前生成器保持一致。"""
+def test_langextract_curator_uses_cpu_bounded_workers() -> None:
+    """LangExtract 默认使用 n+1=9 个 CPU/内存 worker，模型请求仍由独立 I/O 池负责。"""
     from app.review.langextract_curator import LangExtractKnowledgeCurator
 
     assert LangExtractKnowledgeCurator(api_key="test-key").timeout_seconds == 615.0
-    assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 16
+    assert LangExtractKnowledgeCurator(api_key="test-key").max_workers == 9
 
 
 def test_langextract_passes_eight_workers_to_official_thread_pool() -> None:
