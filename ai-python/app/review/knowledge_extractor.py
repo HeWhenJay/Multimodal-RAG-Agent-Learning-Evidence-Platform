@@ -27,6 +27,10 @@ from prompts.review import (
     REVIEW_CARD_PROMPT_VERSION,
     review_card_system_prompt,
     review_card_user_prompt,
+    review_merge_repair_system_prompt,
+    review_merge_repair_user_prompt,
+    review_multi_card_observer_system_prompt,
+    review_multi_card_observer_user_prompt,
 )
 
 
@@ -225,6 +229,21 @@ class KnowledgePointExtractor:
                     source_questions=source_questions,
                     curator_context=curator_context,
                     generation_mode=mode,
+                ),
+                multi_card_observer=lambda payload, curator_context, merge_round: self._observe_multi_card_candidate(
+                    material,
+                    payload,
+                    curator_context=curator_context,
+                    merge_round=merge_round,
+                    progress_callback=progress_callback,
+                ),
+                merge_repair=lambda payload, merge_plan, curator_context, merge_round: self._merge_card_groups(
+                    material,
+                    payload,
+                    merge_plan=merge_plan,
+                    curator_context=curator_context,
+                    merge_round=merge_round,
+                    progress_callback=progress_callback,
                 ),
                 plan={
                     "materialId": material.material_id,
@@ -442,8 +461,6 @@ class KnowledgePointExtractor:
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """调用复习模型；空响应或非法 JSON 在当前质量轮内短程重试。"""
-        from openai import OpenAI
-
         source_questions = source_questions or extract_source_question_candidates(evidences)
         curated_knowledge_units = valid_curated_knowledge_units(curator_context)
         prioritized_evidence_ids = {
@@ -481,6 +498,82 @@ class KnowledgePointExtractor:
             user_feedback=user_feedback,
             previous_candidate=previous_candidate,
         )
+        return self._request_json_completion(
+            system_prompt=review_card_system_prompt(),
+            user_prompt=prompt,
+            attempt=attempt,
+            progress_callback=progress_callback,
+        )
+
+    def _observe_multi_card_candidate(
+        self,
+        material: LearningMaterialContext,
+        candidate: dict[str, Any],
+        *,
+        curator_context: dict[str, Any],
+        merge_round: int,
+        progress_callback: ProgressCallback | None,
+    ) -> dict[str, Any]:
+        """请求模型只输出多卡片合并计划，不允许在 Observer 内改卡。"""
+        prompt = review_multi_card_observer_user_prompt(
+            candidate={"materialTitle": material.title, **candidate},
+            curated_knowledge_units=valid_curated_knowledge_units(curator_context),
+            merge_round=merge_round,
+        )
+        return self._request_json_completion(
+            system_prompt=review_multi_card_observer_system_prompt(),
+            user_prompt=prompt,
+            attempt=max(1, merge_round + 1),
+            progress_callback=progress_callback,
+            progress_stage_code="review.multi_card_observer",
+            progress_current_step=5 if curator_context else 4,
+            progress_total_steps=7 if curator_context else 6,
+            progress_percent=90,
+        )
+
+    def _merge_card_groups(
+        self,
+        material: LearningMaterialContext,
+        candidate: dict[str, Any],
+        *,
+        merge_plan: dict[str, Any],
+        curator_context: dict[str, Any],
+        merge_round: int,
+        progress_callback: ProgressCallback | None,
+    ) -> dict[str, Any]:
+        """请求模型只返回点名组的替换卡，未点名卡由生成图原样重建。"""
+        prompt = review_merge_repair_user_prompt(
+            candidate={"materialTitle": material.title, **candidate},
+            merge_plan=merge_plan,
+            curated_knowledge_units=valid_curated_knowledge_units(curator_context),
+            merge_round=merge_round,
+        )
+        return self._request_json_completion(
+            system_prompt=review_merge_repair_system_prompt(),
+            user_prompt=prompt,
+            attempt=max(1, merge_round),
+            progress_callback=progress_callback,
+            progress_stage_code="review.merge_repair",
+            progress_current_step=6 if curator_context else 5,
+            progress_total_steps=7 if curator_context else 6,
+            progress_percent=90,
+        )
+
+    def _request_json_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        attempt: int,
+        progress_callback: ProgressCallback | None,
+        progress_stage_code: str = "review.actor",
+        progress_current_step: int = 2,
+        progress_total_steps: int = 4,
+        progress_percent: int = 26,
+    ) -> dict[str, Any]:
+        """统一执行复习图各模型节点的 JSON 请求、解析重试和 Cockpit 降级。"""
+        from openai import OpenAI
+
         # 关闭 SDK 隐式重试，由统一 Cockpit 策略记录每次尝试并在耗尽后决定是否降级。
         client = OpenAI(
             api_key=self.api_key,
@@ -494,8 +587,8 @@ class KnowledgePointExtractor:
                 request: dict[str, Any] = {
                     "model": self.model,
                     "messages": [
-                        {"role": "system", "content": review_card_system_prompt()},
-                        {"role": "user", "content": prompt},
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
                     ],
                     "reasoning_effort": self.reasoning_effort,
                     "response_format": {"type": "json_object"},
@@ -508,6 +601,10 @@ class KnowledgePointExtractor:
                     request,
                     attempt=attempt,
                     progress_callback=progress_callback,
+                    progress_stage_code=progress_stage_code,
+                    progress_current_step=progress_current_step,
+                    progress_total_steps=progress_total_steps,
+                    progress_percent=progress_percent,
                 )
                 choices = getattr(response, "choices", None) or []
                 content = choices[0].message.content if choices else ""
@@ -538,6 +635,10 @@ class KnowledgePointExtractor:
         *,
         attempt: int,
         progress_callback: ProgressCallback | None,
+        progress_stage_code: str = "review.actor",
+        progress_current_step: int = 2,
+        progress_total_steps: int = 4,
+        progress_percent: int = 26,
     ) -> Any:
         """先按 Cockpit 长等待策略重试，尝试耗尽后才降级 DeepSeek。"""
         from openai import OpenAI, OpenAIError
@@ -558,16 +659,16 @@ class KnowledgePointExtractor:
             ) -> None:
                 emit_progress(
                     progress_callback,
-                    stageCode="review.actor",
+                    stageCode=progress_stage_code,
                     stageLabel="Cockpit 重试",
                     message=(
                         f"{self.primary_endpoint.display_name} 的 Cockpit 请求未成功，"
                         f"正在等待 Cockpit 切换账号或上游后重试 {next_attempt}/{max_attempts}"
                     ),
                     status="RUNNING",
-                    currentStep=2,
-                    totalSteps=4,
-                    percent=26,
+                    currentStep=progress_current_step,
+                    totalSteps=progress_total_steps,
+                    percent=progress_percent,
                     attempt=attempt,
                     maxAttempts=None,
                     detail=f"{type(error).__name__}；退避 {delay:.1f} 秒",
@@ -592,16 +693,16 @@ class KnowledgePointExtractor:
             )
             emit_progress(
                 progress_callback,
-                stageCode="review.actor",
+                stageCode=progress_stage_code,
                 stageLabel="DeepSeek 降级",
                 message=(
                     f"{self.primary_endpoint.display_name} 的 Cockpit 尝试已耗尽，正在切换至 "
                     f"DeepSeek（{fallback.model}）"
                 ),
                 status="RUNNING",
-                currentStep=2,
-                totalSteps=4,
-                percent=28,
+                currentStep=progress_current_step,
+                totalSteps=progress_total_steps,
+                percent=max(progress_percent, 28),
                 attempt=attempt,
                 maxAttempts=None,
                 detail=f"主中转失败：{type(primary_error).__name__}",
@@ -666,14 +767,20 @@ class KnowledgePointExtractor:
             if not isinstance(raw, dict):
                 diagnostics.append(f"{label} 不是 JSON 对象")
                 continue
-            answer = normalize_answer_text(raw.get("answer"), 600)
+            answer = normalize_answer_text(raw.get("answer"), 1200)
             if not answer:
                 diagnostics.append(f"{label} 的 answer 为空或不是有效文本")
                 continue
             raw_evidence_ids = raw.get("evidenceIds")
-            evidence_ids = raw_evidence_ids if isinstance(raw_evidence_ids, list) else []
-            if not 1 <= len(evidence_ids) <= 2:
-                diagnostics.append(f"{label} 必须引用 1 到 2 个 evidenceId")
+            evidence_ids = list(
+                dict.fromkeys(
+                    str(item)
+                    for item in (raw_evidence_ids if isinstance(raw_evidence_ids, list) else [])
+                    if str(item).strip()
+                )
+            )
+            if not evidence_ids:
+                diagnostics.append(f"{label} 必须按逐论断支撑引用至少 1 个 evidenceId")
                 continue
             unknown_ids = [str(evidence_id) for evidence_id in evidence_ids if evidence_id not in evidence_by_id]
             if unknown_ids:
@@ -683,7 +790,7 @@ class KnowledgePointExtractor:
                 evidence_by_id[evidence_id]
                 for evidence_id in evidence_ids
                 if evidence_id in evidence_by_id
-            )[:2]
+            )
             if not refs:
                 diagnostics.append(f"{label} 没有可用 evidence 引用")
                 continue
@@ -727,14 +834,17 @@ class KnowledgePointExtractor:
             if not question or not is_high_quality_review_question(question):
                 diagnostics.append(f"{label} 的 question 不是主题明确、自包含的疑问句或主动回忆指令")
                 continue
-            raw_source_question = compact_text(raw.get("sourceQuestion"), 180)
-            source_question = resolve_source_question(
-                raw_source_question,
+            source_questions_for_card = resolve_card_source_questions(
+                raw,
                 refs,
                 question_candidates,
                 review_question=question,
             )
-            if raw_source_question and source_question != raw_source_question:
+            raw_source_question = compact_text(raw.get("sourceQuestion"), 180)
+            if raw_source_question and all(
+                canonical_source_question_key(item) != canonical_source_question_key(raw_source_question)
+                for item in source_questions_for_card
+            ):
                 logger.info(
                     "复习卡片忽略了无法按资料问题候选核对的 sourceQuestion：material_id=%s card=%s",
                     material.material_id,
@@ -743,14 +853,18 @@ class KnowledgePointExtractor:
             if not hint or not is_high_quality_review_hint(hint):
                 diagnostics.append(f"{label} 的 hint 为空、过于泛化或直接包含无效占位内容")
                 continue
+            if question_reveals_answer_structure(question):
+                diagnostics.append(f"{label} 的 question 包含答案子项或多个面试意图，应把回忆方向移入 hint")
+                continue
             section = clean_section_name(refs[0].sectionName, material.title)
             question_key = normalized_sentence(question)
             if not question_key or question_key in seen_questions:
                 diagnostics.append(f"{label} 与其他卡片问题重复或无法形成稳定问题标识")
                 continue
             seen_questions.add(question_key)
-            if source_question:
-                covered_source_questions.add(canonical_source_question_key(source_question))
+            covered_source_questions.update(
+                canonical_source_question_key(item) for item in source_questions_for_card
+            )
             covered_curated_units.update(knowledge_unit_ids)
             points.append(
                 KnowledgePoint(
@@ -1463,6 +1577,53 @@ def validated_source_question(
     return None
 
 
+def resolve_card_source_questions(
+    raw_card: dict[str, Any],
+    evidence_refs: tuple[Evidence, ...],
+    candidates: list[dict[str, str]],
+    *,
+    review_question: str,
+) -> list[str]:
+    """兼容单个与多个来源问题，并把显式覆盖键限制在真实候选集合内。"""
+    candidate_by_key = {
+        canonical_source_question_key(question): question
+        for candidate in candidates
+        if (question := compact_text(candidate.get("question"), 180))
+        and is_meaningful_source_question(question)
+    }
+    raw_source_questions = raw_card.get("sourceQuestions")
+    raw_covered_keys = raw_card.get("coveredSourceQuestionKeys")
+    has_plural_contract = isinstance(raw_source_questions, list) or isinstance(raw_covered_keys, list)
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(value: object) -> None:
+        """只接纳逐字匹配或稳定键命中的真实原始问题。"""
+        requested = value.get("question") if isinstance(value, dict) else value
+        key = canonical_source_question_key(compact_text(requested, 180))
+        question = candidate_by_key.get(key)
+        if question and key not in seen:
+            seen.add(key)
+            resolved.append(question)
+
+    if isinstance(raw_source_questions, list):
+        for item in raw_source_questions:
+            add_candidate(item)
+    if isinstance(raw_covered_keys, list):
+        for item in raw_covered_keys:
+            add_candidate(item)
+    if has_plural_contract:
+        add_candidate(raw_card.get("sourceQuestion"))
+        return resolved
+    legacy = resolve_source_question(
+        raw_card.get("sourceQuestion"),
+        evidence_refs,
+        candidates,
+        review_question=review_question,
+    )
+    return [legacy] if legacy else []
+
+
 def resolve_source_question(
     value: object,
     evidence_refs: tuple[Evidence, ...],
@@ -1568,6 +1729,8 @@ def is_high_quality_review_question(value: str) -> bool:
     normalized = normalized_sentence(question)
     if not 8 <= len(normalized) <= 180:
         return False
+    if question_reveals_answer_structure(question):
+        return False
     if contains_review_artifact(question) or is_noise_fragment(question):
         return False
     if re.match(r"^(?:就|还|接下来|下面|首先)?(?:必须|需要|要)?(?:先)?(?:搞定|来看|看看|讲解|学习)", question):
@@ -1598,6 +1761,18 @@ def is_high_quality_review_question(value: str) -> bool:
         question,
     )
     return bool(question_form or recall_instruction)
+
+
+def question_reveals_answer_structure(value: str) -> bool:
+    """拒绝在一个问题中先问主问题、再列答案子项继续追问的卡面。"""
+    question = " ".join(str(value or "").split()).strip()
+    if len(re.findall(r"[？?]", question)) > 1:
+        return True
+    if re.search(r"[？?].+(?:分别)?(?:如何|怎么|怎样|使用|实现|起什么作用)", question):
+        return True
+    if re.search(r"(?:解决方案|策略|类型|组成)(?:包括|例如|比如|如[：:]?)", question):
+        return True
+    return False
 
 
 def is_high_quality_review_hint(value: str) -> bool:

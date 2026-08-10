@@ -26,6 +26,7 @@ from app.review.knowledge_extractor import (
     is_noise_fragment,
     is_repetitive_noise,
     minimum_structured_question_coverage,
+    question_reveals_answer_structure,
     review_card_limit,
     sanitize_evidences,
     select_review_prompt_evidences,
@@ -38,8 +39,10 @@ from prompts.review import (
     REVIEW_CARD_PROMPT_VERSION,
     review_card_rewrite_system_prompt,
     review_card_system_prompt,
+    review_merge_repair_system_prompt,
     review_material_rewrite_system_prompt,
     review_missing_knowledge_system_prompt,
+    review_multi_card_observer_system_prompt,
 )
 
 
@@ -165,7 +168,7 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     )
 
     assert len(calls) == 1
-    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v14"
+    assert REVIEW_CARD_PROMPT_VERSION == "review-card-v15"
     assert clients == [
         {
             "api_key": "test-key",
@@ -186,6 +189,64 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert len(result.knowledge_points) == 1
 
 
+def test_multiple_cards_invoke_structured_multi_card_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两张以上合格卡必须额外调用多卡 Observer，并仅接收结构化合并计划。"""
+    calls: list[dict] = []
+    actor_payload = {
+        "summary": "资料介绍 Kafka 的 ISR 与 ACK 可靠性机制，并说明二者分别负责的核心边界。",
+        "cards": [
+            {
+                "question": "Kafka 的 ISR 在故障转移中起什么作用？",
+                "sourceQuestion": None,
+                "knowledgeUnitIds": [],
+                "answer": "ISR 保存与 Leader 保持同步的副本集合。",
+                "hint": "关注同步副本集合与故障转移候选范围",
+                "evidenceIds": ["multi-1"],
+            },
+            {
+                "question": "Kafka 的 ACK 机制如何确认消息写入？",
+                "sourceQuestion": None,
+                "knowledgeUnitIds": [],
+                "answer": "ACK 用于确认消息已经写入 Kafka。",
+                "hint": "从生产者等待写入确认的方向回忆",
+                "evidenceIds": ["multi-2"],
+            },
+        ],
+    }
+    responses = [actor_payload, {"passed": True, "mergeGroups": []}]
+
+    class FakeCompletions:
+        """依次返回 Actor 候选和多卡片通过计划。"""
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=json.dumps(responses.pop(0), ensure_ascii=False))
+                    )
+                ]
+            )
+
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+
+    result = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False).extract(
+        LearningMaterialContext(12, "Kafka 可靠性课程", "pdf"),
+        [
+            evidence("multi-1", "ISR", "ISR 保存与 Leader 保持同步的副本集合。"),
+            evidence("multi-2", "ACK", "ACK 用于确认消息已经写入 Kafka。"),
+        ],
+    )
+
+    assert len(result.knowledge_points) == 2
+    assert len(calls) == 2
+    assert calls[1]["messages"][0]["content"] == review_multi_card_observer_system_prompt()
+
+
 def test_review_prompts_require_interviewer_style_questions() -> None:
     """生成、补漏和改写 Prompt 都必须要求使用真实面试官提问口吻。"""
     prompts = [
@@ -197,6 +258,98 @@ def test_review_prompts_require_interviewer_style_questions() -> None:
 
     assert all("面试官" in prompt for prompt in prompts)
     assert all("你会如何" in prompt for prompt in prompts)
+
+
+def test_multi_card_prompts_encode_merge_boundaries_and_required_examples() -> None:
+    """Actor、多卡 Observer 与 Merge Repair 必须固化聚合、拆分和问题防泄露规则。"""
+    actor_prompt = review_card_system_prompt()
+    observer_prompt = review_multi_card_observer_system_prompt()
+    repair_prompt = review_merge_repair_system_prompt()
+
+    assert "Redis 8 种淘汰策略" in actor_prompt
+    assert "一张表格卡" in actor_prompt
+    assert "总体为 4 张" in actor_prompt
+    assert "缓存穿透有哪些解决方案？" in actor_prompt
+    assert "空值缓存和布隆过滤器分别如何使用" in actor_prompt
+    assert "sourceQuestions" in actor_prompt
+    assert "LangExtract 知识单元不等于卡片" in observer_prompt
+    assert "总体应为 4 张" in observer_prompt
+    assert "mustPreserveKnowledgeUnitIds" in observer_prompt
+    assert "mustPreserveEvidenceIds" in observer_prompt
+    assert "mustPreserveClaims" in observer_prompt
+    assert "未被点名的卡片" in repair_prompt
+    assert "1000-1200" in repair_prompt
+    assert "4 个以内" in repair_prompt and "超过 4 个时必须完整保留" in repair_prompt
+
+
+def test_question_does_not_reveal_answer_and_hint_keeps_recall_directions() -> None:
+    """卡面只保留一个面试意图，答案关键词应转移到 hint。"""
+    valid_question = "缓存穿透有哪些解决方案？"
+    valid_hint = "从空值缓存和布隆过滤器两个方向回忆。"
+    leaking_question = "缓存穿透有哪些解决方案？空值缓存和布隆过滤器分别如何使用？"
+
+    assert question_reveals_answer_structure(valid_question) is False
+    assert question_reveals_answer_structure(leaking_question) is True
+    assert "空值缓存" not in valid_question
+    assert "空值缓存" in valid_hint and "布隆过滤器" in valid_hint
+
+
+def test_merged_card_accepts_multiple_source_questions_units_and_evidence_union() -> None:
+    """一张合并卡可覆盖多个原问题和知识单元，并引用最多四条逐论断 evidence。"""
+    source_questions = [
+        {"evidenceId": f"merge-{index}", "question": f"并列知识{index}是什么？"}
+        for index in range(1, 5)
+    ]
+    evidences = [
+        evidence(
+            f"merge-{index}",
+            "并列知识",
+            f"并列知识{index}是什么？定义{index}。",
+            position=index,
+        )
+        for index in range(1, 5)
+    ]
+    curator_context = {
+        "status": "COMPLETED",
+        "knowledgeUnits": [
+            {
+                "knowledgeUnitId": f"KU-{index}",
+                "text": f"定义{index}",
+                "topic": "并列知识",
+                "knowledgeType": "定义",
+                "evidenceIds": [f"merge-{index}"],
+            }
+            for index in range(1, 5)
+        ],
+    }
+    payload = {
+        "summary": "资料系统说明四项并列知识的定义、共同上位主题以及面试复习时需要区分的主要边界。",
+        "cards": [
+            {
+                "question": "请你解释一下四项并列知识分别是什么？",
+                "sourceQuestion": None,
+                "sourceQuestions": [item["question"] for item in source_questions],
+                "coveredSourceQuestionKeys": [
+                    canonical_source_question_key(item["question"]) for item in source_questions
+                ],
+                "knowledgeUnitIds": [f"KU-{index}" for index in range(1, 5)],
+                "answer": "定义1。定义2。定义3。定义4。",
+                "hint": "从四项并列定义及其共同上位主题展开回忆",
+                "evidenceIds": [f"merge-{index}" for index in range(1, 5)],
+            }
+        ],
+    }
+
+    result = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False)._validate_model_result(
+        LearningMaterialContext(12, "并列知识课程", "pdf"),
+        evidences,
+        payload,
+        source_questions=source_questions,
+        curator_context=curator_context,
+    )
+
+    assert len(result.knowledge_points) == 1
+    assert len(result.knowledge_points[0].evidence_refs) == 4
 
 
 def test_model_extractor_falls_back_to_deepseek_and_reports_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
