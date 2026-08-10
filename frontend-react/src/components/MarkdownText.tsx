@@ -15,6 +15,12 @@ export function MarkdownText({ content, className = '', rewriteHref }: MarkdownT
 type MarkdownListMarker = { indent: number; ordered: boolean; number?: number; content: string };
 type MarkdownListItem = { content: string; children: MarkdownListBlock[] };
 type MarkdownListBlock = { ordered: boolean; start?: number; items: MarkdownListItem[] };
+type MarkdownTableAlignment = 'left' | 'center' | 'right';
+type MarkdownTableBlock = {
+  headers: string[];
+  alignments: MarkdownTableAlignment[];
+  rows: string[][];
+};
 
 // 将 Markdown 行拆成标题、段落、列表、引用和代码块；列表项目允许使用空行和缩进续写。
 function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, contextText?: string) => string) {
@@ -61,6 +67,14 @@ function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, cont
       continue;
     }
 
+    const parsedTable = parseMarkdownTable(lines, lineIndex);
+    if (parsedTable) {
+      flushParagraph();
+      blocks.push(renderMarkdownTable(parsedTable.block, `table-${blocks.length}`, rewriteHref));
+      lineIndex = parsedTable.nextIndex;
+      continue;
+    }
+
     const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
     if (heading) {
       flushParagraph();
@@ -97,6 +111,118 @@ function renderMarkdownBlocks(content: string, rewriteHref?: (href: string, cont
   flushParagraph();
 
   return blocks.length ? blocks : [<p key="empty">暂无内容</p>];
+}
+
+// 识别 GFM 表格的表头、分隔行和数据行，并保留列对齐语义。
+function parseMarkdownTable(lines: string[], startIndex: number): { block: MarkdownTableBlock; nextIndex: number } | null {
+  if (startIndex + 1 >= lines.length) return null;
+  const headers = parseMarkdownTableRow(lines[startIndex]);
+  const delimiterCells = parseMarkdownTableRow(lines[startIndex + 1]);
+  if (!headers || !delimiterCells || headers.length !== delimiterCells.length) return null;
+
+  const alignments = delimiterCells.map(parseMarkdownTableAlignment);
+  if (alignments.some((alignment) => alignment === null)) return null;
+
+  const rows: string[][] = [];
+  let lineIndex = startIndex + 2;
+  while (lineIndex < lines.length) {
+    if (!lines[lineIndex].trim()) break;
+    const cells = parseMarkdownTableRow(lines[lineIndex]);
+    if (!cells) break;
+    rows.push(normalizeMarkdownTableCells(cells, headers.length));
+    lineIndex += 1;
+  }
+
+  return {
+    block: {
+      headers,
+      alignments: alignments as MarkdownTableAlignment[],
+      rows
+    },
+    nextIndex: lineIndex
+  };
+}
+
+// 按未转义的竖线拆分单行，避免把 `\|` 或行内代码中的竖线误当作列边界。
+function parseMarkdownTableRow(line: string): string[] | null {
+  let source = line.trim();
+  if (!source.includes('|')) return null;
+  if (source.startsWith('|')) source = source.slice(1);
+  if (source.endsWith('|') && !source.endsWith('\\|')) source = source.slice(0, -1);
+
+  const cells: string[] = [];
+  let current = '';
+  let inInlineCode = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '\\' && source[index + 1] === '|') {
+      current += '|';
+      index += 1;
+      continue;
+    }
+    if (character === '`') {
+      inInlineCode = !inInlineCode;
+      current += character;
+      continue;
+    }
+    if (character === '|' && !inInlineCode) {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += character;
+  }
+  cells.push(current.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+// 分隔行中的冒号决定表格列的左、中、右对齐方式。
+function parseMarkdownTableAlignment(value: string): MarkdownTableAlignment | null {
+  const normalized = value.replace(/\s+/g, '');
+  const match = /^(:)?-{3,}(:)?$/.exec(normalized);
+  if (!match) return null;
+  if (match[1] && match[2]) return 'center';
+  if (match[2]) return 'right';
+  return 'left';
+}
+
+// 数据列少于表头时补空单元格，多余列按 GFM 行为忽略。
+function normalizeMarkdownTableCells(cells: string[], columnCount: number) {
+  return Array.from({ length: columnCount }, (_, index) => cells[index] || '');
+}
+
+// 使用语义化 table 渲染，并由外层容器承担窄屏横向滚动。
+function renderMarkdownTable(
+  block: MarkdownTableBlock,
+  key: string,
+  rewriteHref?: (href: string, contextText?: string) => string
+): ReactNode {
+  return (
+    <div className="markdown-table-scroll" key={key} role="region" aria-label="内容表格，可横向滚动" tabIndex={0}>
+      <table>
+        <thead>
+          <tr>
+            {block.headers.map((header, index) => (
+              <th className={`markdown-table-align-${block.alignments[index]}`} key={`${key}-header-${index}`} scope="col">
+                {renderInlineMarkdown(header, header, rewriteHref)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {block.rows.map((row, rowIndex) => (
+            <tr key={`${key}-row-${rowIndex}`}>
+              {row.map((cell, columnIndex) => (
+                <td className={`markdown-table-align-${block.alignments[columnIndex]}`} key={`${key}-cell-${rowIndex}-${columnIndex}`}>
+                  {renderInlineMarkdown(cell, cell, rewriteHref)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 // 读取列表标记并保留缩进，用于区分同级列表与嵌套列表。
