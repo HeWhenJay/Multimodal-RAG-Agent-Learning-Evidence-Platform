@@ -30,7 +30,7 @@ def test_review_segment_budget_config_env_mapping_is_effective() -> None:
                 "segment": {
                     "timeout-seconds": 1800,
                     "request-timeout-seconds": 180,
-                    "cockpit-request-retries": 1,
+                    "cockpit-request-retries": 2,
                     "max-generation-attempts": 3,
                     "max-merge-rounds": 2,
                 }
@@ -40,7 +40,7 @@ def test_review_segment_budget_config_env_mapping_is_effective() -> None:
 
     assert env_defaults["REVIEW_SEGMENT_TIMEOUT_SECONDS"] == "1800"
     assert env_defaults["REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS"] == "180"
-    assert env_defaults["REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES"] == "1"
+    assert env_defaults["REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES"] == "2"
     assert env_defaults["REVIEW_SEGMENT_MAX_GENERATION_ATTEMPTS"] == "3"
     assert env_defaults["REVIEW_SEGMENT_MAX_MERGE_ROUNDS"] == "2"
 

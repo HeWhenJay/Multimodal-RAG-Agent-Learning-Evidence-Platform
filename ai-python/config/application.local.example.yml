@@ -81,7 +81,7 @@ review:
   segment:
     timeout-seconds: ${REVIEW_SEGMENT_TIMEOUT_SECONDS:1800}
     request-timeout-seconds: ${REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS:180}
-    cockpit-request-retries: ${REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES:1}
+    cockpit-request-retries: ${REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES:2}
     max-generation-attempts: ${REVIEW_SEGMENT_MAX_GENERATION_ATTEMPTS:3}
     max-merge-rounds: ${REVIEW_SEGMENT_MAX_MERGE_ROUNDS:2}
   langextract:

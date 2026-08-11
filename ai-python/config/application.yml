@@ -145,8 +145,8 @@ review:
     timeout-seconds: ${REVIEW_SEGMENT_TIMEOUT_SECONDS:1800}
     # 交互式请求必须显著短于总预算，SDK 超时后释放已运行的 LLM I/O 线程。
     request-timeout-seconds: ${REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS:180}
-    # Cockpit 失败后保留一次账号/上游轮换机会，再切换 DeepSeek。
-    cockpit-request-retries: ${REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES:1}
+    # Cockpit 失败后保留两次账号/上游轮换机会，再切换 DeepSeek。
+    cockpit-request-retries: ${REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES:2}
     # 交互式工作台优先快速给出候选；未收敛结果交由人工保留、编辑或重试。
     max-generation-attempts: ${REVIEW_SEGMENT_MAX_GENERATION_ATTEMPTS:3}
     max-merge-rounds: ${REVIEW_SEGMENT_MAX_MERGE_ROUNDS:2}

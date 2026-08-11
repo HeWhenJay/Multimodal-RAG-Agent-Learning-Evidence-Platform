@@ -16,7 +16,7 @@
 
 同一轮选中的分段会进入进程级共享 I/O 线程池并发生成，默认最多 16 个；多份资料共用这一个池，避免每个任务各建线程导致并发膨胀。LangExtract 的本地切分、映射和聚合按 CPU/内存密集阶段限制为 n+1=9，实际模型网络请求仍受 16 个 I/O 并发槽约束。
 
-分段任务会透传 evidence 清洗、LangExtract、实际模型、模型第 N 轮生成、单请求超时、剩余总预算、质量校验、自动修复和多卡复查事件，并每 15 秒刷新后台心跳。单段总执行预算由 `REVIEW_SEGMENT_TIMEOUT_SECONDS` 控制，默认 1800 秒；所有节点共享同一截止时间，超时后不再发起后续模型请求。交互式单次模型请求默认最多 180 秒，Cockpit 失败后保留一次账号或上游轮换机会，两次请求均失败后再切换 DeepSeek；某段超时只返回该段 `FAILED`，其他段继续完成。前端超过 60 秒未收到心跳时展示失联诊断，并允许用 `forceRestart=true` 显式替代旧任务。
+分段任务会透传 evidence 清洗、LangExtract、实际模型、模型第 N 轮生成、单请求超时、剩余总预算、质量校验、自动修复和多卡复查事件，并每 15 秒刷新后台心跳。单段总执行预算由 `REVIEW_SEGMENT_TIMEOUT_SECONDS` 控制，默认 1800 秒；所有节点共享同一截止时间，超时后不再发起后续模型请求。交互式单次模型请求默认最多 180 秒，该时间包含连接、上游排队、模型思考与生成以及响应接收；Cockpit 首次请求失败后最多再重试两次，三次请求均失败后再切换 DeepSeek。某段超时只返回该段 `FAILED`，其他段继续完成。前端超过 60 秒未收到心跳时展示失联诊断，并允许用 `forceRestart=true` 显式替代旧任务。
 
 ### 接口
 
@@ -199,7 +199,7 @@ Cockpit 重试参数默认与本机“长等待方案”保持一致：
 | `REVIEW_EXTRACTION_TIMEOUT_SECONDS` | `615` | 单次 Cockpit 请求等待窗口；默认覆盖两次 180 秒流打开、一次 240 秒空闲和 15 秒余量 |
 | `REVIEW_SEGMENT_TIMEOUT_SECONDS` | `1800` | 交互式生成单个分段的总预算；超时只结束该段等待，不拖住整轮 |
 | `REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS` | `180` | 交互式分段单次模型请求上限；与 Cockpit 流打开窗口一致且明显小于单段总预算 |
-| `REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES` | `1` | 交互式分段的 Cockpit 请求重试数；保留一次账号或上游轮换机会 |
+| `REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES` | `2` | 交互式分段的 Cockpit 请求重试数；首次失败后保留两次账号或上游轮换机会 |
 | `REVIEW_SEGMENT_MAX_GENERATION_ATTEMPTS` | `3` | 交互式分段的质量生成/修复轮数，耗尽后返回人工候选 |
 | `REVIEW_SEGMENT_MAX_MERGE_ROUNDS` | `2` | 交互式分段的多卡合并轮数，耗尽后由用户保留或编辑候选 |
 

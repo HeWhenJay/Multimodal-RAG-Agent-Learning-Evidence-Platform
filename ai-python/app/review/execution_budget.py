@@ -89,11 +89,11 @@ class ReviewExecutionBudget:
 
 
 def configured_segment_cockpit_request_retries() -> int:
-    """读取交互式分段的 Cockpit 重试次数，默认保留一次账号轮换机会。"""
+    """读取交互式分段的 Cockpit 重试次数，默认保留两次账号轮换机会。"""
     try:
-        value = int(os.getenv("REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES", "1"))
+        value = int(os.getenv("REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES", "2"))
     except (TypeError, ValueError):
-        value = 1
+        value = 2
     return max(0, min(3, value))
 
 
