@@ -14,6 +14,7 @@ from app.review.knowledge_extractor import (
     LearningMaterialContext,
     ReviewExtractionError,
 )
+from app.review.generation_graph import ReviewManualReviewRequired
 from app.review.repository import (
     MaterialSourceRecord,
     ReviewCardRecord,
@@ -89,6 +90,19 @@ class SegmentExtractor:
             ),),
             extractor="model:test",
             summary=f"摘要：{source.sectionName}",
+        )
+
+
+class ManualReviewSegmentExtractor(SegmentExtractor):
+    """模拟单卡门禁通过但多卡合并未收敛，必须保留最后候选供人工选择。"""
+
+    def extract(self, material, evidences, **kwargs):
+        candidate = super().extract(material, evidences, **kwargs)
+        raise ReviewManualReviewRequired(
+            "多卡片合并未收敛，需要人工选择",
+            attempts=1,
+            quality_feedback=["卡片 2 的 answer 未通过逐论断 evidence 忠实度校验"],
+            last_valid_result=candidate,
         )
 
 
@@ -265,6 +279,28 @@ def test_segment_timeout_returns_failed_result_without_blocking_whole_round(monk
     assert time.monotonic() - started_at < 0.14
     assert result.segments[0].status == "FAILED"
     assert "超过执行时间预算" in result.segments[0].qualityFeedback[0]
+
+
+def test_failed_segment_keeps_last_valid_cards_for_manual_selection() -> None:
+    """多卡门禁失败时，仍应把单卡门禁通过的候选返回工作台，而不是丢弃。"""
+    transaction = SegmentTransaction()
+    service = service_with(transaction, ManualReviewSegmentExtractor())
+    workspace = service.get_segment_workspace(31, "7")
+
+    result = service.generate_selected_segments(
+        31,
+        "7",
+        [workspace.segments[0].segmentId],
+        {},
+        mode="RELAXED",
+    )
+
+    segment_result = result.segments[0]
+    assert segment_result.status == "FAILED"
+    assert segment_result.candidateAvailable is True
+    assert len(segment_result.cards) == 1
+    assert segment_result.cards[0].evidenceIds == ["e-0"]
+    assert "卡片 2" in segment_result.qualityFeedback[0]
 
 
 def test_merge_segment_candidates_supports_first_generation_and_rejects_unsupported_answer() -> None:

@@ -181,6 +181,7 @@ export interface ReviewSegmentResult {
   status: 'SUCCEEDED' | 'FAILED';
   summary?: string | null;
   cards: ReviewMaterialCardSnapshot[];
+  candidateAvailable: boolean;
   qualityFeedback: string[];
   error?: string | null;
 }

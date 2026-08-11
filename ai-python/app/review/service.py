@@ -1008,6 +1008,28 @@ class ReviewService:
             """在线程池中独立生成一段，异常只影响当前段。"""
             segment_model, segment = segment_map[segment_id]
             prompt = " ".join(str(prompts.get(segment_id) or "").split()).strip()
+
+            def failed_result(
+                error: Exception,
+                *,
+                feedback: list[str] | tuple[str, ...],
+                last_valid_result: object | None = None,
+            ) -> ReviewSegmentResult:
+                """保留单卡门禁通过但多卡未收敛的最后候选，交给用户逐卡决策。"""
+                candidate_points = tuple(getattr(last_valid_result, "knowledge_points", ()) or ())
+                candidate_cards = [knowledge_point_snapshot(point) for point in candidate_points]
+                return ReviewSegmentResult(
+                    segmentId=segment_id,
+                    segmentIndex=segment_model.segmentIndex,
+                    title=segment_model.title,
+                    status="FAILED",
+                    cards=candidate_cards,
+                    candidateAvailable=bool(candidate_cards),
+                    summary=getattr(last_valid_result, "summary", None),
+                    qualityFeedback=list(feedback)[:80],
+                    error=str(error),
+                )
+
             try:
                 result = self.extractor.extract(
                     LearningMaterialContext(
@@ -1030,17 +1052,15 @@ class ReviewService:
                     status="SUCCEEDED",
                     summary=result.summary,
                     cards=[knowledge_point_snapshot(point) for point in result.knowledge_points],
+                    candidateAvailable=True,
                     qualityFeedback=list(result.quality_feedback),
                 )
             except (ReviewManualReviewRequired, ReviewExtractionError) as exc:
                 feedback = list(getattr(exc, "quality_feedback", ()) or getattr(exc, "diagnostics", ()) or [str(exc)])
-                return ReviewSegmentResult(
-                    segmentId=segment_id,
-                    segmentIndex=segment_model.segmentIndex,
-                    title=segment_model.title,
-                    status="FAILED",
-                    qualityFeedback=feedback[:80],
-                    error=str(exc),
+                return failed_result(
+                    exc,
+                    feedback=feedback,
+                    last_valid_result=getattr(exc, "last_valid_result", None),
                 )
 
             except Exception as exc:  # noqa: BLE001 - 单段模型异常必须收敛为可重试结果。
@@ -1050,6 +1070,7 @@ class ReviewService:
                     segmentIndex=segment_model.segmentIndex,
                     title=segment_model.title,
                     status="FAILED",
+                    candidateAvailable=False,
                     qualityFeedback=["本段模型调用出现异常，可调整提示词后重试"],
                     error=f"本段生成失败：{exc.__class__.__name__}",
                 )

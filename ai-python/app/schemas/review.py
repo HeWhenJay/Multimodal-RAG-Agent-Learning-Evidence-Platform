@@ -213,6 +213,7 @@ class ReviewSegmentResult(BaseModel):
     status: Literal["SUCCEEDED", "FAILED"]
     summary: str | None = None
     cards: list[ReviewMaterialCardSnapshot] = Field(default_factory=list)
+    candidateAvailable: bool = False
     qualityFeedback: list[str] = Field(default_factory=list, max_length=80)
     error: str | None = None
 
