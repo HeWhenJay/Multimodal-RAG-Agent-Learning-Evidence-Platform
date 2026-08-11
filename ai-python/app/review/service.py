@@ -108,9 +108,9 @@ def configured_review_segment_timeout_seconds() -> float:
 def configured_review_segment_request_timeout_seconds() -> float:
     """读取交互式分段单次模型请求预算，默认明显小于单段总预算。"""
     try:
-        configured = float(os.getenv("REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS", "240"))
+        configured = float(os.getenv("REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS", "180"))
     except (TypeError, ValueError):
-        configured = 240.0
+        configured = 180.0
     return max(0.05, min(900.0, configured))
 
 

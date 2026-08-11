@@ -2,7 +2,21 @@
 
 import pytest
 
-from app.review.execution_budget import ReviewExecutionBudget, ReviewExecutionTimeout
+from app.review.execution_budget import (
+    ReviewExecutionBudget,
+    ReviewExecutionTimeout,
+    configured_segment_cockpit_request_retries,
+)
+from app.review.service import configured_review_segment_request_timeout_seconds
+
+
+def test_interactive_segment_timeout_and_retry_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """交互式分段默认使用 180 秒单请求并保留一次 Cockpit 重试。"""
+    monkeypatch.delenv("REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES", raising=False)
+
+    assert configured_review_segment_request_timeout_seconds() == 180.0
+    assert configured_segment_cockpit_request_retries() == 1
 
 
 def test_request_timeout_is_capped_by_segment_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

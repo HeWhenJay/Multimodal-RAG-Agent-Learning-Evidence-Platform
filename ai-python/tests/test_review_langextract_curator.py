@@ -188,8 +188,8 @@ def test_langextract_proxy_retries_with_deepseek_after_primary_connection_failur
     assert fallback_requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
-def test_interactive_langextract_budget_skips_repeated_cockpit_wait() -> None:
-    """交互式分段遇到 Cockpit 连接错误时应直接切换 DeepSeek，并透传短 timeout。"""
+def test_interactive_langextract_budget_keeps_one_cockpit_retry() -> None:
+    """交互式分段保留一次 Cockpit 轮换重试，耗尽后切换 DeepSeek。"""
     from httpx import Request
     from openai import APIConnectionError
 
@@ -223,7 +223,7 @@ def test_interactive_langextract_budget_skips_repeated_cockpit_wait() -> None:
 
     proxy.create(model="gpt-5.6-terra", messages=[])
 
-    assert len(primary_requests) == 1
+    assert len(primary_requests) == 2
     assert len(fallback_requests) == 1
     assert 0 < float(primary_requests[0]["timeout"]) <= 5
     assert 0 < float(fallback_requests[0]["timeout"]) <= 5
