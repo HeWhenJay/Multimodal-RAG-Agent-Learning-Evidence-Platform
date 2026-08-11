@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 import asyncio
 import os
@@ -20,6 +20,10 @@ MAX_CPU_WORKERS = DEFAULT_CPU_WORKERS
 DEFAULT_LLM_IO_WORKERS = DEFAULT_IO_WORKERS
 MAX_LLM_IO_WORKERS = 64
 T = TypeVar("T")
+
+
+class LlmIoTimeoutError(TimeoutError):
+    """模型 I/O 等待超过调用方预算；已经运行的底层请求仍由 SDK 超时回收。"""
 
 
 def configured_io_workers(
@@ -60,11 +64,23 @@ class ProcessIoLimiter:
         self._active: defaultdict[str, int] = defaultdict(int)
 
     @contextmanager
-    def slot(self, group: str, limit: int) -> Iterator[None]:
-        """等待并占用一个并发槽，退出时唤醒同组等待线程。"""
+    def slot(
+        self,
+        group: str,
+        limit: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """等待并占用一个并发槽，超过调用方预算时不再无限排队。"""
         bounded_limit = max(1, int(limit))
         with self._condition:
-            self._condition.wait_for(lambda: self._active[group] < bounded_limit)
+            timeout = None if timeout_seconds is None else max(0.001, float(timeout_seconds))
+            acquired = self._condition.wait_for(
+                lambda: self._active[group] < bounded_limit,
+                timeout=timeout,
+            )
+            if not acquired:
+                raise LlmIoTimeoutError(f"等待模型并发槽超过 {int(timeout or 0)} 秒")
             self._active[group] += 1
         try:
             yield
@@ -97,18 +113,35 @@ def _execute_llm_action(action: Callable[[], T]) -> T:
         _llm_io_local.active = False
 
 
-def run_llm_io(action: Callable[[], T]) -> T:
-    """把同步模型网络请求放入专用 I/O 线程池，并返回调用结果。"""
+def run_llm_io(action: Callable[[], T], *, timeout_seconds: float | None = None) -> T:
+    """把同步模型网络请求放入专用 I/O 线程池，并按需限制等待时间。"""
     if bool(getattr(_llm_io_local, "active", False)):
         return action()
 
-    return _llm_io_executor.submit(_execute_llm_action, action).result()
+    future = _llm_io_executor.submit(_execute_llm_action, action)
+    try:
+        return future.result(
+            timeout=None if timeout_seconds is None else max(0.001, float(timeout_seconds))
+        )
+    except FutureTimeoutError as exc:
+        # cancel 只能阻止尚未开始的任务；已经运行的 SDK 请求依靠自己的 timeout 退出。
+        future.cancel()
+        raise LlmIoTimeoutError("模型 I/O 等待超过当前调用预算") from exc
 
 
-async def run_llm_io_async(action: Callable[[], T]) -> T:
+async def run_llm_io_async(
+    action: Callable[[], T],
+    *,
+    timeout_seconds: float | None = None,
+) -> T:
     """异步等待专用 LLM I/O 线程池，不占用事件循环。"""
     loop = asyncio.get_running_loop()
-    return await asyncio.wrap_future(
-        _llm_io_executor.submit(_execute_llm_action, action),
-        loop=loop,
-    )
+    future = _llm_io_executor.submit(_execute_llm_action, action)
+    wrapped = asyncio.wrap_future(future, loop=loop)
+    try:
+        if timeout_seconds is None:
+            return await wrapped
+        return await asyncio.wait_for(wrapped, timeout=max(0.001, float(timeout_seconds)))
+    except asyncio.TimeoutError as exc:
+        future.cancel()
+        raise LlmIoTimeoutError("模型 I/O 异步等待超过当前调用预算") from exc

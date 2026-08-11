@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 import threading
 import time
@@ -10,6 +10,10 @@ from typing import Any, Callable
 
 from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter, run_llm_io
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
+from app.review.execution_budget import (
+    ReviewExecutionBudget,
+    configured_segment_cockpit_request_retries,
+)
 from app.review.knowledge_extractor import (
     ReviewLlmEndpoint,
     compact_text,
@@ -120,6 +124,7 @@ class _CompletionsAuditProxy:
         fallback_delegate: Any | None = None,
         fallback_model: str | None = None,
         on_fallback: Callable[[], None] | None = None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> None:
         self._delegate = delegate
         self._audit = audit
@@ -128,10 +133,15 @@ class _CompletionsAuditProxy:
         self._fallback_delegate = fallback_delegate
         self._fallback_model = fallback_model
         self._on_fallback = on_fallback
+        self._execution_budget = execution_budget
 
     def create(self, **kwargs: Any) -> Any:
         from openai import OpenAIError
 
+        if self._execution_budget is not None:
+            kwargs["timeout"] = self._execution_budget.timeout_for_request(
+                "LangExtract 知识发现"
+            )
         self._audit.begin_request()
         if self._thinking_enabled:
             extra_body = dict(kwargs.get("extra_body") or {})
@@ -140,13 +150,40 @@ class _CompletionsAuditProxy:
         # LangExtract 会为同一批文本块创建线程；进程级闸门同时防止多份资料叠加后压垮复习模型。
         try:
             def request_primary() -> Any:
-                with process_io_limiter.slot("review.langextract", self._max_in_flight):
-                    return run_llm_io(lambda: self._delegate.create(**kwargs))
+                request_kwargs = dict(kwargs)
+                slot_timeout = None
+                io_timeout = None
+                if self._execution_budget is not None:
+                    request_kwargs["timeout"] = self._execution_budget.timeout_for_request(
+                        "LangExtract 知识发现"
+                    )
+                    slot_timeout = self._execution_budget.remaining_seconds()
+                    io_timeout = min(
+                        self._execution_budget.remaining_seconds(),
+                        float(request_kwargs["timeout"]) + 2.0,
+                    )
+                with process_io_limiter.slot(
+                    "review.langextract",
+                    self._max_in_flight,
+                    timeout_seconds=slot_timeout,
+                ):
+                    return run_llm_io(
+                        lambda: self._delegate.create(**request_kwargs),
+                        timeout_seconds=io_timeout,
+                    )
 
             response = call_cockpit_with_retry(
                 request_primary,
                 operation="gpt-5.6-terra LangExtract",
                 logger=logger,
+                policy=(
+                    replace(
+                        cockpit_retry_policy(),
+                        request_retries=configured_segment_cockpit_request_retries(),
+                    )
+                    if self._execution_budget is not None
+                    else None
+                ),
             )
         except OpenAIError:
             if self._fallback_delegate is None or not self._fallback_model:
@@ -154,8 +191,26 @@ class _CompletionsAuditProxy:
             self._audit.begin_request()
             fallback_kwargs = dict(kwargs)
             fallback_kwargs["model"] = self._fallback_model
-            with process_io_limiter.slot("review.langextract", self._max_in_flight):
-                response = run_llm_io(lambda: self._fallback_delegate.create(**fallback_kwargs))
+            slot_timeout = None
+            io_timeout = None
+            if self._execution_budget is not None:
+                fallback_kwargs["timeout"] = self._execution_budget.timeout_for_request(
+                    "LangExtract DeepSeek 降级"
+                )
+                slot_timeout = self._execution_budget.remaining_seconds()
+                io_timeout = min(
+                    self._execution_budget.remaining_seconds(),
+                    float(fallback_kwargs["timeout"]) + 2.0,
+                )
+            with process_io_limiter.slot(
+                "review.langextract",
+                self._max_in_flight,
+                timeout_seconds=slot_timeout,
+            ):
+                response = run_llm_io(
+                    lambda: self._fallback_delegate.create(**fallback_kwargs),
+                    timeout_seconds=io_timeout,
+                )
             if self._on_fallback is not None:
                 self._on_fallback()
             kwargs = fallback_kwargs
@@ -178,6 +233,7 @@ class _ChatAuditProxy:
         fallback_delegate: Any | None = None,
         fallback_model: str | None = None,
         on_fallback: Callable[[], None] | None = None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> None:
         self._delegate = delegate
         self.completions = _CompletionsAuditProxy(
@@ -188,6 +244,7 @@ class _ChatAuditProxy:
             fallback_delegate,
             fallback_model,
             on_fallback,
+            execution_budget,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -206,6 +263,7 @@ class _OpenAIClientAuditProxy:
         fallback_delegate: Any | None = None,
         fallback_model: str | None = None,
         on_fallback: Callable[[], None] | None = None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> None:
         self._delegate = delegate
         self.chat = _ChatAuditProxy(
@@ -216,6 +274,7 @@ class _OpenAIClientAuditProxy:
             fallback_delegate,
             fallback_model,
             on_fallback,
+            execution_budget,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -264,7 +323,13 @@ class LangExtractKnowledgeCurator:
         self.last_usage = ModelUsageAudit(max_requests=self.max_model_requests)
         self.active_model_name = self.model
 
-    def extract(self, title: str, evidences: list[Evidence]) -> LangExtractCuratorResult:
+    def extract(
+        self,
+        title: str,
+        evidences: list[Evidence],
+        *,
+        execution_budget: ReviewExecutionBudget | None = None,
+    ) -> LangExtractCuratorResult:
         """抽取全部陈述式与问答式知识，并只保留能精确回指原文的结果。"""
         source_text, spans = build_source_document(evidences)
         if not source_text:
@@ -277,7 +342,15 @@ class LangExtractKnowledgeCurator:
         audit = ModelUsageAudit(max_requests=self.max_model_requests)
         self.last_usage = audit
         started_at = time.perf_counter()
-        annotated = self._run_langextract(title, source_text, api_key, audit)
+        if execution_budget is not None:
+            execution_budget.ensure_active("LangExtract 知识发现")
+        annotated = self._run_langextract(
+            title,
+            source_text,
+            api_key,
+            audit,
+            execution_budget=execution_budget,
+        )
         raw_extractions = list(getattr(annotated, "extractions", None) or [])
         grounded: list[CuratorCandidate] = []
         for extraction in raw_extractions:
@@ -302,6 +375,8 @@ class LangExtractKnowledgeCurator:
         source_text: str,
         api_key: str,
         audit: ModelUsageAudit,
+        *,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> Any:
         """使用官方 OpenAI provider、中文 tokenizer、分块和多轮 passes。"""
         import langextract as lx
@@ -345,6 +420,7 @@ class LangExtractKnowledgeCurator:
             fallback_client.chat.completions if fallback_client is not None else None,
             fallback_endpoint.model if fallback_endpoint is not None else None,
             lambda: setattr(self, "active_model_name", "DeepSeek"),
+            execution_budget,
         )
         extractor = self._extract_function or lx.extract
         return extractor(

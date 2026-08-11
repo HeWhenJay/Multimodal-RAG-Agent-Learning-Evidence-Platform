@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.core.result import BusinessError
 from app.core.io_concurrency import configured_io_workers
 from app.review.fsrs_scheduler import FsrsReviewScheduler, as_utc
+from app.review.execution_budget import ReviewExecutionBudget
 from app.review.card_rewriter import (
     CardRewriter,
     infer_material_rewrite_card_count,
@@ -102,6 +103,15 @@ def configured_review_segment_timeout_seconds() -> float:
     except (TypeError, ValueError):
         configured = 1800.0
     return max(0.05, configured)
+
+
+def configured_review_segment_request_timeout_seconds() -> float:
+    """读取交互式分段单次模型请求预算，默认明显小于单段总预算。"""
+    try:
+        configured = float(os.getenv("REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS", "240"))
+    except (TypeError, ValueError):
+        configured = 240.0
+    return max(0.05, min(900.0, configured))
 
 
 def report_progress(
@@ -928,6 +938,7 @@ class ReviewService:
             normalized_mode = "RELAXED"
         total = len(segment_ids)
         segment_timeout_seconds = configured_review_segment_timeout_seconds()
+        segment_request_timeout_seconds = configured_review_segment_request_timeout_seconds()
         segment_progress_lock = Lock()
         local_progress = {segment_id: 0 for segment_id in segment_ids}
         selected_positions = {
@@ -1004,7 +1015,10 @@ class ReviewService:
                 except Exception:  # noqa: BLE001 - 页面轮询断开不能影响任务收敛。
                     logger.debug("分段终态进度回调已断开: material_id=%s segment_id=%s", material.id, segment_id)
 
-        def generate_one(segment_id: str) -> ReviewSegmentResult:
+        def generate_one(
+            segment_id: str,
+            execution_budget: ReviewExecutionBudget,
+        ) -> ReviewSegmentResult:
             """在线程池中独立生成一段，异常只影响当前段。"""
             segment_model, segment = segment_map[segment_id]
             prompt = " ".join(str(prompts.get(segment_id) or "").split()).strip()
@@ -1031,6 +1045,7 @@ class ReviewService:
                 )
 
             try:
+                execution_budget.ensure_active(f"原文第 {segment_model.segmentIndex} 段")
                 result = self.extractor.extract(
                     LearningMaterialContext(
                         material_id=material.id,
@@ -1042,6 +1057,7 @@ class ReviewService:
                     user_feedback=prompt or "请模拟真实面试官提问，完整保留本段独立知识点。",
                     generation_mode=normalized_mode,
                     progress_callback=lambda event: emit_segment_progress(segment_id, event),
+                    execution_budget=execution_budget,
                 )
                 if not result.knowledge_points:
                     raise ReviewExtractionError("本段没有生成通过 evidence 门禁的卡片")
@@ -1077,12 +1093,22 @@ class ReviewService:
 
         results: list[ReviewSegmentResult] = []
         worker_count = min(total, configured_io_workers("LLM_IO_MAX_WORKERS"))
-        futures: dict[object, tuple[str, float]] = {}
+        futures: dict[object, tuple[str, ReviewExecutionBudget]] = {}
 
         def submit_segment(segment_id: str) -> None:
             """提交一段并记录独立截止时间，排队时间也计入用户可感知预算。"""
-            future = _review_segment_extract_executor.submit(generate_one, segment_id)
-            futures[future] = (segment_id, monotonic())
+            started_at = monotonic()
+            execution_budget = ReviewExecutionBudget.start(
+                segment_timeout_seconds,
+                segment_request_timeout_seconds,
+                started_at=started_at,
+            )
+            future = _review_segment_extract_executor.submit(
+                generate_one,
+                segment_id,
+                execution_budget,
+            )
+            futures[future] = (segment_id, execution_budget)
 
         for segment_id in segment_ids[:worker_count]:
             submit_segment(segment_id)
@@ -1090,8 +1116,8 @@ class ReviewService:
         pending_ids = segment_ids[worker_count:]
         while futures:
             next_deadline = min(
-                started_at + segment_timeout_seconds
-                for _segment_id, started_at in futures.values()
+                execution_budget.deadline
+                for _segment_id, execution_budget in futures.values()
             )
             wait_timeout = max(0.0, min(0.25, next_deadline - monotonic()))
             done, _not_done = wait(
@@ -1102,24 +1128,30 @@ class ReviewService:
             now = monotonic()
             expired = {
                 future
-                for future, (_segment_id, started_at) in futures.items()
-                if future not in done and now - started_at >= segment_timeout_seconds
+                for future, (_segment_id, execution_budget) in futures.items()
+                if future not in done and now >= execution_budget.deadline
             }
             for future in [*done, *expired]:
                 item = futures.pop(future, None)
                 if item is None:
                     continue
-                segment_id, _started_at = item
+                segment_id, execution_budget = item
                 segment_model, _segment = segment_map[segment_id]
                 if future in expired:
+                    execution_budget.cancel("本段总执行预算已耗尽")
                     future.cancel()
                     segment_result = ReviewSegmentResult(
                         segmentId=segment_id,
                         segmentIndex=segment_model.segmentIndex,
                         title=segment_model.title,
                         status="FAILED",
-                        qualityFeedback=["本段超过执行时间预算，已停止等待；可稍后单独重试本段"],
-                        error=f"本段生成超过 {int(segment_timeout_seconds)} 秒，已从本轮任务中释放",
+                        qualityFeedback=[
+                            "本段超过执行时间预算，已阻止后续模型请求；可稍后单独重试本段",
+                        ],
+                        error=(
+                            f"本段生成超过 {int(segment_timeout_seconds)} 秒，已从本轮任务中释放；"
+                            f"单次模型请求上限 {int(segment_request_timeout_seconds)} 秒"
+                        ),
                     )
                 else:
                     segment_result = future.result()

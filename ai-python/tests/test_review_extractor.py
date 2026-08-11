@@ -34,6 +34,7 @@ from app.review.knowledge_extractor import (
     stable_source_key,
 )
 from app.schemas.rag import Evidence
+from app.review.execution_budget import ReviewExecutionBudget
 from app.review.langextract_curator import CuratorCandidate
 from prompts.review import (
     REVIEW_CARD_PROMPT_VERSION,
@@ -187,6 +188,51 @@ def test_model_extractor_uses_one_centralized_prompt_call_per_material(monkeypat
     assert result.summary == payload["summary"]
     assert result.summary != "这只是 RAG 截断摘要，不应直接展示。"
     assert len(result.knowledge_points) == 1
+
+
+def test_interactive_segment_reports_model_round_and_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """交互式分段应使用短请求 timeout，并把真实模型、轮次和预算写入进度。"""
+    calls: list[dict] = []
+    events: list[dict] = []
+    payload = valid_payload()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))],
+            )
+
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **_kwargs: SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    monkeypatch.setenv("REVIEW_LLM_API_KEY", "test-key")
+    extractor = KnowledgePointExtractor(provider="deepseek", langextract_enabled=False)
+
+    result = extractor.extract(
+        LearningMaterialContext(12, "Kafka 的高可用性", "pdf"),
+        [
+            evidence(
+                "material-12-7",
+                "ISR",
+                "ISR 保存与 Leader 保持同步的副本集合，Leader 故障后会优先从 ISR 中选举新 Leader。",
+            )
+        ],
+        generation_mode="RELAXED",
+        progress_callback=events.append,
+        execution_budget=ReviewExecutionBudget.start(60, 12),
+    )
+
+    assert result.knowledge_points
+    assert len(calls) == 1
+    assert 0 < float(calls[0]["timeout"]) <= 12
+    request_event = next(item for item in events if item["stageLabel"] == "gpt-5.6-terra 请求")
+    assert request_event["attempt"] == 1
+    assert "模型=gpt-5.6-terra" in request_event["detail"]
+    assert "剩余" in request_event["detail"]
 
 
 def test_multiple_cards_invoke_structured_multi_card_observer(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -15,6 +15,7 @@ from app.review.langextract_curator import (
     grounded_candidate,
     select_production_curator_candidates,
 )
+from app.review.execution_budget import ReviewExecutionBudget
 from app.schemas.rag import Evidence
 from rag.evaluation.review_curator_ab_common import (
     CuratorArmResult,
@@ -185,6 +186,47 @@ def test_langextract_proxy_retries_with_deepseek_after_primary_connection_failur
     assert fallback_used == [True]
     assert fallback_requests[0]["model"] == "deepseek-v4-flash"
     assert fallback_requests[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_interactive_langextract_budget_skips_repeated_cockpit_wait() -> None:
+    """交互式分段遇到 Cockpit 连接错误时应直接切换 DeepSeek，并透传短 timeout。"""
+    from httpx import Request
+    from openai import APIConnectionError
+
+    primary_requests: list[dict] = []
+    fallback_requests: list[dict] = []
+
+    class FailingDelegate:
+        def create(self, **kwargs):
+            primary_requests.append(kwargs)
+            raise APIConnectionError(
+                request=Request("POST", "http://localhost:58966/v1/chat/completions")
+            )
+
+    class FallbackDelegate:
+        def create(self, **kwargs):
+            fallback_requests.append(kwargs)
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+            )
+
+    proxy = _CompletionsAuditProxy(
+        FailingDelegate(),
+        ModelUsageAudit(max_requests=2),
+        1,
+        False,
+        FallbackDelegate(),
+        "deepseek-v4-flash",
+        execution_budget=ReviewExecutionBudget.start(60, 5),
+    )
+
+    proxy.create(model="gpt-5.6-terra", messages=[])
+
+    assert len(primary_requests) == 1
+    assert len(fallback_requests) == 1
+    assert 0 < float(primary_requests[0]["timeout"]) <= 5
+    assert 0 < float(fallback_requests[0]["timeout"]) <= 5
 
 
 def test_langextract_curator_uses_cpu_bounded_workers() -> None:

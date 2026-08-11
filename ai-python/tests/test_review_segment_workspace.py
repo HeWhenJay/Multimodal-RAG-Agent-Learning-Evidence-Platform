@@ -258,13 +258,19 @@ def test_segment_timeout_returns_failed_result_without_blocking_whole_round(monk
     class SlowSegmentExtractor(SegmentExtractor):
         """模拟超过单段预算后才返回的同步模型调用。"""
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.budgets = []
+
         def extract(self, *args, **kwargs):
+            self.budgets.append(kwargs["execution_budget"])
             time.sleep(0.15)
             return super().extract(*args, **kwargs)
 
     monkeypatch.setenv("REVIEW_SEGMENT_TIMEOUT_SECONDS", "0.05")
     transaction = SegmentTransaction()
-    service = service_with(transaction, SlowSegmentExtractor())
+    extractor = SlowSegmentExtractor()
+    service = service_with(transaction, extractor)
     workspace = service.get_segment_workspace(31, "7")
     started_at = time.monotonic()
 
@@ -279,6 +285,7 @@ def test_segment_timeout_returns_failed_result_without_blocking_whole_round(monk
     assert time.monotonic() - started_at < 0.14
     assert result.segments[0].status == "FAILED"
     assert "超过执行时间预算" in result.segments[0].qualityFeedback[0]
+    assert extractor.budgets[0].cancelled is True
 
 
 def test_failed_segment_keeps_last_valid_cards_for_manual_selection() -> None:

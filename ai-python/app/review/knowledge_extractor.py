@@ -13,8 +13,21 @@ import time
 from typing import Any
 
 from app.core.environment import read_process_or_windows_user_environment
-from app.core.io_concurrency import configured_cpu_workers, configured_io_workers, process_io_limiter, run_llm_io
+from app.core.io_concurrency import (
+    LlmIoTimeoutError,
+    configured_cpu_workers,
+    configured_io_workers,
+    process_io_limiter,
+    run_llm_io,
+)
 from app.review.cockpit_retry import call_cockpit_with_retry, cockpit_retry_policy
+from app.review.execution_budget import (
+    ReviewExecutionBudget,
+    ReviewExecutionTimeout,
+    configured_segment_cockpit_request_retries,
+    configured_segment_generation_attempts,
+    configured_segment_merge_rounds,
+)
 from app.review.generation_graph import (
     ProgressCallback,
     ReviewManualReviewRequired,
@@ -153,6 +166,7 @@ class KnowledgePointExtractor:
         user_feedback: str | None = None,
         generation_mode: str = "STANDARD",
         progress_callback: ProgressCallback | None = None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> ExtractionResult:
         """只根据 evidence 运行多轮复习模型生成图，失败时不发布降级内容。"""
         # 提取器通常随 FastAPI 一起初始化；本地开发时用户可能在服务启动后才补充环境变量。
@@ -185,8 +199,11 @@ class KnowledgePointExtractor:
                 reason=reason,
                 user_feedback=user_feedback,
                 progress_callback=progress_callback,
+                execution_budget=execution_budget,
             )
         try:
+            if execution_budget is not None:
+                execution_budget.ensure_active("整理 evidence")
             # 原始问题全部参与完整性检查，不设置候选数量截断。
             source_questions = extract_source_question_candidates(cleaned)
             required_questions = required_structured_source_questions(source_questions)
@@ -209,7 +226,13 @@ class KnowledgePointExtractor:
                 ),
             )
             outcome = run_review_generation_graph(
-                curator=(lambda: self._curate_material(material, cleaned)) if langextract_enabled else None,
+                curator=(
+                    lambda: self._curate_material(
+                        material,
+                        cleaned,
+                        execution_budget=execution_budget,
+                    )
+                ) if langextract_enabled else None,
                 actor=lambda attempt, feedback, previous_candidate, curator_context: self._generate_model_payload(
                     material,
                     cleaned,
@@ -221,6 +244,7 @@ class KnowledgePointExtractor:
                     generation_mode=mode,
                     previous_candidate=previous_candidate,
                     progress_callback=progress_callback,
+                    execution_budget=execution_budget,
                 ),
                 observer=lambda payload, curator_context: self._validate_model_result(
                     material,
@@ -236,6 +260,7 @@ class KnowledgePointExtractor:
                     curator_context=curator_context,
                     merge_round=merge_round,
                     progress_callback=progress_callback,
+                    execution_budget=execution_budget,
                 ),
                 merge_repair=lambda payload, merge_plan, curator_context, merge_round: self._merge_card_groups(
                     material,
@@ -244,6 +269,7 @@ class KnowledgePointExtractor:
                     curator_context=curator_context,
                     merge_round=merge_round,
                     progress_callback=progress_callback,
+                    execution_budget=execution_budget,
                 ),
                 plan={
                     "materialId": material.material_id,
@@ -257,6 +283,16 @@ class KnowledgePointExtractor:
                     "langExtractEnabled": langextract_enabled,
                     "llmModel": self.model,
                 },
+                max_attempts=(
+                    configured_segment_generation_attempts()
+                    if execution_budget is not None
+                    else None
+                ),
+                max_merge_rounds=(
+                    configured_segment_merge_rounds()
+                    if execution_budget is not None
+                    else None
+                ),
                 on_progress=progress_callback,
             )
             modeled = outcome.result
@@ -274,6 +310,28 @@ class KnowledgePointExtractor:
             raise
         except ReviewExtractionError:
             raise
+        except (ReviewExecutionTimeout, LlmIoTimeoutError) as exc:
+            emit_progress(
+                progress_callback,
+                stageCode="review.timeout",
+                stageLabel="模型调用已停止",
+                message="本段模型调用已达到当前执行预算，正在收敛为可重试失败",
+                status="FAILED",
+                currentStep=1,
+                totalSteps=1,
+                percent=100,
+                attempt=0,
+                maxAttempts=None,
+                detail=(
+                    execution_budget.diagnostics()
+                    if execution_budget is not None
+                    else str(exc)
+                ),
+            )
+            raise ReviewExtractionError(
+                "本段模型调用超过执行预算，请稍后单独重试",
+                diagnostics=[str(exc)],
+            ) from exc
         except json.JSONDecodeError as exc:
             logger.warning("%s 响应不是合法 JSON", self.active_model_name)
             raise ReviewExtractionError(f"{self.active_model_name} 返回的复习内容格式无效，请重新生成") from exc
@@ -296,6 +354,7 @@ class KnowledgePointExtractor:
         reason: str,
         user_feedback: str | None,
         progress_callback: ProgressCallback | None,
+        execution_budget: ReviewExecutionBudget | None,
     ) -> ExtractionResult:
         """按连续 evidence 分段生成，成功段经确定性 reducer 去重合并。"""
         segments = split_review_evidence_segments(evidences)
@@ -341,6 +400,7 @@ class KnowledgePointExtractor:
                     user_feedback=segment_feedback,
                     generation_mode="RELAXED",
                     progress_callback=segment_progress,
+                    execution_budget=execution_budget,
                 )
             except ReviewManualReviewRequired as exc:
                 attempts += exc.attempts
@@ -401,6 +461,8 @@ class KnowledgePointExtractor:
         self,
         material: LearningMaterialContext,
         evidences: list[Evidence],
+        *,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> dict[str, Any]:
         """运行一次官方 LangExtract，并转换为生成图的严格 evidence 候选上下文。"""
         from app.review.langextract_curator import (
@@ -421,7 +483,15 @@ class KnowledgePointExtractor:
             ),
             timeout_seconds=float(os.getenv("REVIEW_LANGEXTRACT_TIMEOUT_SECONDS", str(self.timeout_seconds))),
         )
-        result = curator.extract(material.title, evidences)
+        if execution_budget is None:
+            result = curator.extract(material.title, evidences)
+        else:
+            execution_budget.ensure_active("LangExtract 知识发现")
+            result = curator.extract(
+                material.title,
+                evidences,
+                execution_budget=execution_budget,
+            )
         context = build_production_curator_context(result)
         context["llmModel"] = getattr(curator, "active_model_name", self.model)
         return context
@@ -459,6 +529,7 @@ class KnowledgePointExtractor:
         generation_mode: str = "STANDARD",
         previous_candidate: dict[str, Any] | None = None,
         progress_callback: ProgressCallback | None = None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> dict[str, Any]:
         """调用复习模型；空响应或非法 JSON 在当前质量轮内短程重试。"""
         source_questions = source_questions or extract_source_question_candidates(evidences)
@@ -503,6 +574,7 @@ class KnowledgePointExtractor:
             user_prompt=prompt,
             attempt=attempt,
             progress_callback=progress_callback,
+            execution_budget=execution_budget,
         )
 
     def _observe_multi_card_candidate(
@@ -513,6 +585,7 @@ class KnowledgePointExtractor:
         curator_context: dict[str, Any],
         merge_round: int,
         progress_callback: ProgressCallback | None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> dict[str, Any]:
         """请求模型只输出多卡片合并计划，不允许在 Observer 内改卡。"""
         prompt = review_multi_card_observer_user_prompt(
@@ -529,6 +602,7 @@ class KnowledgePointExtractor:
             progress_current_step=5 if curator_context else 4,
             progress_total_steps=7 if curator_context else 6,
             progress_percent=90,
+            execution_budget=execution_budget,
         )
 
     def _merge_card_groups(
@@ -540,6 +614,7 @@ class KnowledgePointExtractor:
         curator_context: dict[str, Any],
         merge_round: int,
         progress_callback: ProgressCallback | None,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> dict[str, Any]:
         """请求模型只返回点名组的替换卡，未点名卡由生成图原样重建。"""
         prompt = review_merge_repair_user_prompt(
@@ -557,6 +632,7 @@ class KnowledgePointExtractor:
             progress_current_step=6 if curator_context else 5,
             progress_total_steps=7 if curator_context else 6,
             progress_percent=90,
+            execution_budget=execution_budget,
         )
 
     def _request_json_completion(
@@ -570,6 +646,7 @@ class KnowledgePointExtractor:
         progress_current_step: int = 2,
         progress_total_steps: int = 4,
         progress_percent: int = 26,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> dict[str, Any]:
         """统一执行复习图各模型节点的 JSON 请求、解析重试和 Cockpit 降级。"""
         from openai import OpenAI
@@ -584,6 +661,11 @@ class KnowledgePointExtractor:
         last_error: Exception | None = None
         for transport_attempt in range(1, REVIEW_RESPONSE_PARSE_ATTEMPTS + 1):
             try:
+                request_timeout = (
+                    execution_budget.timeout_for_request(progress_stage_code)
+                    if execution_budget is not None
+                    else self.timeout_seconds
+                )
                 request: dict[str, Any] = {
                     "model": self.model,
                     "messages": [
@@ -592,10 +674,33 @@ class KnowledgePointExtractor:
                     ],
                     "reasoning_effort": self.reasoning_effort,
                     "response_format": {"type": "json_object"},
-                    "timeout": self.timeout_seconds,
+                    "timeout": request_timeout,
                 }
                 if self.thinking_enabled:
                     request["extra_body"] = {"thinking": {"type": "enabled"}}
+                emit_progress(
+                    progress_callback,
+                    stageCode=progress_stage_code,
+                    stageLabel=f"{self.primary_endpoint.display_name} 请求",
+                    message=(
+                        f"正在请求 {self.primary_endpoint.display_name}，"
+                        f"当前为质量轮次 {attempt}、传输尝试 {transport_attempt}"
+                    ),
+                    status="RUNNING",
+                    currentStep=progress_current_step,
+                    totalSteps=progress_total_steps,
+                    percent=progress_percent,
+                    attempt=attempt,
+                    maxAttempts=None,
+                    detail=(
+                        f"模型={self.primary_endpoint.display_name}；单请求超时={int(request_timeout)} 秒；"
+                        + (
+                            execution_budget.diagnostics()
+                            if execution_budget is not None
+                            else f"默认模型超时={int(self.timeout_seconds)} 秒"
+                        )
+                    ),
+                )
                 response = self._create_completion(
                     client,
                     request,
@@ -605,6 +710,7 @@ class KnowledgePointExtractor:
                     progress_current_step=progress_current_step,
                     progress_total_steps=progress_total_steps,
                     progress_percent=progress_percent,
+                    execution_budget=execution_budget,
                 )
                 choices = getattr(response, "choices", None) or []
                 content = choices[0].message.content if choices else ""
@@ -639,17 +745,34 @@ class KnowledgePointExtractor:
         progress_current_step: int = 2,
         progress_total_steps: int = 4,
         progress_percent: int = 26,
+        execution_budget: ReviewExecutionBudget | None = None,
     ) -> Any:
         """先按 Cockpit 长等待策略重试，尝试耗尽后才降级 DeepSeek。"""
         from openai import OpenAI, OpenAIError
 
         try:
             def request_primary() -> Any:
+                request_payload = dict(request)
+                slot_timeout = None
+                io_timeout = None
+                if execution_budget is not None:
+                    request_payload["timeout"] = execution_budget.timeout_for_request(
+                        progress_stage_code
+                    )
+                    slot_timeout = execution_budget.remaining_seconds()
+                    io_timeout = min(
+                        execution_budget.remaining_seconds(),
+                        float(request_payload["timeout"]) + 2.0,
+                    )
                 with process_io_limiter.slot(
                     "review.llm",
                     configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
+                    timeout_seconds=slot_timeout,
                 ):
-                    return run_llm_io(lambda: client.chat.completions.create(**request))
+                    return run_llm_io(
+                        lambda: client.chat.completions.create(**request_payload),
+                        timeout_seconds=io_timeout,
+                    )
 
             def report_cockpit_retry(
                 error: Exception,
@@ -671,7 +794,15 @@ class KnowledgePointExtractor:
                     percent=progress_percent,
                     attempt=attempt,
                     maxAttempts=None,
-                    detail=f"{type(error).__name__}；退避 {delay:.1f} 秒",
+                    detail=(
+                        f"模型={self.primary_endpoint.display_name}；{type(error).__name__}；"
+                        f"退避 {delay:.1f} 秒；"
+                        + (
+                            execution_budget.diagnostics()
+                            if execution_budget is not None
+                            else "使用默认请求预算"
+                        )
+                    ),
                 )
 
             response = call_cockpit_with_retry(
@@ -679,6 +810,14 @@ class KnowledgePointExtractor:
                 operation=self.primary_endpoint.display_name,
                 logger=logger,
                 on_retry=report_cockpit_retry,
+                policy=(
+                    replace(
+                        cockpit_retry_policy(),
+                        request_retries=configured_segment_cockpit_request_retries(),
+                    )
+                    if execution_budget is not None
+                    else None
+                ),
             )
             self.active_model_name = self.primary_endpoint.display_name
             return response
@@ -705,7 +844,14 @@ class KnowledgePointExtractor:
                 percent=max(progress_percent, 28),
                 attempt=attempt,
                 maxAttempts=None,
-                detail=f"主中转失败：{type(primary_error).__name__}",
+                detail=(
+                    f"模型={fallback.display_name}；主中转失败={type(primary_error).__name__}；"
+                    + (
+                        execution_budget.diagnostics()
+                        if execution_budget is not None
+                        else "使用默认请求预算"
+                    )
+                ),
             )
             fallback_client = OpenAI(
                 api_key=fallback.api_key,
@@ -715,11 +861,26 @@ class KnowledgePointExtractor:
             )
             fallback_request = dict(request)
             fallback_request["model"] = fallback.model
+            slot_timeout = None
+            io_timeout = None
+            if execution_budget is not None:
+                fallback_request["timeout"] = execution_budget.timeout_for_request(
+                    progress_stage_code
+                )
+                slot_timeout = execution_budget.remaining_seconds()
+                io_timeout = min(
+                    execution_budget.remaining_seconds(),
+                    float(fallback_request["timeout"]) + 2.0,
+                )
             with process_io_limiter.slot(
                 "review.llm",
                 configured_io_workers("REVIEW_DEEPSEEK_MAX_IN_FLIGHT"),
+                timeout_seconds=slot_timeout,
             ):
-                response = run_llm_io(lambda: fallback_client.chat.completions.create(**fallback_request))
+                response = run_llm_io(
+                    lambda: fallback_client.chat.completions.create(**fallback_request),
+                    timeout_seconds=io_timeout,
+                )
             self.active_model_name = fallback.display_name
             return response
 

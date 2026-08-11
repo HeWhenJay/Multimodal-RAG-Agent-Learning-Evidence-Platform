@@ -22,6 +22,29 @@ def test_llm_io_thread_pool_config_env_mapping_is_effective():
     assert env_defaults["LLM_IO_MAX_WORKERS"] == "24"
 
 
+def test_review_segment_budget_config_env_mapping_is_effective() -> None:
+    """交互式分段的单请求、重试和质量轮次预算必须可由 YAML 配置。"""
+    env_defaults = build_env_defaults(
+        {
+            "review": {
+                "segment": {
+                    "timeout-seconds": 1800,
+                    "request-timeout-seconds": 240,
+                    "cockpit-request-retries": 0,
+                    "max-generation-attempts": 3,
+                    "max-merge-rounds": 2,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["REVIEW_SEGMENT_TIMEOUT_SECONDS"] == "1800"
+    assert env_defaults["REVIEW_SEGMENT_REQUEST_TIMEOUT_SECONDS"] == "240"
+    assert env_defaults["REVIEW_SEGMENT_COCKPIT_REQUEST_RETRIES"] == "0"
+    assert env_defaults["REVIEW_SEGMENT_MAX_GENERATION_ATTEMPTS"] == "3"
+    assert env_defaults["REVIEW_SEGMENT_MAX_MERGE_ROUNDS"] == "2"
+
+
 def test_fusion_and_local_rerank_config_env_mapping_is_effective():
     """校验融合与本地重排配置能从 YAML 映射为运行环境变量。"""
     env_defaults = build_env_defaults(

@@ -2,8 +2,11 @@
 
 import asyncio
 import threading
+import time
 
-from app.core.io_concurrency import run_llm_io, run_llm_io_async
+import pytest
+
+from app.core.io_concurrency import LlmIoTimeoutError, run_llm_io, run_llm_io_async
 
 
 def test_run_llm_io_uses_dedicated_worker_thread() -> None:
@@ -36,3 +39,23 @@ def test_nested_llm_io_call_executes_inline_without_deadlock() -> None:
     )
 
     assert outer_thread == inner_thread
+
+
+def test_run_llm_io_timeout_releases_caller_without_waiting_forever() -> None:
+    """调用方预算耗尽时应立即退出等待，底层测试任务随后自行释放。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        started.set()
+        release.wait(timeout=1)
+
+    before = time.monotonic()
+    try:
+        with pytest.raises(LlmIoTimeoutError):
+            run_llm_io(block, timeout_seconds=0.03)
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert time.monotonic() - before < 0.2
