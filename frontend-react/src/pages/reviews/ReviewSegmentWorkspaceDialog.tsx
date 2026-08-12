@@ -1,5 +1,6 @@
 import {
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   FileSearch,
@@ -62,6 +63,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
   const [drafts, setDrafts] = useState<Record<string, ReviewMaterialCardSnapshot[]>>({});
   const [cardIncluded, setCardIncluded] = useState<Record<string, Record<string, boolean>>>({});
   const [included, setIncluded] = useState<Record<string, boolean>>({});
+  const [candidatePages, setCandidatePages] = useState<Record<string, number>>({});
   const [summary, setSummary] = useState('');
   const [task, setTask] = useState<ReviewSegmentGenerationTask | null>(null);
   const [starting, setStarting] = useState(false);
@@ -115,6 +117,10 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
       ...previous,
       ...Object.fromEntries(nextResults.map((item) => [item.segmentId, false]))
     }));
+    setCandidatePages((previous) => ({
+      ...previous,
+      ...Object.fromEntries(nextResults.map((item) => [item.segmentId, 0]))
+    }));
     const generatedSummaries = nextResults
       .map((item) => item.summary?.trim())
       .filter((item): item is string => Boolean(item));
@@ -134,6 +140,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     setDrafts({});
     setCardIncluded({});
     setIncluded({});
+    setCandidatePages({});
     setSummary('');
     setTask(null);
     setError('');
@@ -156,6 +163,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
       setDrafts(stored?.drafts || {});
       setCardIncluded(stored?.cardIncluded || {});
       setIncluded(stored?.included || {});
+      setCandidatePages({});
       setSummary(stored?.summary || nextWorkspace.originalSummary || '');
       const firstUnfinished = nextWorkspace.segments.find((segment) => !stored?.drafts?.[segment.segmentId]?.length);
       setSelected(firstUnfinished ? { [firstUnfinished.segmentId]: true } : {});
@@ -312,6 +320,14 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
         .map(([key, value]) => [String(Number(key) > cardIndex ? Number(key) - 1 : Number(key)), value] as const);
       return { ...previous, [segmentId]: Object.fromEntries(entries) };
     });
+    setCandidatePages((previous) => ({
+      ...previous,
+      [segmentId]: Math.max(0, Math.min(previous[segmentId] || 0, (drafts[segmentId]?.length || 1) - 2))
+    }));
+  }
+
+  function changeCandidatePage(segmentId: string, page: number) {
+    setCandidatePages((previous) => ({ ...previous, [segmentId]: Math.max(0, page) }));
   }
 
   function keepSegmentCandidate(segmentId: string) {
@@ -339,6 +355,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     setDrafts({});
     setIncluded({});
     setCardIncluded({});
+    setCandidatePages({});
     setSummary(workspace.originalSummary || '');
     setTask(null);
     setError('');
@@ -434,16 +451,23 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
                   const selectedSegmentCardCount = included[segment.segmentId]
                     ? segmentDrafts.filter((_card, index) => cardIncluded[segment.segmentId]?.[String(index)] !== false).length
                     : 0;
+                  const currentCardPage = Math.min(candidatePages[segment.segmentId] || 0, Math.max(0, segmentDrafts.length - 1));
+                  const currentCard = segmentDrafts[currentCardPage];
                   return <article className={`review-segment-result${included[segment.segmentId] ? ' is-included' : ''}${result?.status === 'FAILED' ? ' needs-review' : ''}`} key={`result-${segment.segmentId}`}>
                     <div className="review-segment-result-head"><div><strong>第 {segment.segmentIndex} 段</strong><span>{selectedSegmentCardCount}/{segmentDrafts.length} 张候选参与合并</span></div><label className="review-segment-include"><input type="checkbox" checked={Boolean(included[segment.segmentId])} onChange={(event) => toggleSegmentIncluded(segment.segmentId, event.target.checked)} disabled={merging} /><span>{result?.status === 'FAILED' ? '人工确认后参与' : '参与最终合并'}</span></label></div>
                     {result?.status === 'FAILED' ? <div className="review-segment-result-review"><CircleAlert size={14} /><span>本段未通过完整门禁，以下候选不会自动覆盖正式卡片；请逐张选择或直接保留当前正式卡片。</span></div> : null}
-                    <div className="review-segment-card-list">{segmentDrafts.map((card, cardIndex) => <article className="review-segment-card-editor" key={`${segment.segmentId}-card-${cardIndex}`}>
-                      <div className="review-segment-card-title"><label className="review-segment-card-keep"><input type="checkbox" checked={cardIncluded[segment.segmentId]?.[String(cardIndex)] ?? result?.status === 'SUCCEEDED'} onChange={(event) => toggleCardIncluded(segment.segmentId, cardIndex, event.target.checked)} disabled={merging} /><span>保留候选卡片 {cardIndex + 1}</span></label><button className="icon-button tiny danger" type="button" title="移除这张候选" aria-label={`移除第 ${segment.segmentIndex} 段的候选卡片 ${cardIndex + 1}`} onClick={() => removeSegmentCard(segment.segmentId, cardIndex)} disabled={merging}><Trash2 size={13} /></button></div>
-                      <label><span>面试官问题</span><textarea value={card.content.question} maxLength={500} rows={3} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, cardIndex, 'question', event.target.value)} disabled={merging} /></label>
-                      <label><span>参考答案（Markdown）</span><textarea value={card.content.answer} maxLength={5000} rows={8} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, cardIndex, 'answer', event.target.value)} disabled={merging} /></label>
-                      <label><span>作答提示（可选）</span><textarea value={card.content.hint || ''} maxLength={1000} rows={2} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, cardIndex, 'hint', event.target.value)} disabled={merging} /></label>
-                      <small className="review-segment-evidence-count">保留 {card.evidenceIds.length} 条 evidence 引用</small>
-                    </article>)}</div>
+                    <div className="review-segment-card-pagination" aria-label={`第 ${segment.segmentIndex} 段候选卡片翻页`}>
+                      <button className="outline-action small" type="button" onClick={() => changeCandidatePage(segment.segmentId, currentCardPage - 1)} disabled={merging || currentCardPage === 0} title="上一张候选卡片" aria-label={`第 ${segment.segmentIndex} 段上一张候选卡片`}><ChevronLeft size={14} />上一张</button>
+                      <span>第 <strong>{currentCardPage + 1}</strong> / {segmentDrafts.length} 张</span>
+                      <button className="outline-action small" type="button" onClick={() => changeCandidatePage(segment.segmentId, currentCardPage + 1)} disabled={merging || currentCardPage >= segmentDrafts.length - 1} title="下一张候选卡片" aria-label={`第 ${segment.segmentIndex} 段下一张候选卡片`}>下一张<ChevronRight size={14} /></button>
+                    </div>
+                    {currentCard ? <div className="review-segment-card-list"><article className="review-segment-card-editor" key={`${segment.segmentId}-card-${currentCardPage}`}>
+                      <div className="review-segment-card-title"><label className="review-segment-card-keep"><input type="checkbox" checked={cardIncluded[segment.segmentId]?.[String(currentCardPage)] ?? result?.status === 'SUCCEEDED'} onChange={(event) => toggleCardIncluded(segment.segmentId, currentCardPage, event.target.checked)} disabled={merging} /><span>保留候选卡片 {currentCardPage + 1}</span></label><button className="icon-button tiny danger" type="button" title="移除这张候选" aria-label={`移除第 ${segment.segmentIndex} 段的候选卡片 ${currentCardPage + 1}`} onClick={() => removeSegmentCard(segment.segmentId, currentCardPage)} disabled={merging}><Trash2 size={13} /></button></div>
+                      <label><span>面试官问题</span><textarea value={currentCard.content.question} maxLength={500} rows={3} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'question', event.target.value)} disabled={merging} /></label>
+                      <label><span>参考答案（Markdown）</span><textarea value={currentCard.content.answer} maxLength={5000} rows={8} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'answer', event.target.value)} disabled={merging} /></label>
+                      <label><span>作答提示（可选）</span><textarea value={currentCard.content.hint || ''} maxLength={1000} rows={2} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'hint', event.target.value)} disabled={merging} /></label>
+                      <small className="review-segment-evidence-count">保留 {currentCard.evidenceIds.length} 条 evidence 引用</small>
+                    </article></div> : null}
                   </article>;
                 }) : <div className="review-segment-empty"><Layers3 size={28} /><strong>还没有候选卡片</strong><span>在左侧查看原文，勾选一个或多个分段后开始生成。</span></div>}
               </div>
