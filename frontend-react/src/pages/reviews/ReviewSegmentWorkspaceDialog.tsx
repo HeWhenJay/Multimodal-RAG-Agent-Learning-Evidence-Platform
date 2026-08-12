@@ -7,12 +7,13 @@ import {
   Layers3,
   Loader2,
   Merge,
+  Pencil,
   RotateCcw,
   Sparkles,
   Trash2,
   X
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchLatestReviewSegmentTask,
   fetchReviewSegmentTask,
@@ -25,6 +26,8 @@ import {
   type ReviewSegmentResult,
   type ReviewSegmentWorkspace
 } from '../../api/reviews';
+import { MarkdownText } from '../../components/MarkdownText';
+import { ReviewCandidateCardEditDialog, type ReviewCandidateCardEditTarget } from './ReviewCandidateCardEditDialog';
 
 export interface ReviewSegmentWorkspaceTarget {
   materialId: number;
@@ -64,6 +67,8 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
   const [cardIncluded, setCardIncluded] = useState<Record<string, Record<string, boolean>>>({});
   const [included, setIncluded] = useState<Record<string, boolean>>({});
   const [candidatePages, setCandidatePages] = useState<Record<string, number>>({});
+  const [activeCandidateSegmentId, setActiveCandidateSegmentId] = useState<string | null>(null);
+  const [candidateEditTarget, setCandidateEditTarget] = useState<ReviewCandidateCardEditTarget | null>(null);
   const [summary, setSummary] = useState('');
   const [task, setTask] = useState<ReviewSegmentGenerationTask | null>(null);
   const [starting, setStarting] = useState(false);
@@ -121,6 +126,8 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
       ...previous,
       ...Object.fromEntries(nextResults.map((item) => [item.segmentId, 0]))
     }));
+    const firstGenerated = nextResults.find((item) => item.cards.length);
+    if (firstGenerated) setActiveCandidateSegmentId(firstGenerated.segmentId);
     const generatedSummaries = nextResults
       .map((item) => item.summary?.trim())
       .filter((item): item is string => Boolean(item));
@@ -141,6 +148,8 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     setCardIncluded({});
     setIncluded({});
     setCandidatePages({});
+    setActiveCandidateSegmentId(null);
+    setCandidateEditTarget(null);
     setSummary('');
     setTask(null);
     setError('');
@@ -164,6 +173,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
       setCardIncluded(stored?.cardIncluded || {});
       setIncluded(stored?.included || {});
       setCandidatePages({});
+      setActiveCandidateSegmentId(nextWorkspace.segments.find((segment) => stored?.drafts?.[segment.segmentId]?.length)?.segmentId || null);
       setSummary(stored?.summary || nextWorkspace.originalSummary || '');
       const firstUnfinished = nextWorkspace.segments.find((segment) => !stored?.drafts?.[segment.segmentId]?.length);
       setSelected(firstUnfinished ? { [firstUnfinished.segmentId]: true } : {});
@@ -203,11 +213,11 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
   useEffect(() => {
     if (!target) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !merging) onClose();
+      if (event.key === 'Escape' && !merging && !candidateEditTarget) onClose();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [merging, onClose, target]);
+  }, [candidateEditTarget, merging, onClose, target]);
 
   useEffect(() => {
     if (!target || !task || !['QUEUED', 'RUNNING'].includes(task.status)) return undefined;
@@ -256,7 +266,22 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     [cardIncluded, drafts, included, workspace]
   );
   const generatedSegmentCount = workspace?.segments.filter((segment) => (drafts[segment.segmentId] || []).length > 0).length || 0;
+  const generatedSegments = useMemo(
+    () => workspace?.segments.filter((segment) => (drafts[segment.segmentId] || []).length > 0) || [],
+    [drafts, workspace]
+  );
+  const activeCandidateSegment = generatedSegments.find((segment) => segment.segmentId === activeCandidateSegmentId) || generatedSegments[0] || null;
   const invalidCandidate = candidateCards.some((card) => !card.content.question.trim() || !card.content.answer.trim() || !card.evidenceIds.length);
+
+  useEffect(() => {
+    if (!generatedSegments.length) {
+      setActiveCandidateSegmentId(null);
+      return;
+    }
+    if (!generatedSegments.some((segment) => segment.segmentId === activeCandidateSegmentId)) {
+      setActiveCandidateSegmentId(generatedSegments[0].segmentId);
+    }
+  }, [activeCandidateSegmentId, generatedSegments]);
 
   if (!target) return null;
 
@@ -326,6 +351,21 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     }));
   }
 
+  function openCandidateEditor(segmentId: string, segmentIndex: number, cardIndex: number, initialMode: 'MANUAL' | 'AI') {
+    const card = drafts[segmentId]?.[cardIndex];
+    if (!card) return;
+    setCandidateEditTarget({ materialId: target!.materialId, segmentId, segmentIndex, cardIndex, card, initialMode });
+  }
+
+  function applyCandidateEdit(card: ReviewMaterialCardSnapshot) {
+    if (!candidateEditTarget) return;
+    const { segmentId, cardIndex } = candidateEditTarget;
+    setDrafts((previous) => ({
+      ...previous,
+      [segmentId]: (previous[segmentId] || []).map((current, index) => index === cardIndex ? card : current)
+    }));
+  }
+
   function changeCandidatePage(segmentId: string, page: number) {
     setCandidatePages((previous) => ({ ...previous, [segmentId]: Math.max(0, page) }));
   }
@@ -356,6 +396,8 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
     setIncluded({});
     setCardIncluded({});
     setCandidatePages({});
+    setActiveCandidateSegmentId(null);
+    setCandidateEditTarget(null);
     setSummary(workspace.originalSummary || '');
     setTask(null);
     setError('');
@@ -444,9 +486,19 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
             <section className="review-segment-result-column" aria-labelledby="review-segment-result-title">
               <div className="review-segment-column-heading"><div><Sparkles size={16} /><h4 id="review-segment-result-title">可编辑候选</h4></div><span>逐段决定是否合并</span></div>
               <div className="review-segment-result-list">
-                {workspace.segments.some((segment) => (drafts[segment.segmentId] || []).length) ? workspace.segments.map((segment) => {
+                {generatedSegments.length ? <>
+                  <nav className="review-segment-candidate-tabs" aria-label="已生成候选的分段">
+                    {generatedSegments.map((segment) => {
+                      const segmentDrafts = drafts[segment.segmentId] || [];
+                      const selectedCount = included[segment.segmentId]
+                        ? segmentDrafts.filter((_card, index) => cardIncluded[segment.segmentId]?.[String(index)] !== false).length
+                        : 0;
+                      return <button key={`candidate-tab-${segment.segmentId}`} type="button" className={activeCandidateSegment?.segmentId === segment.segmentId ? 'is-active' : ''} onClick={() => setActiveCandidateSegmentId(segment.segmentId)}><strong>第 {segment.segmentIndex} 段</strong><span>{segmentDrafts.length} 张候选 · {selectedCount} 张参与</span></button>;
+                    })}
+                  </nav>
+                  {activeCandidateSegment ? (() => {
+                  const segment = activeCandidateSegment;
                   const segmentDrafts = drafts[segment.segmentId] || [];
-                  if (!segmentDrafts.length) return null;
                   const result = results[segment.segmentId];
                   const selectedSegmentCardCount = included[segment.segmentId]
                     ? segmentDrafts.filter((_card, index) => cardIncluded[segment.segmentId]?.[String(index)] !== false).length
@@ -463,13 +515,11 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
                     </div>
                     {currentCard ? <div className="review-segment-card-list"><article className="review-segment-card-editor" key={`${segment.segmentId}-card-${currentCardPage}`}>
                       <div className="review-segment-card-title"><label className="review-segment-card-keep"><input type="checkbox" checked={cardIncluded[segment.segmentId]?.[String(currentCardPage)] ?? result?.status === 'SUCCEEDED'} onChange={(event) => toggleCardIncluded(segment.segmentId, currentCardPage, event.target.checked)} disabled={merging} /><span>保留候选卡片 {currentCardPage + 1}</span></label><button className="icon-button tiny danger" type="button" title="移除这张候选" aria-label={`移除第 ${segment.segmentIndex} 段的候选卡片 ${currentCardPage + 1}`} onClick={() => removeSegmentCard(segment.segmentId, currentCardPage)} disabled={merging}><Trash2 size={13} /></button></div>
-                      <label><span>面试官问题</span><textarea value={currentCard.content.question} maxLength={500} rows={3} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'question', event.target.value)} disabled={merging} /></label>
-                      <label><span>参考答案（Markdown）</span><textarea value={currentCard.content.answer} maxLength={5000} rows={8} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'answer', event.target.value)} disabled={merging} /></label>
-                      <label><span>作答提示（可选）</span><textarea value={currentCard.content.hint || ''} maxLength={1000} rows={2} onChange={(event) => updateSegmentCard(setDrafts, segment.segmentId, currentCardPage, 'hint', event.target.value)} disabled={merging} /></label>
-                      <small className="review-segment-evidence-count">保留 {currentCard.evidenceIds.length} 条 evidence 引用</small>
+                      <div className="review-segment-card-preview"><div><span>面试官问题</span><MarkdownText content={currentCard.content.question || '暂无问题'} className="review-card-question-markdown" /></div><div className="review-answer-block"><span className="answer-label">参考答案</span><MarkdownText content={currentCard.content.answer || '暂无答案'} /></div>{currentCard.content.hint ? <div className="review-hint"><span>作答提示</span><MarkdownText content={currentCard.content.hint} /></div> : null}</div>
+                      <div className="review-segment-card-actions"><button className="outline-action small" type="button" onClick={() => openCandidateEditor(segment.segmentId, segment.segmentIndex, currentCardPage, 'MANUAL')} disabled={merging}><Pencil size={14} />自己修改</button><button className="outline-action small is-ai" type="button" onClick={() => openCandidateEditor(segment.segmentId, segment.segmentIndex, currentCardPage, 'AI')} disabled={merging}><Sparkles size={14} />AI 修改</button><small className="review-segment-evidence-count">保留 {currentCard.evidenceIds.length} 条 evidence 引用</small></div>
                     </article></div> : null}
                   </article>;
-                }) : <div className="review-segment-empty"><Layers3 size={28} /><strong>还没有候选卡片</strong><span>在左侧查看原文，勾选一个或多个分段后开始生成。</span></div>}
+                })() : null}</> : <div className="review-segment-empty"><Layers3 size={28} /><strong>还没有候选卡片</strong><span>在左侧查看原文，勾选一个或多个分段后开始生成。</span></div>}
               </div>
               <label className="review-segment-summary"><span>合并后的资料摘要（可选）</span><textarea value={summary} maxLength={5000} rows={4} onChange={(event) => setSummary(event.target.value)} disabled={merging} /></label>
             </section>
@@ -478,6 +528,7 @@ export function ReviewSegmentWorkspaceDialog({ target, onClose, onApplied }: Rev
           <footer className="review-segment-footer"><div><Check size={14} /><span>关闭只保留正式卡片与本地草稿；点击最终合并后才会按勾选候选整体替换正式卡片。</span></div><div className="review-delete-actions"><button className="outline-action" type="button" onClick={resetDraft} disabled={busy || merging}><RotateCcw size={15} />清空本地草稿</button><button className="outline-action" type="button" onClick={onClose} disabled={merging}><X size={15} />保留正式卡片和草稿并关闭</button><button className="primary-action" type="button" onClick={() => void mergeCandidates()} disabled={!candidateCards.length || invalidCandidate || busy || merging}>{merging ? <Loader2 className="spin" size={16} /> : <Merge size={16} />}{merging ? '正在合并' : `合并 ${candidateCards.length} 张为正式卡片`}</button></div></footer>
         </> : null}
       </section>
+      <ReviewCandidateCardEditDialog target={candidateEditTarget} onClose={() => setCandidateEditTarget(null)} onConfirmed={applyCandidateEdit} />
     </div>
   );
 }
@@ -547,19 +598,4 @@ function readStoredDraft(materialId: number, sourceVersion: number): StoredSegme
 function mergeSummaryText(current: string, additions: string[]) {
   const parts = [current.trim(), ...additions].filter(Boolean);
   return Array.from(new Set(parts)).join('\n\n').slice(0, 5000);
-}
-
-function updateSegmentCard(
-  setDrafts: Dispatch<SetStateAction<Record<string, ReviewMaterialCardSnapshot[]>>>,
-  segmentId: string,
-  cardIndex: number,
-  field: 'question' | 'answer' | 'hint',
-  value: string
-) {
-  setDrafts((previous) => ({
-    ...previous,
-    [segmentId]: (previous[segmentId] || []).map((card, index) => index === cardIndex
-      ? { ...card, content: { ...card.content, [field]: value } }
-      : card)
-  }));
 }

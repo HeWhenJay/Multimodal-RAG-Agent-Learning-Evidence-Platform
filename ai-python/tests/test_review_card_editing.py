@@ -21,8 +21,11 @@ from app.review.repository import MaterialSourceRecord, ReviewCardRecord, Review
 from app.review.service import ReviewService
 from app.schemas.rag import Evidence
 from app.schemas.review import (
+    ReviewCandidateRewriteRequest,
     ReviewCardRewriteRequest,
     ReviewCardUpdateRequest,
+    ReviewCardContent,
+    ReviewMaterialCardSnapshot,
     ReviewMaterialRewriteApplyRequest,
     ReviewMaterialRewriteRequest,
 )
@@ -174,7 +177,7 @@ class StubCardRewriter:
 
     def rewrite(self, material, card, evidences, *, instruction: str, mode: str):
         assert material.material_id == 12
-        assert card.id == 81
+        assert card.id in {0, 81}
         assert instruction == "改成两点列表"
         assert mode == "SOURCE_FIRST"
         return CardRewriteCandidate(
@@ -312,6 +315,59 @@ def test_rewrite_preview_does_not_write_card_before_user_applies() -> None:
     assert result.proposed.answer.startswith("- **跟踪**")
     assert result.evidenceRefs[0].evidenceId == "material-12-1"
     assert transaction.update_called is False
+
+
+def test_candidate_rewrite_preview_uses_current_draft_without_writing() -> None:
+    """分段候选应以当前草稿和真实 evidence 生成预览，且不触发持久化。"""
+    transaction = CardEditingTransaction()
+    service = ReviewService(
+        repository=CardEditingRepository(transaction),
+        card_rewriter=StubCardRewriter(),  # type: ignore[arg-type]
+        now_provider=lambda: NOW,
+    )
+
+    result = service.preview_candidate_rewrite(
+        12,
+        ReviewCandidateRewriteRequest(
+            instruction="改成两点列表",
+            mode="SOURCE_FIRST",
+            candidate=ReviewMaterialCardSnapshot(
+                content=ReviewCardContent(
+                    question="ISR 有什么作用？",
+                    answer="ISR 保存与 Leader 保持同步的副本集合。",
+                    hint="回忆 Leader 与 Follower",
+                ),
+                evidenceRefs=[transaction.evidences[0]],
+                evidenceIds=[transaction.evidences[0].evidenceId],
+            ),
+        ),
+        "7",
+    )
+
+    assert result.original.question == "ISR 有什么作用？"
+    assert result.proposed.question == "ISR 的核心作用是什么？"
+    assert result.evidenceIds == ["material-12-1"]
+    assert transaction.update_called is False
+
+
+def test_candidate_rewrite_rejects_foreign_evidence() -> None:
+    """候选卡片不能把其他资料的 evidence 带入模型上下文。"""
+    transaction = CardEditingTransaction()
+    service = ReviewService(repository=CardEditingRepository(transaction), now_provider=lambda: NOW)
+
+    with pytest.raises(BusinessError, match="不属于当前资料"):
+        service.preview_candidate_rewrite(
+            12,
+            ReviewCandidateRewriteRequest(
+                instruction="改得更清晰",
+                mode="SOURCE_FIRST",
+                candidate=ReviewMaterialCardSnapshot(
+                    content=ReviewCardContent(question="原问题", answer="原答案"),
+                    evidenceIds=["material-99-1"],
+                ),
+            ),
+            "7",
+        )
 
 
 def test_manual_update_preserves_fsrs_progress_and_marks_card_as_user_edited() -> None:

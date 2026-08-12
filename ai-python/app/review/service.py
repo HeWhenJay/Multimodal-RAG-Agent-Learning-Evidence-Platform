@@ -48,6 +48,8 @@ from app.review.repository import (
 from app.schemas.rag import Evidence
 from app.schemas.review import (
     ReviewCard,
+    ReviewCandidateRewritePreview,
+    ReviewCandidateRewriteRequest,
     ReviewCardContent,
     ReviewCardLibrary,
     ReviewCardLibraryMaterial,
@@ -788,6 +790,79 @@ class ReviewService:
                 hint=candidate.hint,
             ),
             evidenceRefs=list(candidate.evidence_refs),
+            modelName=candidate.model_name,
+        )
+
+    def preview_candidate_rewrite(
+        self,
+        material_id: int,
+        payload: ReviewCandidateRewriteRequest,
+        user_id: str,
+    ) -> ReviewCandidateRewritePreview:
+        """基于候选正文与所属资料 evidence 生成预览，不写入数据库。"""
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material(material_id, user_id)
+            if material is None:
+                raise BusinessError("学习资料不存在")
+            evidences = transaction.list_evidences(material)
+        evidence_by_id = {item.evidenceId: item for item in evidences}
+        requested_ids = list(dict.fromkeys(payload.candidate.evidenceIds))
+        invalid_ids = [item for item in requested_ids if item not in evidence_by_id]
+        if invalid_ids:
+            raise BusinessError("候选卡片包含不属于当前资料的 evidence")
+        selected_refs = [evidence_by_id[item] for item in requested_ids]
+        original = payload.candidate.content
+        transient_card = ReviewCardRecord(
+            id=0,
+            material_id=material.id,
+            user_id=user_id,
+            material_title=material.title,
+            document_type=material.document_type,
+            question=original.question,
+            answer=original.answer,
+            hint=original.hint,
+            evidence_refs_json=json.dumps(
+                [item.model_dump(mode="json") for item in selected_refs],
+                ensure_ascii=False,
+            ),
+            fsrs_card_json="{}",
+            due_at=as_utc(self.now_provider()),
+            retrievability=0.0,
+            review_count=0,
+            lapse_count=0,
+            active=True,
+            created_at=None,
+            updated_at=None,
+            source_key="candidate-preview",
+            material_summary=material.document_summary,
+        )
+        try:
+            candidate = self.card_rewriter.rewrite(
+                LearningMaterialContext(
+                    material_id=material.id,
+                    title=material.title,
+                    document_type=material.document_type,
+                    summary=material.document_summary,
+                ),
+                transient_card,
+                evidences,
+                instruction=payload.instruction,
+                mode=payload.mode,
+            )
+        except ReviewExtractionError as exc:
+            raise BusinessError(str(exc)) from exc
+        refs = list(candidate.evidence_refs)
+        return ReviewCandidateRewritePreview(
+            materialId=material.id,
+            mode=payload.mode,
+            original=original,
+            proposed=ReviewCardContent(
+                question=candidate.question,
+                answer=candidate.answer,
+                hint=candidate.hint,
+            ),
+            evidenceRefs=refs,
+            evidenceIds=[item.evidenceId for item in refs],
             modelName=candidate.model_name,
         )
 

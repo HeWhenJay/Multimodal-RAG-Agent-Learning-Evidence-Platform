@@ -18,6 +18,7 @@ from app.schemas.review import (
     ReviewCardLibrary,
     ReviewCardLibraryMaterial,
     ReviewCardRewritePreview,
+    ReviewCandidateRewritePreview,
     ReviewCardGroup,
     ReviewDeletionResult,
     ReviewDueGroups,
@@ -147,6 +148,20 @@ class StubReviewService:
             original=ReviewCardContent(question="ISR 有什么作用？", answer="原答案"),
             proposed=ReviewCardContent(question="ISR 的核心作用是什么？", answer="- **跟踪**同步副本"),
             evidenceRefs=[],
+            modelName="gpt-5.6-terra",
+        )
+
+    def preview_candidate_rewrite(self, material_id: int, payload, user_id: str) -> ReviewCandidateRewritePreview:
+        """模拟对尚未入库的分段候选生成无副作用预览。"""
+        self.remember(user_id)
+        assert material_id == 12 and payload.mode == "SOURCE_FIRST"
+        return ReviewCandidateRewritePreview(
+            materialId=material_id,
+            mode=payload.mode,
+            original=payload.candidate.content,
+            proposed=ReviewCardContent(question="ISR 的核心作用是什么？", answer="- **跟踪**同步副本"),
+            evidenceRefs=payload.candidate.evidenceRefs,
+            evidenceIds=payload.candidate.evidenceIds,
             modelName="gpt-5.6-terra",
         )
 
@@ -648,6 +663,55 @@ def test_card_rewrite_task_runs_in_background_and_restores_comparison() -> None:
         assert mismatched.json()["code"] == 0
     finally:
         service.rewrite_release.set()
+        app.dependency_overrides.clear()
+
+
+def test_candidate_rewrite_task_returns_preview_without_apply_endpoint() -> None:
+    """分段候选 AI 修改应后台生成对比，且只能由前端确认写回草稿。"""
+    service = StubReviewService()
+    app.dependency_overrides[get_auth_service] = StaticAuthService
+    app.dependency_overrides[get_review_service] = lambda: service
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer review-token"}
+    try:
+        created = client.post(
+            "/api/reviews/materials/12/candidate-rewrite-tasks",
+            headers=headers,
+            json={
+                "instruction": "问题更像面试官追问",
+                "mode": "SOURCE_FIRST",
+                "candidate": {
+                    "content": {"question": "ISR 有什么作用？", "answer": "原答案"},
+                    "evidenceRefs": [],
+                    "evidenceIds": [],
+                },
+            },
+        )
+        assert created.status_code == 200
+        task = created.json()["data"]
+        assert task["materialId"] == 12
+
+        latest = None
+        for _ in range(100):
+            latest = client.get(
+                f"/api/reviews/materials/12/candidate-rewrite-tasks/{task['taskId']}",
+                headers=headers,
+            ).json()["data"]
+            if latest["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert latest is not None
+        assert latest["status"] == "SUCCEEDED"
+        assert latest["result"]["original"]["answer"] == "原答案"
+        assert latest["result"]["proposed"]["answer"].startswith("-")
+        assert latest["progress"]["stageCode"] == "rewrite.candidate.completed"
+
+        foreign = client.get(
+            f"/api/reviews/materials/99/candidate-rewrite-tasks/{task['taskId']}",
+            headers=headers,
+        )
+        assert foreign.json()["code"] == 0
+    finally:
         app.dependency_overrides.clear()
 
 

@@ -61,6 +61,22 @@ export interface ReviewCardRewritePreview {
   modelName: string;
 }
 
+export interface ReviewCandidateRewritePayload {
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+  candidate: ReviewMaterialCardSnapshot;
+}
+
+export interface ReviewCandidateRewritePreview {
+  materialId: number;
+  mode: ReviewCardRewriteMode;
+  original: ReviewCardContent;
+  proposed: ReviewCardContent;
+  evidenceRefs: RagEvidence[];
+  evidenceIds: string[];
+  modelName: string;
+}
+
 export interface ReviewMaterialCardSnapshot {
   cardId?: number | null;
   content: ReviewCardContent;
@@ -112,6 +128,19 @@ export interface ReviewCardRewriteTask {
   status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
   progress: ReviewRewriteTaskProgress;
   result?: ReviewCardRewritePreview | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewCandidateRewriteTask {
+  taskId: string;
+  materialId: number;
+  instruction: string;
+  mode: ReviewCardRewriteMode;
+  status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  progress: ReviewRewriteTaskProgress;
+  result?: ReviewCandidateRewritePreview | null;
   error?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -619,6 +648,20 @@ export function fetchLatestReviewSegmentTask(materialId: number): Promise<Review
 // 轮询指定分段任务，不阻塞页面上的原文浏览和候选编辑。
 export function fetchReviewSegmentTask(materialId: number, taskId: string): Promise<ReviewSegmentGenerationTask> {
   return request<ReviewSegmentGenerationTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/segment-tasks/${encodeURIComponent(taskId)}`);
+}
+
+// 为尚未入库的一张分段候选创建 AI 修改预览，确认前不会改变候选草稿。
+export function startReviewCandidateRewriteTask(materialId: number, payload: ReviewCandidateRewritePayload): Promise<ReviewCandidateRewriteTask> {
+  return request<ReviewCandidateRewriteTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/candidate-rewrite-tasks`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+// 轮询一张分段候选的 AI 修改预览进度。
+export function fetchReviewCandidateRewriteTask(materialId: number, taskId: string): Promise<ReviewCandidateRewriteTask> {
+  return request<ReviewCandidateRewriteTask>(`/api/reviews/materials/${encodeURIComponent(String(materialId))}/candidate-rewrite-tasks/${encodeURIComponent(taskId)}`);
 }
 
 // 将用户确认参与的候选一次性发布为正式复习卡片。

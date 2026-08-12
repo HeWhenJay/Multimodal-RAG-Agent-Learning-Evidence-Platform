@@ -132,6 +132,35 @@ class ReviewMaterialCardSnapshot(BaseModel):
     evidenceIds: list[str] = Field(default_factory=list, max_length=4)
 
 
+class ReviewCandidateRewriteRequest(BaseModel):
+    """为尚未入库的分段候选请求一次无副作用 AI 改写。"""
+
+    instruction: str = Field(..., min_length=1, max_length=2000)
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"] = "SOURCE_FIRST"
+    candidate: ReviewMaterialCardSnapshot
+
+    @field_validator("instruction")
+    @classmethod
+    def normalize_instruction(cls, value: str) -> str:
+        """压缩改写说明空白，避免空提示进入模型。"""
+        normalized = " ".join(value.split()).strip()
+        if not normalized:
+            raise ValueError("候选卡片改写想法不能为空")
+        return normalized
+
+
+class ReviewCandidateRewritePreview(BaseModel):
+    """一张分段候选在用户确认前的 AI 修改对比。"""
+
+    materialId: int = Field(ge=1)
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    original: ReviewCardContent
+    proposed: ReviewCardContent
+    evidenceRefs: list[Evidence] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list, max_length=4)
+    modelName: str
+
+
 class ReviewMaterialRewriteRequest(BaseModel):
     """请求把资料当前卡片重新组织为指定数量的新卡片集合。"""
 
@@ -299,6 +328,21 @@ class ReviewCardRewriteTask(BaseModel):
     status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
     progress: ReviewRewriteTaskProgress
     result: ReviewCardRewritePreview | None = None
+    error: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
+
+
+class ReviewCandidateRewriteTask(BaseModel):
+    """可轮询的分段候选 AI 修改任务。"""
+
+    taskId: str = Field(min_length=1, max_length=80)
+    materialId: int = Field(ge=1)
+    instruction: str
+    mode: Literal["STRICT_SOURCE", "SOURCE_FIRST", "SOURCE_REFERENCE"]
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    progress: ReviewRewriteTaskProgress
+    result: ReviewCandidateRewritePreview | None = None
     error: str | None = None
     createdAt: datetime
     updatedAt: datetime

@@ -1,6 +1,6 @@
 # 学习复习与提醒接口文档
 
-更新日期：2026-08-10
+更新日期：2026-08-12
 
 ## 交互式分段生成工作台（2026-08-10）
 
@@ -249,6 +249,8 @@ LangExtract provider 内部使用 `ThreadPoolExecutor` 并行等待当前实际�
 | POST | `/api/reviews/materials/{materialId}/rewrite-tasks` | 创建资料级后台合并/重新生成任务，立即返回任务编号 |
 | GET | `/api/reviews/materials/{materialId}/rewrite-tasks/latest` | 获取当前资料最近一次合并/重新生成任务 |
 | GET | `/api/reviews/materials/{materialId}/rewrite-tasks/{taskId}` | 查询资料级改写任务的阶段、进度和对比结果 |
+| POST | `/api/reviews/materials/{materialId}/candidate-rewrite-tasks` | 为分段工作台中的一张未入库候选创建无副作用 AI 改写任务 |
+| GET | `/api/reviews/materials/{materialId}/candidate-rewrite-tasks/{taskId}` | 查询候选卡片 AI 改写任务及修改前后预览 |
 | POST | `/api/reviews/materials/{materialId}/rewrite-apply` | 携带预览版本和用户确认后的任意数量候选，事务内替换旧卡片 |
 | POST | `/api/reviews/materials/{materialId}/cards` | 创建一张用户手动复习卡片，不依赖 AI 补漏 |
 | POST | `/api/reviews/materials/{materialId}/missing-knowledge` | 兼容旧客户端：同步查找并追加遗漏知识点 |
@@ -336,6 +338,35 @@ Authorization: Bearer <token>
 - `SOURCE_REFERENCE`：原文仅参考，优先满足用户的表达和补充想法；模型没有引用原文时 `evidenceRefs` 可为空。
 
 成功响应包含 `original`、`proposed`、`evidenceRefs` 和 `modelName`，不会写入卡片。用户可直接回退关闭，也可在前端继续编辑 `proposed` 后使用 `PUT /api/reviews/cards/{cardId}` 应用；AI 应用请求额外携带本次 `rewriteMode` 与 `evidenceIds`，服务端重新校验证据属于当前用户资料。严格档位下，用户二次编辑造成答案脱离引用原文时，应用会返回“编辑后的答案未通过严格原文忠实度校验”。
+
+### 分段候选卡片 AI 修改预览
+
+分段工作台里的候选尚未写入数据库，没有正式 `cardId`。前端通过资料级候选任务提交当前卡片正文及 evidence，Python 只生成修改前后对比，不直接改动浏览器草稿或正式卡片：
+
+```http
+POST /api/reviews/materials/12/candidate-rewrite-tasks
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "instruction": "问题更像真实面试官追问，答案保留数据淘汰与过期策略的区别",
+  "mode": "SOURCE_FIRST",
+  "candidate": {
+    "cardId": null,
+    "content": {
+      "question": "Redis 的淘汰策略和过期策略有什么区别？",
+      "answer": "原候选答案",
+      "hint": "区分触发条件"
+    },
+    "evidenceIds": ["material-12-redis-1"],
+    "evidenceRefs": []
+  }
+}
+```
+
+服务端必须按认证用户校验 `materialId`，并只接受属于该资料的真实 `evidenceIds`。任务响应包含 `taskId`、`materialId`、状态与进度；成功后的 `result` 包含 `original`、`proposed`、`evidenceRefs`、`evidenceIds`、`mode` 和 `modelName`。该端点没有应用操作：前端必须先展示 Markdown 对比预览，用户点击“确认采用”后才把 `proposed` 写回当前本地候选；正式卡片仍只会在用户最后调用 `/segments/merge` 时更新。人工修改同样必须先展示修改前后预览，再由用户确认写回本地候选。
+
+同一用户、同一资料同时只保留最近一次候选改写任务；新请求会使旧运行任务的结果失效。任务状态保存在 Python API 进程内，服务重启后需要重新发起。
 
 ### 资料级合并改写与确认覆盖
 

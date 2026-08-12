@@ -25,6 +25,9 @@ from app.schemas.review import (
     ReviewBatchDeletionResult,
     ReviewCardBatchDeleteRequest,
     ReviewCardLibrary,
+    ReviewCandidateRewritePreview,
+    ReviewCandidateRewriteRequest,
+    ReviewCandidateRewriteTask,
     ReviewCardRewritePreview,
     ReviewCardRewriteRequest,
     ReviewCardRewriteTask,
@@ -125,13 +128,13 @@ class _ReviewRewriteJob:
     user_id: str
     target_kind: str
     target_id: int
-    payload: ReviewCardRewriteRequest | ReviewMaterialRewriteRequest
+    payload: ReviewCardRewriteRequest | ReviewCandidateRewriteRequest | ReviewMaterialRewriteRequest
     target_card_count: int = 1
     base_cards: tuple[Any, ...] = ()
     status: str = "QUEUED"
     progress: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
-    result: ReviewCardRewritePreview | ReviewMaterialRewritePreview | None = None
+    result: ReviewCardRewritePreview | ReviewCandidateRewritePreview | ReviewMaterialRewritePreview | None = None
     error: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -439,6 +442,45 @@ def apply_review_material_rewrite(
     )
     _invalidate_review_rewrite_job(user_id, "MATERIAL", material_id)
     return Result.success(applied)
+
+
+@router.post(
+    "/materials/{material_id}/candidate-rewrite-tasks",
+    response_model=Result[ReviewCandidateRewriteTask],
+)
+def start_review_candidate_rewrite_task(
+    material_id: int,
+    payload: ReviewCandidateRewriteRequest,
+    current_user: CurrentUser,
+    service: ReviewService = Depends(get_review_service),
+) -> Result[ReviewCandidateRewriteTask]:
+    """创建一张分段候选的后台 AI 修改预览任务。"""
+    user_id = str(current_user.id)
+    with _review_rewrite_jobs_lock:
+        existing = _find_active_review_rewrite_job(user_id, "CANDIDATE", material_id, payload)
+        if existing is not None:
+            return Result.success(_candidate_rewrite_task_response(existing))
+        job = _create_review_rewrite_job(user_id, "CANDIDATE", material_id, payload)
+    _review_rewrite_executor.submit(_run_review_rewrite_job, service, job)
+    return Result.success(_candidate_rewrite_task_response(job))
+
+
+@router.get(
+    "/materials/{material_id}/candidate-rewrite-tasks/{task_id}",
+    response_model=Result[ReviewCandidateRewriteTask],
+)
+def get_review_candidate_rewrite_task(
+    material_id: int,
+    task_id: str,
+    current_user: CurrentUser,
+) -> Result[ReviewCandidateRewriteTask]:
+    """查询当前用户一张分段候选的 AI 修改进度与预览。"""
+    user_id = str(current_user.id)
+    with _review_rewrite_jobs_lock:
+        job = _review_rewrite_jobs.get(task_id)
+        if job is None or not _review_rewrite_job_matches(job, user_id, "CANDIDATE", material_id):
+            raise BusinessError("候选卡片改写任务不存在或已过期")
+        return Result.success(_candidate_rewrite_task_response(job))
 
 
 @router.get(
@@ -831,7 +873,7 @@ def _find_active_review_rewrite_job(
     user_id: str,
     target_kind: str,
     target_id: int,
-    payload: ReviewCardRewriteRequest | ReviewMaterialRewriteRequest,
+    payload: ReviewCardRewriteRequest | ReviewCandidateRewriteRequest | ReviewMaterialRewriteRequest,
 ) -> _ReviewRewriteJob | None:
     """只复用请求内容完全相同的运行任务，避免新指令被旧任务吞掉。"""
     task_id = _latest_review_rewrite_jobs.get((user_id, target_kind, target_id))
@@ -849,10 +891,14 @@ def _create_review_rewrite_job(
     user_id: str,
     target_kind: str,
     target_id: int,
-    payload: ReviewCardRewriteRequest | ReviewMaterialRewriteRequest,
+    payload: ReviewCardRewriteRequest | ReviewCandidateRewriteRequest | ReviewMaterialRewriteRequest,
 ) -> _ReviewRewriteJob:
     """在持锁状态下登记改写任务及其初始排队进度。"""
-    prefix = "card-rewrite" if target_kind == "CARD" else "material-rewrite"
+    prefix = {
+        "CARD": "card-rewrite",
+        "CANDIDATE": "candidate-rewrite",
+        "MATERIAL": "material-rewrite",
+    }.get(target_kind, "review-rewrite")
     key = (user_id, target_kind, target_id)
     previous_task_id = _latest_review_rewrite_jobs.get(key)
     previous = _review_rewrite_jobs.get(previous_task_id) if previous_task_id else None
@@ -969,6 +1015,22 @@ def _card_rewrite_task_response(job: _ReviewRewriteJob) -> ReviewCardRewriteTask
         status=job.status,  # type: ignore[arg-type]
         progress=job.progress,
         result=job.result if isinstance(job.result, ReviewCardRewritePreview) else None,
+        error=job.error,
+        createdAt=job.created_at,
+        updatedAt=job.updated_at,
+    )
+
+
+def _candidate_rewrite_task_response(job: _ReviewRewriteJob) -> ReviewCandidateRewriteTask:
+    """把分段候选进程内任务转换为公开响应。"""
+    return ReviewCandidateRewriteTask(
+        taskId=job.task_id,
+        materialId=job.target_id,
+        instruction=job.payload.instruction,
+        mode=job.payload.mode,
+        status=job.status,  # type: ignore[arg-type]
+        progress=job.progress,
+        result=job.result if isinstance(job.result, ReviewCandidateRewritePreview) else None,
         error=job.error,
         createdAt=job.created_at,
         updatedAt=job.updated_at,
@@ -1280,7 +1342,8 @@ def _trim_review_segment_jobs() -> None:
 def _run_review_rewrite_job(service: ReviewService, job: _ReviewRewriteJob) -> None:
     """后台生成无副作用对比候选，关闭弹窗不会中断模型调用。"""
     is_card = job.target_kind == "CARD"
-    target_label = "卡片" if is_card else "资料"
+    is_candidate = job.target_kind == "CANDIDATE"
+    target_label = "正式卡片" if is_card else "候选卡片" if is_candidate else "资料"
     stage_prefix = f"rewrite.{job.target_kind.lower()}"
     with _review_rewrite_jobs_lock:
         if job.task_id not in _review_rewrite_jobs:
@@ -1306,6 +1369,10 @@ def _run_review_rewrite_job(service: ReviewService, job: _ReviewRewriteJob) -> N
             if not isinstance(job.payload, ReviewCardRewriteRequest):
                 raise BusinessError("卡片改写任务参数无效")
             result = service.preview_card_rewrite(job.target_id, job.payload, job.user_id)
+        elif is_candidate:
+            if not isinstance(job.payload, ReviewCandidateRewriteRequest):
+                raise BusinessError("候选卡片改写任务参数无效")
+            result = service.preview_candidate_rewrite(job.target_id, job.payload, job.user_id)
         else:
             if not isinstance(job.payload, ReviewMaterialRewriteRequest):
                 raise BusinessError("资料改写任务参数无效")
