@@ -2773,7 +2773,11 @@
 .review-segment-result-review { display: flex; align-items: flex-start; gap: 6px; padding: 8px 11px; color: #9a3412; background: #fff7ed; border-bottom: 1px solid #fed7aa; font-size: 10px; line-height: 1.45; }
 .review-segment-result-review svg { flex: 0 0 auto; margin-top: 1px; }
 .review-segment-evidence-count { color: #7c8798; font-size: 9px; }
-.review-segment-card-preview { display: grid; min-width: 0; gap: 10px; padding: 12px; color: #334155; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; }
+.review-segment-card-preview { display: grid; min-width: 0; max-height: 440px; gap: 10px; padding: 12px; color: #334155; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; overflow-y: scroll; overscroll-behavior: contain; scrollbar-color: #a5b4fc #eef2ff; scrollbar-gutter: stable; scrollbar-width: thin; }
+.review-segment-card-preview::-webkit-scrollbar { width: 9px; }
+.review-segment-card-preview::-webkit-scrollbar-track { background: #eef2ff; border-radius: 99px; }
+.review-segment-card-preview::-webkit-scrollbar-thumb { background: #a5b4fc; border: 2px solid #eef2ff; border-radius: 99px; }
+.review-segment-card-preview::-webkit-scrollbar-thumb:hover { background: #818cf8; }
 .review-segment-card-preview > div:first-child { display: grid; gap: 5px; }
 .review-segment-card-preview > div:first-child > span { color: #64748b; font-size: 9px; font-weight: 800; }
 .review-segment-card-preview .review-card-question-markdown { color: #1f2937; font-size: 13px; font-weight: 750; line-height: 1.55; }
@@ -2819,7 +2823,11 @@
 .review-candidate-preview-heading { display: flex; align-items: center; gap: 6px; padding: 12px 20px 0; color: #475569; font-size: 11px; font-weight: 800; }
 .review-candidate-preview-heading small { margin-left: auto; color: #8a94a3; font-size: 10px; font-weight: 500; }
 .review-candidate-preview-section .review-rewrite-comparison { padding-top: 12px; }
-.review-candidate-preview-section .review-comparison-card { max-height: 52vh; min-height: 220px; overflow: auto; }
+.review-candidate-preview-section .review-comparison-card { max-height: 52vh; min-height: 220px; overflow-y: scroll; overscroll-behavior: contain; scrollbar-color: #a5b4fc #eef2ff; scrollbar-gutter: stable; scrollbar-width: thin; }
+.review-candidate-preview-section .review-comparison-card::-webkit-scrollbar { width: 9px; }
+.review-candidate-preview-section .review-comparison-card::-webkit-scrollbar-track { background: #eef2ff; border-radius: 99px; }
+.review-candidate-preview-section .review-comparison-card::-webkit-scrollbar-thumb { background: #a5b4fc; border: 2px solid #eef2ff; border-radius: 99px; }
+.review-candidate-preview-section .review-comparison-card::-webkit-scrollbar-thumb:hover { background: #818cf8; }
 
 .review-segment-empty { display: flex; min-height: 250px; align-items: center; flex-direction: column; justify-content: center; padding: 24px; color: #94a3b8; text-align: center; }
 .review-segment-empty strong { margin-top: 9px; color: #475569; font-size: 13px; }
