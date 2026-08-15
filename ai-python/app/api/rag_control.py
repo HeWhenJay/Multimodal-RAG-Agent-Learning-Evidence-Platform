@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import date
 import inspect
 import logging
@@ -199,13 +200,18 @@ def reindex_material(
 
 
 @router.post("/query", response_model=Result[QueryResponse])
-def query(
+async def query(
     payload: RagQueryPublicRequest,
     user_id: str = Depends(current_rag_user_id),
     service: RagControlService = Depends(get_rag_control_service),
 ) -> Result[QueryResponse]:
-    """在当前用户私有资料范围执行同步检索问答。"""
-    return Result.success(execute("RAG 检索问答", lambda: service.query(payload, user_id)))
+    """在当前用户私有资料范围执行查询，最终模型网络等待不占用 llm-io 线程。"""
+    return Result.success(
+        await execute_async(
+            "RAG 检索问答",
+            lambda: query_service_async(service, payload, user_id),
+        )
+    )
 
 
 @router.get("/query/history", response_model=Result[list[RagQueryHistoryResponse]])
@@ -251,6 +257,29 @@ def execute(operation: str, action: Callable[[], T]) -> T:
     except Exception:
         logger.exception("%s失败", operation)
         raise BusinessError(f"{operation}失败") from None
+
+
+async def execute_async(operation: str, action: Callable[[], Awaitable[T]]) -> T:
+    """将异步查询异常映射为既有中文业务错误。"""
+    try:
+        return await action()
+    except BusinessError:
+        raise
+    except Exception:
+        logger.exception("%s失败", operation)
+        raise BusinessError(f"{operation}失败") from None
+
+
+async def query_service_async(
+    service: RagControlService,
+    payload: RagQueryPublicRequest,
+    user_id: str,
+) -> QueryResponse:
+    """优先调用异步服务；测试或旧适配器仅有同步入口时安全下沉线程。"""
+    async_query = getattr(service, "query_async", None)
+    if callable(async_query):
+        return await async_query(payload, user_id)
+    return await asyncio.to_thread(service.query, payload, user_id)
 
 
 async def stream_upload_to_temp(file: UploadFile) -> Path:

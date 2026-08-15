@@ -35,7 +35,10 @@ dashscope:
 - `RAG_TEXT_CORRECTION_MODEL`：默认 `qwen-plus`，按批纠正口音同音字、OCR 形近字和明显断句错误
 - `RAG_TEXT_CORRECTION_BATCH_MAX_ITEMS` / `RAG_TEXT_CORRECTION_BATCH_MAX_CHARS`：默认 `32` / `12000`，限制单次纠错 Prompt 的识别块数和字符数
 - `RAG_TEXT_CORRECTION_MIN_SIMILARITY`：默认 `0.55`，差异过大的模型结果会被拒绝，避免纠错节点改写 evidence
-- `LLM_IO_MAX_WORKERS`：所有在线 LLM、embedding、rerank、OCR 和 ASR 请求共用的进程级 I/O 线程池，默认 `16`、硬上限 `64`
+- `LLM_IO_MAX_WORKERS`：同步 Worker/CLI 以及尚未迁移的 embedding、rerank、OCR、ASR、Agent/复习模型调用共用的进程级 I/O 线程池，默认 `16`、硬上限 `64`
+- `ASYNC_MODEL_HTTP_MAX_CONNECTIONS` / `ASYNC_MODEL_HTTP_MAX_KEEPALIVE_CONNECTIONS`：共享异步模型 HTTP 连接上限与 keep-alive 连接上限，默认 `32` / `16`
+- `ASYNC_MODEL_HTTP_MAX_IN_FLIGHT`：共享异步模型 HTTP 在途上限，默认 `16`；超过上限时最多等待 `ASYNC_MODEL_HTTP_ACQUIRE_TIMEOUT_SECONDS`（默认 `5` 秒）
+- `ASYNC_MODEL_HTTP_CONNECT_TIMEOUT_SECONDS` / `ASYNC_MODEL_HTTP_DEFAULT_TIMEOUT_SECONDS`：共享客户端默认连接预算与请求总预算，默认 `10` / `45` 秒；具体模型可使用更小的调用预算
 - `RAG_KAFKA_HANDLER_CONCURRENCY`：Kafka 视频/文档索引长任务并发，CPU/内存阶段默认 `9`（n+1）；同一 partition 内按资料 key 并发
 - `RAG_KAFKA_CONTROL_CONCURRENCY`：progress/result/promote/DLQ 控制消息 I/O 并发，默认 `16`（2n）
 - `RAG_OUTBOX_PUBLISH_CONCURRENCY`：Outbox Kafka/数据库 I/O 并发，默认 `16`（2n）；不同 topic/key 并行，同一 topic/key 按事件 ID 保序
@@ -161,6 +164,16 @@ $env:AI_KAFKA_WORKER_ENABLED='true'
 ```
 
 可使用 `--without-cron`、`--without-kafka`、`--without-agent-worker` 或 `--without-rag-worker` 做本地排障；`--with-*` 参数可以临时覆盖 YAML 开关。`--without-kafka` 会同时关闭 Kafka 投递模式，资料任务自动改由 PostgreSQL `LOCAL` durable worker 执行；`--with-kafka` 会同时启用 Kafka 投递和 worker。`app.workers.kafka_worker` 是正式 Kafka 入口，`ai-python/run_kafka_worker.py` 仅保留兼容转发。
+
+## 异步模型 HTTP 边界
+
+公开 `POST /api/rag/query` 已将最终百炼回答生成迁移为真正异步链路：FastAPI async 路由调用 `RagControlService.query_async`，同步 PostgreSQL、Multi-Query、embedding、rerank 和本地检索阶段由兼容线程执行，回答准入通过后在事件循环中直接 `await httpx.AsyncClient`。最终回答等待不再占用一个 `llm-io` 线程；响应仍保留原有 `Result`、`QueryResponse`、answer guard、diagnostics、progressEvents 和完整 evidence 引用。
+
+共享 `AsyncClient` 由 FastAPI lifespan 启动和关闭，绑定单一事件循环并复用连接池；连接数、keep-alive、在途并发、并发槽等待、连接超时和请求总超时均有界。HTTP 429、超时、网络错误、HTTP 错误和空响应继续降级为本地 evidence 回答，限流提示不会泄露密钥或完整响应正文。
+
+当前保留同步边界：耐久 RAG Worker/CLI 的 `store.query`、Multi-Query、embedding、rerank、OCR、ASR、识别文本纠错、Agent Qwen、复习生成和简历改写仍使用同步客户端或 OpenAI SDK，并由 `llm-io` 线程池隔离。后续应按调用链逐条增加原生 async 客户端和生命周期管理，不跨事件循环复用当前共享客户端，也不使用 async 外壳包装同步 SDK 冒充非阻塞网络 I/O。
+
+审计时应区分三类实现：`AsyncModelHttpClientPool` 和 Douyin MCP 的 `httpx.AsyncClient` 属于真正异步 HTTP；`run_llm_io_async` 只是协程等待同步函数在线程池执行，仍会占用一个 `llm-io` worker；`httpx.Client`、同步 `OpenAI` SDK、OCR/ASR SDK 与 Worker/CLI 调用均属于同步兼容路径。Douyin MCP 当前按 MCP session 创建异步客户端，尚未并入模型共享池，后续迁移需先验证 session 生命周期和认证隔离。
 
 ## 目录结构
 

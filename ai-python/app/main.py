@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
 
@@ -23,12 +24,24 @@ from app.api.logs import router as logs_router
 from app.api.page_data import router as page_data_router
 from app.api.rag_control import router as rag_control_router
 from app.api.review import router as review_router
+from app.core.io_concurrency import async_model_http_pool
 from app.core.result import BusinessError, Result
+
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    """随 FastAPI 生命周期启动并关闭共享异步模型 HTTP 连接池。"""
+    await async_model_http_pool.start()
+    try:
+        yield
+    finally:
+        await async_model_http_pool.close()
 
 
 app = FastAPI(
     title="Multimodal RAG Agent Learning Evidence Platform - AI Service",
     version="0.1.0",
+    lifespan=app_lifespan,
 )
 
 

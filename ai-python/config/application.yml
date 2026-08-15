@@ -7,8 +7,17 @@ server:
   reload: ${AI_SERVICE_RELOAD:true}
 
 llm:
-  # 所有在线模型 HTTP 请求共用专用 I/O 线程池，避免阻塞 API、Worker 或 Agent 编排线程。
+  # 同步 Worker/CLI 与尚未迁移的模型 SDK 共用专用 I/O 线程池。
   io-max-workers: ${LLM_IO_MAX_WORKERS:16}
+  async-http:
+    # FastAPI 最终回答链复用生命周期级 AsyncClient；连接数与在途请求分别有界。
+    max-connections: ${ASYNC_MODEL_HTTP_MAX_CONNECTIONS:32}
+    max-keepalive-connections: ${ASYNC_MODEL_HTTP_MAX_KEEPALIVE_CONNECTIONS:16}
+    keepalive-expiry-seconds: ${ASYNC_MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS:30}
+    max-in-flight: ${ASYNC_MODEL_HTTP_MAX_IN_FLIGHT:16}
+    acquire-timeout-seconds: ${ASYNC_MODEL_HTTP_ACQUIRE_TIMEOUT_SECONDS:5}
+    connect-timeout-seconds: ${ASYNC_MODEL_HTTP_CONNECT_TIMEOUT_SECONDS:10}
+    default-timeout-seconds: ${ASYNC_MODEL_HTTP_DEFAULT_TIMEOUT_SECONDS:45}
 
 rag:
   store:

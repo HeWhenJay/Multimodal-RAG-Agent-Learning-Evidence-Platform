@@ -478,8 +478,14 @@ class PgVectorRagStore:
         )
 
     @logged_rag_method("query.pipeline", "pgvector_query", "pgvector 模式执行 RAG 检索问答")
-    def query(self, request: QueryRequest, progress_reporter: RagProgressReporter | None = None) -> QueryResponse:
-        """执行 RAG 查询；任务接口可注入 reporter 实时读取阶段事件。"""
+    def query(
+        self,
+        request: QueryRequest,
+        progress_reporter: RagProgressReporter | None = None,
+        *,
+        defer_answer: bool = False,
+    ) -> QueryResponse:
+        """执行 RAG 查询；异步 API 可延后最终回答，避免在线等待占用线程。"""
         progress_reporter = progress_reporter or RagProgressReporter(document_id="query", persist=False)
         progress_reporter.emit("query.expand", "正在生成 Multi-Query 查询变体", current_step=1, total_steps=8, percent=8)
         filter_plan = build_metadata_filter_plan(request.metadataFilter)
@@ -718,6 +724,20 @@ class PgVectorRagStore:
             percent=92,
             detail=f"目前在使用 {answer_model} 模型完成基于 evidence 生成回答事件",
         )
+        if defer_answer:
+            return QueryResponse(
+                answer="",
+                answerStatus=guard.answerStatus,
+                refusalReason=guard.refusalReason,
+                refusalPolicy=guard.refusalPolicy,
+                confidence=guard.confidence,
+                supportingEvidenceIds=guard.supportingEvidenceIds,
+                refusalMessage=None,
+                expandedQueries=expanded_queries,
+                evidences=supporting_evidences,
+                diagnostics=diagnostics,
+                progressEvents=progress_reporter.events,
+            )
         generated = generate_grounded_answer(request.question, supporting_evidences)
         diagnostics.update(generated.diagnostics())
         progress_reporter.emit(

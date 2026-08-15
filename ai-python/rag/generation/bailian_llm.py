@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.io_concurrency import run_llm_io
+from app.core.io_concurrency import AsyncModelHttpClientPool, async_model_http_pool, run_llm_io
 from app.schemas.rag import Evidence
 from rag.core.source_references import evidence_source_label
 from rag.observability.model_logging import log_model_call
@@ -45,12 +45,14 @@ class BailianChatClient:
         model: str | None = None,
         provider: str | None = None,
         timeout_seconds: float | None = None,
+        async_http_pool: AsyncModelHttpClientPool | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.base_url = (base_url or os.getenv("RAG_LLM_BASE_URL") or DEFAULT_CHAT_BASE_URL).rstrip("/")
         self.model = model or os.getenv("RAG_LLM_MODEL") or DEFAULT_CHAT_MODEL
         self.provider = (provider or os.getenv("RAG_ANSWER_PROVIDER") or "auto").strip().lower()
         self.timeout_seconds = timeout_seconds or float(os.getenv("RAG_LLM_TIMEOUT_SECONDS", "45"))
+        self.async_http_pool = async_http_pool or async_model_http_pool
 
     @property
     def should_call_dashscope(self) -> bool:
@@ -104,6 +106,53 @@ class BailianChatClient:
                 fallback_reason=f"百炼回答生成失败: {exc}",
             )
 
+    @logged_rag_method("query.answer", "bailian_answer_async", "异步执行百炼或本地回答生成")
+    async def generate_async(self, question: str, evidences: list[Evidence]) -> GeneratedAnswer:
+        """在 FastAPI 事件循环中直接等待异步 HTTP，并保持同步入口的降级语义。"""
+        process_event(
+            stage="query.answer",
+            action="answer_select_provider",
+            message="已选择回答生成提供方",
+            context={
+                "provider": "dashscope" if self.should_call_dashscope else "local",
+                "evidenceCount": len(evidences),
+                "ioMode": "async-http",
+            },
+        )
+        if not evidences:
+            return GeneratedAnswer(
+                answer="当前知识库没有检索到足够相关的证据，请先上传或索引学习资料。",
+                provider="local",
+                model="deterministic-grounded-answer",
+            )
+        if not self.should_call_dashscope:
+            return GeneratedAnswer(
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
+                provider="local",
+                model="deterministic-grounded-answer",
+            )
+        if not self.api_key:
+            return GeneratedAnswer(
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
+                provider="local",
+                model="deterministic-grounded-answer",
+                fallback_reason="DASHSCOPE_API_KEY 未配置",
+            )
+        try:
+            content = await self._call_chat_async(question, evidences)
+            return GeneratedAnswer(
+                answer=append_evidence_reference_summary(content, evidences),
+                provider="dashscope",
+                model=self.model,
+            )
+        except Exception as exc:
+            return GeneratedAnswer(
+                answer=append_evidence_reference_summary(deterministic_grounded_answer(question, evidences), evidences),
+                provider="local",
+                model="deterministic-grounded-answer",
+                fallback_reason=f"百炼回答生成失败: {exc}",
+            )
+
     @logged_rag_method("query.answer", "bailian_chat_call", "调用百炼回答生成接口")
     def _call_chat(self, question: str, evidences: list[Evidence]) -> str:
         try:
@@ -111,24 +160,8 @@ class BailianChatClient:
         except ImportError as exc:
             raise RuntimeError("使用百炼 LLM 需要安装 httpx 依赖") from exc
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": rag_answer_system_prompt(),
-                },
-                {
-                    "role": "user",
-                    "content": build_prompt(question, evidences),
-                },
-            ],
-            "temperature": float(os.getenv("RAG_LLM_TEMPERATURE", "0.2")),
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        payload = self._payload(question, evidences)
+        headers = self._headers()
         with log_model_call(
             stage="query.answer",
             action="bailian_chat",
@@ -143,8 +176,61 @@ class BailianChatClient:
                     return client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
 
             response = run_llm_io(request_completion)
+        return self._response_content(response)
+
+    @logged_rag_method("query.answer", "bailian_chat_call_async", "异步调用百炼回答生成接口")
+    async def _call_chat_async(self, question: str, evidences: list[Evidence]) -> str:
+        """复用生命周期级 AsyncClient，不占用 llm-io 线程等待网络响应。"""
+        with log_model_call(
+            stage="query.answer",
+            action="bailian_chat_async",
+            model_name=self.model,
+            event="基于 evidence 异步生成回答",
+            extra_context={"evidenceCount": len(evidences), "questionLength": len(question)},
+            recoverable=True,
+            fallback_message=f"使用 {self.model} 模型完成异步回答事件失败，已降级到本地证据摘要继续处理",
+        ):
+            response = await self.async_http_pool.request(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(),
+                json=self._payload(question, evidences),
+                timeout_seconds=self.timeout_seconds,
+            )
+        return self._response_content(response)
+
+    def _payload(self, question: str, evidences: list[Evidence]) -> dict[str, Any]:
+        """构造同步与异步入口共用的 Chat Completions 请求体。"""
+        return {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": rag_answer_system_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": build_prompt(question, evidences),
+                },
+            ],
+            "temperature": float(os.getenv("RAG_LLM_TEMPERATURE", "0.2")),
+        }
+
+    def _headers(self) -> dict[str, str]:
+        """构造不写入日志的百炼鉴权请求头。"""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _response_content(self, response: Any) -> str:
+        """统一映射限流、HTTP 错误、空响应和兼容响应结构。"""
+        if response.status_code == 429:
+            retry_after = str(response.headers.get("Retry-After") or "").strip()
+            retry_hint = f"，建议 {retry_after} 秒后重试" if retry_after else ""
+            raise RuntimeError(f"百炼回答生成触发限流{retry_hint}")
         if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code} {response.text[:500]}")
+            raise RuntimeError(f"百炼回答生成 HTTP {response.status_code} {response.text[:500]}")
         data = response.json()
         content = extract_message_content(data).strip()
         if not content:
@@ -155,6 +241,11 @@ class BailianChatClient:
 def generate_grounded_answer(question: str, evidences: list[Evidence]) -> GeneratedAnswer:
     """生成带证据引用约束的回答，生产优先走百炼，测试可本地降级。"""
     return BailianChatClient().generate(question, evidences)
+
+
+async def generate_grounded_answer_async(question: str, evidences: list[Evidence]) -> GeneratedAnswer:
+    """供异步 FastAPI 查询链直接调用共享连接池生成回答。"""
+    return await BailianChatClient().generate_async(question, evidences)
 
 
 def build_prompt(question: str, evidences: list[Evidence]) -> str:

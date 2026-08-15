@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 import json
 import logging
@@ -50,6 +51,7 @@ from app.services.remote_video_import import RemoteVideoUrl, extract_remote_vide
 from app.services.material_processing_progress import build_material_processing_progress, public_progress_text
 from rag.loaders.document_parsers import DocumentParserRouter
 from rag.loaders.mineru_loader import MineruDocumentLoader
+from rag.generation.bailian_llm import generate_grounded_answer_async
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import create_rag_store
 
@@ -922,6 +924,33 @@ class RagControlService:
         self._insert_query_history(request, user_id, response, elapsed_ms(start), task_id=None, status="COMPLETED")
         return response
 
+    async def query_async(self, request: RagQueryPublicRequest, user_id: str) -> QueryResponse:
+        """异步执行公开查询，让最终回答 HTTP 直接 await 共享 AsyncClient。"""
+        start = time.perf_counter()
+        scoped = self._scoped_query_request(request, user_id)
+        try:
+            response = await self._execute_query_async(scoped, user_id)
+        except Exception as exc:
+            await asyncio.to_thread(
+                self._save_failed_query_history,
+                request,
+                user_id,
+                elapsed_ms(start),
+            )
+            raise BusinessError("RAG 查询失败") from exc
+        duration_ms = elapsed_ms(start)
+        await asyncio.to_thread(
+            lambda: self._insert_query_history(
+                request,
+                user_id,
+                response,
+                duration_ms,
+                task_id=None,
+                status="COMPLETED",
+            )
+        )
+        return response
+
     def list_query_history(
         self,
         user_id: str,
@@ -1029,6 +1058,46 @@ class RagControlService:
             delivery_mode="database",
         )
         return self.store.query(request, progress_reporter=progress)
+
+    async def _execute_query_async(self, request: QueryRequest, user_id: str) -> QueryResponse:
+        """在线程中完成现有同步检索，再在事件循环直接等待最终回答 HTTP。"""
+        progress = RagProgressReporter(
+            document_id="query",
+            user_id=user_id,
+            persist=True,
+            delivery_mode="database",
+        )
+        response = await asyncio.to_thread(
+            lambda: self.store.query(
+                request,
+                progress_reporter=progress,
+                defer_answer=True,
+            )
+        )
+        if response.answerStatus == "REFUSED":
+            return response
+
+        generated = await generate_grounded_answer_async(request.question, response.evidences)
+        diagnostics = dict(response.diagnostics)
+        diagnostics.update(generated.diagnostics())
+        answer_model = generated.diagnostics().get("answerModel") or os.getenv("RAG_LLM_MODEL") or "qwen-plus"
+        await asyncio.to_thread(
+            progress.emit,
+            "query.answer",
+            "RAG 检索问答完成",
+            status="COMPLETED",
+            current_step=8,
+            total_steps=8,
+            percent=100,
+            detail=f"回答模型：{answer_model}；引用 evidence 数：{len(response.evidences)}；ioMode=async-http",
+        )
+        return response.model_copy(
+            update={
+                "answer": generated.answer,
+                "diagnostics": diagnostics,
+                "progressEvents": list(progress.events),
+            }
+        )
 
     def _index_text_material(self, material: MaterialRecord, content: str):
         """保留 Markdown 标题和段落结构，走现有递归切块入口。"""

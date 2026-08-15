@@ -7,8 +7,14 @@ server:
   reload: ${AI_SERVICE_RELOAD:true}
 
 llm:
-  # I/O 密集型在线模型调用的进程级线程数，本机可按账号配额和网络容量调整。
+  # 同步兼容调用的进程级线程数，本机可按账号配额和网络容量调整。
   io-max-workers: ${LLM_IO_MAX_WORKERS:16}
+  async-http:
+    # 公开 RAG 最终回答的共享异步连接池；max-in-flight 不应超过账号在线配额。
+    max-connections: ${ASYNC_MODEL_HTTP_MAX_CONNECTIONS:32}
+    max-keepalive-connections: ${ASYNC_MODEL_HTTP_MAX_KEEPALIVE_CONNECTIONS:16}
+    max-in-flight: ${ASYNC_MODEL_HTTP_MAX_IN_FLIGHT:16}
+    acquire-timeout-seconds: ${ASYNC_MODEL_HTTP_ACQUIRE_TIMEOUT_SECONDS:5}
 
 storage:
   # 本地开发默认写 uploads/rag；生产切换为 oss 并补齐下方环境变量。

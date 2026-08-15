@@ -22,6 +22,33 @@ def test_llm_io_thread_pool_config_env_mapping_is_effective():
     assert env_defaults["LLM_IO_MAX_WORKERS"] == "24"
 
 
+def test_async_model_http_config_env_mapping_is_effective() -> None:
+    """共享 AsyncClient 的连接、并发和超时配置必须完整映射。"""
+    env_defaults = build_env_defaults(
+        {
+            "llm": {
+                "async-http": {
+                    "max-connections": 40,
+                    "max-keepalive-connections": 20,
+                    "keepalive-expiry-seconds": 25,
+                    "max-in-flight": 12,
+                    "acquire-timeout-seconds": 4,
+                    "connect-timeout-seconds": 8,
+                    "default-timeout-seconds": 50,
+                }
+            }
+        }
+    )
+
+    assert env_defaults["ASYNC_MODEL_HTTP_MAX_CONNECTIONS"] == "40"
+    assert env_defaults["ASYNC_MODEL_HTTP_MAX_KEEPALIVE_CONNECTIONS"] == "20"
+    assert env_defaults["ASYNC_MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS"] == "25"
+    assert env_defaults["ASYNC_MODEL_HTTP_MAX_IN_FLIGHT"] == "12"
+    assert env_defaults["ASYNC_MODEL_HTTP_ACQUIRE_TIMEOUT_SECONDS"] == "4"
+    assert env_defaults["ASYNC_MODEL_HTTP_CONNECT_TIMEOUT_SECONDS"] == "8"
+    assert env_defaults["ASYNC_MODEL_HTTP_DEFAULT_TIMEOUT_SECONDS"] == "50"
+
+
 def test_review_segment_budget_config_env_mapping_is_effective() -> None:
     """交互式分段的单请求、重试和质量轮次预算必须可由 YAML 配置。"""
     env_defaults = build_env_defaults(
