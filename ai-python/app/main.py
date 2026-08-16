@@ -23,6 +23,7 @@ from app.api.auth import router as auth_router
 from app.api.logs import router as logs_router
 from app.api.page_data import router as page_data_router
 from app.api.rag_control import router as rag_control_router
+from app.api.dsh_plugin_rag import router as dsh_plugin_rag_router
 from app.api.review import router as review_router
 from app.core.io_concurrency import async_model_http_pool
 from app.core.result import BusinessError, Result
@@ -54,7 +55,7 @@ async def handle_business_error(_: Request, error: BusinessError) -> JSONRespons
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(request: Request, error: RequestValidationError):
     """将公开认证、RAG 和复习参数错误转换为既有 `Result` 信封。"""
-    if request.url.path.startswith(("/api/auth", "/api/rag", "/api/agent", "/api/reviews")):
+    if request.url.path.startswith(("/api/auth", "/api/rag", "/api/dsh-plugin", "/api/agent", "/api/reviews")):
         return JSONResponse(status_code=200, content=Result.failure(public_validation_message(error)).model_dump())
     return await request_validation_exception_handler(request, error)
 
@@ -99,4 +100,5 @@ app.include_router(auth_router)
 app.include_router(logs_router)
 app.include_router(page_data_router)
 app.include_router(rag_control_router)
+app.include_router(dsh_plugin_rag_router)
 app.include_router(review_router)

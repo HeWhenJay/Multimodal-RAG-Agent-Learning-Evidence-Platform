@@ -346,6 +346,28 @@ def test_public_rag_validation_and_missing_token_use_result_envelope() -> None:
         app.dependency_overrides.clear()
 
 
+def test_dsh_plugin_rag_routes_require_no_login_and_use_fixed_partition(monkeypatch) -> None:
+    """DSH 插件本机路由不读取登录令牌，并固定资料分区。"""
+    service = StubRagControlService()
+    app.dependency_overrides[get_rag_control_service] = lambda: service
+    monkeypatch.setenv("DSH_PLUGIN_RAG_USER_ID", "dsh-study")
+    client = TestClient(app)
+    try:
+        query_response = client.post("/api/dsh-plugin/rag/query", json={"question": "资料够吗？"})
+        video_response = client.post(
+            "/api/dsh-plugin/rag/materials/url",
+            json={
+                "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                "confirmedAuthorized": True,
+            },
+        )
+        assert query_response.status_code == 200 and query_response.json()["code"] == 1
+        assert video_response.status_code == 200 and video_response.json()["code"] == 1
+        assert service.users == ["dsh-study", "dsh-study"]
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_public_query_scope_overrides_client_user_and_visibility() -> None:
     """服务端必须覆盖客户端伪造的 userId 与 visibilityScope。"""
     service = RagControlService(repository=object(), store=object(), parser_router=object(), object_storage=object(), executor=object())
