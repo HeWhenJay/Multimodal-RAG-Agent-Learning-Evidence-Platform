@@ -92,6 +92,16 @@ class RagControlTransaction(Protocol):
 
     def list_materials(self, user_id: str, limit: int) -> list[MaterialRecord]: ...
 
+    def list_materials_page(
+        self,
+        user_id: str,
+        *,
+        limit: int,
+        query: str | None,
+        cursor_updated_at: datetime | None,
+        cursor_id: int | None,
+    ) -> tuple[list[MaterialRecord], int]: ...
+
     def find_material(self, material_id: int, user_id: str) -> MaterialRecord | None: ...
 
     def find_material_by_public_url(
@@ -257,6 +267,55 @@ class DatabaseRagControlTransaction:
             (user_id, limit),
         )
         return [self._to_material(row) for row in self._cursor.fetchall()]
+
+    def list_materials_page(
+        self,
+        user_id: str,
+        *,
+        limit: int,
+        query: str | None,
+        cursor_updated_at: datetime | None,
+        cursor_id: int | None,
+    ) -> tuple[list[MaterialRecord], int]:
+        """使用更新时间和 ID 游标分页读取资料，并按标题或来源参数化筛选。"""
+        base_filters = ["user_id = %s"]
+        base_params: list[object] = [user_id]
+        if query:
+            base_filters.append("(title ILIKE %s OR COALESCE(source, '') ILIKE %s)")
+            keyword = f"%{query}%"
+            base_params.extend((keyword, keyword))
+        page_filters = list(base_filters)
+        page_params = list(base_params)
+        if cursor_updated_at is not None and cursor_id is not None:
+            page_filters.append("(updated_at < %s OR (updated_at = %s AND id < %s))")
+            page_params.extend((cursor_updated_at, cursor_updated_at, cursor_id))
+        base_where_clause = " AND ".join(base_filters)
+        page_where_clause = " AND ".join(page_filters)
+        self._cursor.execute(
+            self._statement(
+                f"""
+                SELECT COUNT(1) AS total
+                FROM {{schema}}.learning_material
+                WHERE {base_where_clause}
+                """
+            ),
+            tuple(base_params),
+        )
+        total_row = self._cursor.fetchone() or {}
+        total = int(total_row.get("total") or 0)
+        self._cursor.execute(
+            self._statement(
+                f"""
+                SELECT id, title, user_id, document_type, source, status, parser, chunk_count, created_at, updated_at
+                FROM {{schema}}.learning_material
+                WHERE {page_where_clause}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %s
+                """
+            ),
+            (*page_params, limit),
+        )
+        return [self._to_material(row) for row in self._cursor.fetchall()], total
 
     def find_material(self, material_id: int, user_id: str) -> MaterialRecord | None:
         """仅按资料 ID 与所有者联合读取，避免越权。"""

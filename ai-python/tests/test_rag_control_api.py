@@ -14,6 +14,8 @@ from app.repositories.rag_control import MaterialRecord, ProgressLogRecord
 from app.schemas.auth import AuthUserResponse
 from app.schemas.rag import QueryResponse, QueryTaskResponse
 from app.schemas.rag_control import (
+    DshPluginMaterialPageResponse,
+    DshPluginMaterialResponse,
     MaterialPreviewResponse,
     MaterialUploadChunkResponse,
     RagMaterialResponse,
@@ -50,6 +52,15 @@ class StubRagControlService:
     def list_materials(self, user_id: str) -> list[RagMaterialResponse]:
         self._remember(user_id)
         return [sample_material()]
+
+    def list_dsh_materials(self, user_id: str, **kwargs) -> DshPluginMaterialPageResponse:
+        self._remember(user_id)
+        assert kwargs["limit"] == 30
+        return DshPluginMaterialPageResponse(
+            items=[DshPluginMaterialResponse(id=1, title="测试资料", documentType="markdown", source="manual", status="READY")],
+            total=1,
+            hasMore=False,
+        )
 
     def get_material(self, material_id: int, user_id: str) -> RagMaterialResponse:
         self._remember(user_id)
@@ -353,6 +364,9 @@ def test_dsh_plugin_rag_routes_require_no_login_and_use_fixed_partition(monkeypa
     monkeypatch.setenv("DSH_PLUGIN_RAG_USER_ID", "dsh-study")
     client = TestClient(app)
     try:
+        overview_response = client.get("/api/dsh-plugin/rag/overview")
+        materials_response = client.get("/api/dsh-plugin/rag/materials")
+        preview_response = client.get("/api/dsh-plugin/rag/materials/1/preview")
         query_response = client.post("/api/dsh-plugin/rag/query", json={"question": "资料够吗？"})
         video_response = client.post(
             "/api/dsh-plugin/rag/materials/url",
@@ -361,9 +375,12 @@ def test_dsh_plugin_rag_routes_require_no_login_and_use_fixed_partition(monkeypa
                 "confirmedAuthorized": True,
             },
         )
+        assert overview_response.status_code == 200 and overview_response.json()["code"] == 1
+        assert materials_response.status_code == 200 and materials_response.json()["code"] == 1
+        assert preview_response.status_code == 200 and preview_response.json()["code"] == 1
         assert query_response.status_code == 200 and query_response.json()["code"] == 1
         assert video_response.status_code == 200 and video_response.json()["code"] == 1
-        assert service.users == ["dsh-study", "dsh-study"]
+        assert service.users == ["dsh-study"] * 5
     finally:
         app.dependency_overrides.clear()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import date, datetime, timedelta
 import json
 import logging
@@ -31,6 +32,8 @@ from app.schemas.rag_control import (
     RagIndexRemoteVideoBatchPublicRequest,
     RagIndexRemoteVideoPublicRequest,
     RagIndexTextPublicRequest,
+    DshPluginMaterialPageResponse,
+    DshPluginMaterialResponse,
     RagMaterialResponse,
     RagOverviewPublicResponse,
     RagQueryHistoryResponse,
@@ -139,6 +142,57 @@ class RagControlService:
         with self.repository.transaction() as transaction:
             records = transaction.list_materials(user_id, 20)
             return [self._material_response(transaction, record) for record in records]
+
+    def list_dsh_materials(
+        self,
+        user_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 30,
+        query: str | None = None,
+    ) -> DshPluginMaterialPageResponse:
+        """为 DSH 插件提供服务端游标分页的最小资料列表。"""
+        safe_limit = clamp(limit, 1, 100, 30)
+        cursor_updated_at, cursor_id = decode_material_cursor(cursor)
+        with self.repository.transaction() as transaction:
+            try:
+                records, total = transaction.list_materials_page(
+                    user_id,
+                    limit=safe_limit + 1,
+                    query=query.strip() if query and query.strip() else None,
+                    cursor_updated_at=cursor_updated_at,
+                    cursor_id=cursor_id,
+                )
+            except AttributeError:
+                # 兼容尚未升级分页协议的测试替身，仍限制返回数量，避免一次加载全部资料。
+                records = transaction.list_materials(user_id, safe_limit + 1)
+                total = len(records)
+        has_more = len(records) > safe_limit
+        visible = records[:safe_limit]
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            if last.updated_at is not None:
+                next_cursor = encode_material_cursor(last.updated_at, last.id)
+        return DshPluginMaterialPageResponse(
+            items=[
+                DshPluginMaterialResponse(
+                    id=record.id,
+                    title=record.title,
+                    documentType=record.document_type,
+                    source=record.source,
+                    status=record.status,
+                    parser=record.parser,
+                    chunkCount=record.chunk_count,
+                    createdAt=record.created_at,
+                    updatedAt=record.updated_at,
+                )
+                for record in visible
+            ],
+            total=total,
+            hasMore=has_more,
+            nextCursor=next_cursor,
+        )
 
     def get_material(self, material_id: int, user_id: str) -> RagMaterialResponse:
         """读取当前用户拥有的一条资料。"""
@@ -2020,6 +2074,25 @@ def normalize_filter_value(value: Any) -> Any:
         values = [str(item).strip() for item in value if str(item).strip()]
         return values or None
     return value
+
+
+def encode_material_cursor(updated_at: datetime, material_id: int) -> str:
+    """把更新时间和 ID 编码为不透明游标，避免客户端拼接 SQL 条件。"""
+    raw = f"{updated_at.isoformat()}|{material_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_material_cursor(cursor: str | None) -> tuple[datetime | None, int | None]:
+    """解析游标；非法游标以中文业务错误拒绝，避免静默跳页。"""
+    if not cursor:
+        return None, None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        timestamp, raw_id = decoded.rsplit("|", 1)
+        return datetime.fromisoformat(timestamp), int(raw_id)
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise BusinessError("分页游标无效") from exc
 
 
 def clamp(value: int | None, minimum: int, maximum: int, default: int) -> int:

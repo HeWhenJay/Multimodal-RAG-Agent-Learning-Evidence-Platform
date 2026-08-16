@@ -89,6 +89,29 @@ class RagOverviewPublicResponse(BaseModel):
     lastIndexedTitle: str | None = None
 
 
+class DshPluginMaterialResponse(BaseModel):
+    """DSH 知识浏览列表使用的最小资料元数据，不包含原文和索引内容。"""
+
+    id: int
+    title: str
+    documentType: str
+    source: str | None = None
+    status: MaterialStatus
+    parser: str | None = None
+    chunkCount: int = 0
+    createdAt: datetime | None = None
+    updatedAt: datetime | None = None
+
+
+class DshPluginMaterialPageResponse(BaseModel):
+    """DSH 知识浏览的游标分页结果。"""
+
+    items: list[DshPluginMaterialResponse] = Field(default_factory=list)
+    total: int = 0
+    hasMore: bool = False
+    nextCursor: str | None = None
+
+
 class RagMaterialResponse(BaseModel):
     """学习资料及其最近可见进度。"""
 
