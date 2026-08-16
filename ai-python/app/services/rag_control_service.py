@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import logging
 import mimetypes
@@ -273,6 +274,51 @@ class RagControlService:
             )
             material = schedule.material
         return self._material_response_for_user(material, user_id)
+
+    def sync_text_material(self, request: RagIndexTextPublicRequest, user_id: str) -> RagMaterialResponse:
+        """按项目内部稳定来源新增或替换手工文本，并复用耐久索引与版本围栏。"""
+        source = non_blank(request.source, "manual")
+        content_hash = hashlib.sha256(request.content.encode("utf-8")).hexdigest()
+        with self.repository.transaction() as transaction:
+            material = transaction.find_material_by_source(source, user_id)
+            if material is None:
+                material = transaction.insert_material(
+                    title=request.title,
+                    user_id=user_id,
+                    document_type=normalized_document_type(request.documentType, "markdown"),
+                    source=source,
+                    status="PENDING",
+                    original_filename=None,
+                    original_file_path=None,
+                    storage_type="manual",
+                    object_key=None,
+                    public_url=None,
+                )
+                next_status = "PENDING"
+            else:
+                if (material.storage_type or "").lower() != "manual":
+                    raise BusinessError("同步来源已被非手工资料占用")
+                existing_hash = transaction.find_latest_index_content_hash(material.id, user_id)
+                material = transaction.update_manual_material(
+                    material.id,
+                    user_id,
+                    title=request.title,
+                    source=source,
+                )
+                if material is None:
+                    raise BusinessError("同步资料状态已变化，请重试")
+                if existing_hash == content_hash:
+                    return self._material_response(transaction, material)
+                next_status = "REINDEXING"
+            schedule = transaction.enqueue_index_job(
+                material=material,
+                operation="INDEX_TEXT",
+                status=next_status,
+                high_precision=False,
+                source_ref={"type": "INLINE_TEXT", "parser": "python-manual-text"},
+                text=request.content,
+            )
+            return self._material_response(transaction, schedule.material)
 
     def import_remote_video(
         self,

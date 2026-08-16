@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import os
 import re
@@ -104,6 +105,10 @@ class RagControlTransaction(Protocol):
 
     def find_material(self, material_id: int, user_id: str) -> MaterialRecord | None: ...
 
+    def find_material_by_source(self, source: str, user_id: str) -> MaterialRecord | None: ...
+
+    def find_latest_index_content_hash(self, material_id: int, user_id: str) -> str | None: ...
+
     def find_material_by_public_url(
         self,
         public_url: str,
@@ -127,6 +132,8 @@ class RagControlTransaction(Protocol):
     ) -> MaterialRecord: ...
 
     def update_material_status(self, material_id: int, status: str) -> MaterialRecord | None: ...
+
+    def update_manual_material(self, material_id: int, user_id: str, *, title: str, source: str) -> MaterialRecord | None: ...
 
     def update_material_storage(
         self,
@@ -331,6 +338,53 @@ class DatabaseRagControlTransaction:
         )
         return self._to_material(self._cursor.fetchone())
 
+    def find_material_by_source(self, source: str, user_id: str) -> MaterialRecord | None:
+        """按当前用户和项目内部同步来源加锁读取，避免并发同步重复创建。"""
+        self._cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"rag-manual-source:{user_id}:{source}",),
+        )
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT *
+                FROM {schema}.learning_material
+                WHERE user_id = %s AND source = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            (user_id, source),
+        )
+        return self._to_material(self._cursor.fetchone())
+
+    def find_latest_index_content_hash(self, material_id: int, user_id: str) -> str | None:
+        """读取资料最近一次文本索引任务中的正文哈希，用于崩溃补偿和并发幂等。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                SELECT request_json
+                FROM {schema}.rag_index_job
+                WHERE material_id = %s
+                  AND user_id = %s
+                  AND operation = 'INDEX_TEXT'
+                  AND status NOT IN ('FAILED', 'DLQ', 'STALE_IGNORED')
+                ORDER BY request_version DESC, created_at DESC
+                LIMIT 1
+                """
+            ),
+            (material_id, user_id),
+        )
+        row = self._cursor.fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row.get("request_json") or "{}"))
+        except json.JSONDecodeError:
+            return None
+        value = str(payload.get("contentHash") or "")
+        return value if re.fullmatch(r"[0-9a-f]{64}", value) else None
+
     def find_material_by_public_url(
         self,
         public_url: str,
@@ -395,6 +449,7 @@ class DatabaseRagControlTransaction:
         }
         if text is not None:
             payload["text"] = text
+            payload["contentHash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
         self._cursor.execute(
             self._statement(
                 """
@@ -519,6 +574,25 @@ class DatabaseRagControlTransaction:
                 """
             ),
             (status, material_id),
+        )
+        return self._to_material(self._cursor.fetchone())
+
+    def update_manual_material(self, material_id: int, user_id: str, *, title: str, source: str) -> MaterialRecord | None:
+        """只更新当前用户手工文本资料的展示元数据，正文随新 INDEX_TEXT 任务投递。"""
+        self._cursor.execute(
+            self._statement(
+                """
+                UPDATE {schema}.learning_material
+                SET title = %s,
+                    source = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                  AND user_id = %s
+                  AND storage_type = 'manual'
+                RETURNING *
+                """
+            ),
+            (title, source, material_id, user_id),
         )
         return self._to_material(self._cursor.fetchone())
 

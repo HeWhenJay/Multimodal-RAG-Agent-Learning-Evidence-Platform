@@ -1190,6 +1190,29 @@ def test_local_prefilter_skips_misc_content_and_accepts_study_material() -> None
     assert study[1] == "面试复习"
 
 
+def test_local_prefilter_accepts_structured_english_learning_material() -> None:
+    """英文技术资料也必须依靠主题与结构化陈述双信号进入既有卡片链。"""
+    study = classify_learning_content(
+        LearningMaterialContext(5, "RAG evidence retrieval and review cards", "markdown"),
+        [
+            evidence(
+                "english-study",
+                "Retrieval pipeline",
+                "Retrieval-Augmented Generation is a method for grounding answers in evidence. "
+                "It combines vector retrieval with keyword matching and uses reranking to promote strong evidence.",
+            )
+        ],
+    )
+    misc = classify_learning_content(
+        LearningMaterialContext(6, "Weekly report", "markdown"),
+        [evidence("english-misc", "Status", "Completed tickets and scheduled next week's meeting.")],
+    )
+
+    assert study[0] is True
+    assert study[1] == "技术原理"
+    assert misc[0] is False
+
+
 def test_local_prefilter_uses_title_intent_without_overfiltering_technical_courses() -> None:
     """杂项标题优先跳过，显式讲解系统日志的课程仍可进入复习生成。"""
     log_dump = classify_learning_content(

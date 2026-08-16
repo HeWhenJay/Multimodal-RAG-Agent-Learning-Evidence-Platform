@@ -23,6 +23,7 @@ PYTHON_MIGRATIONS = (
     "20260805_0200_optimize_review_query_indexes.sql",
     "20260807_0100_add_remote_video_platform_import_guard.sql",
     "20260807_0200_expand_review_card_hint.sql",
+    "20260816_0200_add_dsh_local_material_sync.sql",
 )
 PYTHON_MIGRATION_LOCK_KEY = 6842476948943452609
 

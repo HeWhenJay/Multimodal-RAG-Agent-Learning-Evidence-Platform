@@ -60,6 +60,18 @@ dashscope:
 - `REVIEW_LANGEXTRACT_MAX_WORKERS`：单份资料 LangExtract 本地切分与定位聚合并发，默认及硬上限均为 `9`（n+1）
 - `REDIS_URL`：可选；用于跨实例复习生成短锁和 Agent L2 运行态快照，不能替代 PostgreSQL 的排程、消息和摘要事实
 - `REVIEW_GENERATION_LOCK_TTL_SECONDS`：复习生成短锁 TTL，默认 `180` 秒
+- `DSH_LOCAL_SYNC_ENABLED`：当前项目的 DSH 个人同步适配器开关，默认 `true`；共享部署或不允许读取服务账户本地资料时应显式设为 `false`
+- `DSH_KNOWLEDGE_STORE_PATH`：项目服务端只读的 DSH 插件 v2 manifest；默认 `~/.dsh/project-knowledge-review/knowledge.json`
+
+### DSH 本地知识库个人同步适配器
+
+`GET /api/dsh-local-sync/status` 和 `POST /api/dsh-local-sync/sync` 是当前项目私有的 pull adapter，不属于公开 DSH 插件。项目主动读取服务端固定的插件 v2 store；插件不会调用、配对或识别本项目。
+
+- 浏览器请求不接受 `userId`、store path、document ID 或资料正文；项目登录会话决定导入后的所有者。
+- 第一次成功同步的项目账号会成为该本机 store 的唯一 owner，防止共享部署中的其他项目账号复制同一 OS 用户资料。
+- 项目资料使用稳定来源 `dsh-local:<documentId>` 和正文 SHA-256 幂等同步，并复用既有 durable `INDEX_TEXT`、pgvector 和 ReviewService 链。
+- 插件摘要、系统分类和用户分类只保存在同步映射表作来源审计，不覆盖项目 ReviewService 生成的摘要、分类或复习卡片。
+- 该能力适用于项目服务与 DSH 使用同一可信 OS identity 的个人本机部署；多用户或远程共享环境应默认关闭，或由运维提供独立的服务端身份映射。
 
 Agent、RAG、复习、简历、视觉 OCR、音频 ASR 和识别文本纠错 Prompt 统一维护在 `ai-python/prompts/`；修改模板时应同步更新版本常量和对应测试。
 
@@ -229,6 +241,7 @@ conda run -n learning-evidence-rag python -B ai-python/rag/evaluation/run_ragas_
 - `/api/page-data/*`：工作台和系统设置。
 - `/api/logs/*`：事件、错误和概览。
 - `/api/rag/*`：资料、索引、检索、查询历史与耐久查询任务。
+- `/api/dsh-local-sync/*`：登录用户查看并主动触发当前项目的 DSH 本地 v2 pull adapter。
 - `/api/agent/*`：任务、会话、审批、SSE、工具和长期记忆。
 
 ## RAG 策略

@@ -63,15 +63,23 @@ SUBTITLE_CREDIT_PATTERN = r"字幕由.{1,40}?(?:提供|制作)"
 LEARNING_INTENT_KEYWORDS = (
     "八股", "面经", "面试题", "课程", "教程", "知识点", "技术讲解",
     "学习笔记", "复习", "源码分析", "教学", "讲解",
+    "study guide", "learning notes", "review notes", "tutorial", "course",
+    "lesson", "interview question", "source code analysis",
 )
 LEARNING_TOPIC_KEYWORDS = (
     "原理", "机制", "高可用", "分布式", "算法", "数据库", "缓存",
     "消息队列", "向量检索", "大模型", "事务", "并发", "架构",
+    "algorithm", "database", "cache", "distributed system", "architecture",
+    "vector retrieval", "embedding", "machine learning", "language model",
+    "retrieval-augmented generation", "transaction", "concurrency",
 )
 NON_LEARNING_KEYWORDS = (
     "个人简历", "求职简历", "招聘职位", "岗位描述", "职位描述", "会议纪要",
     "工作周报", "工作日报", "聊天记录", "通知公告", "系统日志", "错误日志",
     "上传清单", "账单", "发票", "歌词", "声乐练习",
+    "resume", "curriculum vitae", "job description", "meeting minutes",
+    "weekly report", "daily report", "chat transcript", "invoice", "lyrics",
+    "system log", "error log",
 )
 ANSWER_CLAIM_CONNECTOR_PATTERN = (
     r"此外|另外|同时|而且|并且|但是|然而|因此|所以|从而|这意味着|这说明|"
@@ -1343,11 +1351,20 @@ def classify_learning_content(
     topic_hits = [keyword for keyword in LEARNING_TOPIC_KEYWORDS if keyword in corpus]
     negative_hits = [keyword for keyword in NON_LEARNING_KEYWORDS if keyword in corpus]
     negative_title_hits = [keyword for keyword in NON_LEARNING_KEYWORDS if keyword in title]
-    question_like = len(re.findall(r"[？?]|为什么|如何|是什么|区别|作用|流程", corpus))
+    question_like = len(
+        re.findall(
+            r"[？?]|为什么|如何|是什么|区别|作用|流程|"
+            r"\b(?:why|how|what|difference|purpose|workflow|when)\b",
+            corpus,
+        )
+    )
     knowledge_statements = len(
         re.findall(
             r"是指|用于|通过|包括|分为|原因|区别|优点|缺点|步骤|机制|原理|实现|"
-            r"保证|负责|依赖|同步|选举|配置|组成|采用|导致|解决|比较",
+            r"保证|负责|依赖|同步|选举|配置|组成|采用|导致|解决|比较|"
+            r"\b(?:is a|is an|refers to|used for|uses|combines|includes|consists of|"
+            r"works by|ensures|depends on|responsible for|implements|solves|causes|"
+            r"first|second|third|finally)\b",
             corpus,
         )
     )
@@ -1366,11 +1383,17 @@ def classify_learning_content(
 
 def infer_learning_category(corpus: str) -> str:
     """本地过滤阶段只生成内部分类标签，不生成任何面向用户的复习正文。"""
-    if any(word in corpus for word in ("面经", "面试题", "八股", "面试官")):
+    if any(word in corpus for word in ("面经", "面试题", "八股", "面试官", "interview question")):
         return "面试复习"
-    if any(word in corpus for word in ("课程", "教程", "视频", "讲解")):
+    if any(word in corpus for word in ("课程", "教程", "视频", "讲解", "course", "tutorial", "lesson")):
         return "课程复习"
-    if any(word in corpus for word in ("原理", "机制", "算法", "高可用", "分布式")):
+    if any(
+        word in corpus
+        for word in (
+            "原理", "机制", "算法", "高可用", "分布式", "algorithm",
+            "distributed system", "architecture", "retrieval-augmented generation",
+        )
+    ):
         return "技术原理"
     return "学习资料"
 

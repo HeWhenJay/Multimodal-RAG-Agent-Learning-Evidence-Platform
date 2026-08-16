@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
+import logging
 import os
 import signal
 import socket
@@ -25,6 +26,9 @@ from rag.kafka.producer import build_envelope
 from rag.kafka.worker import RagKafkaIndexWorker, RagKafkaPromoteWorker
 from rag.observability.progress import RagProgressReporter
 from rag.retrievers.retrieval import create_rag_store
+
+
+logger = logging.getLogger(__name__)
 
 
 class CapturingProducer:
@@ -224,6 +228,8 @@ class RagDurableTaskWorker:
                     terminal_failed = True
             return not terminal_failed
         except Exception:
+            # 只记录任务标识与异常栈，不记录 request_json 正文或任何模型密钥。
+            logger.exception("本地耐久索引发生未预期错误，jobId=%s, materialId=%s", job.id, job.material_id)
             # 数据库/请求反序列化等失败由租约恢复；业务异常由 worker 内部结果/DLQ 收敛。
             return False
 

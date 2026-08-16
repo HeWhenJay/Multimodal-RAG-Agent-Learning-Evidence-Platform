@@ -142,6 +142,13 @@ class RagKafkaIndexWorker:
         except IndexExecutionLostError as exc:
             raise RetryNotReady(execution_retry_seconds(execution), str(exc)) from exc
         except Exception as exc:
+            # 仅记录任务标识与异常栈，避免把资料正文、第三方响应或模型密钥写入日志。
+            logger.exception(
+                "RAG 索引处理失败，jobId=%s, materialId=%s, documentId=%s",
+                payload.jobId,
+                payload.materialId,
+                payload.canonicalDocumentId,
+            )
             try:
                 self._assert_execution_active(execution, verify_repository=True)
             except IndexExecutionLostError as lease_error:

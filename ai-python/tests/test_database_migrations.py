@@ -146,3 +146,16 @@ def test_review_generation_progress_migration_is_registered() -> None:
     sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
     assert "ADD COLUMN IF NOT EXISTS generation_progress JSONB" in sql
     assert "DEFAULT '{}'::jsonb" in sql
+
+
+def test_dsh_local_sync_migration_registers_owner_mapping_and_conflict_guard() -> None:
+    """个人 DSH 同步必须保存唯一 owner、用户资料映射并在重复来源时明确拒绝。"""
+    filename = "20260816_0200_add_dsh_local_material_sync.sql"
+
+    assert filename in PYTHON_MIGRATIONS
+    sql = " ".join((MIGRATION_DIRECTORY / filename).read_text(encoding="utf-8").split())
+    assert "CREATE TABLE IF NOT EXISTS learning_evidence.dsh_local_material_sync" in sql
+    assert "CREATE TABLE IF NOT EXISTS learning_evidence.dsh_local_sync_owner" in sql
+    assert "发现重复 DSH 本地同步来源" in sql
+    assert "LEFT(COALESCE(source, ''), 10) = 'dsh-local:'" in sql
+    assert "folder_sync_status" not in sql
